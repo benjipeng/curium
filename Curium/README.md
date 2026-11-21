@@ -1,45 +1,47 @@
 # Curium · 96 Cm
 
-Curium is a native iOS browser shell for embedded Blink and Manifest V3 extensions.
-Build it with Xcode 27.2. The deployment floor is iOS 26.0; the system vertical
-bar and reserved fold regions are available on iOS 27.1 and later.
+Curium (`com.appautomaton.curium`) is a native iOS browser shell for embedded Chromium Blink, V8, Manifest V3 extensions, and isolated fingerprint profiles. Build it with Xcode 27.2 (`iphoneos27.2` / `iphonesimulator27.2`). The deployment floor is iOS 26.0; the `84 pt` system vertical bar and reserved fold (`.division`) regions activate on iOS 27.1 and later.
 
-`CURIUM_USE_ENGINE_XCFRAMEWORK` in `Version.xcconfig` selects the build mode.
-With `NO`, the app builds without the engine and starts in standby: the
-address field and tab history stay in memory, and standby neither loads
-websites nor installs extensions. The shell never substitutes WebKit for Blink.
+## Build Modes
 
-To run with Blink:
+`CURIUM_USE_ENGINE_XCFRAMEWORK` in [`Version.xcconfig`](../Version.xcconfig) selects the build mode:
 
-1. Run `scripts/sync_curium_engine.py` to assemble the engine pinned in
-   `Kernel.lock` into `Vendor/CuriumEngine/`: `chrome_framework.xcframework`
-   and its matching `EarlyMallocZoneRegistration.xcframework`. The default
-   slice names are `ios-arm64` and `ios-arm64-simulator`; override
-   `CURIUM_ENGINE_SLICE` if the vendor uses a different slice identifier. The handoff also provides
-   `EngineResources/` and, when needed, `Lottie.xcframework`. The build copies
-   engine resources into the app bundle where Blink expects them.
-2. Pass `CURIUM_USE_ENGINE_XCFRAMEWORK=YES` to the build or enable it in
-   `Version.xcconfig`. For a device build, select the signing team and
-   provisioning appropriate to the engine artifact.
-3. The link flags put `-Wl,-framework,EarlyMallocZoneRegistration` first.
-   The embed phase checks the first strong Mach-O load command and signs the
-   embedded frameworks before the app is signed.
+- **`NO` (Standby / Unit Testing):** Builds without `Vendor/CuriumEngine/` and runs `CuriumTests` in milliseconds. Standby keeps the address bar and tab history in memory and never substitutes WebKit for Blink.
+- **`YES` (Embedded Blink):** Links `EarlyMallocZoneRegistration.xcframework` first, followed by `chrome_framework.xcframework` and `Lottie.xcframework`, and copies `EngineResources/` into the app bundle.
 
-To build and package an ad-hoc signed `arm64` IPA locally or in CI against the
-engine pinned in `Kernel.lock`:
+### Local Setup with Blink
+
+1. Assemble and SHA-256 verify the engine pinned in [`Kernel.lock`](../Kernel.lock) into `Vendor/CuriumEngine/`:
+   ```sh
+   python3 scripts/sync_curium_engine.py
+   python3 scripts/sync_curium_engine.py --status
+   ```
+2. Set `CURIUM_USE_ENGINE_XCFRAMEWORK=YES` (default in `Version.xcconfig`) and build `Curium.xcodeproj` with `unset SDKROOT`.
+3. The embed phase checks that `EarlyMallocZoneRegistration` is the first strong Mach-O `LC_LOAD_DYLIB` load command and signs embedded frameworks inside-out before signing the app.
+
+### Packaging & Releases
+
+Build an ad-hoc signed Release `arm64` IPA locally against the pinned engine:
 
 ```sh
 ./scripts/build_curium_ipa.sh --output-dir dist
 ```
 
-On GitHub Actions, `.github/workflows/build-curium.yml` runs the same script on
-`xcode-27` (`/Applications/Xcode_27.2.app`), uploads the IPA artifact, and
-publishes a GitHub Release on `curium-v*` tag pushes or manual
-`workflow_dispatch`.
+On GitHub Actions, [`.github/workflows/build-curium.yml`](../.github/workflows/build-curium.yml) runs the same script on `xcode-27` (`/Applications/Xcode_27.2.app`), uploads the IPA and `.sha256` artifact, and publishes a GitHub Release on `curium-v*` tag pushes or manual `workflow_dispatch`.
 
-Curium registers its shell delegate before entering `ChromeMain`. The engine
-owns the scene lifecycle, browsing context, and live tab and popup views. The
-shell mounts those views, owns the native chrome, and reviews extension
-permissions returned by the engine before confirming an install. A signed CRX
-or Chrome Web Store listing is always prepared and verified by the engine.
-Only the shared regular browsing context is exposed.
+## Architecture & Modules
+
+| Directory | Role |
+| --- | --- |
+| `Curium/App/` | Entry point (`CuriumApp.swift`), pre-`ChromeMain` fail-closed profile bootstrap gate, dedicated UIKit recovery scene delegate (`CuriumRecoveryApplicationDelegate`), and scene lifecycle WAL checkpoints. |
+| `Curium/Browser/` | Liquid Glass address bar, 120 Hz compositor scroll collapse, `.occlusion` / `.division` fold adaptation, Blink viewport host, and Picture in Picture state machine. |
+| `Curium/Fingerprint/` | Build 40 `schemaVersion: 1` config models, 7 built-in presets (`default`, `ios-blink`, `macos-desktop`, `win11-workstation`, `linux-desktop`, `pixel-android`, `privacy-hardened`), structural + coherence validator, durable JSON store, and symlink/`flock`-hardened profile storage inspection & wipe helpers. |
+| `Curium/Sheets/` | Settings, native `NavigationStack` Fingerprint Profile Studio & Editor (`CuriumFingerprintStudioSheet.swift`), Diagnostics contract & hook inspector, Extensions manager & popups, Tabs, Downloads, Bookmarks, and History. |
+| `Curium/Data/` | LiveContainer-durable SQLite library (`curium.sqlite` with WAL `0xdead10cc` `can-suspend-locked` xattr protection) and rolling diagnostics log (`curium-diagnostics.log`). |
+| `Curium/Engine/` | Objective-C runtime bridge (`CuriumRuntime.m`) for launch switches (including profile-gated `GlobalPrivacyControlApi`), early V8 JIT probe, extension calls, and `CrIOSEngineBootstrap` capability/status queries. |
+
+## Shell ↔ Engine Lifecycle
+
+Curium validates and registers its launch fingerprint profile before calling `ChromeMain`. If an explicitly selected profile is missing, invalid, unsupported, or locked, Curium fails closed to a dedicated recovery screen without touching Chromium or the default cookie jar.
+
+When launch succeeds, Curium registers its `CrIOSShellBootstrapDelegate` and enters `ChromeMain`. The engine owns the single regular browsing context, scene lifecycle, and live tab/popup views; the Swift shell mounts those views, owns native chrome, and confirms extension permissions before installation.

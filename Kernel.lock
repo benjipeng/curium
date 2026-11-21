@@ -1,5 +1,5 @@
 # Verified Actions artifact for local Curium engine assembly.
-KERNEL_REPO=benjipeng/chromium-blink-ios
+KERNEL_REPO=benjipeng/curium
 KERNEL_BRANCH=main
 KERNEL_COMMIT=8b550ce56a86bc44977df3731dd80833d5786014
 KERNEL_RUN_ID=44939797575
