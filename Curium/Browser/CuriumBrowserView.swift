@@ -22,7 +22,7 @@ struct CuriumBrowserView: View {
     }
 
     private var tab: CuriumTabModel? { store.activeTab }
-    private var isFullscreen: Bool { tab?.isFullscreen == true }
+    private var isFullscreen: Bool { tab?.isFullscreen == true && tab?.isShowingPDF != true }
     private var showsStartPage: Bool { tab?.isBlankStartPage == true }
 
     var body: some View {
@@ -49,8 +49,23 @@ struct CuriumBrowserView: View {
                 )
                 .ignoresSafeArea(.container, edges: [.top, .bottom])
                 .ignoresSafeArea(.keyboard)
-                .allowsHitTesting(!showsStartPage)
-                .accessibilityHidden(showsStartPage)
+                .allowsHitTesting(!showsStartPage && tab?.isShowingPDF != true)
+                .accessibilityHidden(showsStartPage || tab?.isShowingPDF == true)
+
+                if let pdfSession = tab?.pdfSession {
+                    CuriumInlinePDFView(
+                        session: pdfSession,
+                        topInset: restingTopInset,
+                        bottomPadding: placement == .none ? CuriumSpace.bottomToolbarClearance : 14,
+                        palette: palette,
+                        onClose: { tab?.dismissPDFSession() },
+                        onRetry: pdfSession.originalURL.map { url in { tab?.load(url) } },
+                        onOpenLink: { tab?.load($0) },
+                        onSavedToDownloads: { _ in store.refreshSavedDownloads() },
+                        onSaveError: { store.errorMessage = $0 }
+                    )
+                    .id(pdfSession.id)
+                }
 
                 if !isFullscreen {
                     CuriumReadingEdge(
@@ -90,13 +105,31 @@ struct CuriumBrowserView: View {
                     .ignoresSafeArea(.container, edges: .top)
                 }
 
-                if !isFullscreen {
+                if !isFullscreen, tab?.isShowingPDF != true {
                     CuriumStoreInstallPillOverlay(
                         store: store,
                         palette: palette,
                         bottomPadding: placement == .none ? CuriumSpace.bottomToolbarClearance : 14,
                         openExtensions: { present(.extensions) }
                     )
+                }
+
+                if !isFullscreen, let bannerDownload = store.activeDownloadBanner {
+                    let pdfStackOffset: CGFloat = {
+                        guard let pdf = tab?.pdfSession, case .ready = pdf.phase else { return 0 }
+                        return pdf.isSearching ? 114 : 58
+                    }()
+                    CuriumDownloadBannerOverlay(
+                        store: store,
+                        download: bannerDownload,
+                        palette: palette,
+                        bottomPadding: (placement == .none ? CuriumSpace.bottomToolbarClearance : 14) + pdfStackOffset,
+                        openDownloads: {
+                            store.dismissDownloadBanner()
+                            present(.downloads)
+                        }
+                    )
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
             .onChange(of: proxy.size.width, initial: true) { _, newWidth in
@@ -153,8 +186,8 @@ struct CuriumBrowserView: View {
             case .bookmarks:
                 CuriumLibrarySheet(
                     store: store, section: .bookmarks,
-                    currentPage: store.activeTab?.url.map {
-                        CuriumBookmarkPage(url: $0, title: store.activeTab?.title ?? "")
+                    currentPage: store.activeTab?.bookmarkableURL.map {
+                        CuriumBookmarkPage(url: $0, title: store.activeTab?.displayTitle ?? "")
                     }
                 )
             case .history: CuriumLibrarySheet(store: store, section: .history)
@@ -396,7 +429,7 @@ private struct CuriumBackToolbarButton: View {
         Button {
             store.activeTab?.goBack()
         } label: { Label("Back", systemImage: "chevron.left") }
-        .disabled(store.activeTab?.canGoBack != true)
+        .disabled(store.activeTab?.effectiveCanGoBack != true)
     }
 }
 
@@ -407,7 +440,7 @@ private struct CuriumForwardToolbarButton: View {
         Button {
             store.activeTab?.goForward()
         } label: { Label("Forward", systemImage: "chevron.right") }
-        .disabled(store.activeTab?.canGoForward != true)
+        .disabled(store.activeTab?.effectiveCanGoForward != true)
     }
 }
 
@@ -428,17 +461,32 @@ private struct CuriumOverflowToolbarMenu: View {
     let present: (CuriumBrowserView.Destination) -> Void
 
     private var tab: CuriumTabModel? { store.activeTab }
-    private var canScalePage: Bool { tab?.url != nil && tab?.engine != nil }
+    private var canScalePage: Bool {
+        if let pdf = tab?.pdfSession {
+            return pdf.phase == .ready
+        }
+        return tab?.url != nil && tab?.engine != nil
+    }
+    private var canFindInPage: Bool {
+        if let pdf = tab?.pdfSession {
+            return pdf.phase == .ready
+        }
+        return tab?.url != nil && tab?.engine != nil
+    }
 
     var body: some View {
         Menu {
             pageScaleControls
             Button {
-                tab?.engine?.presentFindInPage()
+                if let pdf = tab?.pdfSession {
+                    pdf.openSearch()
+                } else {
+                    tab?.engine?.presentFindInPage()
+                }
             } label: {
-                Label("Find in Page", systemImage: "magnifyingglass")
+                Label(tab?.isShowingPDF == true ? "Find in PDF" : "Find in Page", systemImage: "magnifyingglass")
             }
-            .disabled(tab?.url == nil || tab?.engine == nil)
+            .disabled(!canFindInPage)
 
             Button {
                 tab?.toggleDesktopSite()
@@ -448,14 +496,21 @@ private struct CuriumOverflowToolbarMenu: View {
                     systemImage: tab?.usesDesktopSite == true ? "iphone" : "desktopcomputer"
                 )
             }
-            .disabled(tab?.engine == nil)
+            .disabled(tab?.engine == nil || tab?.isShowingPDF == true)
 
             Button { present(.bookmarks) } label: { Label("Bookmarks", systemImage: "book") }
                 .accessibilityIdentifier("curium.menu.bookmarks")
             Button { present(.history) } label: { Label("History", systemImage: "clock") }
                 .accessibilityIdentifier("curium.menu.history")
 
-            Button { present(.downloads) } label: { Label("Downloads", systemImage: "arrow.down.circle") }
+            Button { present(.downloads) } label: {
+                let pending = store.pendingOrActiveDownloadCount
+                Label(
+                    pending > 0 ? "Downloads (\(pending))" : "Downloads",
+                    systemImage: "arrow.down.circle"
+                )
+            }
+            .accessibilityIdentifier("curium.menu.downloads")
             Button { present(.settings) } label: { Label("Settings", systemImage: "gearshape") }
         } label: {
             Label("More", systemImage: "ellipsis")
@@ -464,7 +519,7 @@ private struct CuriumOverflowToolbarMenu: View {
 
     /// One compact inline row, as Safari's: steps keep the menu open; the percentage resets to 100%.
     @ViewBuilder private var pageScaleControls: some View {
-        let percentage = Int(((tab?.zoomScale ?? 1) * 100).rounded())
+        let percentage = Int(((tab?.effectiveZoomScale ?? 1) * 100).rounded())
         let value = Text(Double(percentage) / 100, format: .percent.precision(.fractionLength(0)))
         ControlGroup {
             Button { setPageScale(percentage - 5) } label: {
@@ -532,10 +587,154 @@ private struct CuriumStoreInstallPillOverlay: View {
                 .glassEffect(.regular.interactive(), in: Capsule())
                 .accessibilityIdentifier("curium.store.install")
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 16)
+        .padding(.bottom, bottomPadding)
+        .ignoresSafeArea(.keyboard)
+        }
+    }
+}
+
+/// Floating Liquid Glass download prompt & progress bar for non-PDF downloads.
+private struct CuriumDownloadBannerOverlay: View {
+    let store: CuriumBrowserStore
+    @Bindable var download: CuriumDownload
+    let palette: CuriumPalette
+    let bottomPadding: CGFloat
+    let openDownloads: () -> Void
+
+    var body: some View {
+        GeometryReader { proxy in
+            let pane = bannerPane(in: proxy)
+            VStack {
+                Spacer()
+                HStack(spacing: 12) {
+                    Image(systemName: statusIcon)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(palette.tint)
+                        .frame(width: 24)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(download.filename)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if download.isActive {
+                            if let fraction = download.fraction {
+                                ProgressView(value: fraction)
+                                    .tint(palette.tint)
+                            } else {
+                                Text("Downloading…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else if let failure = download.failure {
+                            Text(failure)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        } else if download.state == .completed {
+                            Text("Saved to Downloads")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else if let size = download.formattedByteSize {
+                            Text(size)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("Ready to download")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    if download.isActive {
+                        Button {
+                            download.cancel()
+                        } label: {
+                            Text("Cancel")
+                                .font(.footnote.weight(.semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    } else if download.state == .pending {
+                        Button {
+                            Task { await store.startDownload(download) }
+                        } label: {
+                            Text("Download")
+                                .font(.footnote.weight(.semibold))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(palette.tint)
+                        .controlSize(.small)
+                        .accessibilityIdentifier("curium.download.banner.start")
+                    } else if download.state == .completed {
+                        Button("View", action: openDownloads)
+                            .font(.footnote.weight(.semibold))
+                            .buttonStyle(.borderedProminent)
+                            .tint(palette.tint)
+                            .controlSize(.small)
+                            .accessibilityIdentifier("curium.download.banner.view")
+                    }
+
+                    Button {
+                        store.dismissDownloadBanner()
+                    } label: {
+                        Label("Dismiss Download Banner", systemImage: "xmark")
+                            .labelStyle(.iconOnly)
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 28, height: 28)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("curium.download.banner.dismiss")
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .frame(maxWidth: min(480, pane.maxWidth), minHeight: CuriumSpace.tapTarget + 6)
+                .glassEffect(.regular.interactive(), in: Capsule())
+            }
+            .padding(.leading, pane.leading)
+            .padding(.trailing, pane.trailing)
             .padding(.bottom, bottomPadding)
-            .ignoresSafeArea(.keyboard)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: pane.alignment)
+        }
+        .ignoresSafeArea(.keyboard)
+        .task(id: download.isActive) {
+            guard download.isActive else { return }
+            while !Task.isCancelled && download.isActive {
+                download.refresh()
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { break }
+            }
+        }
+    }
+
+    private func bannerPane(in proxy: GeometryProxy) -> (leading: CGFloat, trailing: CGFloat, maxWidth: CGFloat, alignment: Alignment) {
+        let width = proxy.size.width
+        guard #available(iOS 27.1, *) else {
+            return (16, 16, max(240, width - 32), .center)
+        }
+        for region in proxy.reservedRegions(kind: .division, options: [.includeInactive]) where region.isActive {
+            let frame = region.frame
+            guard frame.height > frame.width, frame.minX < width - 2, frame.maxX > 2 else { continue }
+            let leftRoom = max(0, frame.minX - 28)
+            let rightRoom = max(0, width - frame.maxX - 28)
+            if leftRoom >= rightRoom, leftRoom >= 220 {
+                return (16, width - frame.minX + 12, leftRoom, .leading)
+            } else if rightRoom >= 220 {
+                return (frame.maxX + 12, 16, rightRoom, .trailing)
+            }
+        }
+        return (16, 16, max(240, width - 32), .center)
+    }
+
+    private var statusIcon: String {
+        switch download.state {
+        case .completed: "checkmark.circle.fill"
+        case .failed: "exclamationmark.triangle.fill"
+        default: "arrow.down.circle.fill"
         }
     }
 }
@@ -570,7 +769,7 @@ private struct CuriumReadingEdge: View {
     let height: CGFloat
 
     var body: some View {
-        let collapse = tab?.chrome.collapse(focused: focused, hasPage: tab?.url != nil) ?? 0
+        let collapse = tab?.chrome.collapse(focused: focused, hasPage: tab?.url != nil && tab?.isShowingPDF != true) ?? 0
         let base = Color(uiColor: tab?.pageCanvasColor ?? .systemBackground)
         LinearGradient(
             stops: [
@@ -610,7 +809,8 @@ private struct CuriumAddressBar: View {
     private var text: String { address.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     private var showsPictureInPictureButton: Bool {
-        !addressFocused && (tab?.pictureInPicture.phase ?? .unavailable) != .unavailable
+        !addressFocused && tab?.isShowingPDF != true
+            && (tab?.pictureInPicture.phase ?? .unavailable) != .unavailable
     }
 
     private var showsClearButton: Bool {
@@ -618,20 +818,38 @@ private struct CuriumAddressBar: View {
     }
 
     private var showsReloadButton: Bool {
-        !addressFocused && tab?.engine != nil && (tab?.url != nil || tab?.isLoading == true)
+        guard !addressFocused else { return false }
+        if let pdf = tab?.pdfSession {
+            return pdf.originalURL != nil
+        }
+        return tab?.engine != nil && (tab?.url != nil || tab?.isLoading == true)
     }
 
     private var showsTrailingActionButton: Bool {
         showsClearButton || showsReloadButton
     }
 
-    private static func hostLabel(for url: URL?) -> String {
-        let host = url?.host(percentEncoded: false) ?? ""
+    private static func addressDisplayText(for tab: CuriumTabModel?) -> String {
+        guard let tab else { return "" }
+        if let pdf = tab.pdfSession {
+            return pdf.originalURL?.absoluteString ?? pdf.displayTitle
+        }
+        return tab.url?.absoluteString ?? ""
+    }
+
+    private static func hostLabel(for tab: CuriumTabModel?) -> String {
+        if let pdf = tab?.pdfSession {
+            if let host = pdf.originalURL?.host(percentEncoded: false), !host.isEmpty {
+                return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+            }
+            return pdf.displayTitle
+        }
+        let host = tab?.url?.host(percentEncoded: false) ?? ""
         return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
     }
 
-    private func refreshCachedSite(for url: URL?) {
-        let nextSite = Self.hostLabel(for: url)
+    private func refreshCachedSite(for tab: CuriumTabModel?) {
+        let nextSite = Self.hostLabel(for: tab)
         guard nextSite != cachedSite else { return }
         cachedSite = nextSite
         siteWidth = (nextSite as NSString).size(withAttributes: [.font: CuriumSpace.pillUIFont]).width.rounded(.up)
@@ -640,7 +858,10 @@ private struct CuriumAddressBar: View {
     var body: some View {
         // One capsule morphs between the bar and the pill; every dimension is a
         // function of the collapse, so the motion follows the page exactly.
-        let collapse = tab?.chrome.collapse(focused: addressFocused, hasPage: tab?.url != nil) ?? 0
+        let collapse = tab?.chrome.collapse(
+            focused: addressFocused,
+            hasPage: tab?.url != nil && tab?.isShowingPDF != true
+        ) ?? 0
         let pillWidth = min(pillMaxWidth, siteWidth + 24)
         let width = span + (pillWidth - span) * collapse
         let height = CuriumSpace.tapTarget + (CuriumSpace.compactPillHeight - CuriumSpace.tapTarget) * collapse
@@ -777,12 +998,16 @@ private struct CuriumAddressBar: View {
         }
         .onChange(of: tab?.id, initial: true) {
             addressFocused = false
-            address = tab?.url?.absoluteString ?? ""
-            refreshCachedSite(for: tab?.url)
+            address = Self.addressDisplayText(for: tab)
+            refreshCachedSite(for: tab)
         }
-        .onChange(of: tab?.url, initial: true) {
-            if !addressFocused { address = tab?.url?.absoluteString ?? "" }
-            refreshCachedSite(for: tab?.url)
+        .onChange(of: tab?.displayURL, initial: true) {
+            if !addressFocused { address = Self.addressDisplayText(for: tab) }
+            refreshCachedSite(for: tab)
+        }
+        .onChange(of: tab?.isShowingPDF) {
+            if !addressFocused { address = Self.addressDisplayText(for: tab) }
+            refreshCachedSite(for: tab)
         }
         .onChange(of: dismissKeyboardTrigger) {
             addressFocused = false
@@ -790,7 +1015,7 @@ private struct CuriumAddressBar: View {
         .onChange(of: addressFocused) {
             if !addressFocused {
                 // An abandoned edit gives way to the page's address.
-                address = tab?.url?.absoluteString ?? ""
+                address = Self.addressDisplayText(for: tab)
             }
         }
     }

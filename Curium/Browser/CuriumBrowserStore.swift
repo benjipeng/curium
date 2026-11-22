@@ -35,6 +35,19 @@ final class CuriumTabModel: Identifiable {
     private(set) var isPictureInPictureActive = false
     private(set) var extensionTabID: Int32 = -1
     private(set) var thumbnail: UIImage?
+    private(set) var pdfSession: CuriumTabPDFSession?
+
+    var isShowingPDF: Bool { pdfSession != nil }
+    var displayURL: URL? { pdfSession?.displayURL ?? url }
+    /// Bookmarkable web URL (excludes local `file://` URLs when viewing a saved PDF offline).
+    var bookmarkableURL: URL? {
+        if let pdfSession { return pdfSession.originalURL }
+        return url
+    }
+    var displayTitle: String { pdfSession?.displayTitle ?? title }
+    var effectiveCanGoBack: Bool { pdfSession != nil || canGoBack }
+    var effectiveCanGoForward: Bool { pdfSession == nil && canGoForward }
+    var effectiveZoomScale: CGFloat { pdfSession?.zoomScale ?? zoomScale }
 
     @ObservationIgnored private var history: [URL?] = [nil]
     @ObservationIgnored private var historyIndex = 0
@@ -53,11 +66,30 @@ final class CuriumTabModel: Identifiable {
     func invalidate() {
         pictureInPictureTimer?.cancel()
         pictureInPictureTimer = nil
+        dismissPDFSession()
         clearSnapshot()
         if engine != nil { engine = nil }
         if webView != nil { webView = nil }
         if scrollView != nil { scrollView = nil }
         updateChrome { $0 = CuriumChromeState() }
+        syncBlankStartPage()
+    }
+
+    func presentPDFSession(_ session: CuriumTabPDFSession) {
+        if let existing = pdfSession, existing !== session {
+            existing.cleanup()
+        }
+        pdfSession = session
+        updateChrome { $0.unpin(.navigated) }
+        clearSnapshot()
+        syncBlankStartPage()
+    }
+
+    func dismissPDFSession() {
+        guard let existing = pdfSession else { return }
+        existing.cleanup()
+        pdfSession = nil
+        clearSnapshot()
         syncBlankStartPage()
     }
 
@@ -135,7 +167,7 @@ final class CuriumTabModel: Identifiable {
     }
 
     private func syncBlankStartPage() {
-        let next = !isFullscreen && engine != nil && url == nil && !isLoading
+        let next = !isFullscreen && engine != nil && url == nil && !isLoading && pdfSession == nil
         if isBlankStartPage != next { isBlankStartPage = next }
     }
 
@@ -183,6 +215,7 @@ final class CuriumTabModel: Identifiable {
     }
 
     func load(_ url: URL, preferDesktop: Bool? = nil) {
+        dismissPDFSession()
         if let engine {
             if let preferDesktop, !configuredInitialSiteMode || self.url == nil {
                 if usesDesktopSite != preferDesktop {
@@ -202,6 +235,10 @@ final class CuriumTabModel: Identifiable {
     }
 
     func goBack() {
+        if pdfSession != nil {
+            dismissPDFSession()
+            return
+        }
         guard canGoBack else { return }
         if let engine { engine.goBack(); return }
         historyIndex -= 1
@@ -209,7 +246,7 @@ final class CuriumTabModel: Identifiable {
     }
 
     func goForward() {
-        guard canGoForward else { return }
+        guard pdfSession == nil, canGoForward else { return }
         if let engine { engine.goForward(); return }
         historyIndex += 1
         updateStandbyHistory()
@@ -268,6 +305,10 @@ final class CuriumTabModel: Identifiable {
     }
 
     func setZoomScale(_ scale: CGFloat) {
+        if let pdfSession {
+            pdfSession.setZoomScale(scale)
+            return
+        }
         let clamped = min(2.0, max(0.5, scale))
         guard abs(zoomScale - clamped) > 0.001 else { return }
         zoomScale = clamped
@@ -277,6 +318,14 @@ final class CuriumTabModel: Identifiable {
     }
 
     func reloadOrStop() {
+        if let pdfSession {
+            if let remoteURL = pdfSession.originalURL {
+                load(remoteURL)
+            } else if case .loading = pdfSession.phase {
+                dismissPDFSession()
+            }
+            return
+        }
         guard let engine else { return }
         if isLoading { engine.stopLoading() } else { engine.reload() }
     }
@@ -294,6 +343,14 @@ final class CuriumTabModel: Identifiable {
     /// Captures a compact SDR thumbnail asynchronously via the engine's compositor snapshot
     /// path, downscaling off the main thread so browsing never stalls.
     fileprivate func captureSnapshotAsync() async -> Bool {
+        if let pdfSession {
+            guard case .ready = pdfSession.phase, thumbnail == nil else { return false }
+            if let rendered = pdfSession.makeTabThumbnail(maxPixels: Self.maxSnapshotPixels) {
+                thumbnail = rendered
+                return true
+            }
+            return false
+        }
         guard let engine, let webView, url != nil, !isLoading, !isFullscreen, thumbnail == nil else { return false }
         let bounds = webView.bounds
         guard webView.window != nil, bounds.width > 1, bounds.height > 1 else { return false }
@@ -420,6 +477,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     private(set) var tabs: [CuriumTabModel] = []
     private(set) var activeTab: CuriumTabModel?
     private(set) var downloads: [CuriumDownload] = []
+    private(set) var savedDownloads: [CuriumSavedDownload] = []
+    private(set) var activeDownloadBanner: CuriumDownload?
     private(set) var backgroundEpoch = 0
     private(set) var activeMediaPermissionPrompt: CuriumMediaPermissionPrompt?
     var errorMessage: String? {
@@ -440,17 +499,28 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     @ObservationIgnored private var idleSnapshotTask: Task<Void, Never>?
     @ObservationIgnored private var onDemandSnapshotTask: Task<Void, Never>?
     @ObservationIgnored private var mediaPermissions: CuriumMediaPermissionCoordinator!
+    @ObservationIgnored private let downloadsRootOverride: URL?
+    @ObservationIgnored private let pdfPreviewCacheRootOverride: URL?
     @ObservationIgnored private(set) var viewportWidth: CGFloat = 669
 
     var isEngineReady: Bool { host != nil }
+    var pendingOrActiveDownloadCount: Int {
+        downloads.reduce(into: 0) { count, item in
+            if item.state == .pending || item.isActive { count += 1 }
+        }
+    }
 
     init(
         host: (any CrIOSBrowserHostV1)? = nil,
         extensionManager: (any CrIOSExtensionManagingV1)? = nil,
         captureAuthorizer: @escaping CuriumMediaPermissionCoordinator.CaptureAuthorizer =
-            CuriumMediaPermissionCoordinator.liveCaptureAuthorizer
+            CuriumMediaPermissionCoordinator.liveCaptureAuthorizer,
+        downloadsRoot: URL? = nil,
+        pdfPreviewCacheRoot: URL? = nil
     ) {
         self.host = host
+        self.downloadsRootOverride = downloadsRoot
+        self.pdfPreviewCacheRootOverride = pdfPreviewCacheRoot
         // The optional delegate method is ours, so probing it cannot tell us
         // whether Blink sends it. Patch 0097 adds this forwarder to the host.
         reportsNavigationCommits = host?.responds(to: NSSelectorFromString(
@@ -474,6 +544,11 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         } else {
             newTab()
         }
+        let previewRoot = pdfPreviewCacheRootOverride
+        Task.detached(priority: .utility) {
+            CuriumDownloadStorage.cleanupStalePDFPreviews(cacheRoot: previewRoot)
+        }
+        refreshSavedDownloads()
     }
 
     func updateViewportWidth(_ width: CGFloat) {
@@ -577,10 +652,12 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     func scheduleSnapshot(for tab: CuriumTabModel) {
         guard activeTab === tab else { return }
         cancelIdleSnapshotCapture()
+        let pdfReady = tab.isShowingPDF && tab.pdfSession?.phase == .ready
+        let pageReady = !tab.isShowingPDF && tab.engine != nil && tab.webView != nil && tab.url != nil && !tab.isLoading && !tab.isFullscreen
         guard !isUnderMemoryPressure, !isSceneBackgrounded, !isSheetPresented,
               UIApplication.shared.applicationState == .active,
-              tab.engine != nil, tab.webView != nil, tab.url != nil,
-              !tab.isLoading, !tab.isFullscreen, tab.thumbnail == nil else { return }
+              pdfReady || pageReady,
+              tab.thumbnail == nil else { return }
         let targetID = tab.id
         let revision = tab.snapshotRevision
         let initialOffset = tab.scrollView?.contentOffset
@@ -592,9 +669,11 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
                   UIApplication.shared.applicationState == .active,
                   let current = self.activeTab,
                   current.id == targetID, current.snapshotRevision == revision else { return }
-            let scroll = current.scrollView
-            if scroll?.isTracking == true || scroll?.isDecelerating == true || scroll?.contentOffset != initialOffset {
-                return
+            if !current.isShowingPDF {
+                let scroll = current.scrollView
+                if scroll?.isTracking == true || scroll?.isDecelerating == true || scroll?.contentOffset != initialOffset {
+                    return
+                }
             }
             if await current.captureSnapshotAsync() {
                 self.recordSnapshot(for: targetID)
@@ -603,10 +682,12 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     }
 
     private func captureSnapshotOnDemand(for tab: CuriumTabModel) {
+        let pdfReady = tab.isShowingPDF && tab.pdfSession?.phase == .ready
+        let pageReady = !tab.isShowingPDF && tab.engine != nil && tab.webView?.window != nil && tab.url != nil && !tab.isLoading && !tab.isFullscreen
         guard !isUnderMemoryPressure, !isSceneBackgrounded,
               UIApplication.shared.applicationState == .active,
-              tab.engine != nil, tab.webView?.window != nil, tab.url != nil,
-              !tab.isLoading, !tab.isFullscreen, tab.thumbnail == nil else { return }
+              pdfReady || pageReady,
+              tab.thumbnail == nil else { return }
         let targetID = tab.id
         let revision = tab.snapshotRevision
         onDemandSnapshotTask?.cancel()
@@ -798,6 +879,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     ) {
         if !isSameDocument {
             mediaPermissions.invalidate(tabID: tab.tabID)
+            tabsByID[tab.tabID]?.dismissPDFSession()
         }
         guard reportsNavigationCommits else { return }
         let tabID = tab.tabID
@@ -886,9 +968,99 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     }
 
     func browserHost(_ host: any CrIOSBrowserHostV1, didCreateDownload download: any CrIOSDownloadTaskV1) {
+        let filename = CuriumDownloadStorage.sanitizedFilename(download.suggestedFilename)
+        if CuriumDownloadStorage.isPDF(
+            mimeType: download.mimeType,
+            filename: filename,
+            url: download.originalURL
+        ), let targetTab = (download.sourceTabID.flatMap { tabsByID[$0] }) ?? activeTab {
+            // Stream PDFs into an isolated temporary preview cache inside the tab so
+            // casually viewing a PDF never pollutes Documents/Curium/Downloads/.
+            let session = CuriumTabPDFSession(
+                downloadTask: download,
+                cacheRoot: pdfPreviewCacheRootOverride,
+                onReady: { [weak self, weak targetTab] in
+                    guard let self, let targetTab else { return }
+                    targetTab.clearSnapshot()
+                    self.scheduleSnapshot(for: targetTab)
+                }
+            )
+            targetTab.presentPDFSession(session)
+            return
+        }
+
         let item = CuriumDownload(task: download)
         guard !downloads.contains(where: { $0.id == item.id }) else { return }
         downloads.insert(item, at: 0)
+        activeDownloadBanner = item
+    }
+
+    func startDownload(_ item: CuriumDownload) async {
+        let saved = await item.start(downloadsRoot: downloadsRootOverride)
+        if saved != nil {
+            refreshSavedDownloads()
+        }
+    }
+
+    func dismissDownloadBanner() {
+        activeDownloadBanner = nil
+    }
+
+    func openSavedPDFInActiveTab(_ item: CuriumSavedDownload) {
+        guard item.isPDF else { return }
+        let targetTab: CuriumTabModel?
+        if let active = activeTab {
+            targetTab = active
+        } else {
+            newTab()
+            targetTab = activeTab
+        }
+        guard let targetTab else { return }
+        let session = CuriumTabPDFSession(
+            savedFileURL: item.url,
+            filename: item.filename,
+            onReady: { [weak self, weak targetTab] in
+                guard let self, let targetTab else { return }
+                targetTab.clearSnapshot()
+                self.scheduleSnapshot(for: targetTab)
+            }
+        )
+        targetTab.presentPDFSession(session)
+    }
+
+    func refreshSavedDownloads() {
+        let rootOverride = downloadsRootOverride
+        Task.detached(priority: .utility) {
+            let items = CuriumDownloadStorage.listSavedDownloads(in: rootOverride)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if self.savedDownloads != items {
+                    self.savedDownloads = items
+                }
+            }
+        }
+    }
+
+    func deleteSavedDownload(_ item: CuriumSavedDownload) {
+        let rootOverride = downloadsRootOverride
+        do {
+            try CuriumDownloadStorage.deleteSavedDownload(at: item.url, downloadsRoot: rootOverride)
+            savedDownloads.removeAll { $0.id == item.id }
+            for tab in tabs {
+                if tab.pdfSession?.handleSavedFileDeleted(at: item.url) == true {
+                    tab.dismissPDFSession()
+                }
+            }
+        } catch {
+            errorMessage = "Couldn’t delete “\(item.filename)”: \(error.localizedDescription)"
+        }
+    }
+
+    func clearFinishedDownloadTasks() {
+        downloads.removeAll { !$0.isActive && $0.state != .pending }
+        if let banner = activeDownloadBanner, !downloads.contains(where: { $0.id == banner.id }) {
+            activeDownloadBanner = nil
+        }
     }
 
     private func recordSnapshot(for tabID: String) {

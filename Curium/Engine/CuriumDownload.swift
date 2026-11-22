@@ -1,11 +1,13 @@
 import CuriumEngineContract
+import Foundation
 import Observation
-import UIKit
 
 @MainActor
 @Observable
 final class CuriumDownload: Identifiable {
     let id: String
+    let sourceTabID: String?
+    let originalURL: URL?
     let filename: String
     let mimeType: String?
     private let task: any CrIOSDownloadTaskV1
@@ -13,6 +15,8 @@ final class CuriumDownload: Identifiable {
     private(set) var savedURL: URL?
     private(set) var failure: String?
     private(set) var fraction: Double?
+    private(set) var totalBytes: Int64 = -1
+    private(set) var receivedBytes: Int64 = 0
     private(set) var isStarting = false
 
     var isActive: Bool { isStarting || state == .inProgress }
@@ -20,54 +24,60 @@ final class CuriumDownload: Identifiable {
     init(task: any CrIOSDownloadTaskV1) {
         self.task = task
         id = task.downloadID
-        let name = (task.suggestedFilename as NSString).lastPathComponent
-        filename = ["", "/", ".", ".."].contains(name) ? "Download" : name
+        sourceTabID = task.sourceTabID
+        originalURL = task.originalURL
+        filename = CuriumDownloadStorage.sanitizedFilename(task.suggestedFilename)
         mimeType = task.mimeType
         state = task.state
         refresh()
     }
 
     var isPDF: Bool {
-        mimeType?.caseInsensitiveCompare("application/pdf") == .orderedSame
-            || (filename as NSString).pathExtension.lowercased() == "pdf"
+        CuriumDownloadStorage.isPDF(mimeType: mimeType, filename: filename, url: originalURL)
+    }
+
+    var formattedByteSize: String? {
+        guard totalBytes > 0 else { return nil }
+        return ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
     }
 
     func refresh() {
         let newState = task.state
         if state != newState { state = newState }
         let total = task.totalBytes
+        if totalBytes != total { totalBytes = total }
+        let received = task.receivedBytes
+        if receivedBytes != received { receivedBytes = received }
         let newFraction: Double? = total > 0
-            ? min(1, max(0, Double(task.receivedBytes) / Double(total)))
+            ? min(1, max(0, Double(received) / Double(total)))
             : nil
         if fraction != newFraction { fraction = newFraction }
     }
 
-    nonisolated private static func downloadsRootDirectory() throws -> URL {
-        if let hostPath = ProcessInfo.processInfo.environment["LC_HOME_PATH"], !hostPath.isEmpty {
-            let host = URL(fileURLWithPath: hostPath, isDirectory: true).standardizedFileURL
-            return host.appending(path: "Documents/Curium/Downloads", directoryHint: .isDirectory)
-        }
-        let root = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
-                                               appropriateFor: nil, create: true)
-        return root.appending(path: "Downloads", directoryHint: .isDirectory)
-    }
-
-    func start() async {
-        guard state == .pending, !isStarting else { return }
+    @discardableResult
+    func start(downloadsRoot: URL? = nil) async -> URL? {
+        guard state == .pending, !isStarting else { return savedURL }
         isStarting = true
         failure = nil
         defer { isStarting = false; refresh() }
         let name = filename
+        var reservedURL: URL?
+        defer {
+            if let reservedURL {
+                CuriumDownloadStorage.releaseDownloadReservation(at: reservedURL)
+            }
+        }
         do {
             let destination = try await Task.detached(priority: .utility) {
-                let directory = try Self.downloadsRootDirectory()
-                    .appending(path: UUID().uuidString, directoryHint: .isDirectory)
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                return directory.appending(path: name)
+                try CuriumDownloadStorage.uniqueDownloadDestination(filename: name, in: downloadsRoot)
             }.value
-            savedURL = try await task.start(withDestinationURL: destination)
+            reservedURL = destination
+            let resolved = try await task.start(withDestinationURL: destination)
+            savedURL = resolved
+            return savedURL
         } catch {
             if task.state != .cancelled { failure = error.localizedDescription }
+            return nil
         }
     }
 

@@ -15,8 +15,10 @@ the pinned engine first, translate to `patches/` once proven.
 - **App / On `ac_duo`:** `Curium-0.1.11-b15-arm64.ipa` (Build 40 + native Swift
   Fingerprint Profile Studio, `eb127cb`, verified on `iphone_duo_27_2` Simulator
   and tested on `ac_duo` via LiveContainer).
-- **Local candidate:** `Curium-0.1.11-b16-arm64.ipa` (Build 40 with the permission
-  element workaround). No physical deployment.
+- **Local candidate:** `Curium-0.1.11-b17` (pure-Swift inline tab PDF reader
+  with isolated `Caches/CuriumPDFPreview/` cache + persistent Downloads UI on
+  Build 40; 29/29 `CuriumTests` passing, Simulator `sdk 27.2` + live E2E
+  verified, reviewer LGTM). Previous `b16` (`6538e01`) verified on `ac_duo`.
 
 ## App (on the pinned engine)
 
@@ -53,6 +55,19 @@ the pinned engine first, translate to `patches/` once proven.
   engine's page-scoped cache, and automatically dismisses/denies prompts on
   navigation, origin change, tab switch, or tab close. Under LiveContainer, iOS
   authorization still belongs to the host.
+- [x] **Native Swift inline tab PDF reader & persistent Downloads (`b17`).**
+  PDF links stream automatically into isolated `Caches/CuriumPDFPreview/` (never
+  polluting `Documents/Curium/Downloads/`) and render inline inside the tab via
+  `PDFKit` with page counter, async Find-in-PDF (top-chrome-clear highlighting),
+  embedded Table of Contents, in-tab link routing, one-tap Save to durable
+  Downloads, ShareLink, and automatic temp-cache cleanup on Back / navigation /
+  tab close / launch. Non-PDF downloads present a floating Liquid Glass prompt
+  banner and save flat (collision-safe, no random UUID folders) with disk-backed
+  Saved Files persistence, Open-in-Tab / QuickLook preview, Share, and symlink-safe
+  deletion.
+- [ ] **Picture in Picture skip controls (±10s/±15s rewind & fast-forward).**
+  Next up: `0089` currently sets `requiresLinearPlayback = YES` and leaves
+  `skipByInterval:completionHandler:` as a no-op stub.
 - [ ] **Floating PiP button over the playing video.** Requested. Open question:
   placement over the in-page video or in the top chrome.
 

@@ -1,6 +1,7 @@
 import CuriumEngineContract
 import Darwin
 import Foundation
+import PDFKit
 import Testing
 import UIKit
 
@@ -27,6 +28,7 @@ private final class MockTabHost: NSObject, CrIOSTabHostingV1, CrIOSTabBrowserCon
     var isPictureInPictureActive = false
 
     private(set) var loadedURLs: [URL] = []
+    private(set) var goBackCallCount = 0
     private(set) var snapshotCallCount = 0
     var snapshotImageToReturn: UIImage?
 
@@ -48,7 +50,7 @@ private final class MockTabHost: NSObject, CrIOSTabHostingV1, CrIOSTabBrowserCon
         currentURL = url
     }
 
-    func goBack() {}
+    func goBack() { goBackCallCount += 1 }
     func goForward() {}
     func reload() {}
     func stopLoading() {}
@@ -149,6 +151,92 @@ private final class MockExtensionManager: NSObject, CrIOSExtensionManagingV1 {
 
     func commandsForExtension(withID extensionID: String) throws -> [[String: String]] { [] }
     func dispatchCommandNamed(_ commandName: String, toExtensionWithID extensionID: String) throws {}
+}
+
+@MainActor
+private final class MockDownloadTask: NSObject, CrIOSDownloadTaskV1 {
+    let downloadID: String
+    let sourceTabID: String?
+    let originalURL: URL?
+    let suggestedFilename: String
+    let mimeType: String?
+    var totalBytes: Int64
+    var receivedBytes: Int64
+    var state: CrIOSDownloadState
+
+    var payloadToWrite: Data?
+    var errorToReturn: (any Error)?
+    var holdInProgressUntilCancelled = false
+    private(set) var startedDestinationURL: URL?
+    private(set) var startCallCount = 0
+    private(set) var cancelCount = 0
+    private var pendingCompletion: (@MainActor (URL?, (any Error)?) -> Void)?
+
+    init(
+        downloadID: String = UUID().uuidString,
+        sourceTabID: String? = nil,
+        originalURL: URL? = nil,
+        suggestedFilename: String,
+        mimeType: String? = nil,
+        totalBytes: Int64 = -1,
+        payloadToWrite: Data? = nil,
+        errorToReturn: (any Error)? = nil,
+        holdInProgressUntilCancelled: Bool = false
+    ) {
+        self.downloadID = downloadID
+        self.sourceTabID = sourceTabID
+        self.originalURL = originalURL
+        self.suggestedFilename = suggestedFilename
+        self.mimeType = mimeType
+        self.totalBytes = totalBytes >= 0 ? totalBytes : Int64(payloadToWrite?.count ?? -1)
+        self.receivedBytes = 0
+        self.state = .pending
+        self.payloadToWrite = payloadToWrite
+        self.errorToReturn = errorToReturn
+        self.holdInProgressUntilCancelled = holdInProgressUntilCancelled
+        super.init()
+    }
+
+    func start(
+        withDestinationURL destinationURL: URL,
+        completion: @escaping @MainActor (URL?, (any Error)?) -> Void
+    ) {
+        startCallCount += 1
+        startedDestinationURL = destinationURL
+        state = .inProgress
+
+        if holdInProgressUntilCancelled {
+            pendingCompletion = completion
+            return
+        }
+
+        if let errorToReturn {
+            state = .failed
+            completion(nil, errorToReturn)
+            return
+        }
+
+        do {
+            let data = payloadToWrite ?? Data()
+            try data.write(to: destinationURL, options: .atomic)
+            receivedBytes = Int64(data.count)
+            totalBytes = Int64(data.count)
+            state = .completed
+            completion(destinationURL, nil)
+        } catch {
+            state = .failed
+            completion(nil, error)
+        }
+    }
+
+    func cancel() {
+        cancelCount += 1
+        state = .cancelled
+        if let completion = pendingCompletion {
+            pendingCompletion = nil
+            completion(nil, CancellationError())
+        }
+    }
 }
 
 // MARK: - Suites
@@ -938,5 +1026,611 @@ struct CuriumMediaPermissionTests {
         pendingOSContinuation?.resume(returning: true)
         for _ in 0..<10 { await Task.yield() }
         #expect(midOSResult == [])
+    }
+}
+
+@Suite("Inline PDF & Downloads")
+struct CuriumInlinePDFAndDownloadsTests {
+    private func makeTempDir(_ prefix: String = "curium-dl") throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "\(prefix)-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    @MainActor
+    private func makeSamplePDFData(pageTexts: [String]) -> Data {
+        let pageRect = CGRect(x: 0, y: 0, width: 612, height: 792)
+        let renderer = UIGraphicsPDFRenderer(bounds: pageRect)
+        return renderer.pdfData { ctx in
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 20),
+                .foregroundColor: UIColor.black,
+            ]
+            for text in pageTexts {
+                ctx.beginPage()
+                (text as NSString).draw(in: pageRect.insetBy(dx: 48, dy: 64), withAttributes: attrs)
+            }
+        }
+    }
+
+    @MainActor
+    private func waitUntil(
+        timeout: Duration = .seconds(3),
+        condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while !condition() {
+            if ContinuousClock.now >= deadline { return false }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return true
+    }
+
+    @Test("DownloadStorage sanitizes filenames, dotfiles, long UTF-8 names, MIME precedence, LiveContainer root, and flat dedup")
+    func storageSanitizationDetectionAndFlatDedup() throws {
+        // Filename sanitization (path traversal, control chars, dotfiles, UTF-8 byte clamping)
+        #expect(CuriumDownloadStorage.sanitizedFilename(nil) == "Download")
+        #expect(CuriumDownloadStorage.sanitizedFilename("") == "Download")
+        #expect(CuriumDownloadStorage.sanitizedFilename("   \n\t ") == "Download")
+        #expect(CuriumDownloadStorage.sanitizedFilename(".") == "Download")
+        #expect(CuriumDownloadStorage.sanitizedFilename("..") == "Download")
+        #expect(CuriumDownloadStorage.sanitizedFilename("/") == "Download")
+        #expect(CuriumDownloadStorage.sanitizedFilename("", fallback: "Document.pdf") == "Document.pdf")
+        #expect(CuriumDownloadStorage.sanitizedFilename("../../etc/passwd") == "passwd")
+        #expect(CuriumDownloadStorage.sanitizedFilename("nested/dir/report.pdf") == "report.pdf")
+        #expect(CuriumDownloadStorage.sanitizedFilename("bad\0name.pdf") == "badname.pdf")
+        #expect(CuriumDownloadStorage.sanitizedFilename("\u{0001}sub\u{007F}/clean\u{0007}.pdf") == "clean.pdf")
+        #expect(CuriumDownloadStorage.sanitizedFilename("  paper.pdf  ") == "paper.pdf")
+        #expect(CuriumDownloadStorage.sanitizedFilename(".secret.pdf") == "secret.pdf")
+        #expect(CuriumDownloadStorage.sanitizedFilename("..hidden") == "hidden")
+        #expect(CuriumDownloadStorage.sanitizedFilename(".pdf") == "pdf")
+        #expect(CuriumDownloadStorage.sanitizedFilename(". .pdf") == "pdf")
+
+        // Long ASCII and multi-byte UTF-8 names clamp cleanly below APFS NAME_MAX while preserving extension
+        let longASCII = String(repeating: "a", count: 300) + ".pdf"
+        let clampedASCII = CuriumDownloadStorage.sanitizedFilename(longASCII)
+        #expect(clampedASCII.hasSuffix(".pdf"))
+        #expect((clampedASCII as NSString).deletingPathExtension.utf8.count <= 200)
+        #expect(clampedASCII.utf8.count < 255)
+
+        let longCJK = String(repeating: "文", count: 100) + ".pdf" // 300 UTF-8 bytes in stem
+        let clampedCJK = CuriumDownloadStorage.sanitizedFilename(longCJK)
+        #expect(clampedCJK.hasSuffix(".pdf"))
+        #expect((clampedCJK as NSString).deletingPathExtension.utf8.count <= 200)
+        #expect(clampedCJK.utf8.count < 255)
+
+        // PDF detection & MIME precedence
+        #expect(CuriumDownloadStorage.isPDF(mimeType: "application/pdf", filename: "download"))
+        #expect(CuriumDownloadStorage.isPDF(mimeType: "APPLICATION/PDF; charset=utf-8", filename: "blob"))
+        #expect(CuriumDownloadStorage.isPDF(mimeType: "application/x-pdf", filename: "blob"))
+        #expect(CuriumDownloadStorage.isPDF(mimeType: "application/octet-stream", filename: "Spec.PDF"))
+        #expect(CuriumDownloadStorage.isPDF(
+            mimeType: "application/octet-stream",
+            filename: "attachment",
+            url: URL(string: "https://example.com/files/manual.pdf?dl=1")
+        ))
+        // Explicit non-PDF MIME must beat a `.pdf` URL path when the filename is non-PDF
+        #expect(!CuriumDownloadStorage.isPDF(
+            mimeType: "application/zip",
+            filename: "archive.zip",
+            url: URL(string: "https://example.com/export.pdf")
+        ))
+        #expect(!CuriumDownloadStorage.isPDF(
+            mimeType: "text/csv",
+            filename: "download",
+            url: URL(string: "https://example.com/report.pdf")
+        ))
+        // Generic binary MIME with a conflicting non-PDF filename extension must NOT use URL `.pdf` fallback
+        #expect(!CuriumDownloadStorage.isPDF(
+            mimeType: "application/octet-stream",
+            filename: "notes.txt",
+            url: URL(string: "https://example.com/manual.pdf")
+        ))
+        #expect(!CuriumDownloadStorage.isPDF(
+            mimeType: "text/plain",
+            filename: "notes.txt",
+            url: URL(string: "https://example.com/notes.txt")
+        ))
+
+        // LiveContainer host Downloads root resolution
+        let lcRoot = try CuriumDownloadStorage.downloadsRootDirectory(environment: ["LC_HOME_PATH": "/tmp/lc-host"])
+        #expect(lcRoot.path == "/tmp/lc-host/Documents/Curium/Downloads")
+
+        // Flat collision dedup + concurrent in-flight reservation: paper.pdf -> paper (2).pdf -> paper (3).pdf
+        let root = try makeTempDir("curium-dl-dedup")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let first = try CuriumDownloadStorage.uniqueDownloadDestination(filename: "paper.pdf", in: root)
+        defer { CuriumDownloadStorage.releaseDownloadReservation(at: first) }
+        #expect(first.deletingLastPathComponent().standardizedFileURL == root.standardizedFileURL)
+        #expect(first.lastPathComponent == "paper.pdf")
+
+        // Concurrent reservation before `first` is written still yields `paper (2).pdf`
+        let second = try CuriumDownloadStorage.uniqueDownloadDestination(filename: "paper.pdf", in: root)
+        defer { CuriumDownloadStorage.releaseDownloadReservation(at: second) }
+        #expect(second.deletingLastPathComponent().standardizedFileURL == root.standardizedFileURL)
+        #expect(second.lastPathComponent == "paper (2).pdf")
+
+        try Data("v1".utf8).write(to: first)
+        try Data("v2".utf8).write(to: second)
+
+        let third = try CuriumDownloadStorage.uniqueDownloadDestination(filename: "paper.pdf", in: root)
+        defer { CuriumDownloadStorage.releaseDownloadReservation(at: third) }
+        #expect(third.lastPathComponent == "paper (3).pdf")
+
+        let noExt1 = try CuriumDownloadStorage.uniqueDownloadDestination(filename: "README", in: root)
+        defer { CuriumDownloadStorage.releaseDownloadReservation(at: noExt1) }
+        #expect(noExt1.lastPathComponent == "README")
+        try Data("r1".utf8).write(to: noExt1)
+        let noExt2 = try CuriumDownloadStorage.uniqueDownloadDestination(filename: "README", in: root)
+        defer { CuriumDownloadStorage.releaseDownloadReservation(at: noExt2) }
+        #expect(noExt2.lastPathComponent == "README (2)")
+    }
+
+    @Test("DownloadStorage preserves active previews across stale cleanup, lists legacy folders safely, and refuses symlinks/dirs/traversals")
+    func storagePreviewCacheListingAndSafeDeletion() throws {
+        let sandbox = try makeTempDir("curium-dl-storage")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let downloadsRoot = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+        let previewRoot = sandbox.appending(path: "Caches/CuriumPDFPreview", directoryHint: .isDirectory)
+        let outsideDir = sandbox.appending(path: "Outside", directoryHint: .isDirectory)
+        let outsideFile = sandbox.appending(path: "secret.txt", directoryHint: .notDirectory)
+        let outsideNestedPDF = outsideDir.appending(path: "escape.pdf", directoryHint: .notDirectory)
+        try FileManager.default.createDirectory(at: downloadsRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+        try Data("keep-me".utf8).write(to: outsideFile)
+        try Data("outside-pdf".utf8).write(to: outsideNestedPDF)
+
+        // Isolated temp preview cache (strictly outside Downloads)
+        let preview = try CuriumDownloadStorage.makePreviewDestination(filename: "whitepaper", cacheRoot: previewRoot)
+        defer { CuriumDownloadStorage.removePreviewSessionDirectory(preview.sessionDirectory, cacheRoot: previewRoot) }
+        #expect(preview.sessionDirectory.standardizedFileURL.path.hasPrefix(previewRoot.standardizedFileURL.path + "/"))
+        #expect(!preview.fileURL.standardizedFileURL.path.hasPrefix(downloadsRoot.standardizedFileURL.path + "/"))
+        #expect(preview.fileURL.lastPathComponent == "whitepaper.pdf")
+        #expect(FileManager.default.fileExists(atPath: preview.sessionDirectory.path))
+        let payload = Data("%PDF-1.4\npreview".utf8)
+        try payload.write(to: preview.fileURL)
+        #expect(CuriumDownloadStorage.listSavedDownloads(in: downloadsRoot).isEmpty)
+
+        // Explicit promotion from preview cache into durable Downloads
+        let saved1 = try CuriumDownloadStorage.savePreviewFileToDownloads(
+            sourceURL: preview.fileURL,
+            suggestedFilename: "whitepaper.pdf",
+            downloadsRoot: downloadsRoot
+        )
+        #expect(saved1.deletingLastPathComponent().standardizedFileURL == downloadsRoot.standardizedFileURL)
+        #expect(saved1.lastPathComponent == "whitepaper.pdf")
+        #expect(try Data(contentsOf: saved1) == payload)
+        #expect(FileManager.default.fileExists(atPath: preview.fileURL.path))
+
+        let saved2 = try CuriumDownloadStorage.savePreviewFileToDownloads(
+            sourceURL: preview.fileURL,
+            suggestedFilename: "whitepaper.pdf",
+            downloadsRoot: downloadsRoot
+        )
+        #expect(saved2.lastPathComponent == "whitepaper (2).pdf")
+
+        // Stale preview cleanup removes orphaned preview folders while preserving active in-process sessions
+        let orphanDir = previewRoot.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: orphanDir, withIntermediateDirectories: true)
+        try Data("stale".utf8).write(to: orphanDir.appending(path: "stale.pdf"))
+        CuriumDownloadStorage.cleanupStalePDFPreviews(cacheRoot: previewRoot)
+        #expect(FileManager.default.fileExists(atPath: preview.sessionDirectory.path))
+        #expect(!FileManager.default.fileExists(atPath: orphanDir.path))
+        #expect(FileManager.default.fileExists(atPath: saved1.path))
+
+        // removePreviewSessionDirectory enforces cacheRoot containment (no-op outside cacheRoot)
+        CuriumDownloadStorage.removePreviewSessionDirectory(outsideDir, cacheRoot: previewRoot)
+        #expect(FileManager.default.fileExists(atPath: outsideDir.path))
+        CuriumDownloadStorage.removePreviewSessionDirectory(preview.sessionDirectory, cacheRoot: previewRoot)
+        #expect(!FileManager.default.fileExists(atPath: preview.sessionDirectory.path))
+
+        // Disk listing discovers flat files + legacy <UUID>/<file> subdirectories and skips symlinks
+        let flatNote = downloadsRoot.appending(path: "notes.txt", directoryHint: .notDirectory)
+        try Data("hello".utf8).write(to: flatNote)
+        let legacyDir = downloadsRoot.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: legacyDir, withIntermediateDirectories: true)
+        let legacyPDF = legacyDir.appending(path: "legacy.pdf", directoryHint: .notDirectory)
+        try Data("legacy-pdf".utf8).write(to: legacyPDF)
+
+        let symlinkFile = downloadsRoot.appending(path: "link-secret.txt", directoryHint: .notDirectory)
+        try FileManager.default.createSymbolicLink(at: symlinkFile, withDestinationURL: outsideFile)
+        let symlinkSubdir = downloadsRoot.appending(path: "link-dir", directoryHint: .isDirectory)
+        try FileManager.default.createSymbolicLink(at: symlinkSubdir, withDestinationURL: outsideDir)
+
+        let listed = CuriumDownloadStorage.listSavedDownloads(in: downloadsRoot)
+        let names = Set(listed.map(\.filename))
+        #expect(names == Set(["whitepaper.pdf", "whitepaper (2).pdf", "notes.txt", "legacy.pdf"]))
+        #expect(!names.contains("link-secret.txt"))
+        #expect(!names.contains("escape.pdf"))
+        let listedNote = try #require(listed.first { $0.filename == "notes.txt" })
+        #expect(!listedNote.isPDF)
+        #expect(listedNote.byteCount == 5)
+        let listedLegacy = try #require(listed.first { $0.filename == "legacy.pdf" })
+        #expect(listedLegacy.isPDF)
+
+        // Safe deletion prunes empty legacy UUID parent dir and deletes regular flat files
+        try CuriumDownloadStorage.deleteSavedDownload(at: legacyPDF, downloadsRoot: downloadsRoot)
+        #expect(!FileManager.default.fileExists(atPath: legacyPDF.path))
+        #expect(!FileManager.default.fileExists(atPath: legacyDir.path))
+
+        try CuriumDownloadStorage.deleteSavedDownload(at: flatNote, downloadsRoot: downloadsRoot)
+        #expect(!FileManager.default.fileExists(atPath: flatNote.path))
+
+        // Symlinks, symlinked subdirs, directories, out-of-root traversals, and root-self deletion must all be refused
+        let nonEmptySubdir = downloadsRoot.appending(path: "subdir", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: nonEmptySubdir, withIntermediateDirectories: true)
+        let traversalURL = downloadsRoot.appending(path: "../secret.txt")
+        let symlinkEscapeFile = symlinkSubdir.appending(path: "escape.pdf", directoryHint: .notDirectory)
+
+        #expect(throws: Error.self) {
+            try CuriumDownloadStorage.deleteSavedDownload(at: symlinkFile, downloadsRoot: downloadsRoot)
+        }
+        #expect(throws: Error.self) {
+            try CuriumDownloadStorage.deleteSavedDownload(at: symlinkEscapeFile, downloadsRoot: downloadsRoot)
+        }
+        #expect(throws: Error.self) {
+            try CuriumDownloadStorage.deleteSavedDownload(at: nonEmptySubdir, downloadsRoot: downloadsRoot)
+        }
+        #expect(throws: Error.self) {
+            try CuriumDownloadStorage.deleteSavedDownload(at: traversalURL, downloadsRoot: downloadsRoot)
+        }
+        #expect(throws: Error.self) {
+            try CuriumDownloadStorage.deleteSavedDownload(at: outsideFile, downloadsRoot: downloadsRoot)
+        }
+        #expect(throws: Error.self) {
+            try CuriumDownloadStorage.deleteSavedDownload(at: downloadsRoot, downloadsRoot: downloadsRoot)
+        }
+        #expect(FileManager.default.fileExists(atPath: outsideFile.path))
+        #expect(FileManager.default.fileExists(atPath: outsideNestedPDF.path))
+        #expect(FileManager.default.fileExists(atPath: nonEmptySubdir.path))
+    }
+
+    @Test("PDF download streams to isolated preview cache, supports Find & explicit Save, and Back dismisses and cleans temp cache")
+    @MainActor
+    func pdfInlineStreamingSaveAndBackCleanup() async throws {
+        let sandbox = try makeTempDir("curium-pdf-e2e")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let downloadsRoot = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+        let previewRoot = sandbox.appending(path: "Caches/CuriumPDFPreview", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: downloadsRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: previewRoot, withIntermediateDirectories: true)
+
+        let host = MockBrowserHost()
+        let pageURL = try #require(URL(string: "https://docs.example/index.html"))
+        let pdfURL = try #require(URL(string: "https://docs.example/sample.pdf"))
+        let engineTab = MockTabHost(tabID: "tab-pdf", extensionTabID: 1, url: pageURL, title: "Docs")
+        engineTab.canGoBack = true
+        host.tabs = [engineTab]
+        host.activeTab = engineTab
+
+        let store = CuriumBrowserStore(
+            host: host,
+            extensionManager: MockExtensionManager(),
+            downloadsRoot: downloadsRoot,
+            pdfPreviewCacheRoot: previewRoot
+        )
+        // Let init's detached stale-preview cleanup finish before creating a new session.
+        try await Task.sleep(for: .milliseconds(80))
+
+        let pdfData = makeSamplePDFData(pageTexts: [
+            "Page One Intro",
+            "Page Two CuriumQuantumNeedle Details",
+            "Page Three Appendix",
+        ])
+        let task = MockDownloadTask(
+            sourceTabID: "tab-pdf",
+            originalURL: pdfURL,
+            suggestedFilename: "sample.pdf",
+            mimeType: "application/pdf",
+            payloadToWrite: pdfData
+        )
+
+        store.browserHost(host, didCreateDownload: task)
+
+        // Must stream into tab.pdfSession, NOT store.downloads or activeDownloadBanner or Downloads folder.
+        #expect(store.downloads.isEmpty)
+        #expect(store.activeDownloadBanner == nil)
+        let tab = try #require(store.activeTab)
+        let session = try #require(tab.pdfSession)
+        #expect(tab.isShowingPDF)
+        #expect(tab.displayURL == pdfURL)
+        #expect(tab.effectiveCanGoBack)
+        #expect(!tab.effectiveCanGoForward)
+
+        let ready = await waitUntil { session.phase == .ready }
+        #expect(ready)
+        #expect(session.pageCount == 3)
+        #expect(session.currentPageIndex == 0)
+        #expect(!session.isSavedToDownloads)
+
+        let previewFile = try #require(session.localFileURL)
+        let previewSessionDir = previewFile.deletingLastPathComponent()
+        #expect(previewFile.standardizedFileURL.path.hasPrefix(previewRoot.standardizedFileURL.path + "/"))
+        #expect(!previewFile.standardizedFileURL.path.hasPrefix(downloadsRoot.standardizedFileURL.path + "/"))
+        #expect(CuriumDownloadStorage.listSavedDownloads(in: downloadsRoot).isEmpty)
+        #expect(store.savedDownloads.isEmpty)
+
+        // Find-in-PDF locates text on page 2 and updates currentPageIndex.
+        session.openSearch()
+        session.performSearch(query: "CuriumQuantumNeedle")
+        let searchDone = await waitUntil { !session.isSearchInProgress && !session.searchMatches.isEmpty }
+        #expect(searchDone)
+        #expect(session.searchMatches.count == 1)
+        #expect(session.currentPageIndex == 1)
+
+        // Explicit Save promotes the file into durable Downloads and refreshes store.savedDownloads.
+        let savedURL = try #require(await session.saveToDownloads(downloadsRoot: downloadsRoot))
+        #expect(savedURL.deletingLastPathComponent().standardizedFileURL == downloadsRoot.standardizedFileURL)
+        #expect(savedURL.lastPathComponent == "sample.pdf")
+        #expect(session.isSavedToDownloads)
+        #expect(FileManager.default.fileExists(atPath: savedURL.path))
+        // Repeated save is idempotent and does not duplicate the file.
+        let repeatedSave = await session.saveToDownloads(downloadsRoot: downloadsRoot)
+        #expect(repeatedSave == savedURL)
+
+        store.refreshSavedDownloads()
+        let listedInStore = await waitUntil { store.savedDownloads.contains { $0.filename == "sample.pdf" && $0.isPDF } }
+        #expect(listedInStore)
+
+        // Back dismisses the inline PDF (without navigating the underlying web tab back) and deletes temp cache.
+        tab.goBack()
+        #expect(tab.pdfSession == nil)
+        #expect(!tab.isShowingPDF)
+        #expect(engineTab.goBackCallCount == 0)
+        let previewCleaned = await waitUntil { !FileManager.default.fileExists(atPath: previewSessionDir.path) }
+        #expect(previewCleaned)
+        // Durable saved copy remains intact after dismissing inline preview.
+        #expect(FileManager.default.fileExists(atPath: savedURL.path))
+    }
+
+    @Test("Cross-document navigation and tab close dismiss/cancel PDF sessions and delete temp preview directories")
+    @MainActor
+    func pdfNavigationDismissalAndTabCloseCleanup() async throws {
+        let sandbox = try makeTempDir("curium-pdf-lifecycle")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let downloadsRoot = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+        let previewRoot = sandbox.appending(path: "Caches/CuriumPDFPreview", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: downloadsRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: previewRoot, withIntermediateDirectories: true)
+
+        let host = MockBrowserHost()
+        let tab1Engine = MockTabHost(tabID: "t1", extensionTabID: 1, url: URL(string: "https://site.test/a"))
+        let tab2Engine = MockTabHost(tabID: "t2", extensionTabID: 2, url: URL(string: "https://site.test/b"))
+        host.tabs = [tab1Engine, tab2Engine]
+        host.activeTab = tab1Engine
+
+        let store = CuriumBrowserStore(
+            host: host,
+            extensionManager: MockExtensionManager(),
+            downloadsRoot: downloadsRoot,
+            pdfPreviewCacheRoot: previewRoot
+        )
+        try await Task.sleep(for: .milliseconds(80))
+
+        // 1. Cross-document didCommitNavigationTo dismisses PDF; same-document commit preserves it.
+        let pdfData = makeSamplePDFData(pageTexts: ["Single Page"])
+        let readyTask = MockDownloadTask(
+            sourceTabID: "t1",
+            originalURL: URL(string: "https://site.test/doc.pdf"),
+            suggestedFilename: "doc.pdf",
+            mimeType: "application/pdf",
+            payloadToWrite: pdfData
+        )
+        store.browserHost(host, didCreateDownload: readyTask)
+        let tab1 = try #require(store.tabs.first { $0.id == "t1" })
+        let session1 = try #require(tab1.pdfSession)
+        #expect(await waitUntil { session1.phase == .ready })
+        let dir1 = try #require(session1.localFileURL).deletingLastPathComponent()
+        #expect(FileManager.default.fileExists(atPath: dir1.path))
+
+        let sameDocURL = try #require(URL(string: "https://site.test/a#hash"))
+        store.browserHost(host, tab: tab1Engine, didCommitNavigationTo: sameDocURL, navigationID: 1, isSameDocument: true, isReload: false)
+        #expect(tab1.pdfSession != nil)
+
+        let crossDocURL = try #require(URL(string: "https://site.test/next"))
+        store.browserHost(host, tab: tab1Engine, didCommitNavigationTo: crossDocURL, navigationID: 2, isSameDocument: false, isReload: false)
+        #expect(tab1.pdfSession == nil)
+        #expect(await waitUntil { !FileManager.default.fileExists(atPath: dir1.path) })
+
+        // 2. Closing a tab cancels an in-flight PDF download and removes its temp preview directory.
+        let inflightTask = MockDownloadTask(
+            sourceTabID: "t2",
+            originalURL: URL(string: "https://site.test/large.pdf"),
+            suggestedFilename: "large.pdf",
+            mimeType: "application/pdf",
+            totalBytes: 10_000_000,
+            holdInProgressUntilCancelled: true
+        )
+        store.browserHost(host, didCreateDownload: inflightTask)
+        let tab2 = try #require(store.tabs.first { $0.id == "t2" })
+        #expect(tab2.pdfSession != nil)
+        #expect(await waitUntil { inflightTask.startedDestinationURL != nil })
+        let dir2 = try #require(inflightTask.startedDestinationURL).deletingLastPathComponent()
+        #expect(FileManager.default.fileExists(atPath: dir2.path))
+
+        store.close(tab2)
+        #expect(tab2.pdfSession == nil)
+        #expect(inflightTask.cancelCount == 1)
+        #expect(inflightTask.state == .cancelled)
+        #expect(await waitUntil { !FileManager.default.fileExists(atPath: dir2.path) })
+    }
+
+    @Test("Corrupt PDF fails gracefully while non-PDF downloads populate store.downloads and activeDownloadBanner")
+    @MainActor
+    func corruptPDFAndNonPDFDownloadFlow() async throws {
+        let sandbox = try makeTempDir("curium-pdf-corrupt-and-bin")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let downloadsRoot = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+        let previewRoot = sandbox.appending(path: "Caches/CuriumPDFPreview", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: downloadsRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: previewRoot, withIntermediateDirectories: true)
+
+        let host = MockBrowserHost()
+        let engineTab = MockTabHost(tabID: "t1", extensionTabID: 1, url: URL(string: "https://files.test/"))
+        host.tabs = [engineTab]
+        host.activeTab = engineTab
+
+        let store = CuriumBrowserStore(
+            host: host,
+            extensionManager: MockExtensionManager(),
+            downloadsRoot: downloadsRoot,
+            pdfPreviewCacheRoot: previewRoot
+        )
+        try await Task.sleep(for: .milliseconds(80))
+
+        // 1. Corrupt non-PDF bytes served as application/pdf fail gracefully without crashing or polluting Downloads.
+        let corruptTask = MockDownloadTask(
+            sourceTabID: "t1",
+            originalURL: URL(string: "https://files.test/broken.pdf"),
+            suggestedFilename: "broken.pdf",
+            mimeType: "application/pdf",
+            payloadToWrite: Data("<html>Not actually a PDF</html>".utf8)
+        )
+        store.browserHost(host, didCreateDownload: corruptTask)
+        let tab = try #require(store.activeTab)
+        let corruptSession = try #require(tab.pdfSession)
+        let settled = await waitUntil {
+            if case .loading = corruptSession.phase { return false }
+            return true
+        }
+        #expect(settled)
+        if case .failed(let message) = corruptSession.phase {
+            #expect(!message.isEmpty)
+        } else {
+            Issue.record("Expected corrupt PDF to transition to .failed, got \(corruptSession.phase)")
+        }
+        #expect(corruptSession.document == nil)
+        #expect(corruptSession.pageCount == 0)
+        #expect(corruptSession.canRetry)
+        #expect(store.downloads.isEmpty)
+        #expect(CuriumDownloadStorage.listSavedDownloads(in: downloadsRoot).isEmpty)
+        tab.dismissPDFSession()
+
+        // 2. Non-PDF download populates store.downloads + store.activeDownloadBanner and saves flat to Downloads on start.
+        let textPayload = Data("Curium release notes\n".utf8)
+        let nonPDFTask = MockDownloadTask(
+            downloadID: "dl-notes-1",
+            sourceTabID: "t1",
+            originalURL: URL(string: "https://files.test/notes.txt"),
+            suggestedFilename: "notes.txt",
+            mimeType: "application/octet-stream",
+            payloadToWrite: textPayload
+        )
+        store.browserHost(host, didCreateDownload: nonPDFTask)
+
+        #expect(tab.pdfSession == nil)
+        #expect(store.downloads.count == 1)
+        let item = try #require(store.downloads.first)
+        #expect(store.activeDownloadBanner?.id == item.id)
+        #expect(item.filename == "notes.txt")
+        #expect(!item.isPDF)
+        #expect(item.state == .pending)
+        #expect(store.pendingOrActiveDownloadCount == 1)
+        #expect(CuriumDownloadStorage.listSavedDownloads(in: downloadsRoot).isEmpty)
+
+        await store.startDownload(item)
+        #expect(item.state == .completed)
+        let savedTextURL = try #require(item.savedURL)
+        #expect(savedTextURL.deletingLastPathComponent().standardizedFileURL == downloadsRoot.standardizedFileURL)
+        #expect(savedTextURL.lastPathComponent == "notes.txt")
+        #expect(try Data(contentsOf: savedTextURL) == textPayload)
+        #expect(store.pendingOrActiveDownloadCount == 0)
+
+        let refreshed = await waitUntil { store.savedDownloads.contains { $0.filename == "notes.txt" && !$0.isPDF } }
+        #expect(refreshed)
+
+        store.clearFinishedDownloadTasks()
+        #expect(store.downloads.isEmpty)
+        #expect(store.activeDownloadBanner == nil)
+    }
+
+    @Test("bookmarkableURL excludes file:// URLs, deleteSavedDownload syncs preview/local sessions, and zoom/page requests stay mutually exclusive")
+    @MainActor
+    func bookmarkableURLDeletedDownloadSyncAndNavigationMutualExclusion() async throws {
+        let sandbox = try makeTempDir("curium-pdf-hardening")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let downloadsRoot = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+        let previewRoot = sandbox.appending(path: "Caches/CuriumPDFPreview", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: downloadsRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: previewRoot, withIntermediateDirectories: true)
+
+        let host = MockBrowserHost()
+        let tab1Engine = MockTabHost(tabID: "t1", extensionTabID: 1, url: URL(string: "https://docs.test/"))
+        let tab2Engine = MockTabHost(tabID: "t2", extensionTabID: 2, url: nil)
+        host.tabs = [tab1Engine, tab2Engine]
+        host.activeTab = tab1Engine
+
+        let store = CuriumBrowserStore(
+            host: host,
+            extensionManager: MockExtensionManager(),
+            downloadsRoot: downloadsRoot,
+            pdfPreviewCacheRoot: previewRoot
+        )
+
+        // 1. Remote PDF: bookmarkableURL exposes https:// URL; zoom vs page requests mutually clear.
+        let pdfData = makeSamplePDFData(pageTexts: ["Page 1", "Page 2"])
+        let remoteURL = try #require(URL(string: "https://docs.test/guide.pdf"))
+        let task = MockDownloadTask(
+            sourceTabID: "t1",
+            originalURL: remoteURL,
+            suggestedFilename: "guide.pdf",
+            mimeType: "application/pdf",
+            payloadToWrite: pdfData
+        )
+        store.browserHost(host, didCreateDownload: task)
+        let tab1 = try #require(store.tabs.first { $0.id == "t1" })
+        let previewSession = try #require(tab1.pdfSession)
+        #expect(await waitUntil { previewSession.phase == .ready })
+        #expect(tab1.bookmarkableURL == remoteURL)
+
+        previewSession.setZoomScale(1.5)
+        #expect(previewSession.requestedZoomScale == 1.5)
+        #expect(previewSession.requestedPageIndex == nil)
+        previewSession.jumpToPage(1)
+        #expect(previewSession.requestedPageIndex == 1)
+        #expect(previewSession.requestedZoomScale == nil)
+        previewSession.setZoomScale(1.25)
+        #expect(previewSession.requestedZoomScale == 1.25)
+        #expect(previewSession.requestedPageIndex == nil)
+        #expect(previewSession.requestedSelection == nil)
+
+        // Save from preview into durable Downloads, then delete from Downloads:
+        // preview session stays open in Tab 1 but clears savedDownloadURL so Save re-enables.
+        let savedGuideURL = try #require(await previewSession.saveToDownloads(downloadsRoot: downloadsRoot))
+        #expect(previewSession.isSavedToDownloads)
+        store.refreshSavedDownloads()
+        #expect(await waitUntil { store.savedDownloads.contains { $0.filename == "guide.pdf" } })
+        let savedGuide = try #require(store.savedDownloads.first { $0.filename == "guide.pdf" })
+
+        store.deleteSavedDownload(savedGuide)
+        #expect(!FileManager.default.fileExists(atPath: savedGuideURL.path))
+        #expect(tab1.pdfSession === previewSession)
+        #expect(!previewSession.isSavedToDownloads)
+        #expect(previewSession.savedDownloadURL == nil)
+
+        // 2. Local saved PDF opened in Tab 2: displayURL is file://, bookmarkableURL is nil,
+        // and deleting the saved file dismisses Tab 2's PDF session cleanly.
+        let offlineURL = downloadsRoot.appending(path: "offline.pdf", directoryHint: .notDirectory)
+        try pdfData.write(to: offlineURL)
+        store.refreshSavedDownloads()
+        #expect(await waitUntil { store.savedDownloads.contains { $0.filename == "offline.pdf" } })
+        let savedOffline = try #require(store.savedDownloads.first { $0.filename == "offline.pdf" })
+
+        let tab2 = try #require(store.tabs.first { $0.id == "t2" })
+        store.select(tab2)
+        store.openSavedPDFInActiveTab(savedOffline)
+        let localSession = try #require(tab2.pdfSession)
+        #expect(await waitUntil { localSession.phase == .ready })
+        #expect(tab2.displayURL == offlineURL)
+        #expect(tab2.bookmarkableURL == nil)
+        #expect(localSession.isOpenedFromSavedFile)
+
+        store.deleteSavedDownload(savedOffline)
+        #expect(!FileManager.default.fileExists(atPath: offlineURL.path))
+        #expect(tab2.pdfSession == nil)
+        tab1.dismissPDFSession()
     }
 }

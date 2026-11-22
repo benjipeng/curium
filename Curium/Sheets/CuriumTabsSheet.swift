@@ -155,7 +155,10 @@ private struct CuriumTabCard: View {
                         } else {
                             ZStack {
                                 palette.tile
-                                if tab.url == nil {
+                                if tab.isShowingPDF {
+                                    Image(systemName: "doc.richtext")
+                                        .font(.title2.weight(.light))
+                                } else if tab.url == nil {
                                     Text("Cm").font(.system(.title, design: .serif).weight(.medium))
                                 } else {
                                     Image(systemName: "globe")
@@ -170,7 +173,7 @@ private struct CuriumTabCard: View {
                     if selected {
                         Image(systemName: "circle.fill").font(.system(size: 6)).foregroundStyle(palette.tint)
                     }
-                    Text(tab.title).lineLimit(1).font(.subheadline.weight(.medium))
+                    Text(tab.displayTitle).lineLimit(1).font(.subheadline.weight(.medium))
                 }
                 .padding(10)
             }
@@ -184,7 +187,7 @@ private struct CuriumTabCard: View {
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(tab.title)
+        .accessibilityLabel(tab.displayTitle)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .overlay(alignment: .topTrailing) {
             Button(action: onClose) {
@@ -197,7 +200,7 @@ private struct CuriumTabCard: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Close \(tab.title)")
+            .accessibilityLabel("Close \(tab.displayTitle)")
         }
     }
 }
