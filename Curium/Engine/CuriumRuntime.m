@@ -468,6 +468,7 @@ static void CuriumInstallHeadlessRuntimeGuards(void) {
         [[[NSUserDefaults standardUserDefaults] stringForKey:@"curium.jitMode"] copy];
     CuriumInstallCommandLineGuard();
     CuriumPrepareEarlyV8Jit(jitPref);
+    CuriumInstallPiPSkipHooks();
     Class metricsMediator = NSClassFromString(@"MetricsMediator");
     if (!metricsMediator) {
         CuriumRecordHookStatus(@"MetricsMediator No-Op", @"skipped",
@@ -669,6 +670,49 @@ void CuriumRemoveExtension(id<CrIOSExtensionManagingV1> manager, NSString *ident
         [manager uninstallExtensionWithID:identifier completion:safeCompletion];
     } else {
         safeCompletion(NO, CuriumUnsupported());
+    }
+}
+
+@protocol CuriumTrustedUnpackedExtensionManaging <NSObject>
+@optional
+- (nullable NSString *)trustedUnpackedExtensionsDirectoryWithError:
+    (NSError *__autoreleasing _Nullable *_Nullable)error;
+- (void)installExtensionFromTrustedDirectory:(NSString *)directoryPath
+                                  completion:(void (^)(NSDictionary<NSString *, id> *_Nullable extension,
+                                                       NSError *_Nullable error))completion;
+@end
+
+NSString *_Nullable CuriumTrustedUnpackedExtensionsDirectory(
+    id<CrIOSExtensionManagingV1> manager,
+    NSError *_Nullable *_Nullable error) {
+    if (!manager || ![manager respondsToSelector:@selector(trustedUnpackedExtensionsDirectoryWithError:)]) {
+        if (error) {
+            *error = CuriumUnsupported();
+        }
+        return nil;
+    }
+    return [(id<CuriumTrustedUnpackedExtensionManaging>)manager
+        trustedUnpackedExtensionsDirectoryWithError:error];
+}
+
+void CuriumInstallTrustedUnpackedExtension(
+    id<CrIOSExtensionManagingV1> manager,
+    NSString *directoryPath,
+    CuriumExtensionResult completion) {
+    if (!completion) {
+        return;
+    }
+    CuriumExtensionResult safeCompletion = ^(NSDictionary<NSString *, id> *result, NSError *error) {
+        CuriumRunOnMain(^{
+            completion(result, error);
+        });
+    };
+    if (manager && [manager respondsToSelector:@selector(installExtensionFromTrustedDirectory:completion:)]) {
+        [(id<CuriumTrustedUnpackedExtensionManaging>)manager
+            installExtensionFromTrustedDirectory:directoryPath
+                                      completion:safeCompletion];
+    } else {
+        safeCompletion(nil, CuriumUnsupported());
     }
 }
 

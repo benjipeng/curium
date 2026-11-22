@@ -136,6 +136,9 @@ final class CuriumExtensionStore {
                 self?.handleActionPresentationChange(extensionID: extensionID)
             })
             observationBox = MainThreadObservationBox(token)
+            Task { @MainActor in
+                await CuriumVideoPiPExtension.ensureInstalled(using: manager)
+            }
         }
     }
 
@@ -157,6 +160,9 @@ final class CuriumExtensionStore {
     }
 
     private func handleActionPresentationChange(extensionID: String?) {
+        if let extensionID, CuriumVideoPiPExtension.hiddenExtensionIDs.contains(extensionID) {
+            return
+        }
         if let extensionID, !extensionID.isEmpty, hasLoadedInstalled,
            installed.contains(where: { $0.id == extensionID }) {
             pendingActionIDs.insert(extensionID)
@@ -253,7 +259,10 @@ final class CuriumExtensionStore {
         )
         do {
             let next: [CuriumExtension] = try manager.extensions().compactMap { entry in
-                guard let id = entry["id"] as? String else { return nil }
+                guard let id = entry["id"] as? String,
+                      !CuriumVideoPiPExtension.hiddenExtensionIDs.contains(id) else {
+                    return nil
+                }
                 let enabled = entry["enabled"] as? Bool ?? false
                 let action = (tabID >= 0 && enabled) ? CuriumExtensionAction(manager, id, tabID) : nil
                 let count: Int?
@@ -329,7 +338,8 @@ final class CuriumExtensionStore {
     }
 
     func isInstalled(_ id: String) -> Bool {
-        installed.contains { $0.id == id }
+        guard !CuriumVideoPiPExtension.hiddenExtensionIDs.contains(id) else { return false }
+        return installed.contains { $0.id == id }
     }
 
     func prepareStoreExtension(id: String) {

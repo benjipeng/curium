@@ -808,11 +808,6 @@ private struct CuriumAddressBar: View {
 
     private var text: String { address.trimmingCharacters(in: .whitespacesAndNewlines) }
 
-    private var showsPictureInPictureButton: Bool {
-        !addressFocused && tab?.isShowingPDF != true
-            && (tab?.pictureInPicture.phase ?? .unavailable) != .unavailable
-    }
-
     private var showsClearButton: Bool {
         addressFocused && !address.isEmpty
     }
@@ -876,11 +871,11 @@ private struct CuriumAddressBar: View {
                     searchEngineTitle: store.library.searchEngine.title,
                     text: $address,
                     isFocused: $addressFocused,
-                    leadingInset: showsPictureInPictureButton ? CuriumSpace.tapTarget + 6 : 14,
+                    leadingInset: 14,
                     trailingInset: showsClearButton
                         ? CuriumSpace.tapTarget + 24
                         : (showsReloadButton ? CuriumSpace.tapTarget + 6 : 14),
-                    leadingPassthroughWidth: showsPictureInPictureButton ? CuriumSpace.tapTarget + 2 : 0,
+                    leadingPassthroughWidth: 0,
                     trailingPassthroughWidth: showsTrailingActionButton ? CuriumSpace.tapTarget + 6 : 0,
                     onSubmit: submit
                 )
@@ -910,30 +905,9 @@ private struct CuriumAddressBar: View {
             }
             .clipShape(Capsule())
             .glassEffect(addressFocused ? .regular : .regular.interactive(), in: Capsule())
-            // Keep leading/trailing controls strictly outside UITextField and above the glass
+            // Keep trailing controls strictly outside UITextField and above the glass
             // capsule in Z-order so neither UITextInteraction nor interactive Liquid Glass can
             // cancel touches, while UITextField passes through hits across the trailing button zone.
-            .overlay(alignment: .leading) {
-                if showsPictureInPictureButton, let tab {
-                    let active = tab.pictureInPicture.phase == .active
-                    Button { withAnimation(.smooth(duration: 0.25)) { tab.togglePictureInPicture() } } label: {
-                        Label(active ? "Exit Picture in Picture" : "Picture in Picture",
-                              systemImage: active ? "pip.exit" : "pip.enter")
-                            .labelStyle(.iconOnly)
-                            .contentTransition(.symbolEffect(.replace))
-                            .frame(width: CuriumSpace.tapTarget, height: CuriumSpace.tapTarget)
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.leading, 2)
-                    .scaleEffect(fieldScale)
-                    .opacity(fieldOpacity)
-                    .allowsHitTesting(!collapsed)
-                    .accessibilityHidden(collapsed)
-                    .accessibilitySortPriority(2)
-                    .accessibilityIdentifier("curium.address.pip")
-                }
-            }
             .overlay(alignment: .trailing) {
                 if showsClearButton {
                     Button {
@@ -985,15 +959,6 @@ private struct CuriumAddressBar: View {
 
             if addressFocused {
                 CuriumAddressMatches(library: store.library, text: text, submit: submit, open: openMatch)
-            } else if tab?.pictureInPicture.phase == .refused {
-                Text("Play the video you want, with sound, then try again.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .glassEffect(.regular, in: Capsule())
-                    .transition(.opacity)
-                    .accessibilityAddTraits(.updatesFrequently)
             }
         }
         .onChange(of: tab?.id, initial: true) {

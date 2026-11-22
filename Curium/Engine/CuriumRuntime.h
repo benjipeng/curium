@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import "CuriumPiPHooks.h"
 @import CuriumEngineContract;
 
 NS_ASSUME_NONNULL_BEGIN
@@ -27,6 +28,13 @@ void CuriumConfirmExtension(id<CrIOSExtensionManagingV1> manager, NSString *toke
 void CuriumCancelExtension(id<CrIOSExtensionManagingV1> manager, NSString *token);
 void CuriumRemoveExtension(id<CrIOSExtensionManagingV1> manager, NSString *identifier,
                            void (^NS_SWIFT_UI_ACTOR completion)(BOOL, NSError *_Nullable));
+NSString *_Nullable CuriumTrustedUnpackedExtensionsDirectory(
+    id<CrIOSExtensionManagingV1> manager,
+    NSError *_Nullable *_Nullable error);
+void CuriumInstallTrustedUnpackedExtension(
+    id<CrIOSExtensionManagingV1> manager,
+    NSString *directoryPath,
+    CuriumExtensionResult completion);
 
 NSDictionary<NSString *, id> *_Nullable CuriumExtensionAction(
     id<CrIOSExtensionManagingV1> manager, NSString *identifier, int32_t tabID);

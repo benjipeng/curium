@@ -52,6 +52,9 @@ final class CuriumDiagnostics: @unchecked Sendable {
         self.maxRingLines = max(1, maxRingLines)
 
         if observeSystemNotifications {
+            CuriumSetPiPDiagnosticLogHandler { [weak self] message in
+                self?.record("pip", message)
+            }
             let center = NotificationCenter.default
             notificationTokens.append(
                 center.addObserver(

@@ -30,7 +30,6 @@ final class CuriumTabModel: Identifiable {
     /// The address bar's collapse. Updated every compositor frame while scrolling, so
     /// only the address bar's leaf views read it.
     private(set) var chrome = CuriumChromeState()
-    private(set) var pictureInPicture = CuriumPictureInPictureState()
     private(set) var hasPlayingVideo = false
     private(set) var isPictureInPictureActive = false
     private(set) var extensionTabID: Int32 = -1
@@ -54,7 +53,6 @@ final class CuriumTabModel: Identifiable {
     @ObservationIgnored private(set) var snapshotRevision = 0
     @ObservationIgnored private var configuredInitialSiteMode = false
     @ObservationIgnored private var lastRawTitle: String?
-    @ObservationIgnored private var pictureInPictureTimer: Task<Void, Never>?
 
     init(id: String = UUID().uuidString) { self.id = id }
 
@@ -64,8 +62,6 @@ final class CuriumTabModel: Identifiable {
 
     /// Releases engine/view references and cancels timers once the tab has been closed.
     func invalidate() {
-        pictureInPictureTimer?.cancel()
-        pictureInPictureTimer = nil
         dismissPDFSession()
         clearSnapshot()
         if engine != nil { engine = nil }
@@ -156,8 +152,6 @@ final class CuriumTabModel: Identifiable {
 
         let newPiP = engine.isPictureInPictureActive ?? false
         if isPictureInPictureActive != newPiP { isPictureInPictureActive = newPiP }
-        update(\.pictureInPicture) { $0.engineReported(hasVideo: newHasVideo, active: newPiP) }
-        if newPiP { pictureInPictureTimer?.cancel() }
 
         let newExtTabID = engine.extensionTabID
         if extensionTabID != newExtTabID { extensionTabID = newExtTabID }
@@ -250,31 +244,6 @@ final class CuriumTabModel: Identifiable {
         if let engine { engine.goForward(); return }
         historyIndex += 1
         updateStandbyHistory()
-    }
-
-    func togglePictureInPicture() {
-        guard let engine else { return }
-        var next = pictureInPicture
-        let command = next.requested()
-        pictureInPicture = next
-        switch command {
-        case .exit:
-            engine.exitPictureInPicture?()
-        case .enter:
-            engine.enterPictureInPicture?()
-            pictureInPictureTimer?.cancel()
-            pictureInPictureTimer = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: CuriumPictureInPictureState.confirmationTimeout)
-                guard !Task.isCancelled, let self else { return }
-                self.update(\.pictureInPicture) { $0.confirmationTimedOut() }
-                guard self.pictureInPicture.phase == .refused else { return }
-                try? await Task.sleep(for: CuriumPictureInPictureState.hintDuration)
-                guard !Task.isCancelled else { return }
-                self.update(\.pictureInPicture) { $0.hintExpired() }
-            }
-        case nil:
-            break
-        }
     }
 
     /// Blink's compositor reports the shown fraction of the top controls; nil means the

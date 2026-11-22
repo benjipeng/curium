@@ -15,10 +15,13 @@ the pinned engine first, translate to `patches/` once proven.
 - **App / On `ac_duo`:** `Curium-0.1.11-b15-arm64.ipa` (Build 40 + native Swift
   Fingerprint Profile Studio, `eb127cb`, verified on `iphone_duo_27_2` Simulator
   and tested on `ac_duo` via LiveContainer).
-- **Local candidate:** `Curium-0.1.11-b17` (pure-Swift inline tab PDF reader
-  with isolated `Caches/CuriumPDFPreview/` cache + persistent Downloads UI on
-  Build 40; 29/29 `CuriumTests` passing, Simulator `sdk 27.2` + live E2E
-  verified, reviewer LGTM). Previous `b16` (`6538e01`) verified on `ac_duo`.
+- **Local candidate:** `Curium-0.1.13-b22` (universal per-video floating PiP
+  button + universal anti-PiP & background-pause MV3 guard + Build 40 4-bug
+  HLS/VOD skip-stall fix + iOS 27.2 AVKit `setPlaying:` coalescing so forward/rewind
+  skip never pauses playback + `MappableBufferIOSurface` zero-copy fallback for
+  software-decoded AV1/VP9/Simulator frames + `AVAudioSessionCategoryPlayback`
+  activation for muted PiP; removed address-bar PiP button & refusal banner).
+  Previous `0.1.11-b17` (`57a095c`) verified on `ac_duo`.
 
 ## App (on the pinned engine)
 
@@ -65,19 +68,45 @@ the pinned engine first, translate to `patches/` once proven.
   banner and save flat (collision-safe, no random UUID folders) with disk-backed
   Saved Files persistence, Open-in-Tab / QuickLook preview, Share, and symlink-safe
   deletion.
-- [ ] **Picture in Picture skip controls (±10s/±15s rewind & fast-forward).**
-  Next up: `0089` currently sets `requiresLinearPlayback = YES` and leaves
-  `skipByInterval:completionHandler:` as a no-op stub.
-- [ ] **Floating PiP button over the playing video.** Requested. Open question:
-  placement over the in-page video or in the top chrome.
+- [x] **Universal Picture in Picture overhaul: floating per-video button, anti-PiP/background-pause guard, AVKit skip-keeps-playing fix & SharedImage IOSurface bridge (`0.1.13-b22`).**
+  Removed the address-bar PiP button and refusal banner; added hidden built-in
+  MV3 extension (`CuriumVideoPiPExtension.swift`, deterministic ID
+  `kogjboefmhkckeddcmekebknpjlhkhid` materialized into
+  `TrustedUnpackedExtensions/curium_video_pip/`) with universal `MAIN`-world
+  `pip_guard.js` (locks `disablePictureInPicture = false`, blocks unsolicited
+  `exitPictureInPicture()`, shields active PiP from `visibilitychange`/`blur`
+  background-pause scripts without altering normal tabs) and `ISOLATED`-world
+  `pip_overlay.js` (closed-ShadowDOM floating Liquid Glass PiP pill on every
+  eligible playing/recently-paused `<video>`, muted or unmuted, multi-video,
+  ShadowDOM, cross-origin iframes, pinch-zoom aware, zero idle rAF). Fixed all
+  Build 40 `CuriumPiPBridge` playback/skip bugs in `CuriumPiPHooks.m`:
+  (1) replaced `updatePlaybackPaused:position:` to preserve high-PTS HLS
+  timebases and `rate > 0` during buffering, synchronous `[renderer flush]` on
+  skip & PTS discontinuities, zero-leak pre-seek stale-frame drop via
+  `_isFlushing`, `3.5s` HLS guard window, and `isReadyForMoreMediaData`
+  self-heal; (2) fixed iOS 27.2 `AVSampleBufferDisplayLayerPlayerController`
+  pausing on every forward/rewind skip by synchronously updating
+  `_mainPlaybackPaused` in `setPlaying:`, invoking `completionHandler()` before
+  `invalidatePlaybackState`, and coalescing same-runloop-turn `NO -> YES`
+  transitions so transient seek toggles cancel to a zero-pause no-op while
+  genuine user Pause/Play dispatches immediately; (3) added fail-closed
+  zero-copy `ClientSharedImage -> MappableBufferIOSurface -> CVPixelBufferRef`
+  bridge for `STORAGE_OPAQUE` software-decoded AV1/VP9/Simulator frames and
+  `AVAudioSessionCategoryPlayback` activation for muted videos. Verified live
+  with real native iOS 27.2 SpringBoard Pegasus PiP on `iphone_duo_27_2`
+  Simulator (`42/42` `CuriumTests` passing).
+- [ ] **Dysprosium-inspired media stream sniffer & multi-lane downloader (on Build 40).**
+  Next milestone after `0.1.12` PiP checkpoint.
 
 ## Live hooks
 
-Permanent shell-side runtime guards in `Curium/Engine/CuriumRuntime.m`. All five
+Permanent shell-side runtime guards in `Curium/Engine/CuriumRuntime.m` plus
+scoped Build 40 bridge hooks in `Curium/Engine/CuriumPiPHooks.m`. All five
 temporary Build 35 engine hooks were retired in Build 37 (`0099`–`0104`).
 
 | Hook | Effect | Exit |
 | --- | --- | --- |
+| `CuriumPiPBridge` skip controls (`CuriumPiPHooks.m`) | Enables VOD `requiresLinearPlayback = NO`, native `SeekTo` on `skipByInterval:completionHandler:`, render-queue seek guard against stale pre-seek frames/positions, and offset-contained `timeRangeForPlayback:`. Fails closed on any Build 40 layout drift. | Retire once `0089` wires `OnAVKitSkipByInterval` + seek-epoch timebase handling directly in `ios_video_overlay_window.mm` in the next engine wave. |
 | `CrIOSEngineBootstrap` launch fingerprint bridge (`CuriumRuntime.m`) | Probes Build 40 capabilities, sends bounded `schemaVersion: 1` JSON before `ChromeMain`, fails closed on rejection, and queries live `activeFingerprintStatus`. | Permanent: shell ↔ engine launch contract. |
 | `-[NSProcessInfo arguments]` (`CuriumRuntime.m`) | Adds launch switches: Google features off, `--disable-sync`, JIT mode, Skia Graphite off on Simulator, `--enable-features=GlobalPrivacyControlApi` strictly when the active profile opts into GPC, and legacy `0105` switches only in unconfigured Build 39 default mode. Also disables the affected Blink permission elements on the pinned engine. | Permanent channel; remove each permission element workaround after validating its label and prompt on a new pinned engine. |
 | `V8IOSJitPrepareForProcess` pre-`ChromeMain` probe (`CuriumRuntime.m`) | Prepares V8's iOS TXM / Simulator JIT pool before Crashpad installs exception handlers. | Permanent: shell-controlled JIT preference. |
