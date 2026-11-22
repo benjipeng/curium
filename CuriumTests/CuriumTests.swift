@@ -775,3 +775,168 @@ struct CuriumFingerprintTests {
         }
     }
 }
+
+@Suite("Media Permission Prompts")
+struct CuriumMediaPermissionTests {
+    @Test("Origin parser rejects non-HTTP(S)/opaque URLs and normalizes display labels")
+    func originParsingAndFormatting() throws {
+        let blankURL = try #require(URL(string: "about:blank"))
+        let dataURL = try #require(URL(string: "data:text/html,hi"))
+        let fileURL = try #require(URL(string: "file:///tmp/test.html"))
+        #expect(CuriumMediaPermissionOrigin.parse(blankURL) == nil)
+        #expect(CuriumMediaPermissionOrigin.parse(dataURL) == nil)
+        #expect(CuriumMediaPermissionOrigin.parse(fileURL) == nil)
+
+        let googleURL = try #require(URL(string: "https://WWW.Google.COM:443/search?q=1"))
+        let google = try #require(CuriumMediaPermissionOrigin.parse(googleURL))
+        #expect(google.key == "https://www.google.com:443")
+        #expect(google.displaySite == "www.google.com")
+
+        let customPortURL = try #require(URL(string: "https://localhost:8443/call"))
+        let customPort = try #require(CuriumMediaPermissionOrigin.parse(customPortURL))
+        #expect(customPort.key == "https://localhost:8443")
+        #expect(customPort.displaySite == "localhost:8443")
+
+        let insecureURL = try #require(URL(string: "http://127.0.0.1:8080/mic"))
+        let insecure = try #require(CuriumMediaPermissionOrigin.parse(insecureURL))
+        #expect(insecure.key == "http://127.0.0.1:8080")
+        #expect(insecure.displaySite == "http://127.0.0.1:8080")
+    }
+
+    @Test("Site approval precedes iOS authorization; site denial never asks iOS")
+    @MainActor
+    func siteApprovalPrecedesOSAuthorization() async throws {
+        var osRequests: [CuriumCaptureMediaKind] = []
+        let coordinator = CuriumMediaPermissionCoordinator(
+            isRequestCurrent: { _, _ in true },
+            authorizeCapture: { kind in
+                osRequests.append(kind)
+                return true
+            }
+        )
+        let origin = try #require(URL(string: "https://meet.example.com/"))
+
+        // 1. Site denial must never invoke AVCaptureDevice authorization.
+        var deniedResult: CuriumMediaPermissions?
+        coordinator.enqueue(permissions: [.microphone], originURL: origin, tabID: "tab-1") { granted in
+            deniedResult = granted
+        }
+        #expect(coordinator.activePrompt?.title == "Allow meet.example.com to use your microphone?")
+        coordinator.respondToActivePrompt(allowed: false)
+        #expect(deniedResult == [])
+        #expect(osRequests.isEmpty)
+        #expect(coordinator.activePrompt == nil)
+
+        // 2. Site allow for camera + microphone requests video then audio in order.
+        let granted: CuriumMediaPermissions = await withCheckedContinuation { cont in
+            coordinator.enqueue(permissions: [.camera, .microphone], originURL: origin, tabID: "tab-1") { result in
+                cont.resume(returning: result)
+            }
+            #expect(coordinator.activePrompt?.title == "Allow meet.example.com to use your camera and microphone?")
+            coordinator.respondToActivePrompt(allowed: true)
+            #expect(coordinator.activePrompt == nil)
+        }
+        #expect(granted == [.camera, .microphone])
+        #expect(osRequests == [.video, .audio])
+    }
+
+    @Test("Concurrent duplicate requests coalesce while distinct requests queue without cache poisoning")
+    @MainActor
+    func coalescingAndQueuingBehavior() async throws {
+        let coordinator = CuriumMediaPermissionCoordinator(
+            isRequestCurrent: { _, _ in true },
+            authorizeCapture: { _ in true }
+        )
+        let origin = try #require(URL(string: "https://voice.example.com/"))
+
+        var firstMicResult: CuriumMediaPermissions?
+        var secondMicResult: CuriumMediaPermissions?
+        var cameraResult: CuriumMediaPermissions?
+
+        coordinator.enqueue(permissions: [.microphone], originURL: origin, tabID: "tab-1") { firstMicResult = $0 }
+        // Duplicate mic request coalesces onto the active prompt.
+        coordinator.enqueue(permissions: [.microphone], originURL: origin, tabID: "tab-1") { secondMicResult = $0 }
+        // Distinct camera request queues cleanly behind mic rather than failing immediately.
+        coordinator.enqueue(permissions: [.camera], originURL: origin, tabID: "tab-1") { cameraResult = $0 }
+
+        #expect(coordinator.activePrompt?.permissions == [.microphone])
+        coordinator.respondToActivePrompt(allowed: true)
+
+        // Wait for async OS authorization task to complete and drain the camera prompt.
+        for _ in 0..<20 where coordinator.activePrompt?.permissions != [.camera] {
+            await Task.yield()
+        }
+        #expect(firstMicResult == [.microphone])
+        #expect(secondMicResult == [.microphone])
+        #expect(cameraResult == nil)
+        #expect(coordinator.activePrompt?.permissions == [.camera])
+
+        coordinator.respondToActivePrompt(allowed: false)
+        #expect(cameraResult == [])
+        #expect(coordinator.activePrompt == nil)
+    }
+
+    @Test("Navigation, origin change, and tab close dismiss prompts and fail closed even mid-OS authorization")
+    @MainActor
+    func navigationAndTabLifecycleFailClosed() async throws {
+        let host = MockBrowserHost()
+        var pendingOSContinuation: CheckedContinuation<Bool, Never>?
+        let store = CuriumBrowserStore(
+            host: host,
+            captureAuthorizer: { _ in
+                await withCheckedContinuation { cont in
+                    pendingOSContinuation = cont
+                }
+            }
+        )
+        let tab = try #require(host.activeTab as? MockTabHost)
+        let siteA = try #require(URL(string: "https://site-a.example/page"))
+        let siteASameDoc = try #require(URL(string: "https://site-a.example/page#section"))
+        let siteB = try #require(URL(string: "https://site-b.example/"))
+        tab.currentURL = siteA
+        store.browserHost(host, didUpdateTab: tab)
+
+        // Presentation blocked while a sheet is open; prompt waits and appears once dismissed.
+        store.setSheetPresented(true)
+        var firstResult: CrIOSMediaPermissionTypes?
+        store.browserHost(host, requestMediaPermissions: .microphone, origin: siteA, forTab: tab) {
+            firstResult = $0
+        }
+        #expect(store.activeMediaPermissionPrompt == nil)
+        #expect(firstResult == nil)
+
+        store.setSheetPresented(false)
+        #expect(store.activeMediaPermissionPrompt?.displaySite == "site-a.example")
+
+        // Same-document hash navigation must NOT dismiss the prompt.
+        tab.currentURL = siteASameDoc
+        store.browserHost(host, tab: tab, didCommitNavigationTo: siteASameDoc, navigationID: 1, isSameDocument: true, isReload: false)
+        #expect(store.activeMediaPermissionPrompt?.displaySite == "site-a.example")
+
+        // Cross-document navigation immediately dismisses and denies fail-closed.
+        tab.currentURL = siteB
+        store.browserHost(host, tab: tab, didCommitNavigationTo: siteB, navigationID: 2, isSameDocument: false, isReload: false)
+        #expect(store.activeMediaPermissionPrompt == nil)
+        #expect(firstResult == [])
+
+        // Navigating away while awaiting iOS AVCaptureDevice dialog must still fail closed.
+        var midOSResult: CrIOSMediaPermissionTypes?
+        store.browserHost(host, requestMediaPermissions: .microphone, origin: siteB, forTab: tab) {
+            midOSResult = $0
+        }
+        #expect(store.activeMediaPermissionPrompt?.displaySite == "site-b.example")
+        store.respondToActiveMediaPermissionPrompt(allowed: true)
+        for _ in 0..<20 where pendingOSContinuation == nil {
+            await Task.yield()
+        }
+        #expect(pendingOSContinuation != nil)
+
+        // Tab navigates back to siteA before iOS returns "granted".
+        tab.currentURL = siteA
+        store.browserHost(host, tab: tab, didCommitNavigationTo: siteA, navigationID: 3, isSameDocument: false, isReload: false)
+        #expect(midOSResult == [])
+        pendingOSContinuation?.resume(returning: true)
+        for _ in 0..<10 { await Task.yield() }
+        #expect(midOSResult == [])
+    }
+}

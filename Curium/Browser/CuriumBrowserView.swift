@@ -102,6 +102,21 @@ struct CuriumBrowserView: View {
             .onChange(of: proxy.size.width, initial: true) { _, newWidth in
                 store.updateViewportWidth(newWidth)
             }
+            .alert(
+                store.activeMediaPermissionPrompt?.title ?? "",
+                isPresented: Binding(
+                    get: { store.activeMediaPermissionPrompt != nil },
+                    set: { if !$0 { store.dismissActiveMediaPermissionPromptWithoutAction() } }
+                ),
+                presenting: store.activeMediaPermissionPrompt
+            ) { _ in
+                Button("Don’t Allow", role: .cancel) {
+                    store.respondToActiveMediaPermissionPrompt(allowed: false)
+                }
+                Button("Allow") {
+                    store.respondToActiveMediaPermissionPrompt(allowed: true)
+                }
+            }
         }
         .background {
             CuriumVerticalBarReader { placement = $0 }

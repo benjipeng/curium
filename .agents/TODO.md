@@ -15,6 +15,8 @@ the pinned engine first, translate to `patches/` once proven.
 - **App / On `ac_duo`:** `Curium-0.1.11-b15-arm64.ipa` (Build 40 + native Swift
   Fingerprint Profile Studio, `eb127cb`, verified on `iphone_duo_27_2` Simulator
   and tested on `ac_duo` via LiveContainer).
+- **Local candidate:** `Curium-0.1.11-b16-arm64.ipa` (Build 40 with the permission
+  element workaround). No physical deployment.
 
 ## App (on the pinned engine)
 
@@ -39,6 +41,18 @@ the pinned engine first, translate to `patches/` once proven.
 - [x] **Address bar buttons accessible** (`.overlay` controls above `.glassEffect`).
 - [x] **Swift/Obj-C shell stability, 120 Hz scroll smoothness & idle-efficiency sweep** (`CuriumTests` target).
 - [x] **Top chrome follows `.occlusion` / `.division` reserved regions.**
+- [x] **Avoid the missing permission label crash on Build 40.** Temporarily
+  disable Blink's in-page camera, microphone, user media, and geolocation
+  elements in `CuriumRuntime.m`. The standard web APIs remain exposed. Add
+  fallback iOS usage descriptions for standalone installs.
+- [x] **Native Swift website camera & microphone prompts on Build 40.**
+  Implemented `CrIOSBrowserHostDelegateV1.requestMediaPermissions` in
+  `CuriumBrowserStore.swift` backed by `CuriumMediaPermissionCoordinator.swift`:
+  asks site permission first via SwiftUI `.alert`, then requests `AVCaptureDevice`
+  authorization, coalesces/queues concurrent requests without poisoning the
+  engine's page-scoped cache, and automatically dismisses/denies prompts on
+  navigation, origin change, tab switch, or tab close. Under LiveContainer, iOS
+  authorization still belongs to the host.
 - [ ] **Floating PiP button over the playing video.** Requested. Open question:
   placement over the in-page video or in the top chrome.
 
@@ -50,7 +64,7 @@ temporary Build 35 engine hooks were retired in Build 37 (`0099`–`0104`).
 | Hook | Effect | Exit |
 | --- | --- | --- |
 | `CrIOSEngineBootstrap` launch fingerprint bridge (`CuriumRuntime.m`) | Probes Build 40 capabilities, sends bounded `schemaVersion: 1` JSON before `ChromeMain`, fails closed on rejection, and queries live `activeFingerprintStatus`. | Permanent: shell ↔ engine launch contract. |
-| `-[NSProcessInfo arguments]` (`CuriumRuntime.m`) | Adds launch switches: Google features off, `--disable-sync`, JIT mode, Skia Graphite off on Simulator, `--enable-features=GlobalPrivacyControlApi` strictly when the active profile opts into GPC, and legacy `0105` switches only in unconfigured Build 39 default mode. | Permanent: the app's channel for launch switches. |
+| `-[NSProcessInfo arguments]` (`CuriumRuntime.m`) | Adds launch switches: Google features off, `--disable-sync`, JIT mode, Skia Graphite off on Simulator, `--enable-features=GlobalPrivacyControlApi` strictly when the active profile opts into GPC, and legacy `0105` switches only in unconfigured Build 39 default mode. Also disables the affected Blink permission elements on the pinned engine. | Permanent channel; remove each permission element workaround after validating its label and prompt on a new pinned engine. |
 | `V8IOSJitPrepareForProcess` pre-`ChromeMain` probe (`CuriumRuntime.m`) | Prepares V8's iOS TXM / Simulator JIT pool before Crashpad installs exception handlers. | Permanent: shell-controlled JIT preference. |
 | `+[MetricsMediator logLaunchMetricsWithStartupInformation:connectedScenes:]` (`CuriumRuntime.m`) | No-op. Launch metrics walk Chrome's tab model for uploads Curium never makes. | None planned. |
 
@@ -68,6 +82,23 @@ Built in run `44939797575` (`8b550ce`) after green `graph-diagnose.yml` (`449381
 - [x] **Authentic Chrome dual identity, Client Hints delegate & `Accept-Language` (`0105`).** Landed Build 38/39.
 - [x] **Modular launch-scoped fingerprint contract, isolated profile roots, Zstd baseline, OOPIF Desktop inheritance & optional native-first hardware/GPU overrides (`0106`).**
   Landed Build 40 (`8b550ce`, run `44939797575`) and verified end-to-end on `iphone_duo_27_2` Simulator (Zstd HTTPS decode + Range `identity` control, cross-origin OOPIF + nested `about:blank`/`srcdoc`/Worker + sync `window.open('')`/`window.open('about:blank')`, cold `A → B → A → Default` 4-store isolation, Win11 x64 partial `majorVersion=158` coherence + Window/Worker HW/GPU/TZ parity, DNT/GPC, fail-closed recovery, and fixed-proxy `<-loopback>` zero-direct-leak).
+- [ ] **Package Blink's localized permission element strings (deferred to next engine wave).**
+  On `iphone_duo_27_2`, navigating to `google.com` in `0.1.11-b15` with Build 40
+  triggered a renderer `SIGTRAP` in `ui::ResourceBundle::GetLocalizedStringImpl`
+  for resource `47053` (absent from `resources.pak`). Mitigated downstream on
+  Build 40 via `--disable-blink-features=CameraAndMicrophoneElements,UserMediaElement,GeolocationElement`
+  in `CuriumRuntime.m`; standard media capture and geolocation APIs stay active.
+  Deferred: repack `permission_element_generated_strings.pak` and
+  `permission_element_strings_en-US.pak` into `resources.pak` (with a `link.sh`
+  data-pack check) in the next full engine wave.
+- [ ] **Flip geolocation prompt order & harden cross-origin iframe media checks (deferred to next engine wave).**
+  Build 40 already supports location (iOS prompt first, then site prompt) and
+  delegates camera/microphone prompts to Swift (`CuriumBrowserStore`). Defer
+  moving iOS `GeolocationSystemPermissionManager::RequestSystemPermission()`
+  after site approval and adding `IsCurrentMediaOrigin` in `content_web_state.mm`
+  to the next engine wave. Note: before running Pipeline 1 under `benjipeng/curium`,
+  copy the existing GHCR source/stub/ccache images from
+  `ghcr.io/benjipeng/chromium-blink-ios/*` to `ghcr.io/benjipeng/curium/*`.
 - [ ] **Drop `helpers/extensions_ui` from packaging.** Deferred to next engine wave.
 
 ## Environment

@@ -202,7 +202,7 @@ NSString *CuriumNormalizedAcceptLanguages(NSArray<NSString *> *_Nullable preferr
 static BOOL CuriumMergeListSwitch(NSMutableArray<NSString *> *args, NSString *name,
                                   NSString *separator, NSString *items) {
     NSString *prefix = [name stringByAppendingString:@"="];
-    for (NSUInteger i = 0; i < args.count; i++) {
+    for (NSUInteger i = args.count; i-- > 0;) {
         if ([args[i] hasPrefix:prefix]) {
             NSString *value = [args[i] substringFromIndex:prefix.length];
             args[i] = value.length
@@ -237,6 +237,12 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
     changed |= CuriumAddSwitch(args, @"--disable-skia-graphite");
     changed |= CuriumMergeListSwitch(args, @"--disable-features", @",", @"SkiaGraphite");
 #endif
+
+    // Build 40 omits the strings for Blink's in-page permission controls.
+    // Disable the affected elements until the engine ships those strings.
+    // The standard media capture and geolocation APIs do not use these flags.
+    changed |= CuriumMergeListSwitch(args, @"--disable-blink-features", @",",
+                                    @"CameraAndMicrophoneElements,UserMediaElement,GeolocationElement");
 
     // Keep the engine from contacting Google unprompted: AI Mode eligibility
     // (www.google.com/async/folae) and the translate ranker stay off.

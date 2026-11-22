@@ -421,7 +421,10 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     private(set) var activeTab: CuriumTabModel?
     private(set) var downloads: [CuriumDownload] = []
     private(set) var backgroundEpoch = 0
-    var errorMessage: String?
+    private(set) var activeMediaPermissionPrompt: CuriumMediaPermissionPrompt?
+    var errorMessage: String? {
+        didSet { syncMediaPermissionPresentationGate() }
+    }
     var requestShowTabs = false
 
     @ObservationIgnored private var tabsByID: [String: CuriumTabModel] = [:]
@@ -436,11 +439,17 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     @ObservationIgnored private var hasSyncedInitialViewportWidth = false
     @ObservationIgnored private var idleSnapshotTask: Task<Void, Never>?
     @ObservationIgnored private var onDemandSnapshotTask: Task<Void, Never>?
+    @ObservationIgnored private var mediaPermissions: CuriumMediaPermissionCoordinator!
     @ObservationIgnored private(set) var viewportWidth: CGFloat = 669
 
     var isEngineReady: Bool { host != nil }
 
-    init(host: (any CrIOSBrowserHostV1)? = nil, extensionManager: (any CrIOSExtensionManagingV1)? = nil) {
+    init(
+        host: (any CrIOSBrowserHostV1)? = nil,
+        extensionManager: (any CrIOSExtensionManagingV1)? = nil,
+        captureAuthorizer: @escaping CuriumMediaPermissionCoordinator.CaptureAuthorizer =
+            CuriumMediaPermissionCoordinator.liveCaptureAuthorizer
+    ) {
         self.host = host
         // The optional delegate method is ours, so probing it cannot tell us
         // whether Blink sends it. Patch 0097 adds this forwarder to the host.
@@ -449,6 +458,15 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         )) == true
         extensions = CuriumExtensionStore(manager: host == nil ? nil : (extensionManager ?? CuriumSharedExtensionManager()))
         super.init()
+        mediaPermissions = CuriumMediaPermissionCoordinator(
+            isRequestCurrent: { [weak self] tabID, originKey in
+                self?.isMediaPermissionRequestCurrent(tabID: tabID, originKey: originKey) == true
+            },
+            authorizeCapture: captureAuthorizer,
+            onPromptChange: { [weak self] prompt in
+                self?.activeMediaPermissionPrompt = prompt
+            }
+        )
         if let host {
             host.delegate = self
             updateTabs(from: host)
@@ -495,6 +513,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func handleSceneDidEnterBackground() {
         isSceneBackgrounded = true
+        syncMediaPermissionPresentationGate()
         cancelAllSnapshotCaptures()
         backgroundEpoch += 1
         // Retain at most the active tab's thumbnail in background to minimize idle footprint.
@@ -508,16 +527,43 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     func handleSceneWillEnterForeground() {
         isSceneBackgrounded = false
         isUnderMemoryPressure = false
+        syncMediaPermissionPresentationGate()
         if let activeTab { scheduleSnapshot(for: activeTab) }
     }
 
     func setSheetPresented(_ presented: Bool) {
         isSheetPresented = presented
+        syncMediaPermissionPresentationGate()
         if presented {
             cancelIdleSnapshotCapture()
         } else if let activeTab {
             scheduleSnapshot(for: activeTab)
         }
+    }
+
+    func respondToActiveMediaPermissionPrompt(allowed: Bool) {
+        mediaPermissions.respondToActivePrompt(allowed: allowed)
+    }
+
+    func dismissActiveMediaPermissionPromptWithoutAction() {
+        mediaPermissions.dismissActivePromptWithoutAction()
+    }
+
+    private func syncMediaPermissionPresentationGate() {
+        mediaPermissions?.setPresentationBlocked(
+            isSheetPresented || isSceneBackgrounded || errorMessage != nil
+        )
+    }
+
+    private func isMediaPermissionRequestCurrent(tabID: String, originKey: String) -> Bool {
+        guard !isSceneBackgrounded,
+              let active = activeTab,
+              active.id == tabID,
+              let currentURL = active.engine?.currentURL ?? active.url,
+              let currentOriginKey = CuriumMediaPermissionOrigin.key(for: currentURL) else {
+            return false
+        }
+        return currentOriginKey == originKey
     }
 
     /// Captures the active tab's thumbnail on demand right as the Tabs sheet opens.
@@ -591,6 +637,9 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     private func setActiveTab(_ tab: CuriumTabModel?) {
         guard activeTab !== tab else { return }
+        if let previousID = activeTab?.id {
+            mediaPermissions.invalidate(tabID: previousID)
+        }
         cancelIdleSnapshotCapture()
         activeTab = tab
     }
@@ -689,6 +738,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     }
 
     func close(_ tab: CuriumTabModel) {
+        mediaPermissions.invalidate(tabID: tab.id)
         if let host {
             _ = host.closeTab(withID: tab.id)
             if tabsByID[tab.id] != nil { updateTabs(from: host) }
@@ -721,14 +771,34 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         let oldURL = model.url
         let oldExtID = model.extensionTabID
         refresh(model, from: tab)
+        mediaPermissions.invalidateIfOriginChanged(tabID: tab.tabID, currentURL: model.url)
         let contextChanged = model.url != oldURL || model.extensionTabID != oldExtID
         if activeTab === model && contextChanged { updateExtensionContext(force: true) }
+    }
+
+    func browserHost(
+        _ host: any CrIOSBrowserHostV1,
+        requestMediaPermissions permissions: CrIOSMediaPermissionTypes,
+        origin: URL,
+        forTab tab: any CrIOSTabHostingV1,
+        completion: @escaping @MainActor (CrIOSMediaPermissionTypes) -> Void
+    ) {
+        mediaPermissions.enqueue(
+            permissions: CuriumMediaPermissions(engineTypes: permissions),
+            originURL: origin,
+            tabID: tab.tabID
+        ) { granted in
+            completion(granted.engineTypes)
+        }
     }
 
     func browserHost(
         _ host: any CrIOSBrowserHostV1, tab: any CrIOSTabHostingV1,
         didCommitNavigationTo url: URL, navigationID _: Int64, isSameDocument: Bool, isReload _: Bool
     ) {
+        if !isSameDocument {
+            mediaPermissions.invalidate(tabID: tab.tabID)
+        }
         guard reportsNavigationCommits else { return }
         let tabID = tab.tabID
         let previous = committedHistoryByTabID[tabID]
@@ -881,6 +951,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         var evictedAny = false
         for (evictedID, evictedTab) in tabsByID where nextIndex[evictedID] == nil {
             evictedAny = true
+            mediaPermissions.invalidate(tabID: evictedID)
             evictedTab.invalidate()
             historyByTabID.removeValue(forKey: evictedID)
             committedHistoryByTabID.removeValue(forKey: evictedID)

@@ -6,6 +6,12 @@
 	<true/>
 	<key>CuriumEngineSupportsDisableSync</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Curium uses the camera when you allow a website to use it.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Curium uses the microphone when you allow a website to use it.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Curium shares your location when you allow a website to access it.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
