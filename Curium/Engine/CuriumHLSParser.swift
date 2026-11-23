@@ -1,4 +1,5 @@
 import CommonCrypto
+import Darwin
 import Foundation
 
 /// Errors thrown while validating, parsing, or decrypting RFC 8216 HLS playlists and segments.
@@ -7,6 +8,7 @@ enum CuriumHLSParserError: LocalizedError, Equatable, Sendable {
     case invalidPlaylist(String)
     case tooManySegments(Int)
     case disallowedURLScheme(String)
+    case blockedPrivateNetworkHost(String)
     case invalidKeyLength(Int)
     case invalidIVLength(Int)
     case decryptionFailed(Int32)
@@ -21,6 +23,8 @@ enum CuriumHLSParserError: LocalizedError, Equatable, Sendable {
             return "HLS playlist exceeds the \(CuriumHLSParser.maxSegments)-segment limit (\(count) segments)."
         case .disallowedURLScheme(let detail):
             return "Disallowed URL scheme in HLS playlist: \(detail)"
+        case .blockedPrivateNetworkHost(let host):
+            return "Blocked private or local network host in HLS playlist: \(host)"
         case .invalidKeyLength(let length):
             return "Invalid AES-128 key length (\(length) bytes; expected 16)."
         case .invalidIVLength(let length):
@@ -238,6 +242,108 @@ enum CuriumHLSParser {
         return true
     }
 
+    /// Returns `true` when `rawHost` is a literal loopback, link-local, RFC 1918, CGNAT,
+    /// IPv6 ULA/multicast/unspecified, IPv4-mapped private IPv6, or `.localhost`/`.local` host.
+    static func isPrivateOrLocalHost(_ rawHost: String) -> Bool {
+        var host = rawHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if host.hasPrefix("[") && host.hasSuffix("]"), host.count >= 2 {
+            host = String(host.dropFirst().dropLast())
+        }
+        if let pct = host.firstIndex(of: "%") {
+            host = String(host[..<pct])
+        }
+        host = host.lowercased()
+        while host.hasSuffix(".") {
+            host.removeLast()
+        }
+        guard !host.isEmpty else { return true }
+
+        if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") {
+            return true
+        }
+
+        // Standard dotted-quad IPv4.
+        var addr4 = in_addr()
+        if inet_pton(AF_INET, host, &addr4) == 1 {
+            return isPrivateIPv4HostOrder(UInt32(bigEndian: addr4.s_addr))
+        }
+
+        // Legacy/non-canonical IPv4 forms accepted by BSD resolvers (e.g. `127.1`, `0x7f000001`, `2130706433`, `0177.0.0.1`).
+        var atonAddr = in_addr()
+        if inet_aton(host, &atonAddr) != 0 {
+            return isPrivateIPv4HostOrder(UInt32(bigEndian: atonAddr.s_addr))
+        }
+
+        // IPv6 literals (including IPv4-mapped `::ffff:127.0.0.1`, ULA `fc00::/7`, link-local `fe80::/10`, loopback `::1`).
+        var addr6 = in6_addr()
+        if inet_pton(AF_INET6, host, &addr6) == 1 {
+            let bytes = withUnsafeBytes(of: addr6) { Array($0) }
+            guard bytes.count == 16 else { return true }
+            if bytes.allSatisfy({ $0 == 0 }) {
+                return true // ::
+            }
+            if bytes[0..<15].allSatisfy({ $0 == 0 }) && bytes[15] == 1 {
+                return true // ::1
+            }
+            if bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80 {
+                return true // fe80::/10 link-local
+            }
+            if (bytes[0] & 0xFE) == 0xFC {
+                return true // fc00::/7 ULA
+            }
+            if bytes[0] == 0xFF {
+                return true // ff00::/8 multicast
+            }
+            if bytes[0..<10].allSatisfy({ $0 == 0 }) && bytes[10] == 0xFF && bytes[11] == 0xFF {
+                let ipv4 = (UInt32(bytes[12]) << 24) | (UInt32(bytes[13]) << 16)
+                    | (UInt32(bytes[14]) << 8) | UInt32(bytes[15])
+                return isPrivateIPv4HostOrder(ipv4)
+            }
+            if bytes[0..<12].allSatisfy({ $0 == 0 }) {
+                let ipv4 = (UInt32(bytes[12]) << 24) | (UInt32(bytes[13]) << 16)
+                    | (UInt32(bytes[14]) << 8) | UInt32(bytes[15])
+                return isPrivateIPv4HostOrder(ipv4)
+            }
+            if bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == 0xFF && bytes[3] == 0x9B
+                && bytes[4..<12].allSatisfy({ $0 == 0 }) {
+                let ipv4 = (UInt32(bytes[12]) << 24) | (UInt32(bytes[13]) << 16)
+                    | (UInt32(bytes[14]) << 8) | UInt32(bytes[15])
+                return isPrivateIPv4HostOrder(ipv4)
+            }
+            return false
+        }
+
+        return false
+    }
+
+    static func isPrivateOrLocalURL(_ url: URL) -> Bool {
+        guard let host = url.host, !host.isEmpty else { return true }
+        return isPrivateOrLocalHost(host)
+    }
+
+    /// Blocks public-to-private SSRF transitions while preserving private/loopback -> private/loopback
+    /// (e.g. local test servers or LAN pages referencing LAN streams).
+    static func isAllowedTargetURL(_ targetURL: URL, originatingURL: URL?) -> Bool {
+        guard isAllowedHTTPURL(targetURL) else { return false }
+        guard let originatingURL, isAllowedHTTPURL(originatingURL) else { return true }
+        if !isPrivateOrLocalURL(originatingURL) && isPrivateOrLocalURL(targetURL) {
+            return false
+        }
+        return true
+    }
+
+    private static func isPrivateIPv4HostOrder(_ ip: UInt32) -> Bool {
+        let a = (ip >> 24) & 0xFF
+        let b = (ip >> 16) & 0xFF
+        if a == 0 || a == 10 || a == 127 { return true }
+        if a == 169 && b == 254 { return true }
+        if a == 172 && (16...31).contains(b) { return true }
+        if a == 192 && b == 168 { return true }
+        if a == 100 && (64...127).contains(b) { return true }
+        if a >= 224 { return true }
+        return false
+    }
+
     static func parseMasterOrMedia(text: String, baseURL: URL) throws -> CuriumHLSMasterInspection {
         let lines = try validatedPlaylistLines(text: text, baseURL: baseURL)
 
@@ -332,7 +438,7 @@ enum CuriumHLSParser {
     // MARK: - Master Playlist Parsing
 
     private struct AudioRenditionCandidate {
-        let uri: URL
+        let uri: URL?
         let isDefault: Bool
         let isAutoSelect: Bool
     }
@@ -347,30 +453,36 @@ enum CuriumHLSParser {
 
         // Pass 1: Collect #EXT-X-MEDIA renditions and #EXT-X-SESSION-KEY declarations
         // (tags may appear before or after #EXT-X-STREAM-INF in RFC 8216).
+        // Record URI-less TYPE=AUDIO renditions too so a muxed DEFAULT=YES primary track
+        // is never overwritten by a non-default commentary/foreign URI rendition.
         for line in lines {
             if line.hasPrefix("#EXT-X-MEDIA:") {
                 let attrs = parseAttributeList(String(line.dropFirst("#EXT-X-MEDIA:".count)))
+                let resolvedURI: URL?
                 if let rawURI = attrs["URI"], !rawURI.isEmpty {
-                    let resolvedURI = try resolveAllowedURL(rawURI, relativeTo: baseURL)
-                    referencedPlaylistURLs.insert(resolvedURI)
-                    if attrs["TYPE"]?.uppercased() == "AUDIO",
-                       let groupID = attrs["GROUP-ID"], !groupID.isEmpty {
-                        let isDefault = attrs["DEFAULT"]?.uppercased() == "YES"
-                        let isAutoSelect = attrs["AUTOSELECT"]?.uppercased() == "YES"
-                        let candidate = AudioRenditionCandidate(
-                            uri: resolvedURI,
-                            isDefault: isDefault,
-                            isAutoSelect: isAutoSelect
-                        )
-                        if let existing = audioGroups[groupID] {
-                            let replaces = (!existing.isDefault && candidate.isDefault)
-                                || (!existing.isDefault && !existing.isAutoSelect && candidate.isAutoSelect)
-                            if replaces {
-                                audioGroups[groupID] = candidate
-                            }
-                        } else {
+                    let url = try resolveAllowedURL(rawURI, relativeTo: baseURL)
+                    referencedPlaylistURLs.insert(url)
+                    resolvedURI = url
+                } else {
+                    resolvedURI = nil
+                }
+                if attrs["TYPE"]?.uppercased() == "AUDIO",
+                   let groupID = attrs["GROUP-ID"], !groupID.isEmpty {
+                    let isDefault = attrs["DEFAULT"]?.uppercased() == "YES"
+                    let isAutoSelect = attrs["AUTOSELECT"]?.uppercased() == "YES"
+                    let candidate = AudioRenditionCandidate(
+                        uri: resolvedURI,
+                        isDefault: isDefault,
+                        isAutoSelect: isAutoSelect
+                    )
+                    if let existing = audioGroups[groupID] {
+                        let replaces = (!existing.isDefault && candidate.isDefault)
+                            || (!existing.isDefault && !existing.isAutoSelect && candidate.isAutoSelect)
+                        if replaces {
                             audioGroups[groupID] = candidate
                         }
+                    } else {
+                        audioGroups[groupID] = candidate
                     }
                 }
             } else if line.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:") {
@@ -410,7 +522,7 @@ enum CuriumHLSParser {
             let codecs = attrs["CODECS"].flatMap { $0.isEmpty ? nil : $0 }
             let frameRate = attrs["FRAME-RATE"].flatMap(Double.init).flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
             let audioGroupID = attrs["AUDIO"].flatMap { $0.isEmpty ? nil : $0 }
-            let audioURI = audioGroupID.flatMap { audioGroups[$0]?.uri }
+            let audioURI: URL? = audioGroupID.flatMap { audioGroups[$0]?.uri }
 
             let variant = CuriumHLSVariant(
                 id: resolvedURL.absoluteString,
@@ -444,8 +556,8 @@ enum CuriumHLSParser {
 
         var variants = orderedIDs.compactMap { variantsByID[$0] }
         variants.sort { lhs, rhs in
-            let lhsPixels = (lhs.width ?? 0) * (lhs.height ?? 0)
-            let rhsPixels = (rhs.width ?? 0) * (rhs.height ?? 0)
+            let lhsPixels = Int64(lhs.width ?? 0) * Int64(lhs.height ?? 0)
+            let rhsPixels = Int64(rhs.width ?? 0) * Int64(rhs.height ?? 0)
             if lhsPixels != rhsPixels { return lhsPixels > rhsPixels }
 
             let lhsHeight = lhs.height ?? 0
@@ -593,12 +705,20 @@ enum CuriumHLSParser {
             let resolvedByteRange: (length: Int, offset: Int?)?
             if let rawRange = pendingByteRange {
                 if let explicitOffset = rawRange.offset {
+                    let (nextEnd, overflow) = explicitOffset.addingReportingOverflow(rawRange.length)
+                    guard !overflow else {
+                        throw CuriumHLSParserError.invalidPlaylist("BYTERANGE offset + length overflow.")
+                    }
                     resolvedByteRange = (length: rawRange.length, offset: explicitOffset)
                     lastByteRangeURL = segmentURL
-                    lastByteRangeEnd = explicitOffset + rawRange.length
+                    lastByteRangeEnd = nextEnd
                 } else if lastByteRangeURL == segmentURL, let previousEnd = lastByteRangeEnd {
+                    let (nextEnd, overflow) = previousEnd.addingReportingOverflow(rawRange.length)
+                    guard !overflow else {
+                        throw CuriumHLSParserError.invalidPlaylist("Chained BYTERANGE offset + length overflow.")
+                    }
                     resolvedByteRange = (length: rawRange.length, offset: previousEnd)
-                    lastByteRangeEnd = previousEnd + rawRange.length
+                    lastByteRangeEnd = nextEnd
                 } else {
                     resolvedByteRange = (length: rawRange.length, offset: nil)
                     lastByteRangeURL = segmentURL
@@ -612,9 +732,13 @@ enum CuriumHLSParser {
             pendingByteRange = nil
 
             let index = segments.count
+            let (segmentSequence, seqOverflow) = mediaSequence.addingReportingOverflow(index)
+            guard !seqOverflow else {
+                throw CuriumHLSParserError.invalidPlaylist("MEDIA-SEQUENCE overflow.")
+            }
             let segment = CuriumHLSSegment(
                 index: index,
-                mediaSequence: mediaSequence + index,
+                mediaSequence: segmentSequence,
                 url: segmentURL,
                 duration: duration,
                 byteRange: resolvedByteRange,
@@ -677,6 +801,9 @@ enum CuriumHLSParser {
         }
         guard isAllowedHTTPURL(resolved) else {
             throw CuriumHLSParserError.disallowedURLScheme(resolved.scheme ?? "unknown")
+        }
+        guard isAllowedTargetURL(resolved, originatingURL: baseURL) else {
+            throw CuriumHLSParserError.blockedPrivateNetworkHost(resolved.host ?? "private")
         }
         return resolved
     }
@@ -753,6 +880,8 @@ enum CuriumHLSParser {
         return Data(bytes)
     }
 
+    private static let maxSupportedResolutionDimension = 65_536
+
     private static func parseByteRange(_ raw: String) throws -> (length: Int, offset: Int?) {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
         let parts = trimmed.split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false)
@@ -765,6 +894,9 @@ enum CuriumHLSParser {
             guard let offset = Int(parts[1]), offset >= 0 else {
                 throw CuriumHLSParserError.invalidPlaylist("Malformed BYTERANGE offset: \(trimmed)")
             }
+            guard !offset.addingReportingOverflow(length).overflow else {
+                throw CuriumHLSParserError.invalidPlaylist("BYTERANGE offset + length overflow: \(trimmed)")
+            }
             return (length: length, offset: offset)
         }
         return (length: length, offset: nil)
@@ -774,8 +906,8 @@ enum CuriumHLSParser {
         guard let raw else { return (nil, nil) }
         let parts = raw.lowercased().split(separator: "x", maxSplits: 1)
         guard parts.count == 2,
-              let width = Int(parts[0]), width > 0,
-              let height = Int(parts[1]), height > 0 else {
+              let width = Int(parts[0]), (1...maxSupportedResolutionDimension).contains(width),
+              let height = Int(parts[1]), (1...maxSupportedResolutionDimension).contains(height) else {
             return (nil, nil)
         }
         return (width, height)

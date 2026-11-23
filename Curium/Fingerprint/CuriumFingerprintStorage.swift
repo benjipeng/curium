@@ -15,6 +15,7 @@ enum CuriumFingerprintProfileStorage {
         let cacheDirectory: URL
         let curiumProfileDirectory: URL?
         let lockFile: URL?
+        let sharedLockFile: URL?
         let isDefault: Bool
     }
 
@@ -24,6 +25,29 @@ enum CuriumFingerprintProfileStorage {
         let exists: Bool
 
         var totalBytes: Int64 { supportBytes + cacheBytes }
+    }
+
+    enum SharedLockError: LocalizedError, Equatable {
+        case invalidProfileID
+        case unavailableSupportRoot
+        case unsafeSymlinkDetected
+        case profileLockedByAnotherInstance
+        case ioFailure(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidProfileID:
+                return "Invalid profile identifier."
+            case .unavailableSupportRoot:
+                return "Shared profile support directory is unavailable."
+            case .unsafeSymlinkDetected:
+                return "Refused to lock profile storage because an unexpected symlink or non-directory was encountered."
+            case .profileLockedByAnotherInstance:
+                return "This profile is already open in another active Curium session."
+            case .ioFailure(let detail):
+                return "Unable to lock shared profile storage: \(detail)"
+            }
+        }
     }
 
     enum WipeError: LocalizedError, Equatable {
@@ -52,6 +76,88 @@ enum CuriumFingerprintProfileStorage {
         }
     }
 
+    /// Resolves the companion advisory lock path inside `<CuriumSupportRoot>`
+    /// (`<CuriumSupportRoot>/.curium_default.lock` for `"default"` or
+    /// `<CuriumSupportRoot>/Profiles/<slug>/.curium_profile.lock` for isolated profiles).
+    static func sharedLockFileURL(
+        for profileID: String,
+        curiumSupportRoot: URL? = nil,
+        applicationSupportRoot: URL? = nil
+    ) -> URL? {
+        guard CuriumFingerprintValidator.isValidProfileID(profileID),
+              let resolvedCuriumRoot = resolveCuriumSupportRoot(
+                  curiumSupportRoot: curiumSupportRoot,
+                  applicationSupportRoot: applicationSupportRoot
+              )
+        else { return nil }
+        if profileID == "default" {
+            return resolvedCuriumRoot.appending(path: ".curium_default.lock", directoryHint: .notDirectory)
+        }
+        return resolvedCuriumRoot
+            .appending(path: "Profiles", directoryHint: .isDirectory)
+            .appending(path: profileID, directoryHint: .isDirectory)
+            .appending(path: ".curium_profile.lock", directoryHint: .notDirectory)
+    }
+
+    /// Acquires a non-blocking exclusive advisory `flock` on the companion shared-support
+    /// lock file with `com.apple.runningboard.can-suspend-locked` set, mirroring Build 40
+    /// `paths.mm` so LiveContainer 1 and LiveContainer 2 cannot concurrently run or wipe
+    /// the same shared profile support tree (`curium.sqlite` / `session.json`).
+    static func acquireSharedProfileLock(
+        for profileID: String,
+        curiumSupportRoot: URL? = nil,
+        applicationSupportRoot: URL? = nil
+    ) throws -> Int32 {
+        guard CuriumFingerprintValidator.isValidProfileID(profileID) else {
+            throw SharedLockError.invalidProfileID
+        }
+        guard let resolvedCuriumRoot = resolveCuriumSupportRoot(
+            curiumSupportRoot: curiumSupportRoot,
+            applicationSupportRoot: applicationSupportRoot
+        ) else {
+            throw SharedLockError.unavailableSupportRoot
+        }
+
+        let lockFile: URL
+        if profileID == "default" {
+            try ensureSafeDirectory(resolvedCuriumRoot)
+            lockFile = resolvedCuriumRoot.appending(path: ".curium_default.lock", directoryHint: .notDirectory)
+        } else {
+            let profilesDir = resolvedCuriumRoot.appending(path: "Profiles", directoryHint: .isDirectory)
+            let profileDir = profilesDir.appending(path: profileID, directoryHint: .isDirectory)
+            try ensureSafeDirectory(resolvedCuriumRoot)
+            try ensureSafeDirectory(profilesDir)
+            try ensureSafeDirectory(profileDir)
+            lockFile = profileDir.appending(path: ".curium_profile.lock", directoryHint: .notDirectory)
+        }
+
+        let lockKind = inspectPathWithLstat(lockFile.path)
+        if lockKind == .symlink || lockKind == .directory || lockKind == .otherNonDirectory {
+            throw SharedLockError.unsafeSymlinkDetected
+        }
+
+        let fd = open(lockFile.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        if fd < 0 {
+            if errno == ELOOP {
+                throw SharedLockError.unsafeSymlinkDetected
+            }
+            throw SharedLockError.ioFailure(String(cString: strerror(errno)))
+        }
+
+        var canSuspend: UInt8 = 1
+        _ = fsetxattr(fd, "com.apple.runningboard.can-suspend-locked", &canSuspend, 1, 0, 0)
+
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            let lockErrno = errno
+            close(fd)
+            if lockErrno == EWOULDBLOCK || lockErrno == EAGAIN {
+                throw SharedLockError.profileLockedByAnotherInstance
+            }
+            throw SharedLockError.ioFailure(String(cString: strerror(lockErrno)))
+        }
+        return fd
+    }
+
     /// Resolves the exact `<Application Support>`, `<Caches>`, and durable Curium profile
     /// roots used by Build 42 (`paths.mm`) and Curium's per-profile SQLite/session storage
     /// without creating directories.
@@ -71,21 +177,24 @@ enum CuriumFingerprintProfileStorage {
             appropriateFor: nil, create: false))
         guard let supportBase, let cachesBase else { return nil }
 
+        let resolvedCuriumRoot = resolveCuriumSupportRoot(
+            curiumSupportRoot: curiumSupportRoot,
+            applicationSupportRoot: applicationSupportRoot
+        )
+
         if profileID == "default" {
+            let sharedLock = resolvedCuriumRoot?.appending(path: ".curium_default.lock", directoryHint: .notDirectory)
             return Locations(
                 profileID: profileID,
                 supportDirectory: supportBase.appending(path: "Chromium", directoryHint: .isDirectory),
                 cacheDirectory: cachesBase.appending(path: "Chromium", directoryHint: .isDirectory),
                 curiumProfileDirectory: nil,
                 lockFile: nil,
+                sharedLockFile: sharedLock,
                 isDefault: true
             )
         }
 
-        let resolvedCuriumRoot = resolveCuriumSupportRoot(
-            curiumSupportRoot: curiumSupportRoot,
-            applicationSupportRoot: applicationSupportRoot
-        )
         let curiumProfileDir = resolvedCuriumRoot?
             .appending(path: "Profiles", directoryHint: .isDirectory)
             .appending(path: profileID, directoryHint: .isDirectory)
@@ -97,6 +206,7 @@ enum CuriumFingerprintProfileStorage {
             .appending(path: "ChromiumProfiles", directoryHint: .isDirectory)
             .appending(path: profileID, directoryHint: .isDirectory)
         let lockFile = supportDir.appending(path: ".curium_profile.lock", directoryHint: .notDirectory)
+        let sharedLockFile = curiumProfileDir?.appending(path: ".curium_profile.lock", directoryHint: .notDirectory)
 
         return Locations(
             profileID: profileID,
@@ -104,6 +214,7 @@ enum CuriumFingerprintProfileStorage {
             cacheDirectory: cacheDir,
             curiumProfileDirectory: curiumProfileDir,
             lockFile: lockFile,
+            sharedLockFile: sharedLockFile,
             isDefault: false
         )
     }
@@ -297,11 +408,28 @@ enum CuriumFingerprintProfileStorage {
             }
         }
 
-        // Probe advisory flock on `.curium_profile.lock` if present so we never
-        // delete a profile held open by another running process.
-        if let lockFile = loc.lockFile {
+        // Acquire exclusive advisory locks on BOTH `<Application Support>/ChromiumProfiles/<slug>/.curium_profile.lock`
+        // AND `<CuriumSupportRoot>/Profiles/<slug>/.curium_profile.lock`, keeping every `LOCK_EX` fd held across
+        // all `removeItem` operations so no sibling LiveContainer process can race or open mid-wipe.
+        var lockCandidates: [URL] = []
+        var seenLockPaths: Set<String> = []
+        for candidate in [loc.lockFile, loc.sharedLockFile].compactMap({ $0 }) {
+            let standardized = candidate.standardizedFileURL.path
+            if seenLockPaths.insert(standardized).inserted {
+                lockCandidates.append(candidate)
+            }
+        }
+
+        var heldLockFDs: [Int32] = []
+        defer {
+            for fd in heldLockFDs {
+                close(fd)
+            }
+        }
+
+        for lockFile in lockCandidates {
             let lockState = inspectPathWithLstat(lockFile.path)
-            if lockState == .symlink {
+            if lockState == .symlink || lockState == .directory || lockState == .otherNonDirectory {
                 throw WipeError.unsafeSymlinkDetected
             }
             if lockState == .regularFile {
@@ -312,14 +440,37 @@ enum CuriumFingerprintProfileStorage {
                     }
                     throw WipeError.ioFailure(String(cString: strerror(errno)))
                 }
-                defer { close(fd) }
                 if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-                    if errno == EWOULDBLOCK || errno == EAGAIN {
+                    let lockErrno = errno
+                    close(fd)
+                    if lockErrno == EWOULDBLOCK || lockErrno == EAGAIN {
                         throw WipeError.profileLockedByAnotherInstance
                     }
-                    throw WipeError.ioFailure(String(cString: strerror(errno)))
+                    throw WipeError.ioFailure(String(cString: strerror(lockErrno)))
                 }
-                _ = flock(fd, LOCK_UN)
+                heldLockFDs.append(fd)
+            } else if lockState == .missing {
+                let parentDir = lockFile.deletingLastPathComponent()
+                if inspectPathWithLstat(parentDir.path) == .directory {
+                    let fd = open(lockFile.path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                    if fd < 0 {
+                        if errno == ELOOP {
+                            throw WipeError.unsafeSymlinkDetected
+                        }
+                        continue
+                    }
+                    var canSuspend: UInt8 = 1
+                    _ = fsetxattr(fd, "com.apple.runningboard.can-suspend-locked", &canSuspend, 1, 0, 0)
+                    if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+                        let lockErrno = errno
+                        close(fd)
+                        if lockErrno == EWOULDBLOCK || lockErrno == EAGAIN {
+                            throw WipeError.profileLockedByAnotherInstance
+                        }
+                        throw WipeError.ioFailure(String(cString: strerror(lockErrno)))
+                    }
+                    heldLockFDs.append(fd)
+                }
             }
         }
 
@@ -343,6 +494,28 @@ enum CuriumFingerprintProfileStorage {
     }
 
     // MARK: - Private
+
+    private static func ensureSafeDirectory(_ dir: URL) throws {
+        let state = inspectPathWithLstat(dir.path)
+        switch state {
+        case .symlink, .regularFile, .otherNonDirectory:
+            throw SharedLockError.unsafeSymlinkDetected
+        case .directory:
+            break
+        case .missing:
+            do {
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            } catch {
+                throw SharedLockError.ioFailure(error.localizedDescription)
+            }
+        }
+        guard inspectPathWithLstat(dir.path) == .directory else {
+            throw SharedLockError.unsafeSymlinkDetected
+        }
+        guard access(dir.path, R_OK | W_OK | X_OK) == 0 else {
+            throw SharedLockError.ioFailure(String(cString: strerror(errno)))
+        }
+    }
 
     private static func resolveCuriumSupportRoot(
         curiumSupportRoot: URL?,

@@ -154,8 +154,6 @@ struct CuriumSettingsSheet: View {
     @Binding var siteMode: CuriumSiteMode
     @Bindable var library: CuriumLibrary
     @AppStorage("curium.jitMode") private var jitPreference: CuriumJitPreference = .automatic
-    @AppStorage("curium.uaBrand") private var uaBrandPreference: CuriumUABrandPreference = .chrome
-    @AppStorage("curium.mobileUA") private var mobileUAPreference: CuriumMobileUAPreference = .android
     let engineReady: Bool
     var browserStore: CuriumBrowserStore? = nil
 
@@ -178,6 +176,28 @@ struct CuriumSettingsSheet: View {
     private var fingerprintStore: CuriumFingerprintStore { CuriumFingerprintStore.shared }
     private var folderManager: CuriumDownloadsFolderManager { CuriumDownloadsFolderManager.shared }
 
+    private var uaBrandBinding: Binding<CuriumUABrandPreference> {
+        Binding(
+            get: {
+                CuriumUABrandPreference(rawValue: fingerprintStore.activeProfile.legacyUABrandRawValue) ?? .chrome
+            },
+            set: { newValue in
+                _ = fingerprintStore.applyLegacyIdentityPreferencesToPersonal(uaBrand: newValue.rawValue)
+            }
+        )
+    }
+
+    private var mobileUABinding: Binding<CuriumMobileUAPreference> {
+        Binding(
+            get: {
+                CuriumMobileUAPreference(rawValue: fingerprintStore.activeProfile.legacyMobileUARawValue) ?? .android
+            },
+            set: { newValue in
+                _ = fingerprintStore.applyLegacyIdentityPreferencesToPersonal(mobileUA: newValue.rawValue)
+            }
+        )
+    }
+
     private var activeV8RuntimeLabel: String {
         guard engineReady else { return "Standby" }
         return CuriumDiagnostics.jitModeLabel(CuriumActiveV8JitMode())
@@ -187,6 +207,7 @@ struct CuriumSettingsSheet: View {
         let activeProfile = fingerprintStore.activeProfile
         let activeProfilePalette = activeProfile.resolvedPalette
         let hasPendingSwitch = fingerprintStore.hasPendingProfileSwitch
+        let hasPendingActiveRestart = fingerprintStore.hasPendingActiveProfileEngineChanges
         let nextProfile = hasPendingSwitch ? fingerprintStore.nextLaunchProfile : nil
         let _ = folderManager.status
         let _ = folderManager.revision
@@ -216,10 +237,14 @@ struct CuriumSettingsSheet: View {
                                     .foregroundStyle(.secondary)
                                     .lineLimit(2)
                                 if let nextProfile {
-                                    Text("Next launch: \(nextProfile.displayName)")
-                                        .font(.caption.weight(.medium))
-                                        .foregroundStyle(nextProfile.resolvedPalette.tint)
-                                        .lineLimit(1)
+                                    Text(
+                                        hasPendingActiveRestart
+                                            ? "Restart required to apply changes"
+                                            : "Next launch: \(nextProfile.displayName)"
+                                    )
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(hasPendingActiveRestart ? Color.orange : nextProfile.resolvedPalette.tint)
+                                    .lineLimit(1)
                                 }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -235,13 +260,13 @@ struct CuriumSettingsSheet: View {
                     .foregroundStyle(.primary)
                     .accessibilityIdentifier("curium.settings.fingerprintStudio")
 
-                    if activeProfile.isPrimaryDefault && activeProfile.matchesBuild39EngineDefaults {
-                        Picker("Browser Brand", selection: $uaBrandPreference) {
+                    if activeProfile.isPrimaryDefault && activeProfile.supportsLegacyIdentityPickers {
+                        Picker("Browser Brand", selection: uaBrandBinding) {
                             ForEach(CuriumUABrandPreference.allCases) { option in
                                 Text(option.title).tag(option)
                             }
                         }
-                        Picker("Mobile Profile", selection: $mobileUAPreference) {
+                        Picker("Mobile Profile", selection: mobileUABinding) {
                             ForEach(CuriumMobileUAPreference.allCases) { option in
                                 Text(option.title).tag(option)
                             }

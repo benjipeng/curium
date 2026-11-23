@@ -82,8 +82,16 @@ struct CuriumProfileSwitcherSheet: View {
         fingerprintStore.nextLaunchProfile
     }
 
-    private var hasPendingSwitch: Bool {
+    private var hasPendingProfileIDSwitch: Bool {
         fingerprintStore.nextLaunchProfileID.lowercased() != activeProfileID.lowercased()
+    }
+
+    private var hasPendingActiveEngineRestart: Bool {
+        !hasPendingProfileIDSwitch && fingerprintStore.hasPendingActiveProfileEngineChanges
+    }
+
+    private var hasPendingSwitch: Bool {
+        hasPendingProfileIDSwitch || hasPendingActiveEngineRestart
     }
 
     private func isActiveProfile(_ profile: CuriumFingerprintProfile) -> Bool {
@@ -122,6 +130,7 @@ struct CuriumProfileSwitcherSheet: View {
             .listStyle(.insetGrouped)
             .navigationTitle("Profiles")
             .navigationBarTitleDisplayMode(.inline)
+            .interactiveDismissDisabled(isWiping || isRelaunching)
             .toolbar {
                 ToolbarItemGroup(placement: .topBarLeading) {
                     Button {
@@ -129,7 +138,7 @@ struct CuriumProfileSwitcherSheet: View {
                     } label: {
                         Label("New Profile", systemImage: "plus")
                     }
-                    .disabled(fingerprintStore.loadError != nil)
+                    .disabled(isWiping || isRelaunching || fingerprintStore.loadError != nil)
                     .accessibilityIdentifier("curium.profiles.new")
 
                     Menu {
@@ -138,7 +147,7 @@ struct CuriumProfileSwitcherSheet: View {
                         } label: {
                             Label("Import Profile JSON…", systemImage: "square.and.arrow.down")
                         }
-                        .disabled(fingerprintStore.loadError != nil)
+                        .disabled(isWiping || isRelaunching || fingerprintStore.loadError != nil)
 
                         Button {
                             refreshEngineInfo()
@@ -146,9 +155,11 @@ struct CuriumProfileSwitcherSheet: View {
                         } label: {
                             Label("Refresh Storage", systemImage: "arrow.clockwise")
                         }
+                        .disabled(isWiping || isRelaunching)
                     } label: {
                         Label("More", systemImage: "ellipsis.circle")
                     }
+                    .disabled(isWiping || isRelaunching)
                     .accessibilityIdentifier("curium.profiles.more")
                 }
 
@@ -158,6 +169,7 @@ struct CuriumProfileSwitcherSheet: View {
                     } label: {
                         Label("Done", systemImage: "checkmark")
                     }
+                    .disabled(isWiping || isRelaunching)
                     .accessibilityIdentifier("curium.profiles.done")
                 }
             }
@@ -246,11 +258,12 @@ struct CuriumProfileSwitcherSheet: View {
                         await performSwitchAndRelaunch(to: profile.id)
                     }
                 }
-                .disabled(isRelaunching)
+                .disabled(isWiping || isRelaunching)
 
                 Button("Switch on Next Launch") {
                     selectForNextLaunch(profile)
                 }
+                .disabled(isWiping || isRelaunching)
 
                 Button("Cancel", role: .cancel) {}
 
@@ -258,6 +271,7 @@ struct CuriumProfileSwitcherSheet: View {
                 Button("Wipe Cookies, Bookmarks & Storage", role: .destructive) {
                     wipeProfileStorage(profile)
                 }
+                .disabled(isWiping || isRelaunching)
                 Button("Cancel", role: .cancel) {}
 
             case .deleteProfile(let profile):
@@ -265,6 +279,7 @@ struct CuriumProfileSwitcherSheet: View {
                     Button("Delete Profile & Wipe Data", role: .destructive) {
                         deleteProfileAndWipe(profile)
                     }
+                    .disabled(isWiping || isRelaunching)
                 }
                 Button("Cancel", role: .cancel) {}
             }
@@ -324,6 +339,7 @@ struct CuriumProfileSwitcherSheet: View {
             } label: {
                 Label("Back Up & Reset", systemImage: "arrow.counterclockwise")
             }
+            .disabled(isWiping || isRelaunching)
             .accessibilityIdentifier("curium.profiles.corruptReset")
         } header: {
             Text("Store Recovery Required")
@@ -345,6 +361,7 @@ struct CuriumProfileSwitcherSheet: View {
                             Label("Customize", systemImage: "slider.horizontal.3")
                         }
                         .tint(profile.resolvedPalette.tint)
+                        .disabled(isWiping || isRelaunching)
                     }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         if !profile.isPrimaryDefault {
@@ -362,7 +379,7 @@ struct CuriumProfileSwitcherSheet: View {
                                 } label: {
                                     Label("Delete", systemImage: "trash")
                                 }
-                                .disabled(isWiping || fingerprintStore.loadError != nil)
+                                .disabled(isWiping || isRelaunching || fingerprintStore.loadError != nil)
                             }
                         }
                     }
@@ -380,7 +397,8 @@ struct CuriumProfileSwitcherSheet: View {
     }
 
     private var pendingSwitchSection: some View {
-        Section {
+        let isActiveEngineRestart = hasPendingActiveEngineRestart
+        return Section {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 10) {
                     CuriumProfileAvatar(
@@ -390,11 +408,17 @@ struct CuriumProfileSwitcherSheet: View {
                         isCircle: true
                     )
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Pending Switch: \(nextLaunchProfile.displayName)")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.primary)
                         Text(
-                            "Tabs and library for \(activeProfile.displayName) will be saved before closing so Curium opens cleanly into \(nextLaunchProfile.displayName)."
+                            isActiveEngineRestart
+                                ? "Restart Required: \(activeProfile.displayName)"
+                                : "Pending Switch: \(nextLaunchProfile.displayName)"
+                        )
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        Text(
+                            isActiveEngineRestart
+                                ? "Saved fingerprint or network edits for \(activeProfile.displayName) apply on next launch. Tabs and library will be saved before closing."
+                                : "Tabs and library for \(activeProfile.displayName) will be saved before closing so Curium opens cleanly into \(nextLaunchProfile.displayName)."
                         )
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -412,21 +436,27 @@ struct CuriumProfileSwitcherSheet: View {
                                 ProgressView()
                                     .controlSize(.small)
                             }
-                            Text(CuriumProfileRelauncher.primaryRelaunchButtonTitle)
+                            Text(
+                                isActiveEngineRestart
+                                    ? "Save & Close to Apply"
+                                    : CuriumProfileRelauncher.primaryRelaunchButtonTitle
+                            )
                         }
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .disabled(isRelaunching || fingerprintStore.loadError != nil)
+                    .disabled(isWiping || isRelaunching || fingerprintStore.loadError != nil)
                     .accessibilityIdentifier("curium.profiles.pending.relaunch")
 
-                    Button("Cancel Switch") {
-                        cancelPendingSwitch()
+                    if !isActiveEngineRestart {
+                        Button("Cancel Switch") {
+                            cancelPendingSwitch()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isWiping || isRelaunching || fingerprintStore.loadError != nil)
+                        .accessibilityIdentifier("curium.profiles.pending.cancel")
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(isRelaunching || fingerprintStore.loadError != nil)
-                    .accessibilityIdentifier("curium.profiles.pending.cancel")
                 }
             }
             .padding(.vertical, 4)
@@ -583,7 +613,11 @@ struct CuriumProfileSwitcherSheet: View {
                         ProgressView()
                             .controlSize(.small)
                     } else if active {
-                        statusPill("ACTIVE", foreground: palette.tint, fill: palette.tile)
+                        if hasPendingActiveEngineRestart {
+                            statusPill("RESTART", foreground: .orange, fill: .orange.opacity(0.14))
+                        } else {
+                            statusPill("ACTIVE", foreground: palette.tint, fill: palette.tile)
+                        }
                     } else if next {
                         nextOutlinePill(palette: palette)
                     }
@@ -598,7 +632,7 @@ struct CuriumProfileSwitcherSheet: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .disabled(fingerprintStore.loadError != nil && !active)
+            .disabled(isWiping || isRelaunching || (fingerprintStore.loadError != nil && !active))
             .accessibilityIdentifier("curium.profiles.row.\(profile.id)")
 
             if !active {
@@ -612,6 +646,7 @@ struct CuriumProfileSwitcherSheet: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
+                .disabled(isWiping || isRelaunching)
                 .accessibilityLabel("Customize \(profile.displayName)")
                 .accessibilityIdentifier("curium.profiles.customize.\(profile.id)")
             }
@@ -626,8 +661,9 @@ struct CuriumProfileSwitcherSheet: View {
         let canWipe = !profile.isPrimaryDefault
             && !activeInProcess
             && !isWiping
+            && !isRelaunching
             && usageByProfileID[profile.id]?.exists == true
-        let canDelete = !profile.isPrimaryDefault && !activeInProcess && !isWiping
+        let canDelete = !profile.isPrimaryDefault && !activeInProcess && !isWiping && !isRelaunching
 
         if !active {
             Button {
@@ -635,7 +671,7 @@ struct CuriumProfileSwitcherSheet: View {
             } label: {
                 Label("Switch Profile…", systemImage: "arrow.triangle.2.circlepath")
             }
-            .disabled(fingerprintStore.loadError != nil)
+            .disabled(isWiping || isRelaunching || fingerprintStore.loadError != nil)
         }
 
         Button {
@@ -643,13 +679,14 @@ struct CuriumProfileSwitcherSheet: View {
         } label: {
             Label("Customize…", systemImage: "slider.horizontal.3")
         }
+        .disabled(isWiping || isRelaunching)
 
         Button {
             duplicateAndOpen(profile)
         } label: {
             Label("Duplicate", systemImage: "plus.square.on.square")
         }
-        .disabled(fingerprintStore.loadError != nil)
+        .disabled(isWiping || isRelaunching || fingerprintStore.loadError != nil)
 
         Button {
             exportProfileJSON(profile)
@@ -771,6 +808,7 @@ struct CuriumProfileSwitcherSheet: View {
     }
 
     private func selectForNextLaunch(_ profile: CuriumFingerprintProfile) {
+        guard !isWiping, !isRelaunching else { return }
         let targetID: String? = (profile.isPrimaryDefault && profile.matchesBuild39EngineDefaults)
             ? nil
             : profile.id
@@ -783,6 +821,7 @@ struct CuriumProfileSwitcherSheet: View {
     }
 
     private func cancelPendingSwitch() {
+        guard !isWiping, !isRelaunching else { return }
         let revertID: String? = (activeProfile.isPrimaryDefault && activeProfile.matchesBuild39EngineDefaults)
             ? nil
             : activeProfile.id
@@ -794,7 +833,7 @@ struct CuriumProfileSwitcherSheet: View {
     }
 
     private func performSwitchAndRelaunch(to profileID: String) async {
-        guard !isRelaunching else { return }
+        guard !isRelaunching, !isWiping else { return }
         isRelaunching = true
         if let browserStore {
             let ok = await browserStore.prepareForProfileSwitchAndRelaunch(to: profileID)
@@ -805,8 +844,13 @@ struct CuriumProfileSwitcherSheet: View {
                 alertMessage = fingerprintStore.lastPersistError ?? "Unable to switch profile."
             }
         } else {
-            if fingerprintStore.selectProfile(id: profileID) {
+            let targetProfile = fingerprintStore.profile(id: profileID)
+            let resolvedSelectionID: String? = (targetProfile?.isPrimaryDefault == true && targetProfile?.matchesBuild39EngineDefaults == true)
+                ? nil
+                : profileID
+            if fingerprintStore.selectProfile(id: resolvedSelectionID) {
                 onSelectionChanged?()
+                await CuriumLibrary(profileID: activeProfileID, fingerprintStore: fingerprintStore).checkpointAsync()
                 CuriumDiagnostics.shared.flushSync()
                 CuriumProfileRelauncher.relaunchAfterFlush()
             } else {

@@ -22,8 +22,16 @@ final class CuriumDownload: Identifiable {
     private(set) var receivedBytes: Int64 = 0
     private(set) var isStarting = false
     @ObservationIgnored var onActivityChange: (@MainActor () -> Void)?
+    @ObservationIgnored private var cancelRequested = false
+    @ObservationIgnored private var activeCommitTask: Task<URL, any Error>?
+    @ObservationIgnored var stagedCommitHandlerOverride: (@Sendable (URL, String) async throws -> URL)?
 
     var isActive: Bool { isStarting || state == .inProgress }
+
+    /// Non-nil when this download originated from a specific HLS master playlist's variant row.
+    var hlsMasterPlaylistURL: URL? {
+        (task as? CuriumHLSMediaDownloadTask)?.masterPlaylistURL
+    }
 
     init(task: any CrIOSDownloadTaskV1) {
         self.task = task
@@ -62,7 +70,7 @@ final class CuriumDownload: Identifiable {
     }
 
     func refresh() {
-        let newState = task.state
+        let newState = cancelRequested ? .cancelled : task.state
         if state != newState { state = newState }
         let total = task.totalBytes
         if totalBytes != total { totalBytes = total }
@@ -76,18 +84,22 @@ final class CuriumDownload: Identifiable {
 
     @discardableResult
     func start(downloadsRoot: URL? = nil) async -> URL? {
-        guard state == .pending, !isStarting else { return savedURL }
+        guard state == .pending, !isStarting, !cancelRequested else { return savedURL }
         isStarting = true
         failure = nil
         onActivityChange?()
         defer {
+            activeCommitTask = nil
             isStarting = false
             refresh()
             onActivityChange?()
         }
         let name = filename
+        let customCommitHandler = stagedCommitHandlerOverride
+        let useStagedCommit = customCommitHandler != nil
+            || (downloadsRoot == nil && CuriumDownloadsFolderManager.isUsingCustomDownloadsFolder)
 
-        if downloadsRoot == nil && CuriumDownloadsFolderManager.isUsingCustomDownloadsFolder {
+        if useStagedCommit {
             var stagingDirectory: URL?
             defer {
                 if let stagingDirectory {
@@ -99,30 +111,72 @@ final class CuriumDownload: Identifiable {
                     try CuriumDownloadStorage.makeDownloadStagingDestination(filename: name)
                 }.value
                 stagingDirectory = staged.sessionDirectory
+                if cancelRequested {
+                    state = .cancelled
+                    return nil
+                }
                 let downloadedURL = try await task.start(withDestinationURL: staged.fileURL)
+                if cancelRequested {
+                    state = .cancelled
+                    return nil
+                }
                 let commitName = downloadedURL.lastPathComponent.isEmpty ? name : downloadedURL.lastPathComponent
                 let sessionToClean = staged.sessionDirectory
-                let committedURL = try await Task.detached(priority: .utility) {
+                let commitTask = Task.detached(priority: .utility) { () throws -> URL in
                     defer {
                         CuriumDownloadStorage.removeDownloadStagingDirectory(sessionToClean)
                     }
+                    try Task.checkCancellation()
+                    if let customCommitHandler {
+                        let committed = try await customCommitHandler(downloadedURL, commitName)
+                        if Task.isCancelled {
+                            try? FileManager.default.removeItem(at: committed)
+                            throw CancellationError()
+                        }
+                        return committed
+                    }
                     let destinationDirectory = try CuriumDownloadStorage.downloadsRootDirectory()
-                    return try CuriumDownloadStorage.commitStagedFile(
+                    try Task.checkCancellation()
+                    let committed = try CuriumDownloadStorage.commitStagedFile(
                         from: downloadedURL,
                         toDirectory: destinationDirectory,
                         preferredFilename: commitName,
                         removeSource: true
                     )
-                }.value
+                    if Task.isCancelled {
+                        try? CuriumDownloadStorage.deleteSavedDownload(at: committed, downloadsRoot: destinationDirectory)
+                        throw CancellationError()
+                    }
+                    return committed
+                }
+                activeCommitTask = commitTask
+                let committedURL = try await commitTask.value
                 stagingDirectory = nil
+                if cancelRequested {
+                    let cleanupURL = committedURL
+                    Task.detached(priority: .utility) {
+                        if customCommitHandler != nil {
+                            try? FileManager.default.removeItem(at: cleanupURL)
+                        } else if let destDir = try? CuriumDownloadStorage.downloadsRootDirectory() {
+                            try? CuriumDownloadStorage.deleteSavedDownload(at: cleanupURL, downloadsRoot: destDir)
+                        }
+                    }
+                    state = .cancelled
+                    return nil
+                }
                 savedURL = committedURL
                 let finalName = committedURL.lastPathComponent
                 if !finalName.isEmpty && finalName != filename {
                     filename = finalName
                 }
                 return savedURL
+            } catch is CancellationError {
+                state = .cancelled
+                return nil
             } catch {
-                if task.state != .cancelled { failure = error.localizedDescription }
+                if !cancelRequested && task.state != .cancelled {
+                    failure = error.localizedDescription
+                }
                 return nil
             }
         }
@@ -138,20 +192,37 @@ final class CuriumDownload: Identifiable {
                 try CuriumDownloadStorage.uniqueDownloadDestination(filename: name, in: downloadsRoot)
             }.value
             reservedURL = destination
+            if cancelRequested {
+                state = .cancelled
+                return nil
+            }
             let resolved = try await task.start(withDestinationURL: destination)
+            if cancelRequested {
+                try? FileManager.default.removeItem(at: resolved)
+                state = .cancelled
+                return nil
+            }
             savedURL = resolved
             let finalName = resolved.lastPathComponent
             if !finalName.isEmpty && finalName != filename {
                 filename = finalName
             }
             return savedURL
+        } catch is CancellationError {
+            state = .cancelled
+            return nil
         } catch {
-            if task.state != .cancelled { failure = error.localizedDescription }
+            if !cancelRequested && task.state != .cancelled {
+                failure = error.localizedDescription
+            }
             return nil
         }
     }
 
     func cancel() {
+        guard isActive || state == .pending else { return }
+        cancelRequested = true
+        activeCommitTask?.cancel()
         task.cancel()
         refresh()
         onActivityChange?()

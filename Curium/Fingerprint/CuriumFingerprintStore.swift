@@ -8,9 +8,10 @@ import os
 /// Durable Swift store (v2) for user-retained multi-profile identities & fingerprints.
 /// Lives beside `"default"`'s `curium.sqlite` in the LiveContainer-durable support root
 /// (App Group -> Host Container -> Standalone Application Support).
+@MainActor
 @Observable
 final class CuriumFingerprintStore {
-    struct PersistedState: Codable, Equatable {
+    struct PersistedState: Codable, Equatable, Sendable {
         static let currentVersion = 2
 
         var version: Int = Self.currentVersion
@@ -53,17 +54,17 @@ final class CuriumFingerprintStore {
         let warnings: [String]
     }
 
-    static let fileName = "fingerprint-profiles.json"
+    nonisolated static let fileName = "fingerprint-profiles.json"
 
     /// Process-wide main-actor singleton shared across launch bootstrap, recovery UI,
     /// Settings, and Profile Studio.
-    @MainActor
     static let shared = CuriumFingerprintStore.loadShared()
 
     private let fileURL: URL
     private let applicationSupportRoot: URL?
     private let cachesRoot: URL?
     private let curiumSupportRoot: URL?
+    let isProductionDefaultFile: Bool
     private var migratedSeedIDs: Set<String> = []
 
     private(set) var selectedProfileID: String?
@@ -71,6 +72,21 @@ final class CuriumFingerprintStore {
     private(set) var retiredProfileIDs: Set<String>
     private(set) var loadError: String?
     private(set) var lastPersistError: String?
+    private(set) var recoveredFromBackup: Bool = false
+
+    /// Support root directory backing this store's companion locks and per-profile SQLite/session tree.
+    var effectiveCuriumSupportRoot: URL? {
+        if let curiumSupportRoot {
+            return curiumSupportRoot
+        }
+        if let applicationSupportRoot {
+            return applicationSupportRoot.appending(path: "Curium", directoryHint: .isDirectory)
+        }
+        if isProductionDefaultFile {
+            return try? CuriumLibraryLocation.supportRootDirectory()
+        }
+        return fileURL.deletingLastPathComponent()
+    }
 
     var templates: [CuriumProfileTemplate] {
         CuriumProfileTemplate.allTemplates
@@ -100,14 +116,68 @@ final class CuriumFingerprintStore {
             ?? Self.makeDefaultPersonalProfile()
     }
 
-    var hasPendingProfileSwitch: Bool {
+    /// True when the next launch will open a different profile slug than the active process.
+    var hasPendingProfileIDChange: Bool {
         nextLaunchProfileID.lowercased() != activeLaunchProfileID.lowercased()
+    }
+
+    /// True when the active running profile remains selected for next launch, but its
+    /// saved engine-affecting fields (proxy, identity, farbling, hardware, WebRTC, etc.)
+    /// have diverged from the frozen launch snapshot.
+    var hasPendingActiveProfileEngineChanges: Bool {
+        guard !hasPendingProfileIDChange,
+              let snapshot = CuriumFingerprintBootstrap.activeLaunchEngineSnapshot,
+              snapshot.profileID.lowercased() == activeLaunchProfileID.lowercased()
+        else {
+            return false
+        }
+        return Self.hasPendingActiveProfileEngineChanges(
+            snapshot: snapshot,
+            selectedProfileID: selectedProfileID,
+            candidate: nextLaunchProfile,
+            effectiveBuild39Default: {
+                Self.makeDefaultPersonalProfile(preserveLegacyDefaults: isProductionDefaultFile)
+            }
+        )
+    }
+
+    nonisolated static func hasPendingActiveProfileEngineChanges(
+        snapshot: CuriumFingerprintBootstrap.EngineLaunchSnapshot,
+        selectedProfileID: String?,
+        candidate rawCandidate: CuriumFingerprintProfile,
+        effectiveBuild39Default: () -> CuriumFingerprintProfile
+    ) -> Bool {
+        let candidate = rawCandidate.normalizedForPersistence()
+        if snapshot.wasUnconfiguredBuild39 {
+            if selectedProfileID != nil && !candidate.matchesBuild39EngineDefaults {
+                return true
+            }
+            if !snapshot.matchesEngineFields(of: candidate) {
+                return true
+            }
+            if selectedProfileID == nil {
+                return !snapshot.matchesEngineFields(of: effectiveBuild39Default())
+            }
+            return false
+        }
+        let nextLaunchWillRunBuild39 = selectedProfileID == nil
+            || (candidate.isPrimaryDefault && candidate.matchesBuild39EngineDefaults)
+        if nextLaunchWillRunBuild39 {
+            return true
+        }
+        return !snapshot.matchesEngineFields(of: candidate)
+    }
+
+    /// True when a cold relaunch is needed either to switch profiles or to apply saved
+    /// engine-affecting fingerprint/proxy edits made to the currently running profile.
+    var hasPendingProfileSwitch: Bool {
+        hasPendingProfileIDChange || hasPendingActiveProfileEngineChanges
     }
 
     /// The profile explicitly selected for next launch, or `nil` when using unconfigured defaults.
     var selectedProfile: CuriumFingerprintProfile? {
         guard let selectedProfileID else { return nil }
-        return profiles.first { $0.id == selectedProfileID }
+        return profile(id: selectedProfileID)
     }
 
     /// Compatibility accessor for Wave 1 Studio UI (empty in v2 retained-profile stores).
@@ -139,39 +209,57 @@ final class CuriumFingerprintStore {
         self.applicationSupportRoot = applicationSupportRoot
         self.cachesRoot = cachesRoot
         self.curiumSupportRoot = curiumSupportRoot
+        let isProdDefault = applicationSupportRoot == nil
+            && cachesRoot == nil
+            && curiumSupportRoot == nil
+            && fileURL.standardizedFileURL == Self.defaultStorageURL().standardizedFileURL
+        self.isProductionDefaultFile = isProdDefault
 
-        let data: Data
+        let primaryData: Data?
+        let primaryReadError: Error?
         do {
-            data = try Data(contentsOf: fileURL)
+            primaryData = try Data(contentsOf: fileURL)
+            primaryReadError = nil
         } catch {
-            let isProductionDefaultFile = applicationSupportRoot == nil
-                && cachesRoot == nil
-                && curiumSupportRoot == nil
-                && fileURL.standardizedFileURL == Self.defaultStorageURL().standardizedFileURL
-            let preserveLegacy = Self.isFileMissingError(error) && isProductionDefaultFile
+            primaryData = nil
+            primaryReadError = error
+        }
+
+        if let primaryReadError, Self.isFileMissingError(primaryReadError) {
             self.selectedProfileID = nil
-            self.profiles = [Self.makeDefaultPersonalProfile(preserveLegacyDefaults: preserveLegacy)]
+            self.profiles = [Self.makeDefaultPersonalProfile(preserveLegacyDefaults: isProdDefault)]
             self.retiredProfileIDs = []
             self.migratedSeedIDs = []
-            if Self.isFileMissingError(error) {
-                self.loadError = nil
-            } else {
-                self.loadError = "Unable to read \(Self.fileName): \(error.localizedDescription)"
-                Self.log.error("fingerprint store read failed (fail-closed): \(String(describing: error), privacy: .public)")
-            }
+            self.loadError = nil
             return
         }
 
-        do {
-            let decoded = try JSONDecoder().decode(PersistedState.self, from: data)
-            let diskSlugs = Set(
-                CuriumFingerprintProfileStorage.existingIsolatedProfileSlugs(
-                    applicationSupportRoot: applicationSupportRoot,
-                    cachesRoot: cachesRoot,
-                    curiumSupportRoot: curiumSupportRoot
-                ).map { $0.lowercased() }
-            )
+        let decodedState: PersistedState?
+        let primaryFailureDescription: String?
+        if let primaryData {
+            do {
+                decodedState = try JSONDecoder().decode(PersistedState.self, from: primaryData)
+                primaryFailureDescription = nil
+            } catch {
+                decodedState = nil
+                primaryFailureDescription = "Corrupt \(Self.fileName): \(Self.describeDecodingError(error))"
+                Self.log.error("fingerprint store decode failed: \(String(describing: error), privacy: .public)")
+            }
+        } else {
+            decodedState = nil
+            primaryFailureDescription = "Unable to read \(Self.fileName): \(primaryReadError?.localizedDescription ?? "Unknown I/O error")"
+            Self.log.error("fingerprint store read failed: \(String(describing: primaryReadError), privacy: .public)")
+        }
 
+        let diskSlugs = Set(
+            CuriumFingerprintProfileStorage.existingIsolatedProfileSlugs(
+                applicationSupportRoot: applicationSupportRoot,
+                cachesRoot: cachesRoot,
+                curiumSupportRoot: curiumSupportRoot
+            ).map { $0.lowercased() }
+        )
+
+        if let decoded = decodedState {
             var needsMigrationPersist = false
             if decoded.version < PersistedState.currentVersion {
                 let migrated = Self.migrateV1ToV2(decoded, diskSlugsLowered: diskSlugs)
@@ -181,7 +269,7 @@ final class CuriumFingerprintStore {
                 self.migratedSeedIDs = migrated.migratedSeedIDs
                 needsMigrationPersist = true
             } else {
-                let normalized = Self.normalizeV2State(decoded)
+                let normalized = Self.normalizeV2State(decoded, preserveLegacyDefaults: isProdDefault)
                 self.selectedProfileID = normalized.selectedProfileID
                 self.profiles = normalized.profiles
                 self.retiredProfileIDs = normalized.retiredProfileIDs
@@ -192,17 +280,51 @@ final class CuriumFingerprintStore {
             if needsMigrationPersist {
                 _ = persist()
             }
-        } catch {
-            self.selectedProfileID = nil
-            self.profiles = [Self.makeDefaultPersonalProfile()]
-            self.retiredProfileIDs = []
-            self.migratedSeedIDs = []
-            self.loadError = "Corrupt \(Self.fileName): \(Self.describeDecodingError(error))"
-            Self.log.error("fingerprint store decode failed (fail-closed): \(String(describing: error), privacy: .public)")
+            return
         }
+
+        // Primary store failed to read/decode: attempt automatic recovery from the
+        // verified last-known-good `.bak` shadow copy before failing closed.
+        let backupURL = Self.lastKnownGoodBackupURL(for: fileURL)
+        if let recovered = Self.loadVerifiedBackupState(at: backupURL) {
+            _ = Self.moveCorruptPrimaryAsideIfPresent(at: fileURL)
+            if recovered.version < PersistedState.currentVersion {
+                let migrated = Self.migrateV1ToV2(recovered, diskSlugsLowered: diskSlugs)
+                self.selectedProfileID = migrated.selectedProfileID
+                self.profiles = migrated.profiles
+                self.retiredProfileIDs = migrated.retiredProfileIDs
+                self.migratedSeedIDs = migrated.migratedSeedIDs
+            } else {
+                let normalized = Self.normalizeV2State(recovered, preserveLegacyDefaults: isProdDefault)
+                self.selectedProfileID = normalized.selectedProfileID
+                self.profiles = normalized.profiles
+                self.retiredProfileIDs = normalized.retiredProfileIDs
+                self.migratedSeedIDs = normalized.migratedSeedIDs
+            }
+            self.loadError = nil
+            self.recoveredFromBackup = true
+            Self.log.notice("fingerprint store auto-recovered from verified .bak shadow copy")
+            _ = persist()
+            return
+        }
+
+        // No valid `.bak` shadow copy available: fail closed while preserving any
+        // recoverable retired tombstones so recovery resets never unlock deleted slugs.
+        var extractedRetired: Set<String> = []
+        if let primaryData {
+            extractedRetired.formUnion(Self.extractBestEffortRetiredProfileIDs(from: primaryData))
+        }
+        if let rawBak = try? Data(contentsOf: backupURL) {
+            extractedRetired.formUnion(Self.extractBestEffortRetiredProfileIDs(from: rawBak))
+        }
+        self.selectedProfileID = nil
+        self.profiles = [Self.makeDefaultPersonalProfile(preserveLegacyDefaults: isProdDefault)]
+        self.retiredProfileIDs = extractedRetired
+        self.migratedSeedIDs = []
+        self.loadError = primaryFailureDescription
     }
 
-    static func defaultStorageURL() -> URL {
+    nonisolated static func defaultStorageURL() -> URL {
         if let root = try? CuriumLibraryLocation.supportRootDirectory() {
             return root.appending(path: fileName, directoryHint: .notDirectory)
         }
@@ -213,12 +335,18 @@ final class CuriumFingerprintStore {
         return support.appending(path: "Curium/\(fileName)", directoryHint: .notDirectory)
     }
 
+    nonisolated static func lastKnownGoodBackupURL(for fileURL: URL) -> URL {
+        fileURL.deletingLastPathComponent()
+            .appending(path: "\(fileURL.lastPathComponent).bak", directoryHint: .notDirectory)
+    }
+
     static func loadShared() -> CuriumFingerprintStore {
         CuriumFingerprintStore(fileURL: defaultStorageURL())
     }
 
-    static func makeDefaultPersonalProfile(
+    nonisolated static func makeDefaultPersonalProfile(
         preserveLegacyDefaults: Bool = false,
+        defaults: UserDefaults = .standard,
         now: Date = .now
     ) -> CuriumFingerprintProfile {
         var profile = CuriumFingerprintPresets.build39NativeBaseline
@@ -230,13 +358,13 @@ final class CuriumFingerprintStore {
         profile.templateID = "default"
         profile.createdAt = now
         if preserveLegacyDefaults {
-            let defaults = UserDefaults.standard
             let rawPalette = defaults.string(forKey: "curium.palette")
             let rawSiteMode = defaults.string(forKey: "curium.siteMode")
             let rawSearchEngine = defaults.string(forKey: "curium.searchEngine")
             profile.palette = rawPalette.flatMap(CuriumPalette.init(rawValue:)) ?? .violet
             profile.siteMode = rawSiteMode.flatMap(CuriumSiteMode.init(rawValue:)) ?? .adaptive
             profile.searchEngine = rawSearchEngine.flatMap(CuriumSearchEngine.init(rawValue:)) ?? .google
+            applyLegacyIdentityDefaults(from: defaults, to: &profile)
         } else {
             profile.palette = .violet
             profile.siteMode = .adaptive
@@ -245,27 +373,169 @@ final class CuriumFingerprintStore {
         return profile
     }
 
+    /// Folds legacy Build 39 (`patches/0105`) `UserDefaults` overrides (`curium.uaBrand`,
+    /// `curium.mobileUA`, `curium.acceptLang`, `curium.mobileModel`) into the `"default"`
+    /// (`Personal`) profile so Settings and Profile Editor stay synchronized and editing
+    /// an unrelated toggle never clobbers legacy choices.
+    nonisolated static func applyLegacyIdentityDefaults(
+        from defaults: UserDefaults,
+        to profile: inout CuriumFingerprintProfile
+    ) {
+        if let rawBrand = defaults.string(forKey: "curium.uaBrand")?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawBrand.isEmpty
+        {
+            let lowered = rawBrand.lowercased()
+            if lowered == "chromium" || lowered == "none" {
+                profile.mobile.primaryBrand = ""
+                profile.desktop.primaryBrand = ""
+            } else if lowered == "chrome" || lowered == "google chrome" {
+                profile.mobile.primaryBrand = "Google Chrome"
+                profile.desktop.primaryBrand = "Google Chrome"
+            } else if CuriumFingerprintValidator.isValidClientHintToken(rawBrand) {
+                profile.mobile.primaryBrand = rawBrand
+                profile.desktop.primaryBrand = rawBrand
+            }
+        }
+
+        let rawMobileUA = defaults.string(forKey: "curium.mobileUA")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if rawMobileUA == "ios" {
+            let preservedBrand = profile.mobile.primaryBrand
+            profile.mobile = CuriumFingerprintProfile.build39IOSMobileSlot
+            profile.mobile.primaryBrand = preservedBrand
+        } else if let rawModel = defaults.string(forKey: "curium.mobileModel")?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !rawModel.isEmpty,
+                  CuriumFingerprintValidator.isValidClientHintToken(rawModel)
+        {
+            profile.mobile.model = rawModel
+        }
+
+        if let rawAcceptLang = defaults.string(forKey: "curium.acceptLang")?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawAcceptLang.isEmpty
+        {
+            var parsedTags: [String] = []
+            var seenLowered: Set<String> = []
+            for rawPart in rawAcceptLang.split(separator: ",") {
+                let segments = rawPart.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+                let cleaned: String
+                if segments.count == 2 {
+                    let param = segments[1].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    // Only strip valid HTTP Accept-Language quality weights (`;q=...`); keep
+                    // malformed `;...` garbage intact so it is rejected below.
+                    if param.hasPrefix("q=") {
+                        cleaned = String(segments[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    } else {
+                        cleaned = String(rawPart).trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                } else {
+                    cleaned = String(rawPart).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                guard !cleaned.isEmpty, !cleaned.contains(",") else { continue }
+                let canonical = CuriumNormalizedAcceptLanguages([cleaned])
+                guard canonical != "en-US,en" else { continue }
+                if seenLowered.insert(canonical.lowercased()).inserted {
+                    parsedTags.append(canonical)
+                    if parsedTags.count == 8 { break }
+                }
+            }
+            if !parsedTags.isEmpty {
+                profile.languages = parsedTags
+            }
+        }
+    }
+
+    /// Synchronizes Settings' Browser Brand (`"chrome"` / `"chromium"`) and Mobile Profile
+    /// (`"android"` / `"ios"`) pickers directly into `"default"` (`Personal`) and mirrors
+    /// them to `UserDefaults` so Settings and Profile Studio never desynchronize.
+    @discardableResult
+    func applyLegacyIdentityPreferencesToPersonal(
+        uaBrand: String? = nil,
+        mobileUA: String? = nil,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        guard loadError == nil else {
+            lastPersistError = "Cannot update profile while \(Self.fileName) is unreadable."
+            return false
+        }
+        guard let idx = profiles.firstIndex(where: \.isPrimaryDefault) else {
+            return false
+        }
+        let previousProfiles = profiles
+        let previousSelection = selectedProfileID
+        var updated = profiles[idx]
+
+        if let uaBrand {
+            let normalized = uaBrand.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let brandValue = (normalized == "chromium" || normalized == "none") ? "" : "Google Chrome"
+            updated.mobile.primaryBrand = brandValue
+            updated.desktop.primaryBrand = brandValue
+        }
+
+        if let mobileUA {
+            let normalized = mobileUA.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let preservedBrand = updated.mobile.primaryBrand
+            if normalized == "ios" {
+                updated.mobile = CuriumFingerprintProfile.build39IOSMobileSlot
+                updated.mobile.primaryBrand = preservedBrand
+            } else {
+                let preservedModel = updated.mobile.platform == "Android" ? updated.mobile.model : ""
+                updated.mobile = CuriumFingerprintPresets.build39NativeBaseline.mobile
+                updated.mobile.primaryBrand = preservedBrand
+                if let preservedModel, !preservedModel.isEmpty {
+                    updated.mobile.model = preservedModel
+                }
+            }
+        }
+
+        if updated != profiles[idx] {
+            let bumped = profiles[idx].revision < CuriumFingerprintValidator.maxSafeJSONRevision
+                ? profiles[idx].revision + 1
+                : CuriumFingerprintValidator.maxSafeJSONRevision
+            updated.revision = bumped
+            profiles[idx] = updated
+        }
+
+        if !updated.matchesBuild39EngineDefaults && selectedProfileID == nil {
+            selectedProfileID = "default"
+        }
+
+        if !persist() {
+            profiles = previousProfiles
+            selectedProfileID = previousSelection
+            return false
+        }
+
+        if let uaBrand {
+            defaults.set(uaBrand, forKey: "curium.uaBrand")
+        }
+        if let mobileUA {
+            defaults.set(mobileUA, forKey: "curium.mobileUA")
+        }
+        return true
+    }
+
     /// Moves an unreadable/corrupt `fingerprint-profiles.json` aside to
     /// `fingerprint-profiles.corrupt-<timestamp>.bak`, clears `loadError`,
+    /// preserves any recoverable `retiredProfileIDs` tombstones and legacy defaults,
     /// resets to a clean v2 store with `"default"` (`Personal`), and persists it.
     @discardableResult
-    func backupCorruptStoreAndReset() -> Bool {
-        let fm = FileManager.default
+    func backupCorruptStoreAndReset(
+        preserveLegacyDefaults: Bool? = nil,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        var preservedRetired = retiredProfileIDs
+        if let rawPrimary = try? Data(contentsOf: fileURL) {
+            preservedRetired.formUnion(Self.extractBestEffortRetiredProfileIDs(from: rawPrimary))
+        }
+        if let rawBak = try? Data(contentsOf: Self.lastKnownGoodBackupURL(for: fileURL)) {
+            preservedRetired.formUnion(Self.extractBestEffortRetiredProfileIDs(from: rawBak))
+        }
+
         var st = stat()
         if lstat(fileURL.path, &st) == 0 {
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withFullDate, .withTime, .withDashSeparatorInDate]
-            let stamp = formatter.string(from: Date()).replacingOccurrences(of: ":", with: "")
-            let baseName = "fingerprint-profiles.corrupt-\(stamp)"
-            let dir = fileURL.deletingLastPathComponent()
-            var backupURL = dir.appending(path: "\(baseName).bak", directoryHint: .notDirectory)
-            var suffix = 2
-            while lstat(backupURL.path, &st) == 0 {
-                backupURL = dir.appending(path: "\(baseName)-\(suffix).bak", directoryHint: .notDirectory)
-                suffix += 1
-            }
             do {
-                try fm.moveItem(at: fileURL, to: backupURL)
+                try Self.moveCorruptPrimaryAside(at: fileURL)
             } catch {
                 lastPersistError = "Failed to back up corrupt store: \(error.localizedDescription)"
                 Self.log.error("corrupt store backup failed: \(String(describing: error), privacy: .public)")
@@ -281,8 +551,13 @@ final class CuriumFingerprintStore {
 
         loadError = nil
         selectedProfileID = nil
-        profiles = [Self.makeDefaultPersonalProfile()]
-        retiredProfileIDs = []
+        profiles = [
+            Self.makeDefaultPersonalProfile(
+                preserveLegacyDefaults: preserveLegacyDefaults ?? isProductionDefaultFile,
+                defaults: defaults
+            )
+        ]
+        retiredProfileIDs = preservedRetired
         migratedSeedIDs = []
 
         if !persist() {
@@ -479,10 +754,15 @@ final class CuriumFingerprintStore {
         guard loadError == nil,
               let idx = profiles.firstIndex(where: { $0.id.lowercased() == id.lowercased() })
         else { return false }
+        let previousProfiles = profiles
         let needsPersist = materializeFarblingSeedIfNeeded(at: idx)
             || migratedSeedIDs.contains(id.lowercased())
         guard needsPersist else { return true }
-        return persist()
+        if !persist() {
+            profiles = previousProfiles
+            return false
+        }
+        return true
     }
 
     /// Validates a candidate profile against both structural rules and store constraints
@@ -528,14 +808,22 @@ final class CuriumFingerprintStore {
         let previousProfiles = profiles
         let previousSelection = selectedProfileID
 
-        if let idx = profiles.firstIndex(where: { $0.id == normalized.id }) {
+        if let existing = self.profile(id: normalized.id),
+           let idx = profiles.firstIndex(where: { $0.id == existing.id }) {
+            updated.id = existing.id
             if updated.createdAt == nil {
                 updated.createdAt = profiles[idx].createdAt
             }
             if updated.lastUsedAt == nil {
                 updated.lastUsedAt = profiles[idx].lastUsedAt
             }
-            updated.revision = max(normalized.revision, profiles[idx].revision + 1)
+            let bumped = profiles[idx].revision < CuriumFingerprintValidator.maxSafeJSONRevision
+                ? profiles[idx].revision + 1
+                : CuriumFingerprintValidator.maxSafeJSONRevision
+            updated.revision = min(
+                CuriumFingerprintValidator.maxSafeJSONRevision,
+                max(normalized.revision, bumped)
+            )
             profiles[idx] = updated
             // If the user customized Personal's engine fields while on unconfigured `nil`,
             // opt into `"default"` so the engine applies the customized settings on next launch.
@@ -543,7 +831,10 @@ final class CuriumFingerprintStore {
                 selectedProfileID = "default"
             }
         } else {
-            updated.revision = max(normalized.revision, 1)
+            updated.revision = min(
+                CuriumFingerprintValidator.maxSafeJSONRevision,
+                max(normalized.revision, 1)
+            )
             if updated.createdAt == nil {
                 updated.createdAt = .now
             }
@@ -563,13 +854,14 @@ final class CuriumFingerprintStore {
             lastPersistError = "Cannot delete profile while \(Self.fileName) is unreadable."
             return false
         }
-        let loweredID = id.lowercased()
+        guard let existing = profile(id: id) else { return false }
+        let loweredID = existing.id.lowercased()
         guard loweredID != "default" else { return false }
-        guard allowActiveDeleteForTesting || !CuriumFingerprintProfileStorage.isProfileActiveInCurrentProcess(id) else {
+        guard allowActiveDeleteForTesting || !CuriumFingerprintProfileStorage.isProfileActiveInCurrentProcess(existing.id) else {
             lastPersistError = "Cannot delete the currently active running profile. Switch profiles and relaunch first."
             return false
         }
-        guard let idx = profiles.firstIndex(where: { $0.id == id }) else { return false }
+        guard let idx = profiles.firstIndex(where: { $0.id == existing.id }) else { return false }
 
         let previousProfiles = profiles
         let previousSelection = selectedProfileID
@@ -599,18 +891,22 @@ final class CuriumFingerprintStore {
         guard id.lowercased() != "default" else {
             throw CuriumFingerprintProfileStorage.WipeError.defaultProfileProtected
         }
-        let active = isActiveInCurrentProcess ?? CuriumFingerprintProfileStorage.isProfileActiveInCurrentProcess(id)
+        guard let existing = profile(id: id) else {
+            return false
+        }
+        let canonicalID = existing.id
+        let active = isActiveInCurrentProcess ?? CuriumFingerprintProfileStorage.isProfileActiveInCurrentProcess(canonicalID)
         guard !active else {
             throw CuriumFingerprintProfileStorage.WipeError.activeProfileProtected
         }
         try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
-            id,
+            canonicalID,
             isActiveInCurrentProcess: active,
             applicationSupportRoot: applicationSupportRoot,
             cachesRoot: cachesRoot,
             curiumSupportRoot: curiumSupportRoot
         )
-        return deleteProfile(id: id, allowActiveDeleteForTesting: true)
+        return deleteProfile(id: canonicalID, allowActiveDeleteForTesting: true)
     }
 
     func nextAvailableID(
@@ -664,7 +960,7 @@ final class CuriumFingerprintStore {
             lastPersistError = "Cannot duplicate profile while \(Self.fileName) is unreadable."
             return nil
         }
-        guard var copy = profiles.first(where: { $0.id == sourceID }) else { return nil }
+        guard var copy = profile(id: sourceID) else { return nil }
 
         let resolvedNewID: String
         if let newID {
@@ -705,7 +1001,7 @@ final class CuriumFingerprintStore {
     }
 
     func exportProfileJSON(id: String) throws -> Data {
-        guard let profile = profiles.first(where: { $0.id == id }) else {
+        guard let profile = profile(id: id) else {
             throw CocoaError(.fileNoSuchFile)
         }
         let encoder = JSONEncoder()
@@ -851,6 +1147,18 @@ final class CuriumFingerprintStore {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(state)
             try data.write(to: fileURL, options: .atomic)
+
+            // Verify written primary JSON decodes cleanly before refreshing the
+            // last-known-good `.bak` shadow file.
+            let verifiedData = try Data(contentsOf: fileURL)
+            _ = try JSONDecoder().decode(PersistedState.self, from: verifiedData)
+            let backupURL = Self.lastKnownGoodBackupURL(for: fileURL)
+            do {
+                try verifiedData.write(to: backupURL, options: .atomic)
+            } catch {
+                Self.log.warning("fingerprint store .bak shadow write failed: \(String(describing: error), privacy: .public)")
+            }
+
             lastPersistError = nil
             migratedSeedIDs.removeAll()
             return true
@@ -894,7 +1202,7 @@ final class CuriumFingerprintStore {
             .union(diskProfileSlugsLowered())
     }
 
-    private static func randomHex(byteCount: Int) -> String {
+    private nonisolated static func randomHex(byteCount: Int) -> String {
         var bytes = [UInt8](repeating: 0, count: max(1, byteCount))
         let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
         if status != errSecSuccess {
@@ -905,7 +1213,7 @@ final class CuriumFingerprintStore {
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
-    static func mintFreshSeed(differentFrom existing: String?) -> String {
+    nonisolated static func mintFreshSeed(differentFrom existing: String?) -> String {
         var candidate = CuriumFingerprintSchema.generateRandomSeedHex()
         if let existing, candidate.lowercased() == existing.lowercased() {
             candidate = CuriumFingerprintSchema.generateRandomSeedHex()
@@ -913,7 +1221,7 @@ final class CuriumFingerprintStore {
         return candidate
     }
 
-    static func describeDecodingError(_ error: Error) -> String {
+    nonisolated static func describeDecodingError(_ error: Error) -> String {
         guard let decodingError = error as? DecodingError else {
             return error.localizedDescription
         }
@@ -936,7 +1244,7 @@ final class CuriumFingerprintStore {
         }
     }
 
-    private static func isFileMissingError(_ error: Error) -> Bool {
+    private nonisolated static func isFileMissingError(_ error: Error) -> Bool {
         let nsError = error as NSError
         if nsError.domain == NSCocoaErrorDomain
             && (nsError.code == NSFileReadNoSuchFileError || nsError.code == NSFileNoSuchFileError)
@@ -952,7 +1260,86 @@ final class CuriumFingerprintStore {
         return false
     }
 
-    private static func ensureValidFarblingSeed(_ profile: inout CuriumFingerprintProfile) -> Bool {
+    private nonisolated static func loadVerifiedBackupState(at backupURL: URL) -> PersistedState? {
+        var st = stat()
+        guard lstat(backupURL.path, &st) == 0,
+              (st.st_mode & S_IFMT) == S_IFREG,
+              let data = try? Data(contentsOf: backupURL),
+              let decoded = try? JSONDecoder().decode(PersistedState.self, from: data)
+        else {
+            return nil
+        }
+        return decoded
+    }
+
+    private nonisolated static func moveCorruptPrimaryAside(at fileURL: URL) throws {
+        var st = stat()
+        guard lstat(fileURL.path, &st) == 0 else { return }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withFullDate, .withTime, .withDashSeparatorInDate]
+        let stamp = formatter.string(from: Date()).replacingOccurrences(of: ":", with: "")
+        let baseName = "fingerprint-profiles.corrupt-\(stamp)"
+        let dir = fileURL.deletingLastPathComponent()
+        var backupURL = dir.appending(path: "\(baseName).bak", directoryHint: .notDirectory)
+        var suffix = 2
+        while lstat(backupURL.path, &st) == 0 {
+            backupURL = dir.appending(path: "\(baseName)-\(suffix).bak", directoryHint: .notDirectory)
+            suffix += 1
+        }
+        try FileManager.default.moveItem(at: fileURL, to: backupURL)
+    }
+
+    @discardableResult
+    private nonisolated static func moveCorruptPrimaryAsideIfPresent(at fileURL: URL) -> Bool {
+        do {
+            try moveCorruptPrimaryAside(at: fileURL)
+            return true
+        } catch {
+            log.warning("failed moving corrupt primary store aside before .bak recovery: \(String(describing: error), privacy: .public)")
+            return false
+        }
+    }
+
+    private nonisolated static func extractBestEffortRetiredProfileIDs(from data: Data) -> Set<String> {
+        var result: Set<String> = []
+        if let raw = try? JSONSerialization.jsonObject(with: data, options: []),
+           let dict = raw as? [String: Any],
+           let list = dict["retiredProfileIDs"] as? [String]
+        {
+            for entry in list {
+                let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+                let lowered = trimmed.lowercased()
+                if lowered != "default", CuriumFingerprintValidator.isValidProfileID(trimmed) {
+                    result.insert(lowered)
+                }
+            }
+            return result
+        }
+        if let text = String(data: data, encoding: .utf8),
+           let keyRange = text.range(of: "\"retiredProfileIDs\"")
+        {
+            let tail = text[keyRange.upperBound...]
+            if let openBracket = tail.firstIndex(of: "["),
+               let closeBracket = tail[openBracket...].firstIndex(of: "]")
+            {
+                let arrayBody = String(tail[openBracket...closeBracket])
+                if let arrayData = arrayBody.data(using: .utf8),
+                   let parsed = try? JSONSerialization.jsonObject(with: arrayData, options: []) as? [String]
+                {
+                    for entry in parsed {
+                        let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let lowered = trimmed.lowercased()
+                        if lowered != "default", CuriumFingerprintValidator.isValidProfileID(trimmed) {
+                            result.insert(lowered)
+                        }
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    private nonisolated static func ensureValidFarblingSeed(_ profile: inout CuriumFingerprintProfile) -> Bool {
         guard profile.hasFarblingEnabled else { return false }
         if let seed = profile.fingerprintSeed,
            CuriumFingerprintSchema.isValidSeedHex(seed),
@@ -969,7 +1356,7 @@ final class CuriumFingerprintStore {
     /// - Promotes any of the 6 non-default v1 built-in presets ONLY if currently selected
     ///   or already present on disk (`ChromiumProfiles/<slug>` / `Curium/Profiles/<slug>`).
     /// - Upgrades missing/retired farbling seeds cleanly.
-    private static func migrateV1ToV2(
+    private nonisolated static func migrateV1ToV2(
         _ decoded: PersistedState,
         diskSlugsLowered: Set<String>
     ) -> (
@@ -1089,8 +1476,9 @@ final class CuriumFingerprintStore {
         return (decoded.selectedProfileID, result, retired, migratedSeeds)
     }
 
-    private static func normalizeV2State(
-        _ decoded: PersistedState
+    private nonisolated static func normalizeV2State(
+        _ decoded: PersistedState,
+        preserveLegacyDefaults: Bool = false
     ) -> (
         selectedProfileID: String?,
         profiles: [CuriumFingerprintProfile],
@@ -1110,13 +1498,23 @@ final class CuriumFingerprintStore {
                 defaultProfile.isBuiltIn = false
                 needsPersist = true
             }
+            if preserveLegacyDefaults,
+               decoded.selectedProfileID == nil,
+               defaultProfile.matchesBuild39EngineDefaults
+            {
+                let before = defaultProfile
+                applyLegacyIdentityDefaults(from: .standard, to: &defaultProfile)
+                if defaultProfile != before {
+                    needsPersist = true
+                }
+            }
             if ensureValidFarblingSeed(&defaultProfile) {
                 migratedSeeds.insert("default")
                 needsPersist = true
             }
             result.append(defaultProfile)
         } else {
-            result.append(makeDefaultPersonalProfile())
+            result.append(makeDefaultPersonalProfile(preserveLegacyDefaults: preserveLegacyDefaults))
             needsPersist = true
         }
 
@@ -1159,12 +1557,13 @@ final class CuriumFingerprintStore {
         let hideSpeechVoices: Bool?
     }
 
-    private static let log = Logger(subsystem: "com.appautomaton.curium", category: "fingerprint")
+    private nonisolated static let log = Logger(subsystem: "com.appautomaton.curium", category: "fingerprint")
 }
 
 /// Pre-`ChromeMain` bootstrap coordinator that probes engine capabilities,
-/// validates & registers bounded launch configuration bytes, and fails closed
-/// on any corrupt store, rejected, or unavailable explicit profile.
+/// validates & registers bounded launch configuration bytes, acquires the
+/// shared support companion lock, snapshots immutable launch proxy/engine state,
+/// and fails closed on any corrupt store, rejected, or unavailable explicit profile.
 enum CuriumFingerprintBootstrap {
     enum LaunchOutcome: Equatable, Sendable {
         case defaultBuild39
@@ -1172,13 +1571,79 @@ enum CuriumFingerprintBootstrap {
         case rejected(profileID: String, reason: String)
     }
 
-    private static let outcomeLock = OSAllocatedUnfairLock<LaunchOutcome>(initialState: .defaultBuild39)
+    /// Frozen engine-affecting fields active in the current Blink process.
+    /// Used to detect mid-session engine edits that require a cold relaunch.
+    struct EngineLaunchSnapshot: Equatable, Sendable {
+        let profileID: String
+        let wasUnconfiguredBuild39: Bool
+        let defaultSlot: CuriumDefaultSlot
+        let mobile: CuriumIdentitySlot
+        let desktop: CuriumIdentitySlot
+        let languages: [String]?
+        let proxy: CuriumProxyConfig
+        let webrtcIpHandlingPolicy: CuriumWebRTCPolicy
+        let enableDoNotTrack: Bool
+        let enableGlobalPrivacyControl: Bool
+        let hardware: CuriumHardwareOverrides
+        let fingerprintSeed: String?
+        let effectiveFarbling: CuriumFarblingSettings?
+        let fontProfile: CuriumFontProfile?
+        let hideSpeechVoices: Bool?
 
-    static var lastOutcome: LaunchOutcome {
-        outcomeLock.withLock { $0 }
+        init(from profile: CuriumFingerprintProfile, wasUnconfiguredBuild39: Bool) {
+            let normalized = profile.normalizedForPersistence()
+            self.profileID = normalized.id
+            self.wasUnconfiguredBuild39 = wasUnconfiguredBuild39
+            self.defaultSlot = normalized.defaultSlot
+            self.mobile = normalized.mobile
+            self.desktop = normalized.desktop
+            self.languages = normalized.languages
+            self.proxy = normalized.proxy
+            self.webrtcIpHandlingPolicy = normalized.webrtcIpHandlingPolicy
+            self.enableDoNotTrack = normalized.enableDoNotTrack
+            self.enableGlobalPrivacyControl = normalized.enableGlobalPrivacyControl
+            self.hardware = normalized.hardware
+            self.fingerprintSeed = normalized.fingerprintSeed
+            self.effectiveFarbling = normalized.fingerprintSeed != nil ? (normalized.farbling ?? .allEnabled) : nil
+            self.fontProfile = normalized.fontProfile
+            self.hideSpeechVoices = normalized.hideSpeechVoices
+        }
+
+        func matchesEngineFields(of profile: CuriumFingerprintProfile) -> Bool {
+            let candidate = profile.normalizedForPersistence()
+            let candidateFarbling: CuriumFarblingSettings? =
+                candidate.fingerprintSeed != nil ? (candidate.farbling ?? .allEnabled) : nil
+            return defaultSlot == candidate.defaultSlot
+                && mobile == candidate.mobile
+                && desktop == candidate.desktop
+                && languages == candidate.languages
+                && proxy == candidate.proxy
+                && webrtcIpHandlingPolicy == candidate.webrtcIpHandlingPolicy
+                && enableDoNotTrack == candidate.enableDoNotTrack
+                && enableGlobalPrivacyControl == candidate.enableGlobalPrivacyControl
+                && hardware == candidate.hardware
+                && fingerprintSeed == candidate.fingerprintSeed
+                && effectiveFarbling == candidateFarbling
+                && fontProfile == candidate.fontProfile
+                && hideSpeechVoices == candidate.hideSpeechVoices
+        }
     }
 
-    static var activeProfileID: String {
+    private struct BootstrapState: Sendable {
+        var outcome: LaunchOutcome = .defaultBuild39
+        var activeLaunchProxy: CuriumProxyConfig = .system
+        var activeLaunchEngineSnapshot: EngineLaunchSnapshot? = nil
+        var frozenLaunchProfile: CuriumFingerprintProfile? = nil
+        var sharedLockFD: Int32 = -1
+    }
+
+    private static let stateLock = OSAllocatedUnfairLock<BootstrapState>(initialState: BootstrapState())
+
+    nonisolated static var lastOutcome: LaunchOutcome {
+        stateLock.withLock { $0.outcome }
+    }
+
+    nonisolated static var activeProfileID: String {
         switch lastOutcome {
         case .configured(let profileID, _, _):
             return profileID
@@ -1187,8 +1652,69 @@ enum CuriumFingerprintBootstrap {
         }
     }
 
-    private static func setLastOutcome(_ outcome: LaunchOutcome) {
-        outcomeLock.withLock { $0 = outcome }
+    /// Immutable proxy configuration frozen at launch for this running Blink process.
+    /// Auxiliary `URLSession` networking (e.g. Media Downloader) must read this instead of
+    /// mutating store state so mid-session proxy edits never leak live session cookies/IP.
+    nonisolated static var activeLaunchProxy: CuriumProxyConfig {
+        stateLock.withLock { $0.activeLaunchProxy }
+    }
+
+    /// Alias for `activeLaunchProxy` matching cross-worker Contract A/B.
+    nonisolated static var frozenLaunchProxy: CuriumProxyConfig {
+        activeLaunchProxy
+    }
+
+    /// Immutable snapshot of the launched profile (if `prepareEngineLaunch` ran).
+    nonisolated static var frozenLaunchProfile: CuriumFingerprintProfile? {
+        stateLock.withLock { $0.frozenLaunchProfile }
+    }
+
+    /// Frozen engine-affecting fields used to detect mid-session edits requiring relaunch.
+    nonisolated static var activeLaunchEngineSnapshot: EngineLaunchSnapshot? {
+        stateLock.withLock { $0.activeLaunchEngineSnapshot }
+    }
+
+    private nonisolated static func releaseHeldSharedLock() {
+        let oldFD: Int32 = stateLock.withLock { state in
+            let fd = state.sharedLockFD
+            state.sharedLockFD = -1
+            return fd
+        }
+        if oldFD >= 0 {
+            close(oldFD)
+        }
+    }
+
+    private nonisolated static func recordLaunchState(
+        outcome: LaunchOutcome,
+        proxy: CuriumProxyConfig,
+        snapshot: EngineLaunchSnapshot?,
+        profile: CuriumFingerprintProfile?,
+        sharedLockFD: Int32
+    ) {
+        let oldFD: Int32 = stateLock.withLock { state in
+            let prev = state.sharedLockFD
+            state.outcome = outcome
+            state.activeLaunchProxy = proxy
+            state.activeLaunchEngineSnapshot = snapshot
+            state.frozenLaunchProfile = profile
+            state.sharedLockFD = sharedLockFD
+            return prev
+        }
+        if oldFD >= 0 && oldFD != sharedLockFD {
+            close(oldFD)
+        }
+    }
+
+    /// Releases any held companion lock and resets static launch snapshot state for unit tests.
+    nonisolated static func resetStateForTesting() {
+        recordLaunchState(
+            outcome: .defaultBuild39,
+            proxy: .system,
+            snapshot: nil,
+            profile: nil,
+            sharedLockFD: -1
+        )
     }
 
     static func engineCapabilities() -> CuriumEngineFingerprintCapabilities {
@@ -1203,23 +1729,64 @@ enum CuriumFingerprintBootstrap {
     /// Runs once on the main thread before `ChromeMain`.
     /// Returns `.rejected` (fail closed) whenever the profile store is unreadable/corrupt
     /// or an explicit profile is selected but missing, invalid, unsupported by the linked
-    /// engine, or locked/unavailable.
+    /// engine, unable to persist its farbling seed, or locked/unavailable.
     @MainActor
-    static func prepareEngineLaunch(store: CuriumFingerprintStore = .shared) -> LaunchOutcome {
+    static func prepareEngineLaunch(
+        store: CuriumFingerprintStore = .shared,
+        capabilitiesProvider: (() -> CuriumEngineFingerprintCapabilities)? = nil,
+        configureEngine: ((Data?, inout NSError?) -> Bool)? = nil
+    ) -> LaunchOutcome {
+        // Release any lock held from a prior invocation in this process (tests only;
+        // production invokes `prepareEngineLaunch()` once before `ChromeMain`).
+        releaseHeldSharedLock()
+
+        let applyEngineConfig: (Data?, inout NSError?) -> Bool = configureEngine ?? { data, err in
+            CuriumConfigureLaunchFingerprint(data, &err)
+        }
+
         if let loadError = store.loadError {
             let outcome = LaunchOutcome.rejected(
                 profileID: "store",
                 reason: "Profile store failed to load safely: \(loadError)"
             )
-            setLastOutcome(outcome)
+            recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
             return outcome
         }
 
-        guard let selectedID = store.selectedProfileID else {
-            _ = CuriumConfigureLaunchFingerprint(nil, nil)
+        func launchDefaultBuild39(_ baselineProfile: CuriumFingerprintProfile) -> LaunchOutcome {
+            let sharedLockFD: Int32
+            do {
+                sharedLockFD = try CuriumFingerprintProfileStorage.acquireSharedProfileLock(
+                    for: "default",
+                    curiumSupportRoot: store.effectiveCuriumSupportRoot
+                )
+            } catch {
+                let outcome = LaunchOutcome.rejected(
+                    profileID: "default",
+                    reason: error.localizedDescription
+                )
+                recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
+                return outcome
+            }
+            var ignoredError: NSError?
+            _ = applyEngineConfig(nil, &ignoredError)
             _ = store.markProfileUsed("default")
-            setLastOutcome(.defaultBuild39)
+            let snapshot = EngineLaunchSnapshot(from: baselineProfile, wasUnconfiguredBuild39: true)
+            recordLaunchState(
+                outcome: .defaultBuild39,
+                proxy: .system,
+                snapshot: snapshot,
+                profile: baselineProfile,
+                sharedLockFD: sharedLockFD
+            )
             return .defaultBuild39
+        }
+
+        guard let selectedID = store.selectedProfileID else {
+            let launchedDefault = CuriumFingerprintStore.makeDefaultPersonalProfile(
+                preserveLegacyDefaults: store.isProductionDefaultFile
+            )
+            return launchDefaultBuild39(launchedDefault)
         }
 
         guard let profile = store.profile(id: selectedID) else {
@@ -1227,24 +1794,27 @@ enum CuriumFingerprintBootstrap {
                 profileID: selectedID,
                 reason: "Selected profile \"\(selectedID)\" was not found in the profile store."
             )
-            setLastOutcome(outcome)
+            recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
             return outcome
         }
 
         if profile.isPrimaryDefault && profile.matchesBuild39EngineDefaults {
-            _ = CuriumConfigureLaunchFingerprint(nil, nil)
-            _ = store.markProfileUsed("default")
-            setLastOutcome(.defaultBuild39)
-            return .defaultBuild39
+            return launchDefaultBuild39(profile)
         }
 
-        _ = store.ensureMaterializedSeedPersisted(for: profile.id)
+        guard store.ensureMaterializedSeedPersisted(for: profile.id) else {
+            let reason = store.lastPersistError
+                ?? "Failed to persist materialized farbling seed for profile \"\(profile.id)\"."
+            let outcome = LaunchOutcome.rejected(profileID: selectedID, reason: reason)
+            recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
+            return outcome
+        }
         guard let materialized = store.profile(id: profile.id) else {
             let outcome = LaunchOutcome.rejected(
                 profileID: selectedID,
                 reason: "Selected profile \"\(selectedID)\" was not found in the profile store."
             )
-            setLastOutcome(outcome)
+            recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
             return outcome
         }
 
@@ -1254,17 +1824,17 @@ enum CuriumFingerprintBootstrap {
                 profileID: selectedID,
                 reason: validation.errors.joined(separator: " ")
             )
-            setLastOutcome(outcome)
+            recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
             return outcome
         }
 
-        let caps = engineCapabilities()
+        let caps = (capabilitiesProvider ?? engineCapabilities)()
         guard caps.supportsLaunchFingerprintConfig else {
             let outcome = LaunchOutcome.rejected(
                 profileID: selectedID,
                 reason: "The embedded Blink engine does not support launch fingerprint profiles (requires Build 40+)."
             )
-            setLastOutcome(outcome)
+            recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
             return outcome
         }
 
@@ -1280,16 +1850,32 @@ enum CuriumFingerprintBootstrap {
                 profileID: selectedID,
                 reason: "Failed to encode profile JSON: \(error.localizedDescription)"
             )
-            setLastOutcome(outcome)
+            recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
+            return outcome
+        }
+
+        let sharedLockFD: Int32
+        do {
+            sharedLockFD = try CuriumFingerprintProfileStorage.acquireSharedProfileLock(
+                for: materialized.id,
+                curiumSupportRoot: store.effectiveCuriumSupportRoot
+            )
+        } catch {
+            let outcome = LaunchOutcome.rejected(
+                profileID: materialized.id,
+                reason: error.localizedDescription
+            )
+            recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
             return outcome
         }
 
         var engineError: NSError?
-        guard CuriumConfigureLaunchFingerprint(jsonData, &engineError) else {
+        guard applyEngineConfig(jsonData, &engineError) else {
+            close(sharedLockFD)
             let reason = engineError?.localizedDescription
                 ?? "Blink engine rejected launch fingerprint configuration."
             let outcome = LaunchOutcome.rejected(profileID: selectedID, reason: reason)
-            setLastOutcome(outcome)
+            recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
             return outcome
         }
 
@@ -1299,7 +1885,88 @@ enum CuriumFingerprintBootstrap {
             revision: materialized.revision,
             nativeHardware: materialized.usesNativeHardwareAndGPU
         )
-        setLastOutcome(outcome)
+        let snapshot = EngineLaunchSnapshot(from: materialized, wasUnconfiguredBuild39: false)
+        recordLaunchState(
+            outcome: outcome,
+            proxy: materialized.proxy,
+            snapshot: snapshot,
+            profile: materialized,
+            sharedLockFD: sharedLockFD
+        )
         return outcome
+    }
+}
+
+extension CuriumFingerprintProfile {
+    /// Exact Build 39 (`patches/0105`) iOS Blink mobile slot (`--curium-mobile-ua=ios`).
+    nonisolated static let build39IOSMobileSlot = CuriumIdentitySlot(
+        osCpu: "iPhone; CPU iPhone OS 18_7 like Mac OS X",
+        appendMobileToken: true,
+        primaryBrand: "Google Chrome",
+        platform: "iOS",
+        platformVersion: nil,
+        architecture: "arm",
+        bitness: "64",
+        model: "",
+        mobile: true,
+        wow64: false,
+        formFactors: ["Mobile"],
+        navigatorPlatform: "iPhone"
+    )
+
+    nonisolated var legacyUABrandRawValue: String {
+        if mobile.primaryBrand == "" && desktop.primaryBrand == "" {
+            return "chromium"
+        }
+        return "chrome"
+    }
+
+    nonisolated var legacyMobileUARawValue: String {
+        if mobile.platform == "iOS" {
+            return "ios"
+        }
+        return "android"
+    }
+
+    /// True iff this is `"default"` (`Personal`) and every engine-affecting field matches
+    /// the Build 39 baseline modulo legacy Settings choices (`curium.uaBrand`,
+    /// `curium.mobileUA`, `curium.mobileModel`, `curium.acceptLang`).
+    nonisolated var supportsLegacyIdentityPickers: Bool {
+        guard isPrimaryDefault else { return false }
+        let baseline = CuriumFingerprintPresets.build39NativeBaseline
+        guard defaultSlot == baseline.defaultSlot,
+              proxy == baseline.proxy,
+              webrtcIpHandlingPolicy == baseline.webrtcIpHandlingPolicy,
+              enableDoNotTrack == baseline.enableDoNotTrack,
+              enableGlobalPrivacyControl == baseline.enableGlobalPrivacyControl,
+              hardware == baseline.hardware,
+              fingerprintSeed == nil,
+              !hasFarblingEnabled,
+              (fontProfile == nil || fontProfile == .native),
+              (hideSpeechVoices == nil || hideSpeechVoices == false)
+        else {
+            return false
+        }
+
+        let allowedBrands: Set<String> = ["Google Chrome", ""]
+        let mobileBrand = mobile.primaryBrand ?? "Google Chrome"
+        let desktopBrand = desktop.primaryBrand ?? "Google Chrome"
+        guard mobileBrand == desktopBrand, allowedBrands.contains(mobileBrand) else {
+            return false
+        }
+
+        var normalizedDesktop = desktop
+        normalizedDesktop.primaryBrand = baseline.desktop.primaryBrand
+        guard normalizedDesktop == baseline.desktop else {
+            return false
+        }
+
+        var normalizedMobile = mobile
+        normalizedMobile.primaryBrand = baseline.mobile.primaryBrand
+        if normalizedMobile == Self.build39IOSMobileSlot {
+            return true
+        }
+        normalizedMobile.model = baseline.mobile.model
+        return normalizedMobile == baseline.mobile
     }
 }

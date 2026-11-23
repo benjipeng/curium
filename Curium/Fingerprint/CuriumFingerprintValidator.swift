@@ -10,6 +10,8 @@ struct CuriumFingerprintValidationReport: Equatable, Sendable {
 /// Validates structural invariants (mirroring the C++ engine fail-closed rules)
 /// and emits cross-field coherence warnings for downstream Swift UI/automation.
 enum CuriumFingerprintValidator {
+    static let maxSafeJSONRevision: UInt64 = 9_007_199_254_740_991
+
     static func isValidProfileID(_ id: String) -> Bool {
         if id == "default" { return true }
         let scalars = Array(id.unicodeScalars)
@@ -20,7 +22,13 @@ enum CuriumFingerprintValidator {
     }
 
     static func isValidClientHintToken(_ value: String) -> Bool {
-        guard !value.isEmpty, value.utf8.count <= 128 else { return false }
+        isValidClientHintToken(value, maxBytes: 128)
+    }
+
+    static func isValidClientHintToken(_ value: String, maxBytes: Int) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= maxBytes, !hasLeadingOrTrailingSpace(value) else {
+            return false
+        }
         for scalar in value.unicodeScalars {
             if scalar.value < 0x20 || scalar.value >= 0x7F { return false }
             if scalar == "\"" || scalar == "\\" || scalar == ";" { return false }
@@ -33,6 +41,10 @@ enum CuriumFingerprintValidator {
 
         if !isValidProfileID(profile.id) {
             report.errors.append("Profile ID must be \"default\" or 1–32 ASCII letters, digits, '-' or '_' starting with a letter/digit.")
+        }
+
+        if profile.revision > Self.maxSafeJSONRevision {
+            report.errors.append("revision must be at most \(Self.maxSafeJSONRevision).")
         }
 
         validateSlot(profile.mobile, name: "mobile", into: &report)
@@ -59,7 +71,7 @@ enum CuriumFingerprintValidator {
             if trimmed.isEmpty || trimmed.utf8.count > 1024 || hasControlChars(trimmed)
                 || !isValidFixedProxyRules(trimmed)
             {
-                report.errors.append("Fixed proxy mode requires valid non-direct proxy rules (e.g. \"socks5://127.0.0.1:1080\" or \"http=127.0.0.1:8080;https=127.0.0.1:8080\").")
+                report.errors.append("Fixed proxy mode requires valid non-direct proxy rules covering HTTPS (e.g. \"socks5://127.0.0.1:1080\" or \"http=127.0.0.1:8080;https=127.0.0.1:8080\").")
             }
             if let bypass, bypass.utf8.count > 2048 || hasControlChars(bypass) {
                 report.errors.append("Proxy bypass rules contain invalid control characters or exceed 2048 bytes.")
@@ -79,6 +91,7 @@ enum CuriumFingerprintValidator {
 
         if let tz = profile.hardware.timezone {
             if tz.isEmpty || tz.utf8.count > 64 || tz.contains("..") || tz.hasPrefix("/") || tz.hasSuffix("/")
+                || !isValidTimezoneCharset(tz)
                 || TimeZone(identifier: tz) == nil
             {
                 report.errors.append("Invalid IANA timezone identifier: \(tz)")
@@ -118,17 +131,17 @@ enum CuriumFingerprintValidator {
         into report: inout CuriumFingerprintValidationReport
     ) {
         if let ua = slot.uaString {
-            if ua.isEmpty || ua.utf8.count > 1024 || hasControlChars(ua) {
-                report.errors.append("\(name).uaString must be a non-empty single-line header value (<= 1024 bytes).")
+            if ua.isEmpty || ua.utf8.count > 1024 || !isPrintableASCII(ua) || hasLeadingOrTrailingSpace(ua) {
+                report.errors.append("\(name).uaString must be a non-empty trimmed printable ASCII header value (<= 1024 bytes).")
             }
         }
         if let osCpu = slot.osCpu {
-            if osCpu.isEmpty || osCpu.utf8.count > 256 || !isPrintableASCII(osCpu) || osCpu.contains("(") || osCpu.contains(")") {
-                report.errors.append("\(name).osCpu must be printable ASCII without parentheses.")
+            if osCpu.isEmpty || osCpu.utf8.count > 256 || !isPrintableASCII(osCpu) || hasLeadingOrTrailingSpace(osCpu) || osCpu.contains("(") || osCpu.contains(")") {
+                report.errors.append("\(name).osCpu must be trimmed printable ASCII without parentheses.")
             }
         }
-        if let pv = slot.productVersion, (pv.isEmpty || pv.utf8.count > 128 || !isPrintableASCII(pv)) {
-            report.errors.append("\(name).productVersion must be printable ASCII.")
+        if let pv = slot.productVersion, (pv.isEmpty || pv.utf8.count > 128 || !isPrintableASCII(pv) || hasLeadingOrTrailingSpace(pv)) {
+            report.errors.append("\(name).productVersion must be trimmed printable ASCII.")
         }
         if let brand = slot.primaryBrand, !brand.isEmpty, !isValidClientHintToken(brand) {
             report.errors.append("\(name).primaryBrand contains forbidden Client Hint characters.")
@@ -139,8 +152,8 @@ enum CuriumFingerprintValidator {
                 report.errors.append("\(name).majorVersion must be a positive integer string.")
             }
         }
-        if let full = slot.fullVersion, (full.isEmpty || full.utf8.count > 32 || !isValidClientHintToken(full)) {
-            report.errors.append("\(name).fullVersion is invalid.")
+        if let full = slot.fullVersion, (full.isEmpty || !isValidClientHintToken(full, maxBytes: 32)) {
+            report.errors.append("\(name).fullVersion is invalid (must be trimmed printable ASCII <= 32 bytes).")
         }
         for (listName, list) in [("brands", slot.brands), ("fullVersionBrands", slot.fullVersionBrands)] {
             if let list {
@@ -151,14 +164,14 @@ enum CuriumFingerprintValidator {
                 }
             }
         }
-        if let p = slot.platform, !isValidClientHintToken(p) {
-            report.errors.append("\(name).platform is invalid.")
+        if let p = slot.platform, !isValidClientHintToken(p, maxBytes: 64) {
+            report.errors.append("\(name).platform is invalid (must be trimmed printable ASCII <= 64 bytes).")
         }
-        if let pv = slot.platformVersion, !pv.isEmpty, !isValidClientHintToken(pv) {
-            report.errors.append("\(name).platformVersion is invalid.")
+        if let pv = slot.platformVersion, !pv.isEmpty, !isValidClientHintToken(pv, maxBytes: 64) {
+            report.errors.append("\(name).platformVersion is invalid (must be trimmed printable ASCII <= 64 bytes).")
         }
-        if let arch = slot.architecture, !arch.isEmpty, !isValidClientHintToken(arch) {
-            report.errors.append("\(name).architecture is invalid.")
+        if let arch = slot.architecture, !arch.isEmpty, !isValidClientHintToken(arch, maxBytes: 32) {
+            report.errors.append("\(name).architecture is invalid (must be trimmed printable ASCII <= 32 bytes).")
         }
         if let bitness = slot.bitness, !["", "32", "64"].contains(bitness) {
             report.errors.append("\(name).bitness must be \"\", \"32\", or \"64\".")
@@ -245,6 +258,13 @@ enum CuriumFingerprintValidator {
         if defaultPlatform == "Android", let mem = profile.hardware.deviceMemoryGB, mem > 8 {
             report.warnings.append("Android Chrome caps navigator.deviceMemory at 8 GB; overriding to \(Int(mem)) GB is anomalous.")
         }
+        if case .fixed = profile.proxy,
+           profile.webrtcIpHandlingPolicy != .disableNonProxiedUdp
+        {
+            report.warnings.append(
+                "Fixed proxy mode without \"Disable Non-Proxied UDP\" WebRTC IP policy can leak the real IP address over STUN/UDP."
+            )
+        }
     }
 
     private static func isASCIIAlnum(_ scalar: UnicodeScalar) -> Bool {
@@ -257,19 +277,38 @@ enum CuriumFingerprintValidator {
         value.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value <= 0x7E }
     }
 
+    private static func hasLeadingOrTrailingSpace(_ value: String) -> Bool {
+        guard let first = value.unicodeScalars.first, let last = value.unicodeScalars.last else {
+            return false
+        }
+        return first == " " || last == " "
+    }
+
+    private static func isValidTimezoneCharset(_ tz: String) -> Bool {
+        tz.unicodeScalars.allSatisfy { scalar in
+            isASCIIAlnum(scalar)
+                || scalar == "/" || scalar == "_" || scalar == "-" || scalar == "+" || scalar == "."
+        }
+    }
+
     private static func hasControlChars(_ value: String) -> Bool {
         value.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F }
     }
 
     /// Mirrors Chromium `net::ProxyConfig::ProxyRules::ParseFromString` syntax
-    /// while rejecting `direct://`-only rules and malformed schemes/ports so
-    /// invalid fixed-proxy strings fail at save/import time rather than launch.
+    /// while rejecting `direct://`-only rules, malformed schemes/ports, and per-scheme
+    /// rules that leave HTTP/HTTPS/WSS traffic unproxied (DIRECT real-IP leak).
     static func isValidFixedProxyRules(_ rules: String) -> Bool {
         let allowedRulePrefixes: Set<String> = ["http", "https", "ftp", "socks"]
         let allowedProxySchemes: Set<String> = ["http", "https", "socks", "socks4", "socks5"]
         let clauses = rules.split(separator: ";", omittingEmptySubsequences: false)
         guard !clauses.isEmpty else { return false }
         var foundNonDirectProxy = false
+        var hasPerSchemeClause = false
+        var hasSchemeLessClause = false
+        var hasHTTPClause = false
+        var hasHTTPSClause = false
+        var hasSocksClause = false
 
         for rawClause in clauses {
             let clause = rawClause.trimmingCharacters(in: .whitespaces)
@@ -278,8 +317,13 @@ enum CuriumFingerprintValidator {
             if let eqIdx = clause.firstIndex(of: "=") {
                 let prefix = clause[..<eqIdx].trimmingCharacters(in: .whitespaces).lowercased()
                 guard allowedRulePrefixes.contains(prefix) else { return false }
+                hasPerSchemeClause = true
+                if prefix == "http" { hasHTTPClause = true }
+                if prefix == "https" { hasHTTPSClause = true }
+                if prefix == "socks" { hasSocksClause = true }
                 uriList = String(clause[clause.index(after: eqIdx)...])
             } else {
+                hasSchemeLessClause = true
                 uriList = clause
             }
             let entries = uriList.split(separator: ",", omittingEmptySubsequences: false)
@@ -335,6 +379,15 @@ enum CuriumFingerprintValidator {
                 foundNonDirectProxy = true
             }
         }
-        return foundNonDirectProxy
+        guard foundNonDirectProxy else { return false }
+        if hasPerSchemeClause {
+            // In Chromium's ProxyRules::ParseFromString, mixing per-scheme and scheme-less
+            // clauses ignores one side, and per-scheme rules lacking `socks=` or both
+            // `http=` and `https=` leave web traffic unproxied (DIRECT real-IP leak).
+            guard !hasSchemeLessClause,
+                  hasSocksClause || (hasHTTPClause && hasHTTPSClause)
+            else { return false }
+        }
+        return true
     }
 }

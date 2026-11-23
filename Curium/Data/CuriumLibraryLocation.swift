@@ -24,9 +24,10 @@ enum CuriumLibraryLocation {
     }
 
     /// Durable Curium support root directory (`<AppGroup>/Library/Application Support/Curium`,
-    /// `<Host>/Library/Application Support/Curium`, or `<Standalone AppSupport>/Curium`).
+    /// `<HostContainer>/Library/Application Support/Curium`, or `<Standalone AppSupport>/Curium`).
     static func supportRootDirectory(
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        sharedAppGroupURL: URL? = sharedGroupContainer()
     ) throws -> URL {
         let files = FileManager.default
         let standalone = try files.url(
@@ -36,13 +37,13 @@ enum CuriumLibraryLocation {
         guard let hostPath = environment["LC_HOME_PATH"], !hostPath.isEmpty else {
             return standalone.appending(path: "Curium", directoryHint: .isDirectory)
         }
-        if let group = sharedGroupContainer() {
-            return group
+        if let group = sharedAppGroupURL {
+            return group.standardizedFileURL
                 .appending(path: "Library/Application Support", directoryHint: .isDirectory)
                 .appending(path: "Curium", directoryHint: .isDirectory)
         }
-        let host = URL(fileURLWithPath: hostPath, isDirectory: true).standardizedFileURL
-        return host
+        let hostRoot = resolveLiveContainerHostRoot(from: hostPath)
+        return hostRoot
             .appending(path: "Library/Application Support", directoryHint: .isDirectory)
             .appending(path: "Curium", directoryHint: .isDirectory)
     }
@@ -65,12 +66,20 @@ enum CuriumLibraryLocation {
             .appending(path: profileID, directoryHint: .isDirectory)
     }
 
-    static func resolve(profileID: String = "default") throws -> Resolution {
+    static func resolve(
+        profileID: String = "default",
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        sharedAppGroupURL: URL? = sharedGroupContainer()
+    ) throws -> Resolution {
         guard CuriumFingerprintValidator.isValidProfileID(profileID) else {
             throw CocoaError(.fileNoSuchFile)
         }
         if profileID != "default" {
-            let profileDir = try profileSupportDirectory(for: profileID)
+            let root = try supportRootDirectory(
+                environment: environment,
+                sharedAppGroupURL: sharedAppGroupURL
+            )
+            let profileDir = try profileSupportDirectory(for: profileID, baseSupportRoot: root)
             let dbURL = profileDir.appending(path: fileName, directoryHint: .notDirectory)
             return Resolution(database: dbURL, legacy: [])
         }
@@ -80,18 +89,24 @@ enum CuriumLibraryLocation {
                                        appropriateFor: nil, create: true)
         let ownLibrary = Self.library(in: standalone)
 
-        guard let hostPath = ProcessInfo.processInfo.environment["LC_HOME_PATH"], !hostPath.isEmpty else {
+        guard let hostPath = environment["LC_HOME_PATH"], !hostPath.isEmpty else {
             return Resolution(database: ownLibrary, legacy: [])
         }
-        let host = URL(fileURLWithPath: hostPath, isDirectory: true).standardizedFileURL
-        let hostLibrary = Self.library(in: host.appending(path: "Library/Application Support", directoryHint: .isDirectory))
+        let guestHome = URL(fileURLWithPath: hostPath, isDirectory: true).standardizedFileURL
+        let hostRoot = resolveLiveContainerHostRoot(from: hostPath)
+        let hostLibrary = Self.library(in: hostRoot.appending(path: "Library/Application Support", directoryHint: .isDirectory))
+        let guestLibrary = Self.library(in: guestHome.appending(path: "Library/Application Support", directoryHint: .isDirectory))
 
-        if let group = sharedGroupContainer() {
-            let groupLibrary = Self.library(in: group.appending(path: "Library/Application Support", directoryHint: .isDirectory))
-            return Resolution(database: groupLibrary, legacy: [hostLibrary, ownLibrary])
+        if let group = sharedAppGroupURL {
+            let groupLibrary = Self.library(
+                in: group.standardizedFileURL.appending(path: "Library/Application Support", directoryHint: .isDirectory)
+            )
+            let legacy = deduplicatedLegacy([hostLibrary, guestLibrary, ownLibrary], excluding: groupLibrary)
+            return Resolution(database: groupLibrary, legacy: legacy)
         }
         log.notice("library: LiveContainer App Group unavailable; using the host container")
-        return Resolution(database: hostLibrary, legacy: [ownLibrary])
+        let legacy = deduplicatedLegacy([guestLibrary, ownLibrary], excluding: hostLibrary)
+        return Resolution(database: hostLibrary, legacy: legacy)
     }
 
     /// Copies the newest legacy library into `resolution.database` if it does not exist.
@@ -131,13 +146,33 @@ enum CuriumLibraryLocation {
 
     // MARK: - Private
 
+    private static func resolveLiveContainerHostRoot(from hostPath: String) -> URL {
+        if let hostRoot = CuriumDownloadStorage.resolveLiveContainerHostRoot(fromCandidatePaths: [hostPath]) {
+            return hostRoot.standardizedFileURL
+        }
+        return URL(fileURLWithPath: hostPath, isDirectory: true).standardizedFileURL
+    }
+
+    private static func deduplicatedLegacy(_ candidates: [URL], excluding target: URL) -> [URL] {
+        let excludedPath = target.standardizedFileURL.path
+        var seen: Set<String> = [excludedPath]
+        var result: [URL] = []
+        for candidate in candidates {
+            let path = candidate.standardizedFileURL.path
+            if seen.insert(path).inserted {
+                result.append(candidate)
+            }
+        }
+        return result
+    }
+
     private static func library(in support: URL) -> URL {
         support.appending(path: "Curium/\(fileName)", directoryHint: .notDirectory)
     }
 
     /// The real App Group container. LiveContainer redirects every other group ID into
     /// the guest's own container, so only its own `appGroupID` reaches shared storage.
-    private static func sharedGroupContainer() -> URL? {
+    static func sharedGroupContainer() -> URL? {
         guard let cls = NSClassFromString("LCSharedUtils") as AnyObject?,
               cls.responds(to: NSSelectorFromString("appGroupID")),
               let id = cls.perform(NSSelectorFromString("appGroupID"))?.takeUnretainedValue() as? String,

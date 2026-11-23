@@ -954,6 +954,7 @@ struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
         hardwareVariantID: String? = nil,
         avoidingExisting existingProfiles: [CuriumFingerprintProfile] = [],
         proxy: CuriumProxyConfig? = nil,
+        webrtcIpHandlingPolicy: CuriumWebRTCPolicy? = nil,
         timezone: String? = nil,
         languages: [String]? = nil,
         now: Date = .now
@@ -998,6 +999,11 @@ struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
 
         if let proxy {
             profile.proxy = proxy
+        }
+        if let webrtcIpHandlingPolicy {
+            profile.webrtcIpHandlingPolicy = webrtcIpHandlingPolicy
+        } else if case .fixed = profile.proxy {
+            profile.webrtcIpHandlingPolicy = .disableNonProxiedUdp
         }
         if let timezone {
             let trimmedTZ = timezone.trimmingCharacters(in: .whitespacesAndNewlines)

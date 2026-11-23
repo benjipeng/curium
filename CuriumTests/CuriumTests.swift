@@ -1,11 +1,15 @@
+import AVFAudio
+import AVFoundation
 import CommonCrypto
 import CoreMedia
 import CuriumEngineContract
 import Darwin
 import Foundation
+import JavaScriptCore
 import PDFKit
 import Testing
 import UIKit
+import os
 
 // MARK: - Protocol Mocks
 
@@ -677,6 +681,7 @@ struct CuriumFingerprintTests {
     }
 
     @Test("Fingerprint store persists selection, duplicates, bumps revisions, exports/imports, and protects default")
+    @MainActor
     func storePersistenceAndLifecycle() throws {
         let dir = FileManager.default.temporaryDirectory
             .appending(path: "curium-fp-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -893,6 +898,7 @@ struct CuriumFingerprintTests {
     @Test("Bootstrap fails closed when an explicit profile is selected without a Build 40+ engine")
     @MainActor
     func bootstrapFailsClosedWithoutEngineSupport() throws {
+        defer { CuriumFingerprintBootstrap.resetStateForTesting() }
         let dir = FileManager.default.temporaryDirectory
             .appending(path: "curium-fp-boot-\(UUID().uuidString)", directoryHint: .isDirectory)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -911,6 +917,234 @@ struct CuriumFingerprintTests {
         } else {
             Issue.record("Expected fail-closed rejection when engine lacks Build 40 fingerprint contract, got \(outcome)")
         }
+    }
+
+    @Test("Validator enforces HTTPS fixed-proxy coverage, WebRTC STUN coherence warning, and C++ bounds/charset parity")
+    func validatorFixedProxyHTTPSWebRTCAndCppParity() throws {
+        // P0-1: Scheme-less rules cover all schemes; per-scheme rules must cover HTTP+HTTPS or socks=.
+        #expect(CuriumFingerprintValidator.isValidFixedProxyRules("socks5://127.0.0.1:1080"))
+        #expect(CuriumFingerprintValidator.isValidFixedProxyRules("http://127.0.0.1:8080"))
+        #expect(CuriumFingerprintValidator.isValidFixedProxyRules("127.0.0.1:8080"))
+        #expect(CuriumFingerprintValidator.isValidFixedProxyRules("socks=127.0.0.1:1080"))
+        #expect(CuriumFingerprintValidator.isValidFixedProxyRules("http=127.0.0.1:8080;https=127.0.0.1:8080"))
+        #expect(!CuriumFingerprintValidator.isValidFixedProxyRules("http=127.0.0.1:8080"))
+        #expect(!CuriumFingerprintValidator.isValidFixedProxyRules("https=127.0.0.1:8080"))
+        #expect(!CuriumFingerprintValidator.isValidFixedProxyRules("ftp=127.0.0.1:2121"))
+        #expect(!CuriumFingerprintValidator.isValidFixedProxyRules("http=127.0.0.1:8080;ftp=127.0.0.1:2121"))
+        #expect(!CuriumFingerprintValidator.isValidFixedProxyRules("http=127.0.0.1:8080;socks5://127.0.0.1:1080"))
+
+        // P1-3: Instantiating with a fixed proxy defaults WebRTC to `.disableNonProxiedUdp` (zero warnings),
+        // and pairing `.fixed` with any weaker policy emits a STUN/UDP coherence warning.
+        for templateID in ["macos-desktop", "default", "privacy-hardened"] {
+            let template = try #require(CuriumProfileTemplate.template(for: templateID))
+            let instantiated = template.instantiate(
+                id: "p-a1b2c3d4",
+                displayName: "Proxy \(templateID)",
+                proxy: .fixed(rules: "http=127.0.0.1:8080;https=127.0.0.1:8080", bypassRules: nil)
+            )
+            #expect(instantiated.webrtcIpHandlingPolicy == .disableNonProxiedUdp)
+            let cleanReport = CuriumFingerprintValidator.validate(instantiated)
+            #expect(cleanReport.errors.isEmpty)
+            #expect(cleanReport.warnings.isEmpty)
+
+            var leaky = instantiated
+            leaky.webrtcIpHandlingPolicy = .default
+            let warnReport = CuriumFingerprintValidator.validate(leaky)
+            #expect(warnReport.isValid)
+            #expect(warnReport.warnings.contains { $0.contains("STUN/UDP") || $0.contains("Disable Non-Proxied UDP") })
+        }
+
+        // P1-4: Exact C++ `patches/0106` bounds and charsets.
+        #expect(CuriumFingerprintValidator.isValidClientHintToken("macOS"))
+        #expect(!CuriumFingerprintValidator.isValidClientHintToken(" macOS"))
+        #expect(!CuriumFingerprintValidator.isValidClientHintToken("macOS "))
+
+        var maxOk = CuriumFingerprintPresets.macosDesktopFirst
+        maxOk.id = "p-11223344"
+        maxOk.revision = CuriumFingerprintValidator.maxSafeJSONRevision
+        maxOk.desktop.platform = String(repeating: "A", count: 64)
+        maxOk.desktop.platformVersion = String(repeating: "1", count: 64)
+        maxOk.desktop.architecture = String(repeating: "x", count: 32)
+        maxOk.desktop.fullVersion = String(repeating: "9", count: 32)
+        maxOk.desktop.uaString = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+        maxOk.hardware.timezone = "Etc/GMT+8"
+        #expect(CuriumFingerprintValidator.validate(maxOk).isValid)
+
+        var badBounds = maxOk
+        badBounds.revision = CuriumFingerprintValidator.maxSafeJSONRevision + 1
+        badBounds.desktop.platform = String(repeating: "A", count: 65)
+        badBounds.desktop.platformVersion = String(repeating: "1", count: 65)
+        badBounds.desktop.architecture = String(repeating: "x", count: 33)
+        badBounds.desktop.uaString = "Mozilla/5.0 Café"
+        badBounds.hardware.timezone = "GMT+08:00"
+        let badReport = CuriumFingerprintValidator.validate(badBounds)
+        #expect(!badReport.isValid)
+        #expect(badReport.errors.contains { $0.contains("revision") })
+        #expect(badReport.errors.contains { $0.contains("desktop.platform ") })
+        #expect(badReport.errors.contains { $0.contains("desktop.platformVersion") })
+        #expect(badReport.errors.contains { $0.contains("desktop.architecture") })
+        #expect(badReport.errors.contains { $0.contains("desktop.uaString") })
+        #expect(badReport.errors.contains { $0.contains("Invalid IANA timezone") })
+
+        var untrimmedUA = maxOk
+        untrimmedUA.desktop.uaString = " Mozilla/5.0"
+        #expect(!CuriumFingerprintValidator.validate(untrimmedUA).isValid)
+    }
+
+    @Test("Bootstrap freezes launch proxy/engine snapshot, detects active-profile engine edits, holds companion lock, and fails closed on seed persist failure")
+    @MainActor
+    func bootstrapFrozenSnapshotCompanionLockAndSeedPersistFailClosed() throws {
+        defer { CuriumFingerprintBootstrap.resetStateForTesting() }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-fp-freeze-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let supportRoot = dir.appending(path: "Application Support", directoryHint: .isDirectory)
+        let cachesRoot = dir.appending(path: "Caches", directoryHint: .isDirectory)
+        let curiumRoot = dir.appending(path: "SharedCurium", directoryHint: .isDirectory)
+        let fileURL = curiumRoot.appending(path: CuriumFingerprintStore.fileName, directoryHint: .notDirectory)
+
+        let store = CuriumFingerprintStore(
+            fileURL: fileURL,
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot,
+            curiumSupportRoot: curiumRoot
+        )
+        let fixedProxy = CuriumProxyConfig.fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "localhost")
+        let work = try #require(
+            store.createProfile(
+                fromTemplate: "macos-desktop",
+                displayName: "Work Proxy",
+                proxy: fixedProxy
+            )
+        )
+        #expect(store.selectProfile(id: work.id))
+
+        let v2Caps = CuriumEngineFingerprintCapabilities(dictionary: [
+            "contractVersion": 2,
+            "supportedSchemaVersions": [1, 2],
+            "maxConfigBytes": 65_536,
+        ])
+        let outcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: store,
+            capabilitiesProvider: { v2Caps },
+            configureEngine: { data, _ in data != nil }
+        )
+        guard case .configured(let launchedID, _, _) = outcome else {
+            Issue.record("Expected .configured outcome, got \(outcome)")
+            return
+        }
+        #expect(launchedID == work.id)
+        #expect(CuriumFingerprintBootstrap.activeLaunchProxy == fixedProxy)
+        #expect(CuriumFingerprintBootstrap.frozenLaunchProxy == fixedProxy)
+        #expect(CuriumFingerprintBootstrap.frozenLaunchProfile?.id == work.id)
+        #expect(!store.hasPendingProfileSwitch)
+        #expect(!store.hasPendingActiveProfileEngineChanges)
+
+        // Companion shared support lock must be held with `can-suspend-locked` xattr and block wipes.
+        let sharedLockURL = try #require(
+            CuriumFingerprintProfileStorage.sharedLockFileURL(for: work.id, curiumSupportRoot: curiumRoot)
+        )
+        #expect(FileManager.default.fileExists(atPath: sharedLockURL.path))
+        var suspendXattr: UInt8 = 0
+        let xattrSize = getxattr(
+            sharedLockURL.path,
+            "com.apple.runningboard.can-suspend-locked",
+            &suspendXattr,
+            1,
+            0,
+            0
+        )
+        #expect(xattrSize == 1)
+        #expect(suspendXattr == 1)
+        #expect(throws: CuriumFingerprintProfileStorage.WipeError.profileLockedByAnotherInstance) {
+            try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
+                work.id,
+                isActiveInCurrentProcess: false,
+                applicationSupportRoot: supportRoot,
+                cachesRoot: cachesRoot,
+                curiumSupportRoot: curiumRoot
+            )
+        }
+
+        // P0-2 + P2-1: Mid-session proxy edit keeps `activeLaunchProxy` frozen and lights up `hasPendingProfileSwitch`.
+        var editedProxy = try #require(store.profile(id: work.id))
+        editedProxy.proxy = .direct
+        #expect(store.upsert(editedProxy).isValid)
+        #expect(CuriumFingerprintBootstrap.activeLaunchProxy == fixedProxy)
+        #expect(!store.hasPendingProfileIDChange)
+        #expect(store.hasPendingActiveProfileEngineChanges)
+        #expect(store.hasPendingProfileSwitch)
+
+        // Reverting engine fields and changing only persona metadata clears `hasPendingProfileSwitch`.
+        var personaOnly = try #require(store.profile(id: work.id))
+        personaOnly.proxy = fixedProxy
+        personaOnly.displayName = "Work Proxy Renamed"
+        personaOnly.palette = .californium
+        #expect(store.upsert(personaOnly).isValid)
+        #expect(!store.hasPendingActiveProfileEngineChanges)
+        #expect(!store.hasPendingProfileSwitch)
+
+        // P0-3: External process holding the shared support lock rejects launch before configuring Blink.
+        let other = try #require(store.createProfile(fromTemplate: "privacy-hardened", displayName: "Contended"))
+        let externalFD = try CuriumFingerprintProfileStorage.acquireSharedProfileLock(
+            for: other.id,
+            curiumSupportRoot: curiumRoot
+        )
+        defer { close(externalFD) }
+        #expect(store.selectProfile(id: other.id))
+        var engineCalledWhenLocked = false
+        let lockedOutcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: store,
+            capabilitiesProvider: { v2Caps },
+            configureEngine: { _, _ in
+                engineCalledWhenLocked = true
+                return true
+            }
+        )
+        if case .rejected(let rejectedID, _) = lockedOutcome {
+            #expect(rejectedID == other.id)
+        } else {
+            Issue.record("Expected .rejected when companion lock is held by another session, got \(lockedOutcome)")
+        }
+        #expect(!engineCalledWhenLocked)
+
+        // P2-3: Failing to persist a newly materialized farbling seed fails closed before engine launch.
+        let unseededDir = dir.appending(path: "unseeded", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: unseededDir, withIntermediateDirectories: true)
+        let unseededURL = unseededDir.appending(path: CuriumFingerprintStore.fileName, directoryHint: .notDirectory)
+        var unseededProfile = CuriumFingerprintPresets.privacyHardened
+        unseededProfile.id = "p-feedface"
+        unseededProfile.isBuiltIn = false
+        unseededProfile.fingerprintSeed = nil
+        unseededProfile.farbling = .allEnabled
+        let rawState = CuriumFingerprintStore.PersistedState(
+            version: 2,
+            selectedProfileID: "p-feedface",
+            profiles: [CuriumFingerprintStore.makeDefaultPersonalProfile(), unseededProfile]
+        )
+        try JSONEncoder().encode(rawState).write(to: unseededURL, options: .atomic)
+        // Lock `unseededDir` read-only BEFORE opening the store so `init()` can read the
+        // unseeded file, materializes a seed in memory, fails `persist()`, and leaves the
+        // profile in `migratedSeedIDs`; `prepareEngineLaunch` must then fail closed.
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: unseededDir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: unseededDir.path) }
+        let unseededStore = CuriumFingerprintStore(fileURL: unseededURL)
+        var engineCalledOnSeedFailure = false
+        let seedFailOutcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: unseededStore,
+            capabilitiesProvider: { v2Caps },
+            configureEngine: { _, _ in
+                engineCalledOnSeedFailure = true
+                return true
+            }
+        )
+        if case .rejected(let rejectedID, _) = seedFailOutcome {
+            #expect(rejectedID == "p-feedface")
+        } else {
+            Issue.record("Expected .rejected when seed persistence fails, got \(seedFailOutcome)")
+        }
+        #expect(!engineCalledOnSeedFailure)
     }
 }
 
@@ -1688,6 +1922,7 @@ struct CuriumInlinePDFAndDownloadsTests {
 @Suite("Build 41 Contracts: Schema v2, PDFKit Handoff & Media Radar")
 struct CuriumBuild41ContractTests {
     @Test("Schema v2 wire serialization includes anti-fingerprinting fields and v1 downgrade strips them cleanly")
+    @MainActor
     func schemaV2WireAndV1Downgrade() throws {
         var macSample = CuriumFingerprintPresets.macosDesktopFirst
         macSample.desktop.screen = CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2560, availHeight: 1409, colorDepth: 24)
@@ -1762,6 +1997,7 @@ struct CuriumBuild41ContractTests {
     }
 
     @Test("Store imports both schemaVersion 1 and schemaVersion 2 engine wire payloads")
+    @MainActor
     func storeImportsV1AndV2Wire() throws {
         let dir = FileManager.default.temporaryDirectory
             .appending(path: "curium-v2-import-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -2129,6 +2365,7 @@ struct CuriumAddressBarAndClearanceTests {
 struct CuriumWave1HardeningTests {
     @Test("Corrupt fingerprint-profiles.json fails closed without overwriting and recovers via .bak")
     func corruptStoreFailsClosedAndRecovers() throws {
+        defer { CuriumFingerprintBootstrap.resetStateForTesting() }
         let dir = FileManager.default.temporaryDirectory
             .appending(path: "curium-w1-corrupt-\(UUID().uuidString)", directoryHint: .isDirectory)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -2158,6 +2395,71 @@ struct CuriumWave1HardeningTests {
         #expect(backupFiles.count == 1)
         #expect(try Data(contentsOf: backupFiles[0]) == corruptPayload)
         #expect(CuriumFingerprintBootstrap.prepareEngineLaunch(store: store) == .defaultBuild39)
+    }
+
+    @Test("Persist maintains verified .bak shadow copy, auto-recovers corrupt primary, and preserves tombstones and legacy defaults on reset")
+    func shadowBackupRecoveryAndTombstonePreservation() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-w1-bak-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let storeURL = dir.appending(path: CuriumFingerprintStore.fileName)
+        let shadowURL = CuriumFingerprintStore.lastKnownGoodBackupURL(for: storeURL)
+        let store = CuriumFingerprintStore(fileURL: storeURL)
+        let retiredTarget = try #require(store.createProfile(fromTemplate: "macos-desktop", displayName: "Retire Me"))
+        let survivor = try #require(store.createProfile(fromTemplate: "privacy-hardened", displayName: "Survivor"))
+        #expect(store.deleteProfile(id: retiredTarget.id))
+        #expect(FileManager.default.fileExists(atPath: shadowURL.path))
+
+        // Corrupt primary while valid shadow `.bak` exists -> auto-recovers cleanly and preserves tombstones.
+        try Data("{ truncated primary".utf8).write(to: storeURL)
+        let recovered = CuriumFingerprintStore(fileURL: storeURL)
+        #expect(recovered.loadError == nil)
+        #expect(recovered.recoveredFromBackup)
+        #expect(recovered.profile(id: survivor.id)?.displayName == "Survivor")
+        #expect(recovered.retiredProfileIDs.contains(retiredTarget.id.lowercased()))
+        let healedState = try JSONDecoder().decode(
+            CuriumFingerprintStore.PersistedState.self,
+            from: try Data(contentsOf: storeURL)
+        )
+        #expect(healedState.profiles.contains { $0.id == survivor.id })
+
+        // Unrecoverable corruption (no valid `.bak`): reset preserves extracted tombstones + legacy defaults.
+        try? FileManager.default.removeItem(at: shadowURL)
+        let brokenSchemaJSON = Data("""
+        {
+          "version": 2,
+          "retiredProfileIDs": ["p-deadbeef", "p-cafebabe"],
+          "profiles": [{ "id": "corrupt-entry-missing-fields" }]
+        }
+        """.utf8)
+        try brokenSchemaJSON.write(to: storeURL)
+
+        let failedStore = CuriumFingerprintStore(fileURL: storeURL)
+        #expect(failedStore.loadError != nil)
+        #expect(failedStore.retiredProfileIDs.contains("p-deadbeef"))
+        #expect(failedStore.retiredProfileIDs.contains("p-cafebabe"))
+
+        let suiteName = "curium.reset.legacy.\(UUID().uuidString)"
+        let suite = try #require(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        suite.set("chromium", forKey: "curium.uaBrand")
+        suite.set("ios", forKey: "curium.mobileUA")
+
+        #expect(failedStore.backupCorruptStoreAndReset(preserveLegacyDefaults: true, defaults: suite))
+        #expect(failedStore.loadError == nil)
+        #expect(failedStore.retiredProfileIDs.contains("p-deadbeef"))
+        #expect(failedStore.retiredProfileIDs.contains("p-cafebabe"))
+
+        var retiredReuse = CuriumFingerprintPresets.macosDesktopFirst
+        retiredReuse.id = "p-deadbeef"
+        #expect(!failedStore.upsert(retiredReuse).isValid)
+
+        let personal = try #require(failedStore.profile(id: "default"))
+        #expect(personal.mobile.platform == "iOS")
+        #expect(personal.mobile.primaryBrand == "")
+        #expect(personal.desktop.primaryBrand == "")
     }
 
     @Test("Duplicating a farbled profile rotates fingerprintSeed and blocks orphaned slug reuse")
@@ -2346,6 +2648,7 @@ struct CuriumWave2MultiProfileAndDownloadsTests {
     }
 
     @Test("v1 store automatically migrates to v2 retaining default, custom, selected, and on-disk profiles")
+    @MainActor
     func v1ToV2AutomaticMigration() throws {
         let root = try makeTempDir("curium-w2-migrate")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2449,6 +2752,7 @@ struct CuriumWave2MultiProfileAndDownloadsTests {
     }
 
     @Test("Immutable p-<8hex> creation, tombstone ledger, persona metadata, delete guards, and actinide palettes")
+    @MainActor
     func immutableSlugCreationTombstonesPersonaMetadataAndDeleteGuards() throws {
         let root = try makeTempDir("curium-w2-slugs")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2834,6 +3138,210 @@ struct CuriumWave2MultiProfileAndDownloadsTests {
         #expect(restoredStore.activeTab?.url?.absoluteString == "https://webkit.org")
     }
 
+    @Test("CuriumLibraryLocation walks 3 parents above LC_HOME_PATH and shared companion lock blocks cross-instance wipes")
+    func liveContainerHostFallbackAndSharedLockWipeProtection() throws {
+        let privateGuest = "/var/mobile/Containers/Data/Application/HOST-UUID-1/Documents/Data/Application/GUEST-UUID-1"
+        let privateRoot = try CuriumLibraryLocation.supportRootDirectory(
+            environment: ["LC_HOME_PATH": privateGuest],
+            sharedAppGroupURL: nil
+        )
+        #expect(privateRoot.path == "/var/mobile/Containers/Data/Application/HOST-UUID-1/Library/Application Support/Curium")
+
+        let privateRes = try CuriumLibraryLocation.resolve(
+            profileID: "default",
+            environment: ["LC_HOME_PATH": privateGuest],
+            sharedAppGroupURL: nil
+        )
+        #expect(privateRes.database.path == "/var/mobile/Containers/Data/Application/HOST-UUID-1/Library/Application Support/Curium/curium.sqlite")
+        #expect(privateRes.legacy.contains { $0.path == "\(privateGuest)/Library/Application Support/Curium/curium.sqlite" })
+
+        let sharedGuest = "/var/mobile/Containers/Shared/AppGroup/GROUP-UUID-2/LiveContainer/Data/Application/GUEST-UUID-2"
+        let sharedFallbackRoot = try CuriumLibraryLocation.supportRootDirectory(
+            environment: ["LC_HOME_PATH": sharedGuest],
+            sharedAppGroupURL: nil
+        )
+        #expect(sharedFallbackRoot.path == "/var/mobile/Containers/Shared/AppGroup/GROUP-UUID-2/Library/Application Support/Curium")
+
+        let appGroupURL = URL(fileURLWithPath: "/var/mobile/Containers/Shared/AppGroup/REAL-GROUP", isDirectory: true)
+        let appGroupRes = try CuriumLibraryLocation.resolve(
+            profileID: "default",
+            environment: ["LC_HOME_PATH": privateGuest],
+            sharedAppGroupURL: appGroupURL
+        )
+        #expect(appGroupRes.database.path == "/var/mobile/Containers/Shared/AppGroup/REAL-GROUP/Library/Application Support/Curium/curium.sqlite")
+        #expect(appGroupRes.legacy.contains { $0.path == "/var/mobile/Containers/Data/Application/HOST-UUID-1/Library/Application Support/Curium/curium.sqlite" })
+        #expect(appGroupRes.legacy.contains { $0.path == "\(privateGuest)/Library/Application Support/Curium/curium.sqlite" })
+
+        // Cross-instance LiveContainer wipe protection: even when ChromiumProfiles/<slug> has NO lock file,
+        // holding the shared support lock in <CuriumSupportRoot>/Profiles/<slug>/.curium_profile.lock
+        // blocks wiping ALL directories.
+        let root = try makeTempDir("curium-w2-shared-lock")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let appSupport = root.appending(path: "HostB-AppSupport", directoryHint: .isDirectory)
+        let caches = root.appending(path: "HostB-Caches", directoryHint: .isDirectory)
+        let sharedCurium = root.appending(path: "SharedAppGroup-Curium", directoryHint: .isDirectory)
+
+        let loc = try #require(
+            CuriumFingerprintProfileStorage.locations(
+                for: "p-1234abcd",
+                applicationSupportRoot: appSupport,
+                cachesRoot: caches,
+                curiumSupportRoot: sharedCurium
+            )
+        )
+        try FileManager.default.createDirectory(at: loc.supportDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: loc.cacheDirectory, withIntermediateDirectories: true)
+        try Data("cookies".utf8).write(to: loc.supportDirectory.appending(path: "Cookies"))
+
+        let sharedFD = try CuriumFingerprintProfileStorage.acquireSharedProfileLock(
+            for: "p-1234abcd",
+            curiumSupportRoot: sharedCurium
+        )
+        #expect(throws: CuriumFingerprintProfileStorage.WipeError.profileLockedByAnotherInstance) {
+            try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
+                "p-1234abcd",
+                isActiveInCurrentProcess: false,
+                applicationSupportRoot: appSupport,
+                cachesRoot: caches,
+                curiumSupportRoot: sharedCurium
+            )
+        }
+        #expect(FileManager.default.fileExists(atPath: loc.supportDirectory.path))
+        #expect(FileManager.default.fileExists(atPath: try #require(loc.curiumProfileDirectory).path))
+
+        close(sharedFD)
+        try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
+            "p-1234abcd",
+            isActiveInCurrentProcess: false,
+            applicationSupportRoot: appSupport,
+            cachesRoot: caches,
+            curiumSupportRoot: sharedCurium
+        )
+        #expect(!FileManager.default.fileExists(atPath: loc.supportDirectory.path))
+        #expect(!FileManager.default.fileExists(atPath: loc.cacheDirectory.path))
+        #expect(!FileManager.default.fileExists(atPath: try #require(loc.curiumProfileDirectory).path))
+    }
+
+    @Test("Legacy UserDefaults identity settings fold into Personal and stay synced across Settings and Profile Editor")
+    @MainActor
+    func legacyIdentityDefaultsSyncWithPersonal() throws {
+        let suiteName = "curium.legacy.sync.\(UUID().uuidString)"
+        let suite = try #require(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+
+        suite.set("chromium", forKey: "curium.uaBrand")
+        suite.set("ios", forKey: "curium.mobileUA")
+        suite.set("ja-JP;q=0.9, en-US, bad;tag", forKey: "curium.acceptLang")
+        suite.set("Pixel 9", forKey: "curium.mobileModel")
+        suite.set(CuriumPalette.americium.rawValue, forKey: "curium.palette")
+        suite.set(CuriumSiteMode.desktop.rawValue, forKey: "curium.siteMode")
+        suite.set(CuriumSearchEngine.brave.rawValue, forKey: "curium.searchEngine")
+
+        let iosPersonal = CuriumFingerprintStore.makeDefaultPersonalProfile(
+            preserveLegacyDefaults: true,
+            defaults: suite
+        )
+        #expect(iosPersonal.mobile.platform == "iOS")
+        #expect(iosPersonal.mobile.navigatorPlatform == "iPhone")
+        #expect(iosPersonal.mobile.osCpu == "iPhone; CPU iPhone OS 18_7 like Mac OS X")
+        #expect(iosPersonal.mobile.primaryBrand == "")
+        #expect(iosPersonal.desktop.primaryBrand == "")
+        #expect(iosPersonal.mobile.model == "")
+        #expect(iosPersonal.languages == ["ja-JP", "en-US"])
+        #expect(iosPersonal.palette == .americium)
+        #expect(iosPersonal.siteMode == .desktop)
+        #expect(iosPersonal.searchEngine == .brave)
+        #expect(iosPersonal.supportsLegacyIdentityPickers)
+
+        suite.set("android", forKey: "curium.mobileUA")
+        let androidPersonal = CuriumFingerprintStore.makeDefaultPersonalProfile(
+            preserveLegacyDefaults: true,
+            defaults: suite
+        )
+        #expect(androidPersonal.mobile.platform == "Android")
+        #expect(androidPersonal.mobile.model == "Pixel 9")
+        #expect(androidPersonal.supportsLegacyIdentityPickers)
+
+        // Applying Settings pickers to Personal and later toggling an unrelated flag (DNT) preserves them.
+        let root = try makeTempDir("curium-w2-legacy-sync")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CuriumFingerprintStore(fileURL: root.appending(path: CuriumFingerprintStore.fileName))
+        #expect(store.applyLegacyIdentityPreferencesToPersonal(uaBrand: "chromium", mobileUA: "ios", defaults: suite))
+        #expect(store.selectedProfileID == "default")
+        #expect(suite.string(forKey: "curium.uaBrand") == "chromium")
+        #expect(suite.string(forKey: "curium.mobileUA") == "ios")
+
+        var edited = try #require(store.profile(id: "default"))
+        #expect(edited.supportsLegacyIdentityPickers)
+        edited.enableDoNotTrack = true
+        #expect(store.upsert(edited).isValid)
+
+        let saved = try #require(store.profile(id: "default"))
+        #expect(saved.enableDoNotTrack)
+        #expect(saved.mobile.platform == "iOS")
+        #expect(saved.mobile.primaryBrand == "")
+        #expect(saved.desktop.primaryBrand == "")
+        #expect(!saved.supportsLegacyIdentityPickers)
+    }
+
+    @Test("Store resolves profile IDs case-insensitively across export, duplicate, delete, and deleteAndWipe")
+    @MainActor
+    func caseInsensitiveStoreMutations() throws {
+        let root = try makeTempDir("curium-w2-case")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let appSupport = root.appending(path: "Application Support", directoryHint: .isDirectory)
+        let caches = root.appending(path: "Caches", directoryHint: .isDirectory)
+        let curiumRoot = root.appending(path: "Curium", directoryHint: .isDirectory)
+        let store = CuriumFingerprintStore(
+            fileURL: curiumRoot.appending(path: CuriumFingerprintStore.fileName),
+            applicationSupportRoot: appSupport,
+            cachesRoot: caches,
+            curiumSupportRoot: curiumRoot
+        )
+
+        let created = try #require(store.createProfile(fromTemplate: "macos-desktop", displayName: "Case Test"))
+        let upperID = created.id.uppercased()
+
+        let exported = try store.exportProfileJSON(id: upperID)
+        #expect(!exported.isEmpty)
+
+        let dup = try #require(store.duplicateProfile(from: upperID, displayName: "Case Copy"))
+        #expect(dup.id != created.id)
+
+        let loc = try #require(
+            CuriumFingerprintProfileStorage.locations(
+                for: created.id,
+                applicationSupportRoot: appSupport,
+                cachesRoot: caches,
+                curiumSupportRoot: curiumRoot
+            )
+        )
+        try FileManager.default.createDirectory(at: loc.supportDirectory, withIntermediateDirectories: true)
+        try Data("state".utf8).write(to: loc.supportDirectory.appending(path: "Cookies"))
+
+        let wipedAndDeleted = try store.deleteProfileAndWipeStorage(
+            id: upperID,
+            isActiveInCurrentProcess: false
+        )
+        #expect(wipedAndDeleted)
+        #expect(!FileManager.default.fileExists(atPath: loc.supportDirectory.path))
+        #expect(store.profile(id: created.id) == nil)
+        #expect(store.retiredProfileIDs.contains(created.id.lowercased()))
+
+        #expect(store.deleteProfile(id: dup.id.uppercased()))
+        #expect(store.profile(id: dup.id) == nil)
+
+        // Unknown slug must return false without wiping an unrelated on-disk directory.
+        let orphanDir = appSupport.appending(path: "ChromiumProfiles/orphan-keep", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: orphanDir, withIntermediateDirectories: true)
+        let missingDeleted = try store.deleteProfileAndWipeStorage(
+            id: "orphan-keep",
+            isActiveInCurrentProcess: false
+        )
+        #expect(!missingDeleted)
+        #expect(FileManager.default.fileExists(atPath: orphanDir.path))
+    }
+
     @Test("LiveContainer Tier A 3-parent walk, Tier B bookmark record, per-profile PDF cache, and staged commit")
     func liveContainerTierATierBPDFCacheAndStagedCommit() throws {
         // 1. Tier A Private LiveContainer 3-parent walk -> <HostContainer>/Documents/Curium/Downloads.
@@ -3198,6 +3706,7 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
         }
 
         // Default Personal baseline remains 100% untouched Build 39 native behavior.
+        defer { CuriumFingerprintBootstrap.resetStateForTesting() }
         let rootDir = try makeTempDir("curium-pa-default")
         defer { try? FileManager.default.removeItem(at: rootDir) }
         let store = CuriumFingerprintStore(fileURL: rootDir.appending(path: CuriumFingerprintStore.fileName))
@@ -3209,6 +3718,7 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
     }
 
     @Test("Default createProfile across all verified templates enables farbling with unique 256-bit seeds, supports explicit chip/RAM selection, and honors enableFarbling: false")
+    @MainActor
     func createProfileDefaultFarblingAndExplicitOptOut() throws {
         let rootDir = try makeTempDir("curium-pa-seeds")
         defer { try? FileManager.default.removeItem(at: rootDir) }
@@ -3287,6 +3797,7 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
     }
 
     @Test("Consecutive createProfile calls from multi-variant templates yield distinct GPU, screen, and hardware signatures")
+    @MainActor
     func consecutiveCreateProfileCollisionFreeDifferentiation() throws {
         let multiVariantIDs = [
             "macos-desktop",
@@ -3369,6 +3880,7 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
     }
 
     @Test("createProfile persists custom Fixed Proxy, timezone, and languages and fails closed on invalid inputs")
+    @MainActor
     func createProfileNetworkLocalePersistenceAndFailClosedValidation() throws {
         let rootDir = try makeTempDir("curium-pa-net")
         defer { try? FileManager.default.removeItem(at: rootDir) }
@@ -3468,6 +3980,7 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
     }
 
     @Test("rollCoherentHardwareVariant rotates to a distinct variant while preserving identity, proxy, timezone, languages, and seed")
+    @MainActor
     func rollCoherentHardwareVariantRotatesAndPreservesMetadata() throws {
         let rootDir = try makeTempDir("curium-pa-roll")
         defer { try? FileManager.default.removeItem(at: rootDir) }
@@ -3577,6 +4090,37 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
 
 @Suite("Media Radar, HLS Parser & Authenticated Media Downloads")
 struct CuriumMediaRadarAndDownloaderTests {
+    private actor StagedCommitTestGate {
+        private var entered = false
+        private var enteredWaiter: CheckedContinuation<Void, Never>?
+        private var released = false
+        private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+        func markEnteredAndWaitForRelease() async {
+            entered = true
+            enteredWaiter?.resume()
+            enteredWaiter = nil
+            if !released {
+                await withCheckedContinuation { cont in
+                    releaseWaiter = cont
+                }
+            }
+        }
+
+        func waitUntilEntered() async {
+            if !entered {
+                await withCheckedContinuation { cont in
+                    enteredWaiter = cont
+                }
+            }
+        }
+
+        func release() {
+            released = true
+            releaseWaiter?.resume()
+            releaseWaiter = nil
+        }
+    }
     private func makeTempDir(_ prefix: String = "curium-mr") throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appending(path: "\(prefix)-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -4136,13 +4680,16 @@ struct CuriumMediaRadarAndDownloaderTests {
         #expect((httpDict["HTTPSProxy"] as? String) == "proxy.internal")
         #expect((httpDict["HTTPSPort"] as? Int) == 8080)
 
+        // Explicit `https://` TLS-to-proxy scheme cannot be expressed in CFNetwork connectionProxyDictionary
+        // (whose HTTPSProxy is plaintext HTTP CONNECT), so it fails closed rather than downgrading to cleartext.
         let httpsDict = try #require(CuriumMediaNetworking.proxyDictionary(
             for: .fixed(rules: "https://tls-proxy.internal:8443", bypassRules: nil)
         ))
-        #expect((httpsDict["HTTPEnable"] as? Int) == 1)
-        #expect((httpsDict["HTTPSEnable"] as? Int) == 1)
-        #expect((httpsDict["HTTPSProxy"] as? String) == "tls-proxy.internal")
-        #expect((httpsDict["HTTPSPort"] as? Int) == 8443)
+        #expect((httpsDict["SOCKSEnable"] as? Int) == 1)
+        #expect((httpsDict["SOCKSProxy"] as? String) == "127.0.0.1")
+        #expect((httpsDict["SOCKSPort"] as? Int) == 1)
+        #expect(httpsDict["HTTPEnable"] == nil)
+        #expect(httpsDict["HTTPSEnable"] == nil)
 
         let splitIPv6Dict = try #require(CuriumMediaNetworking.proxyDictionary(
             for: .fixed(rules: "http=10.0.0.2:3128;https=socks5://[::1]:1085", bypassRules: nil)
@@ -4560,6 +5107,1249 @@ struct CuriumMediaRadarAndDownloaderTests {
         #expect(bipbopInspection.referencedPlaylistURLs.contains(appleAudioChild))
         #expect(bipbopInspection.referencedPlaylistURLs.contains(
             try #require(URL(string: "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/v5/iframe_index.m3u8"))
+        ))
+    }
+
+    @Test("P0-1: Fixed proxy blackholes unconfigured HTTP/HTTPS slots, fails closed on https:// proxy scheme, and honors <-loopback>")
+    func fixedProxyBlackholesMissingSlotsRejectsHTTPSProxyAndHonorsNegatedLoopback() throws {
+        // Single-scheme http= must blackhole HTTPS to 127.0.0.1:1 so https:// never leaks direct.
+        let httpOnly = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "http=10.0.0.1:8080", bypassRules: nil)
+        ))
+        #expect((httpOnly["HTTPEnable"] as? Int) == 1)
+        #expect((httpOnly["HTTPProxy"] as? String) == "10.0.0.1")
+        #expect((httpOnly["HTTPPort"] as? Int) == 8080)
+        #expect((httpOnly["HTTPSEnable"] as? Int) == 1)
+        #expect((httpOnly["HTTPSProxy"] as? String) == "127.0.0.1")
+        #expect((httpOnly["HTTPSPort"] as? Int) == 1)
+
+        // Single-scheme https= must blackhole HTTP to 127.0.0.1:1 so http:// never leaks direct.
+        let httpsOnly = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "https=10.0.0.1:8443", bypassRules: nil)
+        ))
+        #expect((httpsOnly["HTTPSEnable"] as? Int) == 1)
+        #expect((httpsOnly["HTTPSProxy"] as? String) == "10.0.0.1")
+        #expect((httpsOnly["HTTPSPort"] as? Int) == 8443)
+        #expect((httpsOnly["HTTPEnable"] as? Int) == 1)
+        #expect((httpsOnly["HTTPProxy"] as? String) == "127.0.0.1")
+        #expect((httpsOnly["HTTPPort"] as? Int) == 1)
+
+        // Explicit `https://` TLS-to-proxy in a fallback list must fail closed instead of downgrading to plaintext.
+        let httpsWithFallback = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "https://tls-proxy.internal:8443,http://cleartext-fallback:8080", bypassRules: nil)
+        ))
+        #expect((httpsWithFallback["SOCKSEnable"] as? Int) == 1)
+        #expect((httpsWithFallback["SOCKSProxy"] as? String) == "127.0.0.1")
+        #expect((httpsWithFallback["SOCKSPort"] as? Int) == 1)
+        #expect(httpsWithFallback["HTTPProxy"] == nil)
+
+        // Per-scheme https=https://tls-proxy fails closed on HTTPS while keeping explicit HTTP proxy.
+        let mixedTLS = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "http=10.0.0.1:8080;https=https://tls-proxy.internal:8443", bypassRules: nil)
+        ))
+        #expect((mixedTLS["HTTPProxy"] as? String) == "10.0.0.1")
+        #expect((mixedTLS["HTTPSProxy"] as? String) == "127.0.0.1")
+        #expect((mixedTLS["HTTPSPort"] as? Int) == 1)
+
+        // Unsupported ftp=socks5:// must not bind SOCKS for HTTP/HTTPS.
+        let ftpSocks = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "ftp=socks5://10.0.0.9:1080", bypassRules: nil)
+        ))
+        #expect((ftpSocks["SOCKSProxy"] as? String) == "127.0.0.1")
+        #expect((ftpSocks["SOCKSPort"] as? Int) == 1)
+
+        // <-loopback> is stripped from ExceptionsList and removes explicit loopback bypasses.
+        let loopbackOnly = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "<-loopback>")
+        ))
+        #expect(loopbackOnly["ExceptionsList"] == nil)
+
+        let loopbackMixed = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "localhost,127.0.0.1,[::1],sub.localhost,<-loopback>,*.internal")
+        ))
+        #expect((loopbackMixed["ExceptionsList"] as? [String]) == ["*.internal"])
+    }
+
+    @Test("P0-2: HostCookieCache scopes cookies by (scheme, host, directoryPath) and never leaks https cookies over http://")
+    func hostCookieCacheEnforcesSchemeAndDirectoryPathScoping() async throws {
+        let baseURL = try #require(URL(string: "https://media.example.com/private/v1/master.m3u8"))
+        let sameDirSeg = try #require(URL(string: "https://media.example.com/private/v1/seg0.ts"))
+        let downgradedHTTPSeg = try #require(URL(string: "http://media.example.com/private/v1/seg0.ts"))
+        let siblingPathSeg = try #require(URL(string: "https://media.example.com/public/seg0.ts"))
+        let traversalSeg = try #require(URL(string: "https://media.example.com/private/v1/../../public/seg1.ts"))
+        let nestedSubSeg0 = try #require(URL(string: "https://media.example.com/private/v1/sub/seg0.ts"))
+        let nestedSubSeg1 = try #require(URL(string: "https://media.example.com/private/v1/sub/seg1.ts"))
+
+        // 1. With no provider: only exact (scheme, host, directoryPath) reuses baseCookie; scheme/path drift fails closed to nil.
+        let noProviderCache = CuriumMediaNetworking.HostCookieCache(
+            baseURL: baseURL,
+            baseCookie: "sid=secret_https_private",
+            provider: nil
+        )
+        #expect(await noProviderCache.cookieHeader(for: sameDirSeg) == "sid=secret_https_private")
+        #expect(await noProviderCache.cookieHeader(for: downgradedHTTPSeg) == nil)
+        #expect(await noProviderCache.cookieHeader(for: siblingPathSeg) == nil)
+        #expect(await noProviderCache.cookieHeader(for: traversalSeg) == nil)
+        #expect(await noProviderCache.cookieHeader(for: nestedSubSeg0) == nil)
+
+        // 2. With provider: same scope avoids @MainActor hop; scheme downgrade & path divergence re-query and cache per scope.
+        let queriedURLs = OSAllocatedUnfairLock<[URL]>(initialState: [])
+        let cache = CuriumMediaNetworking.HostCookieCache(
+            baseURL: baseURL,
+            baseCookie: "sid=secret_https_private",
+            provider: { url in
+                queriedURLs.withLock { $0.append(url) }
+                if url.scheme == "http" {
+                    return "public_nonsecure=1"
+                }
+                if url.path.hasPrefix("/private/v1/sub/") {
+                    return "sid=secret_https_private; sub=yes"
+                }
+                return "public_https=1"
+            }
+        )
+
+        #expect(await cache.cookieHeader(for: sameDirSeg) == "sid=secret_https_private")
+        #expect(queriedURLs.withLock { $0.isEmpty })
+
+        #expect(await cache.cookieHeader(for: downgradedHTTPSeg) == "public_nonsecure=1")
+        #expect(await cache.cookieHeader(for: siblingPathSeg) == "public_https=1")
+        // Dot-segment path normalizes to `/public/`, hitting the `/public/` cache without re-querying.
+        #expect(await cache.cookieHeader(for: traversalSeg) == "public_https=1")
+        // Nested subpath queries once and caches for sibling segments in `/private/v1/sub/`.
+        #expect(await cache.cookieHeader(for: nestedSubSeg0) == "sid=secret_https_private; sub=yes")
+        #expect(await cache.cookieHeader(for: nestedSubSeg1) == "sid=secret_https_private; sub=yes")
+
+        let allQueried = queriedURLs.withLock { $0 }
+        #expect(allQueried.count == 3)
+        #expect(allQueried[0] == downgradedHTTPSeg)
+        #expect(allQueried[1] == siblingPathSeg)
+        #expect(allQueried[2] == nestedSubSeg0)
+    }
+
+    @Test("Profile-audit P0-2 consumer: makeMediaRequestContext uses immutable frozen launch proxy across mid-session edits")
+    @MainActor
+    func makeMediaRequestContextUsesFrozenLaunchProxyAcrossMidSessionProfileEdits() async throws {
+        defer { CuriumFingerprintBootstrap.resetStateForTesting() }
+
+        let dir = try makeTempDir("curium-mr-frozen-proxy")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let supportRoot = dir.appending(path: "Application Support", directoryHint: .isDirectory)
+        let cachesRoot = dir.appending(path: "Caches", directoryHint: .isDirectory)
+        let curiumRoot = dir.appending(path: "SharedCurium", directoryHint: .isDirectory)
+        let fileURL = curiumRoot.appending(path: CuriumFingerprintStore.fileName, directoryHint: .notDirectory)
+
+        let fpStore = CuriumFingerprintStore(
+            fileURL: fileURL,
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot,
+            curiumSupportRoot: curiumRoot
+        )
+        let launchProxy = CuriumProxyConfig.fixed(rules: "socks5://127.0.0.1:1080", bypassRules: nil)
+        let work = try #require(
+            fpStore.createProfile(
+                fromTemplate: "macos-desktop",
+                displayName: "Proxy Locked",
+                proxy: launchProxy
+            )
+        )
+        #expect(fpStore.selectProfile(id: work.id))
+
+        let v2Caps = CuriumEngineFingerprintCapabilities(dictionary: [
+            "contractVersion": 2,
+            "supportedSchemaVersions": [1, 2],
+            "maxConfigBytes": 65_536,
+        ])
+        let outcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: fpStore,
+            capabilitiesProvider: { v2Caps },
+            configureEngine: { data, _ in data != nil }
+        )
+        guard case .configured(let launchedID, _, _) = outcome else {
+            Issue.record("Expected configured launch outcome, got \(outcome)")
+            return
+        }
+        #expect(launchedID == work.id)
+
+        let host = MockBrowserHost()
+        let tab = MockTabHost(tabID: "t-proxy", url: URL(string: "https://media.example/watch"))
+        host.tabs = [tab]
+        host.activeTab = tab
+        let browserStore = CuriumBrowserStore(
+            host: host,
+            activeProfileID: work.id,
+            fingerprintStore: fpStore,
+            restoreSession: false
+        )
+
+        // Mutate the active running profile's proxy in the store to `.direct` mid-session.
+        var edited = try #require(fpStore.profile(id: work.id))
+        edited.proxy = .direct
+        #expect(fpStore.upsert(edited).isValid)
+        #expect(fpStore.profile(id: work.id)?.proxy == .direct)
+
+        // Both synchronous accessor and async makeMediaRequestContext MUST stay pinned to frozen launchProxy.
+        #expect(browserStore.effectiveMediaLaunchProxy() == launchProxy)
+        let context = await browserStore.makeMediaRequestContext(
+            for: try #require(URL(string: "https://cdn.media.example/stream.m3u8")),
+            candidate: nil,
+            inTabID: "t-proxy"
+        )
+        #expect(context.proxy == launchProxy)
+    }
+
+    @Test("P1-3: Separate-audio HLS preserves URI-less DEFAULT=YES muxed audio, detects packed audio extensions, and surfaces mux failures")
+    func hlsSeparateAudioMuxedDefaultPackedExtensionsAndFailureSurfacing() async throws {
+        let baseURL = try #require(URL(string: "https://cdn.video.example/master.m3u8"))
+
+        // 1. Secondary commentary URI appearing BEFORE muxed DEFAULT=YES (no URI) must NOT overwrite primary muxed track.
+        let commentaryFirstMaster = """
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Commentary",DEFAULT=NO,AUTOSELECT=YES,URI="commentary.m3u8"
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English Main",DEFAULT=YES,AUTOSELECT=YES
+        #EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1920x1080,AUDIO="aud"
+        1080p.m3u8
+        """
+        let inspection1 = try CuriumHLSParser.parseMasterOrMedia(text: commentaryFirstMaster, baseURL: baseURL)
+        #expect(inspection1.variants.count == 1)
+        #expect(inspection1.variants[0].audioGroupID == "aud")
+        #expect(inspection1.variants[0].audioURI == nil)
+        #expect(inspection1.referencedPlaylistURLs.contains(try #require(URL(string: "https://cdn.video.example/commentary.m3u8"))))
+
+        // 2. Muxed DEFAULT=YES appearing BEFORE commentary URI must also stay nil.
+        let defaultFirstMaster = """
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English Main",DEFAULT=YES,AUTOSELECT=YES
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Spanish",DEFAULT=NO,AUTOSELECT=YES,URI="es.m3u8"
+        #EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1920x1080,AUDIO="aud"
+        1080p.m3u8
+        """
+        let inspection2 = try CuriumHLSParser.parseMasterOrMedia(text: defaultFirstMaster, baseURL: baseURL)
+        #expect(inspection2.variants[0].audioURI == nil)
+        #expect(inspection2.referencedPlaylistURLs.contains(try #require(URL(string: "https://cdn.video.example/es.m3u8"))))
+
+        // 3. Packed audio extension detection (fMP4 -> .m4a, packed ADTS/AC-3/EC-3/MP3 -> native ext, TS -> .ts).
+        for (segName, expectedExt) in [
+            ("seg0.m4s", "m4a"),
+            ("seg0.aac", "aac"),
+            ("seg0.adts", "aac"),
+            ("seg0.ac3", "ac3"),
+            ("seg0.ec3", "ec3"),
+            ("seg0.mp3", "mp3"),
+            ("seg0.ts", "ts"),
+        ] {
+            let playlistText = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\n\(segName)\n#EXT-X-ENDLIST"
+            let media = try CuriumHLSParser.parseMediaPlaylist(text: playlistText, baseURL: baseURL)
+            #expect(CuriumHLSMediaDownloadTask.preferredAudioTrackExtension(for: media) == expectedExt)
+        }
+
+        // 4. muxFMP4Tracks surfaces audioMuxFailed cleanly on invalid media and rethrows CancellationError when cancelled.
+        let dir = try makeTempDir("curium-mr-mux")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let badVideo = dir.appending(path: "bad.mp4", directoryHint: .notDirectory)
+        let badAudio = dir.appending(path: "bad.m4a", directoryHint: .notDirectory)
+        let outMux = dir.appending(path: "out.mp4", directoryHint: .notDirectory)
+        try Data("not-an-mp4".utf8).write(to: badVideo)
+        try Data("not-an-m4a".utf8).write(to: badAudio)
+
+        do {
+            try await CuriumHLSMediaDownloadTask.muxFMP4Tracks(videoURL: badVideo, audioURL: badAudio, outputURL: outMux)
+            Issue.record("Expected muxFMP4Tracks to throw audioMuxFailed on unreadable inputs")
+        } catch let error as CuriumMediaDownloadError {
+            if case .audioMuxFailed = error {
+                // Expected clean failure surfaced instead of silently saving mute video.
+            } else {
+                Issue.record("Expected .audioMuxFailed, got \(error)")
+            }
+        }
+
+        let cancelledTask = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await CuriumHLSMediaDownloadTask.muxFMP4Tracks(videoURL: badVideo, audioURL: badAudio, outputURL: outMux)
+        }
+        do {
+            try await cancelledTask.value
+            Issue.record("Expected CancellationError when cancelled before muxing")
+        } catch is CancellationError {
+            // Expected.
+        }
+    }
+
+    @Test("P1-4: CuriumBackgroundKeepAlive preserves WebRTC/PiP audio sessions, skips deactivation while playing, and respects .shouldResume")
+    @MainActor
+    func backgroundKeepAlivePreservesWebRTCAndPiPAndRespectsShouldResume() {
+        // Category preservation: never clobber WebRTC `.playAndRecord` or active PiP non-mixing `.playback`.
+        #expect(CuriumBackgroundKeepAlive.shouldPreserveExistingAudioCategory(
+            currentCategory: .playAndRecord,
+            currentOptions: [],
+            isMediaPlaying: false
+        ))
+        #expect(CuriumBackgroundKeepAlive.shouldPreserveExistingAudioCategory(
+            currentCategory: .playback,
+            currentOptions: [],
+            isMediaPlaying: true
+        ))
+        #expect(!CuriumBackgroundKeepAlive.shouldPreserveExistingAudioCategory(
+            currentCategory: .playback,
+            currentOptions: [.mixWithOthers],
+            isMediaPlaying: false
+        ))
+        #expect(!CuriumBackgroundKeepAlive.shouldPreserveExistingAudioCategory(
+            currentCategory: .soloAmbient,
+            currentOptions: [],
+            isMediaPlaying: false
+        ))
+
+        // Session deactivation: skip `setActive(false)` while video/PiP is playing or WebRTC mic is active.
+        #expect(!CuriumBackgroundKeepAlive.shouldDeactivateAudioSession(
+            deactivateRequested: true,
+            wasRunning: true,
+            currentCategory: .playback,
+            isMediaPlaying: true
+        ))
+        #expect(!CuriumBackgroundKeepAlive.shouldDeactivateAudioSession(
+            deactivateRequested: true,
+            wasRunning: true,
+            currentCategory: .playAndRecord,
+            isMediaPlaying: false
+        ))
+        #expect(CuriumBackgroundKeepAlive.shouldDeactivateAudioSession(
+            deactivateRequested: true,
+            wasRunning: true,
+            currentCategory: .playback,
+            isMediaPlaying: false
+        ))
+        #expect(!CuriumBackgroundKeepAlive.shouldDeactivateAudioSession(
+            deactivateRequested: true,
+            wasRunning: false,
+            currentCategory: .playback,
+            isMediaPlaying: false
+        ))
+
+        // Interruption end: honor `.shouldResume` instead of unconditionally restarting.
+        #expect(!CuriumBackgroundKeepAlive.shouldResumeAfterInterruptionEnd(
+            shouldBeActive: true,
+            options: []
+        ))
+        #expect(CuriumBackgroundKeepAlive.shouldResumeAfterInterruptionEnd(
+            shouldBeActive: true,
+            options: [.shouldResume]
+        ))
+        #expect(!CuriumBackgroundKeepAlive.shouldResumeAfterInterruptionEnd(
+            shouldBeActive: false,
+            options: [.shouldResume]
+        ))
+
+        let playingState = OSAllocatedUnfairLock(initialState: true)
+        let keepAlive = CuriumBackgroundKeepAlive(isMediaPlayingProvider: {
+            playingState.withLock { $0 }
+        })
+        defer { keepAlive.stopImmediately() }
+        keepAlive.setExternalMediaPlaybackActive(true)
+        #expect(keepAlive.isExternalMediaActive)
+        playingState.withLock { $0 = false }
+        keepAlive.setExternalMediaPlaybackActive(false)
+        #expect(!keepAlive.isExternalMediaActive)
+        #expect(!keepAlive.isEngineRunning)
+    }
+
+    @Test("P1-5: SPA soft-navigation clears stale media caches on path/query changes while preserving #fragment jumps")
+    @MainActor
+    func spaSoftNavigationClearsMediaCachesWhileFragmentPreservesThem() throws {
+        let host = MockBrowserHost()
+        let videoA = try #require(URL(string: "https://spa.example/watch?v=alpha"))
+        let tab = MockTabHost(tabID: "t-spa", url: videoA, title: "Alpha")
+        host.tabs = [tab]
+        host.activeTab = tab
+        let store = CuriumBrowserStore(host: host, restoreSession: false)
+
+        let streamA = try #require(URL(string: "https://cdn.spa.example/alpha/master.m3u8"))
+        let streamB = try #require(URL(string: "https://cdn.spa.example/beta/master.m3u8"))
+        _ = store.mediaRadar.ingest(
+            rawEvent: ["url": streamA, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200],
+            tabID: "t-spa",
+            effectiveUserAgent: nil
+        )
+        #expect(store.mediaRadar.events(for: "t-spa").count == 1)
+
+        // Fragment-only same-document navigation preserves captured media.
+        store.browserHost(
+            host,
+            tab: tab,
+            didCommitNavigationTo: try #require(URL(string: "https://spa.example/watch?v=alpha#t=30")),
+            navigationID: 1,
+            isSameDocument: true,
+            isReload: false
+        )
+        #expect(store.mediaRadar.events(for: "t-spa").count == 1)
+
+        // Same-document SPA query change (`pushState` to next video) clears stale media caches.
+        store.browserHost(
+            host,
+            tab: tab,
+            didCommitNavigationTo: try #require(URL(string: "https://spa.example/watch?v=beta")),
+            navigationID: 2,
+            isSameDocument: true,
+            isReload: false
+        )
+        #expect(store.mediaRadar.events(for: "t-spa").isEmpty)
+
+        // Same-document SPA path change also clears stale media caches.
+        _ = store.mediaRadar.ingest(
+            rawEvent: ["url": streamB, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200],
+            tabID: "t-spa",
+            effectiveUserAgent: nil
+        )
+        #expect(store.mediaRadar.events(for: "t-spa").count == 1)
+        store.browserHost(
+            host,
+            tab: tab,
+            didCommitNavigationTo: try #require(URL(string: "https://spa.example/shorts/gamma")),
+            navigationID: 3,
+            isSameDocument: true,
+            isReload: false
+        )
+        #expect(store.mediaRadar.events(for: "t-spa").isEmpty)
+    }
+
+    @Test("P1-6: CuriumMediaRadar rejects .cmfv/.cmfa chunks and prevents MSE chunk floods from evicting HLS/DASH manifests")
+    @MainActor
+    func mediaRadarRejectsCMAFAndProtectsManifestsFromChunkEviction() throws {
+        let cmfv = try #require(URL(string: "https://cdn.example/seg001.cmfv"))
+        let cmfa = try #require(URL(string: "https://cdn.example/seg001.cmfa"))
+        #expect(CuriumMediaResourceEvent.classify(url: cmfv, mimeType: "video/mp4", destination: "empty") == nil)
+        #expect(CuriumMediaResourceEvent.classify(url: cmfa, mimeType: "audio/mp4", destination: "empty") == nil)
+
+        let radar = CuriumMediaRadar()
+        let hlsMaster = try #require(URL(string: "https://cdn.example/master.m3u8"))
+        let dashManifest = try #require(URL(string: "https://cdn.example/manifest.mpd"))
+
+        #expect(radar.ingest(
+            rawEvent: ["url": hlsMaster, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200, "requestDestination": "empty"],
+            tabID: "t-evict",
+            effectiveUserAgent: nil
+        ) != nil)
+        #expect(radar.ingest(
+            rawEvent: ["url": dashManifest, "mimeType": "application/dash+xml", "httpMethod": "GET", "httpStatusCode": 200, "requestDestination": "empty"],
+            tabID: "t-evict",
+            effectiveUserAgent: nil
+        ) != nil)
+
+        // Flood 100 unique MSE chunk URLs (exceeding maxEventsPerTab = 64).
+        for idx in 0..<100 {
+            let chunkURL = try #require(URL(string: "https://cdn.example/video.mp4?range=\(idx * 1024)-\((idx + 1) * 1024 - 1)"))
+            let dest = idx.isMultiple(of: 2) ? "empty" : "other"
+            _ = radar.ingest(
+                rawEvent: ["url": chunkURL, "mimeType": "video/mp4", "httpMethod": "GET", "httpStatusCode": 206, "contentLength": 1024, "requestDestination": dest],
+                tabID: "t-evict",
+                effectiveUserAgent: nil
+            )
+        }
+
+        let retained = radar.events(for: "t-evict")
+        #expect(retained.count == CuriumMediaRadar.maxEventsPerTab)
+        #expect(retained.contains(where: { $0.url == hlsMaster }))
+        #expect(retained.contains(where: { $0.url == dashManifest }))
+    }
+
+    @Test("P1-7 & P1-8: 64 MiB segment cap, 86400s direct download timeout, and EXT-X-BYTERANGE 206/200 validation")
+    func byteRangeValidationSegmentCapAndDirectDownloadTimeout() throws {
+        #expect(CuriumHLSMediaDownloadTask.maxSegmentBytes == 64 * 1024 * 1024)
+        #expect(CuriumDirectMediaDownloadTask.resourceTimeoutInterval == 86_400)
+
+        let directSession = CuriumMediaNetworking.makeEphemeralSession(
+            proxy: .direct,
+            timeoutIntervalForResource: CuriumDirectMediaDownloadTask.resourceTimeoutInterval
+        )
+        defer { directSession.invalidateAndCancel() }
+        #expect(directSession.configuration.timeoutIntervalForRequest == 30)
+        #expect(directSession.configuration.timeoutIntervalForResource == 86_400)
+
+        let fullPayload = Data(0..<20)
+
+        // Exact 206 Partial Content succeeds.
+        let ok206 = try CuriumMediaNetworking.validateByteRangeResponse(
+            data: Data(10..<15),
+            statusCode: 206,
+            contentRangeHeader: "bytes 10-14/20",
+            byteRange: (length: 5, offset: 10)
+        )
+        #expect(ok206 == Data(10..<15))
+
+        // Truncated 206 fails closed.
+        #expect(throws: CuriumMediaDownloadError.byteRangeMismatch(expected: 5, actual: 3)) {
+            _ = try CuriumMediaNetworking.validateByteRangeResponse(
+                data: Data(10..<13),
+                statusCode: 206,
+                contentRangeHeader: nil,
+                byteRange: (length: 5, offset: 10)
+            )
+        }
+
+        // Mismatched Content-Range start on 206 fails closed.
+        #expect(throws: CuriumMediaDownloadError.byteRangeMismatch(expected: 5, actual: 5)) {
+            _ = try CuriumMediaNetworking.validateByteRangeResponse(
+                data: Data(0..<5),
+                statusCode: 206,
+                contentRangeHeader: "bytes 0-4/20",
+                byteRange: (length: 5, offset: 10)
+            )
+        }
+
+        // Full 200 OK slices exact [offset ..< offset + length].
+        let sliced200 = try CuriumMediaNetworking.validateByteRangeResponse(
+            data: fullPayload,
+            statusCode: 200,
+            byteRange: (length: 5, offset: 10)
+        )
+        #expect(sliced200 == Data(10..<15))
+
+        // Truncated/out-of-bounds 200 OK fails closed.
+        #expect(throws: CuriumMediaDownloadError.byteRangeMismatch(expected: 5, actual: 2)) {
+            _ = try CuriumMediaNetworking.validateByteRangeResponse(
+                data: Data(0..<12),
+                statusCode: 200,
+                byteRange: (length: 5, offset: 10)
+            )
+        }
+
+        // Non-200/206 2xx status fails closed.
+        #expect(throws: CuriumMediaDownloadError.byteRangeMismatch(expected: 5, actual: 0)) {
+            _ = try CuriumMediaNetworking.validateByteRangeResponse(
+                data: Data(),
+                statusCode: 204,
+                byteRange: (length: 5, offset: 0)
+            )
+        }
+    }
+
+    @Test("P2-9: Public-to-private SSRF guard blocks local/RFC1918/link-local/ULA targets while allowing loopback-to-loopback")
+    @MainActor
+    func publicToPrivateSSRFGuardBlocksLocalTargetsAndAllowsLoopbackToLoopback() async throws {
+        // Private host classifier covers loopback, RFC 1918, link-local, CGNAT, ULA, IPv4-mapped IPv6, and legacy integer IPv4.
+        for privateHost in [
+            "127.0.0.1", "127.1", "2130706433", "0x7f000001", "localhost", "api.localhost", "box.local",
+            "10.0.0.1", "172.16.0.1", "172.31.255.254", "192.168.1.1", "169.254.169.254",
+            "100.64.0.1", "0.0.0.0", "::1", "[::1]", "fc00::1", "fd12:3456::1", "fe80::1%en0",
+            "::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.1",
+        ] {
+            #expect(CuriumHLSParser.isPrivateOrLocalHost(privateHost), "Expected private host for \(privateHost)")
+        }
+        for publicHost in ["cdn.example.com", "1.1.1.1", "8.8.8.8", "172.32.0.1", "2606:4700:4700::1111"] {
+            #expect(!CuriumHLSParser.isPrivateOrLocalHost(publicHost), "Expected public host for \(publicHost)")
+        }
+
+        // Public HLS playlist referencing private variant/key/map/segment fails closed.
+        let publicBase = try #require(URL(string: "https://cdn.example.com/master.m3u8"))
+        for ssrfPlaylist in [
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nhttp://127.0.0.1:9222/json",
+            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"http://169.254.169.254/latest/meta-data/\"\n#EXTINF:4.0,\nseg.ts\n#EXT-X-ENDLIST",
+            "#EXTM3U\n#EXT-X-MAP:URI=\"http://192.168.1.1/init.mp4\"\n#EXTINF:4.0,\nseg.m4s\n#EXT-X-ENDLIST",
+            "#EXTM3U\n#EXTINF:4.0,\nhttp://[fd00::1]/secret.ts\n#EXT-X-ENDLIST",
+            "#EXTM3U\n#EXTINF:4.0,\nhttp://[::ffff:127.0.0.1]/secret.ts\n#EXT-X-ENDLIST",
+        ] {
+            #expect(throws: CuriumHLSParserError.self) {
+                _ = try CuriumHLSParser.parseMasterOrMedia(text: ssrfPlaylist, baseURL: publicBase)
+            }
+        }
+
+        // Loopback -> loopback HLS parsing remains allowed for local test servers.
+        let localBase = try #require(URL(string: "http://127.0.0.1:18080/master.m3u8"))
+        let localMedia = try CuriumHLSParser.parseMediaPlaylist(
+            text: "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\nhttp://127.0.0.1:18080/seg0.ts\n#EXT-X-ENDLIST",
+            baseURL: localBase
+        )
+        #expect(localMedia.segments.count == 1)
+
+        // Public -> private HTTP redirect is rejected; loopback -> loopback redirect is allowed.
+        let publicPrev = try #require(URL(string: "https://cdn.example.com/video.mp4"))
+        let privateRedirect = URLRequest(url: try #require(URL(string: "http://127.0.0.1:8080/internal")))
+        let blocked = CuriumMediaNetworking.validateAndSanitizeRedirectRequest(
+            privateRedirect,
+            from: publicPrev,
+            originatingHostIsPublic: true
+        )
+        #expect(blocked == .rejectedPrivateNetwork("127.0.0.1"))
+
+        let localRedirect = CuriumMediaNetworking.validateAndSanitizeRedirectRequest(
+            privateRedirect,
+            from: localBase,
+            originatingHostIsPublic: false
+        )
+        if case .allowed(let req, _) = localRedirect {
+            #expect(req.url?.host == "127.0.0.1")
+        } else {
+            Issue.record("Expected loopback-to-loopback redirect to be allowed, got \(localRedirect)")
+        }
+
+        // Store download entry point blocks private target launched from a public tab.
+        let host = MockBrowserHost()
+        let publicTab = MockTabHost(tabID: "t-ssrf", url: URL(string: "https://public.example/watch"))
+        host.tabs = [publicTab]
+        host.activeTab = publicTab
+        let store = CuriumBrowserStore(host: host, restoreSession: false)
+        let evilCandidate = CuriumMediaCandidate(
+            id: "http://127.0.0.1:9222/video.mp4",
+            url: try #require(URL(string: "http://127.0.0.1:9222/video.mp4")),
+            kind: .video,
+            title: "Evil",
+            host: "127.0.0.1",
+            mimeType: "video/mp4",
+            contentLength: 1024,
+            resolutionLabel: nil,
+            durationSeconds: nil,
+            referrer: URL(string: "https://public.example/watch"),
+            frameOrigin: "https://public.example",
+            effectiveUserAgent: nil,
+            fromDOM: true,
+            fromNetwork: false
+        )
+        let started = await store.startMediaDownload(candidate: evilCandidate, inTabID: "t-ssrf")
+        #expect(started == nil)
+        #expect(store.errorMessage?.localizedCaseInsensitiveContains("private") == true)
+    }
+
+    @Test("P2-10: DOM probeScript backfills <source type> onto currentSrc, omits url:null blob entries, and walks open shadowRoots")
+    func domProbeScriptBackfillsSourceTypeOmitsBlobEntriesAndWalksOpenShadowRoots() throws {
+        let jsContext = try #require(JSContext())
+        var jsException: String?
+        jsContext.exceptionHandler = { _, exc in
+            jsException = exc?.toString()
+        }
+
+        let harness = """
+        const location = { href: "https://watch.example/page/index.html" };
+        function URL(raw, base) {
+          if (/^https?:\\/\\//i.test(raw)) { this.href = raw; return; }
+          if (raw.startsWith("/")) { this.href = "https://watch.example" + raw; return; }
+          this.href = "https://watch.example/page/" + raw;
+        }
+        function makeNode(tag, props, children, shadowRoot) {
+          return Object.assign({
+            tagName: tag.toUpperCase(),
+            children: children || [],
+            shadowRoot: shadowRoot || null,
+            getAttribute(name) { return (this._attrs && this._attrs[name]) || null; },
+            querySelectorAll(sel) {
+              const wanted = sel.split(",").map(s => s.trim().toLowerCase());
+              const out = [];
+              const walk = (list) => {
+                for (const item of list) {
+                  if (wanted.includes("*") || wanted.includes((item.tagName || "").toLowerCase())) {
+                    out.push(item);
+                  }
+                  if (item.children) walk(item.children);
+                }
+              };
+              walk(this.children);
+              return out;
+            }
+          }, props || {});
+        }
+        const hlsSource = makeNode("source", {
+          src: "https://cdn.example/manifest-no-ext",
+          type: "application/vnd.apple.mpegurl"
+        });
+        const hlsVideo = makeNode("video", {
+          currentSrc: "https://cdn.example/manifest-no-ext",
+          videoWidth: 1920,
+          videoHeight: 1080,
+          duration: 120
+        }, [hlsSource]);
+        const blobVideo = makeNode("video", {
+          currentSrc: "blob:https://watch.example/1234-5678",
+          videoWidth: 1280,
+          videoHeight: 720,
+          duration: 60
+        });
+        const innerShadowVideo = makeNode("video", {
+          currentSrc: "https://cdn.example/shadow-player.mp4",
+          videoWidth: 1920,
+          videoHeight: 1080,
+          duration: 45
+        });
+        const nestedShadowRoot = makeNode("div", {}, [innerShadowVideo]);
+        const nestedHost = makeNode("mux-video", {}, [], nestedShadowRoot);
+        const outerShadowRoot = makeNode("div", {}, [nestedHost]);
+        const outerHost = makeNode("mux-player", {}, [], outerShadowRoot);
+        const document = makeNode("document", {
+          baseURI: "https://watch.example/page/index.html",
+          title: "Shadow Player Demo"
+        }, [hlsVideo, blobVideo, outerHost]);
+        """
+        jsContext.evaluateScript(harness)
+        #expect(jsException == nil)
+
+        let rawVal = jsContext.evaluateScript(CuriumMediaDOMScanner.probeScript)
+        #expect(jsException == nil)
+        let dict = try #require(rawVal?.toDictionary() as? [String: Any])
+        let frame = CuriumIsolatedFrameEvalResult.parse(from: [
+            "isMainFrame": NSNumber(value: true),
+            "frameURL": try #require(URL(string: "https://watch.example/page/index.html")),
+            "frameOrigin": "https://watch.example",
+            "result": dict,
+        ])
+
+        let parsed = CuriumMediaDOMScanner.parseProbeResults([frame])
+        #expect(parsed.pageTitle == "Shadow Player Demo")
+        #expect(parsed.blobVideoCount == 1)
+        // Only the 2 real HTTP(S) media URLs are in entries — zero `url: null` blob placeholders.
+        #expect(parsed.entries.count == 2)
+        #expect(!parsed.entries.contains { $0.isBlob || $0.url == nil })
+
+        let hlsEntry = try #require(parsed.entries.first { $0.url?.absoluteString == "https://cdn.example/manifest-no-ext" })
+        #expect(hlsEntry.mimeType == "application/vnd.apple.mpegurl")
+        #expect(CuriumMediaResourceEvent.classify(
+            url: try #require(hlsEntry.url),
+            mimeType: hlsEntry.mimeType,
+            destination: "video"
+        ) == .hls)
+
+        let shadowEntry = try #require(parsed.entries.first { $0.url?.absoluteString == "https://cdn.example/shadow-player.mp4" })
+        #expect(shadowEntry.width == 1920)
+        #expect(shadowEntry.height == 1080)
+    }
+
+    @Test("P2-11: Direct Origin omission, https->http Referer strip, cross-subdomain redirect cookies, mid-commit cancel, and child HLS collapse")
+    @MainActor
+    func redirectHeaderSanitizationStagedCommitCancelAndChildHLSCollapse() async throws {
+        // 1. Direct media request omits Origin: and strips Referer on https -> http downgrade.
+        let httpsVideo = try #require(URL(string: "https://cdn.example/clip.mp4"))
+        let httpVideo = try #require(URL(string: "http://cdn.example/clip.mp4"))
+        let ctx = CuriumMediaRequestContext(
+            cookieHeader: "sid=1",
+            userAgent: "Curium/1",
+            referrer: URL(string: "https://watch.example/page"),
+            origin: "https://watch.example",
+            proxy: .direct
+        )
+        let directReq = CuriumMediaNetworking.makeRequest(url: httpsVideo, context: ctx, includeOrigin: false)
+        #expect(directReq.value(forHTTPHeaderField: "Origin") == nil)
+        #expect(directReq.value(forHTTPHeaderField: "Referer") == "https://watch.example/page")
+        #expect(directReq.value(forHTTPHeaderField: "Cookie") == "sid=1")
+
+        let downgradedInitialReq = CuriumMediaNetworking.makeRequest(url: httpVideo, context: ctx, includeOrigin: false)
+        #expect(downgradedInitialReq.value(forHTTPHeaderField: "Referer") == nil)
+
+        // 2. Redirect https -> http strips Referer & old Cookie; cross-subdomain redirect refreshes Cookie via cookieResolver.
+        let prevHTTPS = try #require(URL(string: "https://www.example.com/watch/video"))
+        var downgradeProposed = URLRequest(url: try #require(URL(string: "http://www.example.com/watch/video")))
+        downgradeProposed.setValue("https://www.example.com/watch", forHTTPHeaderField: "Referer")
+        downgradeProposed.setValue("secure_sid=secret", forHTTPHeaderField: "Cookie")
+
+        let downgradeResult = await CuriumMediaNetworking.sanitizeRedirectRequest(
+            downgradeProposed,
+            from: prevHTTPS,
+            originatingHostIsPublic: true,
+            cookieResolver: { _ in nil }
+        )
+        if case .allowed(let sanitized, _) = downgradeResult {
+            #expect(sanitized.value(forHTTPHeaderField: "Referer") == nil)
+            #expect(sanitized.value(forHTTPHeaderField: "Cookie") == nil)
+        } else {
+            Issue.record("Expected allowed downgrade redirect with scrubbed headers, got \(downgradeResult)")
+        }
+
+        var crossSubdomainProposed = URLRequest(url: try #require(URL(string: "https://cdn.example.com/assets/movie.mp4")))
+        crossSubdomainProposed.setValue("host_only_www=secret", forHTTPHeaderField: "Cookie")
+        crossSubdomainProposed.setValue("https://www.example.com/watch", forHTTPHeaderField: "Referer")
+
+        let subdomainResult = await CuriumMediaNetworking.sanitizeRedirectRequest(
+            crossSubdomainProposed,
+            from: prevHTTPS,
+            originatingHostIsPublic: true,
+            cookieResolver: { url in
+                url.host == "cdn.example.com" ? "domain_auth=valid_for_cdn" : nil
+            }
+        )
+        if case .allowed(let sanitized, _) = subdomainResult {
+            #expect(sanitized.value(forHTTPHeaderField: "Cookie") == "domain_auth=valid_for_cdn")
+            #expect(sanitized.value(forHTTPHeaderField: "Referer") == "https://www.example.com/watch")
+        } else {
+            Issue.record("Expected cross-subdomain redirect with refreshed cookie, got \(subdomainResult)")
+        }
+
+        // 3. CuriumDownload.cancel() cancels an in-flight staged-file commit after task.state == .completed.
+        let commitDir = try makeTempDir("curium-mr-commit-cancel")
+        defer { try? FileManager.default.removeItem(at: commitDir) }
+        let committedDest = commitDir.appending(path: "movie.mp4", directoryHint: .notDirectory)
+
+        let mockTask = MockDownloadTask(
+            originalURL: httpsVideo,
+            suggestedFilename: "movie.mp4",
+            mimeType: "video/mp4",
+            payloadToWrite: Data("video-bytes".utf8)
+        )
+        let download = CuriumDownload(task: mockTask)
+        let gate = StagedCommitTestGate()
+        download.stagedCommitHandlerOverride = { stagedURL, _ in
+            await gate.markEnteredAndWaitForRelease()
+            try Task.checkCancellation()
+            try FileManager.default.copyItem(at: stagedURL, to: committedDest)
+            return committedDest
+        }
+
+        let startTask = Task { @MainActor in
+            await download.start()
+        }
+        await gate.waitUntilEntered()
+        #expect(mockTask.state == .completed)
+        #expect(download.isActive)
+
+        download.cancel()
+        #expect(download.state == .cancelled)
+        await gate.release()
+
+        let savedURL = await startTask.value
+        #expect(savedURL == nil)
+        #expect(download.state == .cancelled)
+        #expect(download.savedURL == nil)
+        #expect(download.failure == nil)
+        #expect(!FileManager.default.fileExists(atPath: committedDest.path))
+
+        // 4. CuriumMediaRadarSheet.computeSubsumedChildHLSIDs preserves standalone direct child downloads
+        // across sheet reopen without un-subsuming a child already displayed inside a master's variant row.
+        let masterURL = try #require(URL(string: "https://cdn.example/master.m3u8"))
+        let variantURL = try #require(URL(string: "https://cdn.example/v5/prog_index.m3u8"))
+        let audioChildURL = try #require(URL(string: "https://cdn.example/a1/prog_index.m3u8"))
+        let masterInspection = CuriumHLSMasterInspection(
+            sourceURL: masterURL,
+            isMasterPlaylist: true,
+            variants: [
+                CuriumHLSVariant(
+                    id: variantURL.absoluteString,
+                    url: variantURL,
+                    bandwidth: 2_000_000,
+                    averageBandwidth: nil,
+                    width: 1280,
+                    height: 720,
+                    codecs: "avc1.640020,mp4a.40.2",
+                    frameRate: 30,
+                    audioGroupID: "aud1",
+                    audioURI: audioChildURL
+                ),
+            ],
+            directSegmentCount: 0,
+            estimatedDurationSeconds: nil,
+            isLiveStream: false,
+            isFMP4: true,
+            encryption: .none,
+            referencedPlaylistURLs: [variantURL, audioChildURL]
+        )
+        let loadedMasters = [masterURL.absoluteString: masterInspection]
+
+        // No downloads: both variant and audio child are subsumed.
+        let subsumedNone = CuriumMediaRadarSheet.computeSubsumedChildHLSIDs(
+            loadedMasters: loadedMasters,
+            localDownloadsByTargetKey: [:],
+            storeDownloads: []
+        )
+        #expect(subsumedNone == [variantURL.absoluteString, audioChildURL.absoluteString])
+
+        // Master-variant download (across sheet reopen -> empty localDownloadsByTargetKey): variant STAYS subsumed!
+        let masterVariantDownload = CuriumDownload(
+            task: CuriumHLSMediaDownloadTask(
+                playlistURL: variantURL,
+                audioPlaylistURL: audioChildURL,
+                masterPlaylistURL: masterURL,
+                suggestedFilename: "Clip (720p).mp4",
+                context: ctx
+            )
+        )
+        let subsumedMasterVariant = CuriumMediaRadarSheet.computeSubsumedChildHLSIDs(
+            loadedMasters: loadedMasters,
+            localDownloadsByTargetKey: [:],
+            storeDownloads: [masterVariantDownload]
+        )
+        #expect(subsumedMasterVariant.contains(variantURL.absoluteString))
+        #expect(subsumedMasterVariant.contains(audioChildURL.absoluteString))
+
+        // Standalone direct child download (masterPlaylistURL == nil) across sheet reopen: NOT subsumed!
+        let standaloneVariantDownload = CuriumDownload(
+            task: CuriumHLSMediaDownloadTask(
+                playlistURL: variantURL,
+                audioPlaylistURL: nil,
+                masterPlaylistURL: nil,
+                suggestedFilename: "prog_index.ts",
+                context: ctx
+            )
+        )
+        let standaloneAudioDownload = CuriumDownload(
+            task: CuriumHLSMediaDownloadTask(
+                playlistURL: audioChildURL,
+                audioPlaylistURL: nil,
+                masterPlaylistURL: nil,
+                suggestedFilename: "audio.m4a",
+                context: ctx
+            )
+        )
+        let subsumedStandalone = CuriumMediaRadarSheet.computeSubsumedChildHLSIDs(
+            loadedMasters: loadedMasters,
+            localDownloadsByTargetKey: [:],
+            storeDownloads: [standaloneVariantDownload, standaloneAudioDownload]
+        )
+        #expect(!subsumedStandalone.contains(variantURL.absoluteString))
+        #expect(!subsumedStandalone.contains(audioChildURL.absoluteString))
+    }
+
+    @Test("Oracle P1: Untrusted Content-Range, BYTERANGE, MEDIA-SEQUENCE, and RESOLUTION values fail safely without integer overflow traps")
+    func untrustedMediaHeadersAndPlaylistsResistIntegerOverflow() throws {
+        // 1. Content-Range: bytes 0-Int.max/* fails closed without trapping in validateByteRangeResponse.
+        #expect(throws: CuriumMediaDownloadError.byteRangeMismatch(expected: 16, actual: Int.max)) {
+            _ = try CuriumMediaNetworking.validateByteRangeResponse(
+                data: Data(repeating: 0xAA, count: 16),
+                statusCode: 206,
+                contentRangeHeader: "bytes 0-9223372036854775807/*",
+                byteRange: (length: 16, offset: 0)
+            )
+        }
+
+        // 2. Explicit #EXT-X-BYTERANGE overflow throws .invalidPlaylist without trapping.
+        let baseURL = try #require(URL(string: "https://cdn.example/video.m3u8"))
+        let explicitOverflowPlaylist = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXTINF:4.0,
+        #EXT-X-BYTERANGE:16@9223372036854775800
+        seg.mp4
+        #EXT-X-ENDLIST
+        """
+        #expect(throws: CuriumHLSParserError.self) {
+            _ = try CuriumHLSParser.parseMediaPlaylist(text: explicitOverflowPlaylist, baseURL: baseURL)
+        }
+
+        // 3. Chained implicit #EXT-X-BYTERANGE overflow throws .invalidPlaylist without trapping.
+        let chainedOverflowPlaylist = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXTINF:4.0,
+        #EXT-X-BYTERANGE:100@9223372036854775700
+        seg.mp4
+        #EXTINF:4.0,
+        #EXT-X-BYTERANGE:100
+        seg.mp4
+        #EXT-X-ENDLIST
+        """
+        #expect(throws: CuriumHLSParserError.self) {
+            _ = try CuriumHLSParser.parseMediaPlaylist(text: chainedOverflowPlaylist, baseURL: baseURL)
+        }
+
+        // 4. #EXT-X-MAP BYTERANGE overflow throws .invalidPlaylist without trapping.
+        let mapOverflowPlaylist = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-MAP:URI="init.mp4",BYTERANGE="16@9223372036854775800"
+        #EXTINF:4.0,
+        seg.m4s
+        #EXT-X-ENDLIST
+        """
+        #expect(throws: CuriumHLSParserError.self) {
+            _ = try CuriumHLSParser.parseMediaPlaylist(text: mapOverflowPlaylist, baseURL: baseURL)
+        }
+
+        // 5. #EXT-X-MEDIA-SEQUENCE near Int.max with multiple segments throws cleanly.
+        let seqOverflowPlaylist = """
+        #EXTM3U
+        #EXT-X-MEDIA-SEQUENCE:9223372036854775807
+        #EXT-X-TARGETDURATION:4
+        #EXTINF:4.0,
+        seg0.ts
+        #EXTINF:4.0,
+        seg1.ts
+        #EXT-X-ENDLIST
+        """
+        #expect(throws: CuriumHLSParserError.self) {
+            _ = try CuriumHLSParser.parseMediaPlaylist(text: seqOverflowPlaylist, baseURL: baseURL)
+        }
+
+        // 6. Extreme RESOLUTION=4000000000x4000000000 is bounded out rather than trapping during variant sort.
+        let hugeResMaster = """
+        #EXTM3U
+        #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=4000000000x4000000000
+        huge.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080
+        hd.m3u8
+        """
+        let masterInspection = try CuriumHLSParser.parseMasterOrMedia(
+            text: hugeResMaster,
+            baseURL: try #require(URL(string: "https://cdn.example/master.m3u8"))
+        )
+        #expect(masterInspection.variants.count == 2)
+        #expect(masterInspection.variants[0].url.lastPathComponent == "hd.m3u8")
+        #expect(masterInspection.variants[0].width == 1920)
+        #expect(masterInspection.variants[1].url.lastPathComponent == "huge.m3u8")
+        #expect(masterInspection.variants[1].width == nil)
+        #expect(masterInspection.variants[1].height == nil)
+
+        // 7. DOM probe results with huge dimensions (including > Int.max floats) drop cleanly and merge sorts without overflow.
+        let frame = CuriumIsolatedFrameEvalResult.parse(from: [
+            "isMainFrame": NSNumber(value: true),
+            "frameURL": try #require(URL(string: "https://watch.example/")),
+            "frameOrigin": "https://watch.example",
+            "result": [
+                "pageTitle": "Overflow Test",
+                "blobVideoCount": 0,
+                "entries": [
+                    [
+                        "url": "https://cdn.example/huge.mp4",
+                        "tag": "video",
+                        "width": 1.0e30,
+                        "height": 1.0e30,
+                    ],
+                    [
+                        "url": "https://cdn.example/big.mp4",
+                        "tag": "video",
+                        "width": 4_000_000_000.0,
+                        "height": 4_000_000_000.0,
+                    ],
+                ],
+            ] as [String: Any],
+        ])
+        let parsedDOM = CuriumMediaDOMScanner.parseProbeResults([frame])
+        #expect(parsedDOM.entries.count == 2)
+        #expect(parsedDOM.entries.allSatisfy { $0.width == nil && $0.height == nil })
+
+        let syntheticHuge = CuriumDOMMediaEntry(
+            url: URL(string: "https://cdn.example/synthetic-a.mp4"),
+            isBlob: false,
+            tag: "video",
+            title: "A",
+            width: 4_000_000_000,
+            height: 4_000_000_000,
+            durationSeconds: 10,
+            frameURL: nil,
+            frameOrigin: nil,
+            mimeType: "video/mp4"
+        )
+        let syntheticNormal = CuriumDOMMediaEntry(
+            url: URL(string: "https://cdn.example/synthetic-b.mp4"),
+            isBlob: false,
+            tag: "video",
+            title: "B",
+            width: 1920,
+            height: 1080,
+            durationSeconds: 10,
+            frameURL: nil,
+            frameOrigin: nil,
+            mimeType: "video/mp4"
+        )
+        let merged = CuriumMediaDOMScanner.merge(
+            tabID: "t-overflow",
+            pageTitle: "Overflow",
+            networkEvents: [],
+            domEntries: [syntheticHuge, syntheticNormal],
+            blobVideoCount: 0,
+            effectiveUserAgent: nil
+        )
+        #expect(merged.candidates.count == 2)
+    }
+
+    @Test("Oracle P2: Public frameOrigin enforces SSRF guard across about:srcdoc, about:blank, and no-referrer")
+    @MainActor
+    func publicFrameOriginEnforcesSSRFGuardAcrossAboutBlankAndSrcdoc() async throws {
+        let localVideoURL = try #require(URL(string: "http://127.0.0.1:8080/internal.mp4"))
+        let localHLSURL = try #require(URL(string: "http://127.0.0.1:8080/internal.m3u8"))
+        let srcdocURL = try #require(URL(string: "about:srcdoc"))
+        let blankURL = try #require(URL(string: "about:blank"))
+
+        // 1. Direct isOriginatingHostPublic recognizes public origin even when referrer is nil or about:srcdoc.
+        #expect(CuriumMediaNetworking.isOriginatingHostPublic(
+            url: localVideoURL,
+            referrer: nil,
+            origin: "https://evil.example"
+        ))
+        #expect(CuriumMediaNetworking.isOriginatingHostPublic(
+            url: localVideoURL,
+            referrer: srcdocURL,
+            origin: "https://evil.example"
+        ))
+        // Loopback origin -> loopback target remains allowed.
+        #expect(!CuriumMediaNetworking.isOriginatingHostPublic(
+            url: localVideoURL,
+            referrer: nil,
+            origin: "http://127.0.0.1:8080"
+        ))
+
+        // 2. Store inspectHLSStream, startMediaDownload (direct + separate audioURI), and makeMediaRequestContext
+        //    enforce private-network blocking when tab is about:blank and referrer is about:srcdoc/nil.
+        let host = MockBrowserHost()
+        let blankTab = MockTabHost(tabID: "t-srcdoc", url: blankURL)
+        host.tabs = [blankTab]
+        host.activeTab = blankTab
+        let store = CuriumBrowserStore(host: host, restoreSession: false)
+
+        let srcdocHLSCandidate = CuriumMediaCandidate(
+            id: localHLSURL.absoluteString,
+            url: localHLSURL,
+            kind: .hls,
+            title: "Srcdoc SSRF",
+            host: "127.0.0.1",
+            mimeType: "application/vnd.apple.mpegurl",
+            contentLength: -1,
+            resolutionLabel: nil,
+            durationSeconds: nil,
+            referrer: srcdocURL,
+            frameOrigin: "https://evil.example",
+            effectiveUserAgent: nil,
+            fromDOM: true,
+            fromNetwork: false
+        )
+
+        do {
+            _ = try await store.inspectHLSStream(for: srcdocHLSCandidate, inTabID: "t-srcdoc")
+            Issue.record("Expected inspectHLSStream to reject private target from public frameOrigin")
+        } catch let error as CuriumMediaDownloadError {
+            #expect(error == .blockedPrivateNetworkHost("127.0.0.1"))
+        }
+
+        let blockedDirect = await store.startMediaDownload(candidate: srcdocHLSCandidate, inTabID: "t-srcdoc")
+        #expect(blockedDirect == nil)
+        #expect(store.errorMessage?.localizedCaseInsensitiveContains("private") == true)
+
+        // Private audioURI on an otherwise public-frameOrigin variant is also blocked.
+        let publicVariantURL = try #require(URL(string: "https://cdn.evil.example/video.m3u8"))
+        let privateAudioURL = try #require(URL(string: "http://127.0.0.1:9222/audio.m3u8"))
+        let publicHLSCandidate = CuriumMediaCandidate(
+            id: publicVariantURL.absoluteString,
+            url: publicVariantURL,
+            kind: .hls,
+            title: "Audio SSRF",
+            host: "cdn.evil.example",
+            mimeType: "application/vnd.apple.mpegurl",
+            contentLength: -1,
+            resolutionLabel: nil,
+            durationSeconds: nil,
+            referrer: nil,
+            frameOrigin: "https://evil.example",
+            effectiveUserAgent: nil,
+            fromDOM: true,
+            fromNetwork: false
+        )
+        let privateAudioVariant = CuriumHLSVariant(
+            id: publicVariantURL.absoluteString,
+            url: publicVariantURL,
+            bandwidth: 1_000_000,
+            averageBandwidth: nil,
+            width: 1280,
+            height: 720,
+            codecs: nil,
+            frameRate: nil,
+            audioGroupID: "aud",
+            audioURI: privateAudioURL
+        )
+        store.errorMessage = nil
+        let blockedAudio = await store.startMediaDownload(
+            candidate: publicHLSCandidate,
+            hlsVariant: privateAudioVariant,
+            inTabID: "t-srcdoc"
+        )
+        #expect(blockedAudio == nil)
+        #expect(store.errorMessage?.localizedCaseInsensitiveContains("private") == true)
+
+        // makeMediaRequestContext preserves public origin while omitting non-HTTP about:srcdoc Referer.
+        let ctx = await store.makeMediaRequestContext(
+            for: localHLSURL,
+            candidate: srcdocHLSCandidate,
+            inTabID: "t-srcdoc"
+        )
+        #expect(ctx.referrer == nil)
+        #expect(ctx.origin == "https://evil.example")
+        do {
+            _ = try await CuriumMediaNetworking.inspectHLS(url: localHLSURL, context: ctx)
+            Issue.record("Expected CuriumMediaNetworking.inspectHLS to reject private target via context.origin")
+        } catch let error as CuriumMediaDownloadError {
+            #expect(error == .blockedPrivateNetworkHost("127.0.0.1"))
+        }
+    }
+
+    @Test("Oracle P2: Customized Personal booted via selectedProfileID == nil reports pending engine restart instead of silent ACTIVE")
+    @MainActor
+    func customizedPersonalWithNilSelectionReportsPendingEngineRestart() throws {
+        defer { CuriumFingerprintBootstrap.resetStateForTesting() }
+
+        let dir = try makeTempDir("curium-personal-nil-restart")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let supportRoot = dir.appending(path: "Application Support", directoryHint: .isDirectory)
+        let cachesRoot = dir.appending(path: "Caches", directoryHint: .isDirectory)
+        let curiumRoot = dir.appending(path: "SharedCurium", directoryHint: .isDirectory)
+        let fileURL = curiumRoot.appending(path: CuriumFingerprintStore.fileName, directoryHint: .notDirectory)
+
+        let store = CuriumFingerprintStore(
+            fileURL: fileURL,
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot,
+            curiumSupportRoot: curiumRoot
+        )
+
+        // 1. Unmodified Personal booted with selectedProfileID == nil has no pending restart.
+        let cleanOutcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: store,
+            configureEngine: { _, _ in true }
+        )
+        #expect(cleanOutcome == .defaultBuild39)
+        #expect(!store.hasPendingActiveProfileEngineChanges)
+        #expect(!store.hasPendingProfileSwitch)
+
+        // 2. Customize Personal with a Fixed Proxy, then simulate Recovery UI resetting selectedProfileID to nil.
+        var personal = try #require(store.profile(id: "default"))
+        let customProxy = CuriumProxyConfig.fixed(rules: "socks5://127.0.0.1:1080", bypassRules: nil)
+        personal.proxy = customProxy
+        #expect(store.upsert(personal).isValid)
+        #expect(store.resetToBuild39Default())
+        #expect(store.selectedProfileID == nil)
+
+        // Boot into unconfigured Build 39 (.system proxy) while stored Personal carries Fixed Proxy.
+        let recoveryOutcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: store,
+            configureEngine: { _, _ in true }
+        )
+        #expect(recoveryOutcome == .defaultBuild39)
+        #expect(CuriumFingerprintBootstrap.activeLaunchProxy == .system)
+        #expect(store.activeProfile.proxy == customProxy)
+        #expect(store.hasPendingActiveProfileEngineChanges)
+        #expect(store.hasPendingProfileSwitch)
+
+        // 3. Clean Build 39 launch with legacy iOS Blink / Chromium UserDefaults (selectedProfileID == nil)
+        //    must NOT show a spurious RESTART badge while Blink is already running those exact 0105 defaults,
+        //    but MUST show RESTART if legacy UserDefaults change mid-session.
+        let suiteName = "curium.test.legacy.\(UUID().uuidString)"
+        let isolatedDefaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { isolatedDefaults.removePersistentDomain(forName: suiteName) }
+        isolatedDefaults.set("ios", forKey: "curium.mobileUA")
+        isolatedDefaults.set("chromium", forKey: "curium.uaBrand")
+
+        let legacyPersonal = CuriumFingerprintStore.makeDefaultPersonalProfile(
+            preserveLegacyDefaults: true,
+            defaults: isolatedDefaults
+        )
+        #expect(!legacyPersonal.matchesBuild39EngineDefaults)
+        let legacySnapshot = CuriumFingerprintBootstrap.EngineLaunchSnapshot(
+            from: legacyPersonal,
+            wasUnconfiguredBuild39: true
+        )
+        #expect(!CuriumFingerprintStore.hasPendingActiveProfileEngineChanges(
+            snapshot: legacySnapshot,
+            selectedProfileID: nil,
+            candidate: legacyPersonal,
+            effectiveBuild39Default: {
+                CuriumFingerprintStore.makeDefaultPersonalProfile(
+                    preserveLegacyDefaults: true,
+                    defaults: isolatedDefaults
+                )
+            }
+        ))
+
+        isolatedDefaults.set("android", forKey: "curium.mobileUA")
+        #expect(CuriumFingerprintStore.hasPendingActiveProfileEngineChanges(
+            snapshot: legacySnapshot,
+            selectedProfileID: nil,
+            candidate: legacyPersonal,
+            effectiveBuild39Default: {
+                CuriumFingerprintStore.makeDefaultPersonalProfile(
+                    preserveLegacyDefaults: true,
+                    defaults: isolatedDefaults
+                )
+            }
         ))
     }
 }

@@ -29,25 +29,32 @@ struct CuriumMediaRequestContext: Equatable, Sendable {
 
 enum CuriumMediaDownloadError: LocalizedError, Equatable, Sendable {
     case disallowedURLScheme(String)
+    case blockedPrivateNetworkHost(String)
     case invalidHTTPResponse
     case httpStatusError(Int)
     case responseTooLarge(maxBytes: Int)
+    case byteRangeMismatch(expected: Int, actual: Int)
     case liveStreamUnsupported
     case drmUnsupported(String)
     case emptyPlaylist
     case invalidAESKeyLength(Int)
+    case audioMuxFailed(String)
     case cancelled
 
     var errorDescription: String? {
         switch self {
         case .disallowedURLScheme(let detail):
             return "Blocked unsupported media URL scheme (\(detail))."
+        case .blockedPrivateNetworkHost(let host):
+            return "Blocked private or local network target (\(host)) from a public page."
         case .invalidHTTPResponse:
             return "Server returned an invalid HTTP response."
         case .httpStatusError(let code):
             return "Media server responded with HTTP \(code)."
         case .responseTooLarge(let maxBytes):
             return "Response exceeded the \(maxBytes)-byte safety limit."
+        case .byteRangeMismatch(let expected, let actual):
+            return "Server returned \(actual) bytes for a \(expected)-byte HLS range request."
         case .liveStreamUnsupported:
             return "Live HLS streams cannot be downloaded while broadcasting."
         case .drmUnsupported(let method):
@@ -56,6 +63,8 @@ enum CuriumMediaDownloadError: LocalizedError, Equatable, Sendable {
             return "No downloadable media segments were found in the HLS playlist."
         case .invalidAESKeyLength(let count):
             return "AES-128 key response had invalid length (\(count) bytes; expected 16)."
+        case .audioMuxFailed(let detail):
+            return "Failed to combine separate HLS audio track: \(detail)"
         case .cancelled:
             return "Download was cancelled."
         }
@@ -76,11 +85,122 @@ enum CuriumMediaNetworking {
     private static let keyExceptionsList = "ExceptionsList"
     private static let keyExcludeSimpleHostnames = "ExcludeSimpleHostnames"
 
+    enum RedirectValidationResult: Equatable, Sendable {
+        case allowed(URLRequest, needsCookieRefresh: Bool)
+        case rejectedScheme(String)
+        case rejectedPrivateNetwork(String)
+    }
+
+    /// Scheme-, host-, and directory-path-scoped cookie cache (RFC 6265) with coalesced
+    /// `@MainActor` lookups so large CDN playlists hop once per scope while never leaking
+    /// `Secure` cookies over plaintext `http://` or across diverging paths.
+    actor HostCookieCache {
+        struct ScopeKey: Hashable, Sendable {
+            let scheme: String
+            let host: String
+            let directoryPath: String
+        }
+
+        private let baseScope: ScopeKey?
+        private let baseCookie: String?
+        private let provider: (@MainActor @Sendable (URL) async -> String?)?
+        private var resolvedByScope: [ScopeKey: String?] = [:]
+        private var inFlightByScope: [ScopeKey: Task<String?, Never>] = [:]
+
+        init(
+            baseURL: URL?,
+            baseCookie: String?,
+            provider: (@MainActor @Sendable (URL) async -> String?)?
+        ) {
+            self.baseScope = baseURL.flatMap(Self.scopeKey(for:))
+            self.baseCookie = baseCookie
+            self.provider = provider
+        }
+
+        nonisolated static func scopeKey(for url: URL) -> ScopeKey? {
+            guard let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  let host = url.host?.lowercased(),
+                  !host.isEmpty else {
+                return nil
+            }
+            let rawPath = URLComponents(url: url, resolvingAgainstBaseURL: true)?.percentEncodedPath
+                ?? url.path(percentEncoded: true)
+            let normalizedPath = normalizeDotSegments(in: rawPath)
+            let directoryPath: String
+            if normalizedPath.isEmpty || !normalizedPath.hasPrefix("/") {
+                directoryPath = "/"
+            } else if normalizedPath.hasSuffix("/") {
+                directoryPath = normalizedPath
+            } else if let lastSlash = normalizedPath.lastIndex(of: "/") {
+                directoryPath = String(normalizedPath[...lastSlash])
+            } else {
+                directoryPath = "/"
+            }
+            return ScopeKey(scheme: scheme, host: host, directoryPath: directoryPath)
+        }
+
+        /// Deterministically resolves `.` and `..` path segments per RFC 3986 §5.2.4 so
+        /// path-traversal URLs (e.g. `/private/v1/../../public/seg.ts`) normalize to `/public/seg.ts`
+        /// across all Foundation `URL` implementations.
+        private nonisolated static func normalizeDotSegments(in rawPath: String) -> String {
+            guard !rawPath.isEmpty else { return "/" }
+            let hadTrailingSlash = rawPath.hasSuffix("/") || rawPath.hasSuffix("/.") || rawPath.hasSuffix("/..")
+            var stack: [Substring] = []
+            for segment in rawPath.split(separator: "/", omittingEmptySubsequences: true) {
+                if segment == "." {
+                    continue
+                } else if segment == ".." {
+                    if !stack.isEmpty {
+                        stack.removeLast()
+                    }
+                } else {
+                    stack.append(segment)
+                }
+            }
+            if stack.isEmpty {
+                return "/"
+            }
+            let joined = "/" + stack.joined(separator: "/")
+            return hadTrailingSlash ? joined + "/" : joined
+        }
+
+        func cookieHeader(for url: URL) async -> String? {
+            guard let targetScope = Self.scopeKey(for: url) else {
+                return nil
+            }
+            if let baseScope, targetScope == baseScope {
+                return baseCookie
+            }
+            if let cached = resolvedByScope[targetScope] {
+                return cached
+            }
+            if let existingTask = inFlightByScope[targetScope] {
+                return await existingTask.value
+            }
+            guard let provider else {
+                resolvedByScope[targetScope] = nil
+                return nil
+            }
+            let lookupTask = Task<String?, Never> {
+                await provider(url)
+            }
+            inFlightByScope[targetScope] = lookupTask
+            let resolved = await lookupTask.value
+            inFlightByScope.removeValue(forKey: targetScope)
+            resolvedByScope[targetScope] = resolved
+            return resolved
+        }
+    }
+
     /// Maps `CuriumProxyConfig` to a `URLSessionConfiguration.connectionProxyDictionary`.
     /// - `.system`: returns `nil` (inherits OS proxy configuration).
     /// - `.direct`: returns `[:]` (explicitly bypasses system proxy).
-    /// - `.fixed`: parses `http://`, `https://`, `socks5://` / `socks://` / `socks4://`
-    ///   and Chromium `scheme=host:port` clauses so fixed-proxy profiles never leak real IP.
+    /// - `.fixed`: parses `http://`, `socks5://` / `socks://` / `socks4://` and Chromium
+    ///   `scheme=host:port` clauses. Fails closed (`127.0.0.1:1`) on `https://` proxy schemes
+    ///   (CFNetwork `HTTPSProxy` is plaintext HTTP `CONNECT`, not TLS-to-proxy) and blackholes
+    ///   any unconfigured HTTP or HTTPS slot when `SOCKSEnable == nil` so fixed-proxy profiles
+    ///   never leak real IP. Strips/honors Chromium's `<-loopback>` directive.
     static func proxyDictionary(for proxy: CuriumProxyConfig) -> [AnyHashable: Any]? {
         switch proxy {
         case .system:
@@ -107,10 +227,16 @@ enum CuriumMediaNetworking {
                     uriList = clause
                 }
 
-                // Use the first valid proxy server in a comma-separated fallback chain.
+                // Use the first valid proxy server in a comma-separated fallback chain,
+                // failing closed on explicit `https://` TLS-to-proxy schemes rather than
+                // downgrading them to plaintext CFNetwork HTTP `CONNECT` or a fallback entry.
                 for rawEntry in uriList.split(separator: ",", omittingEmptySubsequences: true) {
                     let entry = rawEntry.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !entry.isEmpty, entry.lowercased() != "direct://" else { continue }
+                    let loweredEntry = entry.lowercased()
+                    guard !entry.isEmpty, loweredEntry != "direct://" else { continue }
+                    if loweredEntry.hasPrefix("https://") {
+                        break
+                    }
                     guard let parsed = parseProxyEndpoint(entry, targetPrefix: targetPrefix) else { continue }
 
                     switch parsed.kind {
@@ -154,11 +280,29 @@ enum CuriumMediaNetworking {
                     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
                 var exceptions: [String] = []
+                var forceProxyLoopback = false
                 for token in tokens {
-                    if token.lowercased() == "<local>" {
+                    let lowered = token.lowercased()
+                    if lowered == "<local>" {
                         dict[keyExcludeSimpleHostnames] = 1
+                    } else if lowered == "<-loopback>" {
+                        forceProxyLoopback = true
                     } else {
                         exceptions.append(token)
+                    }
+                }
+                if forceProxyLoopback {
+                    exceptions.removeAll { token in
+                        let lowered = token.lowercased()
+                        return lowered == "localhost"
+                            || lowered.hasPrefix("localhost:")
+                            || lowered == "127.0.0.1"
+                            || lowered == "::1"
+                            || lowered == "[::1]"
+                            || lowered.hasPrefix("[::1]:")
+                            || lowered.hasPrefix("::1/")
+                            || lowered.hasPrefix("127.")
+                            || lowered.hasSuffix(".localhost")
                     }
                 }
                 if !exceptions.isEmpty {
@@ -171,6 +315,19 @@ enum CuriumMediaNetworking {
                 dict[keySOCKSEnable] = 1
                 dict[keySOCKSProxy] = "127.0.0.1"
                 dict[keySOCKSPort] = 1
+            } else if dict[keySOCKSEnable] == nil {
+                // Without a SOCKS catch-all, blackhole any unconfigured HTTP or HTTPS slot
+                // so single-scheme rules never egress the uncovered scheme over the real IP.
+                if dict[keyHTTPEnable] == nil {
+                    dict[keyHTTPEnable] = 1
+                    dict[keyHTTPProxy] = "127.0.0.1"
+                    dict[keyHTTPPort] = 1
+                }
+                if dict[keyHTTPSEnable] == nil {
+                    dict[keyHTTPSEnable] = 1
+                    dict[keyHTTPSProxy] = "127.0.0.1"
+                    dict[keyHTTPSPort] = 1
+                }
             }
 
             return dict
@@ -179,7 +336,8 @@ enum CuriumMediaNetworking {
 
     static func makeEphemeralSession(
         proxy: CuriumProxyConfig,
-        delegate: (any URLSessionDelegate)? = nil
+        delegate: (any URLSessionDelegate)? = nil,
+        timeoutIntervalForResource: TimeInterval = 60 * 60
     ) -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
@@ -189,7 +347,7 @@ enum CuriumMediaNetworking {
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.waitsForConnectivity = false
         config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 60 * 60
+        config.timeoutIntervalForResource = timeoutIntervalForResource
         if let proxyDict = proxyDictionary(for: proxy) {
             config.connectionProxyDictionary = proxyDict
         }
@@ -199,7 +357,8 @@ enum CuriumMediaNetworking {
     static func makeRequest(
         url: URL,
         context: CuriumMediaRequestContext,
-        byteRange: (length: Int, offset: Int?)? = nil
+        byteRange: (length: Int, offset: Int?)? = nil,
+        includeOrigin: Bool = true
     ) -> URLRequest {
         var request = URLRequest(
             url: url,
@@ -217,39 +376,70 @@ enum CuriumMediaNetworking {
            !userAgent.isEmpty {
             request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         }
-        if let referrer = context.referrer, CuriumHLSParser.isAllowedHTTPURL(referrer) {
+        if let referrer = context.referrer,
+           CuriumHLSParser.isAllowedHTTPURL(referrer),
+           !isHTTPSDowngrade(from: referrer, to: url) {
             request.setValue(referrer.absoluteString, forHTTPHeaderField: "Referer")
         }
-        if let origin = context.origin?.trimmingCharacters(in: .whitespacesAndNewlines),
+        if includeOrigin,
+           let origin = context.origin?.trimmingCharacters(in: .whitespacesAndNewlines),
            !origin.isEmpty,
            origin.lowercased() != "null" {
             request.setValue(origin, forHTTPHeaderField: "Origin")
         }
         if let byteRange, byteRange.length > 0 {
             let start = max(0, byteRange.offset ?? 0)
-            let end = start + byteRange.length - 1
-            request.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
+            let (endInclusive, overflow) = start.addingReportingOverflow(byteRange.length - 1)
+            if !overflow {
+                request.setValue("bytes=\(start)-\(endInclusive)", forHTTPHeaderField: "Range")
+            }
         }
         return request
     }
 
-    /// Fetches and parses an HLS Master or Media playlist over an ephemeral, scheme-guarded session.
+    /// Fetches and parses an HLS Master or Media playlist over an ephemeral, scheme- & SSRF-guarded session.
     static func inspectHLS(
         url: URL,
-        context: CuriumMediaRequestContext
+        context: CuriumMediaRequestContext,
+        cookieProvider: (@MainActor @Sendable (URL) async -> String?)? = nil
     ) async throws -> CuriumHLSMasterInspection {
         guard CuriumHLSParser.isAllowedHTTPURL(url) else {
             throw CuriumMediaDownloadError.disallowedURLScheme(url.scheme ?? "unknown")
         }
+        if let referrer = context.referrer,
+           !CuriumHLSParser.isAllowedTargetURL(url, originatingURL: referrer) {
+            throw CuriumMediaDownloadError.blockedPrivateNetworkHost(url.host ?? "private")
+        }
+        if let originURL = originURL(from: context.origin),
+           !CuriumHLSParser.isAllowedTargetURL(url, originatingURL: originURL) {
+            throw CuriumMediaDownloadError.blockedPrivateNetworkHost(url.host ?? "private")
+        }
+        let cookieCache = HostCookieCache(
+            baseURL: url,
+            baseCookie: context.cookieHeader,
+            provider: cookieProvider
+        )
         let coordinator = BoundedFetchCoordinator()
         let session = makeEphemeralSession(proxy: context.proxy, delegate: coordinator)
         defer { session.finishTasksAndInvalidate() }
 
         let request = makeRequest(url: url, context: context)
+        let originatingHostIsPublic = isOriginatingHostPublic(
+            url: url,
+            referrer: context.referrer,
+            origin: context.origin
+        )
+        let cookieResolver: (@Sendable (URL) async -> String?)? = cookieProvider == nil
+            ? nil
+            : { @Sendable targetURL in
+                await cookieCache.cookieHeader(for: targetURL)
+            }
         let (data, finalURL) = try await coordinator.fetchData(
             request: request,
             session: session,
-            maxBytes: CuriumHLSParser.maxPlaylistBytes
+            maxBytes: CuriumHLSParser.maxPlaylistBytes,
+            originatingHostIsPublic: originatingHostIsPublic,
+            cookieResolver: cookieResolver
         )
         let text = String(data: data, encoding: .utf8)
             ?? String(data: data, encoding: .isoLatin1)
@@ -257,7 +447,56 @@ enum CuriumMediaNetworking {
         return try CuriumHLSParser.parseMasterOrMedia(text: text, baseURL: finalURL)
     }
 
-    // MARK: - Proxy Parsing Helpers
+    /// Validates an HTTP response body for an `EXT-X-BYTERANGE` request:
+    /// - `206 Partial Content`: requires exact length match (and matching `Content-Range` if present).
+    /// - `200 OK`: slices `[start ..< start + length]` and fails closed if truncated or out-of-bounds.
+    static func validateByteRangeResponse(
+        data: Data,
+        statusCode: Int,
+        contentRangeHeader: String? = nil,
+        byteRange: (length: Int, offset: Int?)
+    ) throws -> Data {
+        let expectedLength = byteRange.length
+        guard expectedLength > 0 else {
+            throw CuriumMediaDownloadError.byteRangeMismatch(expected: expectedLength, actual: data.count)
+        }
+        let start = max(0, byteRange.offset ?? 0)
+        let (endExclusive, overflow) = start.addingReportingOverflow(expectedLength)
+        guard !overflow else {
+            throw CuriumMediaDownloadError.byteRangeMismatch(expected: expectedLength, actual: data.count)
+        }
+
+        if statusCode == 206 {
+            if let contentRangeHeader,
+               let parsed = parseContentRangeHeader(contentRangeHeader) {
+                let (advertisedLength, lenOverflow) = (parsed.end - parsed.start).addingReportingOverflow(1)
+                guard !lenOverflow, parsed.start == start, advertisedLength == expectedLength else {
+                    throw CuriumMediaDownloadError.byteRangeMismatch(
+                        expected: expectedLength,
+                        actual: lenOverflow ? Int.max : max(0, advertisedLength)
+                    )
+                }
+            }
+            guard data.count == expectedLength else {
+                throw CuriumMediaDownloadError.byteRangeMismatch(expected: expectedLength, actual: data.count)
+            }
+            return data
+        }
+
+        if statusCode == 200 {
+            guard endExclusive <= data.count else {
+                throw CuriumMediaDownloadError.byteRangeMismatch(
+                    expected: expectedLength,
+                    actual: max(0, data.count - start)
+                )
+            }
+            return Data(data[start..<endExclusive])
+        }
+
+        throw CuriumMediaDownloadError.byteRangeMismatch(expected: expectedLength, actual: data.count)
+    }
+
+    // MARK: - Proxy Parsing & Redirect Helpers
 
     private enum ProxyEndpointKind {
         case socks
@@ -276,6 +515,11 @@ enum CuriumMediaNetworking {
         _ entry: String,
         targetPrefix: String?
     ) -> ParsedProxyEndpoint? {
+        if let targetPrefix,
+           targetPrefix != "http" && targetPrefix != "https" && targetPrefix != "socks" {
+            return nil
+        }
+
         let scheme: String?
         let hostPort: Substring
         if let sepRange = entry.range(of: "://") {
@@ -320,8 +564,9 @@ enum CuriumMediaNetworking {
                 kind = .socks
                 defaultPort = 1080
             case "https":
-                kind = (targetPrefix == "http") ? .httpOnly : (targetPrefix == "https" ? .httpsOnly : .httpAndHTTPS)
-                defaultPort = 443
+                // CFNetwork's `HTTPSProxy` configures a plaintext HTTP `CONNECT` proxy, not TLS-to-proxy.
+                // Fail closed rather than downgrading an explicit `https://` TLS proxy to cleartext.
+                return nil
             case "http":
                 kind = (targetPrefix == "http") ? .httpOnly : (targetPrefix == "https" ? .httpsOnly : .httpAndHTTPS)
                 defaultPort = 80
@@ -358,22 +603,107 @@ enum CuriumMediaNetworking {
         return ParsedProxyEndpoint(kind: kind, host: host, port: resolvedPort)
     }
 
-    fileprivate static func sanitizeRedirectRequest(
-        _ proposed: URLRequest,
-        originalHost: String?
-    ) -> URLRequest? {
-        guard let targetURL = proposed.url,
-              CuriumHLSParser.isAllowedHTTPURL(targetURL) else {
+    static func originURL(from rawOrigin: String?) -> URL? {
+        guard let trimmed = rawOrigin?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty,
+              trimmed.lowercased() != "null",
+              let parsed = URL(string: trimmed),
+              CuriumHLSParser.isAllowedHTTPURL(parsed) else {
             return nil
         }
+        return parsed
+    }
+
+    static func isOriginatingHostPublic(url: URL, referrer: URL?, origin: String? = nil) -> Bool {
+        if let referrer, CuriumHLSParser.isAllowedHTTPURL(referrer), !CuriumHLSParser.isPrivateOrLocalURL(referrer) {
+            return true
+        }
+        if let originURL = originURL(from: origin), !CuriumHLSParser.isPrivateOrLocalURL(originURL) {
+            return true
+        }
+        return CuriumHLSParser.isAllowedHTTPURL(url) && !CuriumHLSParser.isPrivateOrLocalURL(url)
+    }
+
+    private static func isHTTPSDowngrade(from sourceURL: URL, to targetURL: URL) -> Bool {
+        sourceURL.scheme?.lowercased() == "https" && targetURL.scheme?.lowercased() == "http"
+    }
+
+    private static func parseContentRangeHeader(_ raw: String) -> (start: Int, end: Int)? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.lowercased().hasPrefix("bytes ") else { return nil }
+        let body = trimmed.dropFirst(6).trimmingCharacters(in: .whitespaces)
+        guard let rangePart = body.split(separator: "/", maxSplits: 1).first else { return nil }
+        let bounds = rangePart.split(separator: "-", maxSplits: 1)
+        guard bounds.count == 2,
+              let start = Int(bounds[0]),
+              let end = Int(bounds[1]),
+              start >= 0,
+              end >= start else {
+            return nil
+        }
+        return (start, end)
+    }
+
+    static func validateAndSanitizeRedirectRequest(
+        _ proposed: URLRequest,
+        from previousURL: URL?,
+        originatingHostIsPublic: Bool
+    ) -> RedirectValidationResult {
+        guard let targetURL = proposed.url,
+              CuriumHLSParser.isAllowedHTTPURL(targetURL) else {
+            return .rejectedScheme(proposed.url?.scheme ?? "unknown")
+        }
+        if originatingHostIsPublic && CuriumHLSParser.isPrivateOrLocalURL(targetURL) {
+            return .rejectedPrivateNetwork(targetURL.host ?? "private")
+        }
+
         var sanitized = proposed
         sanitized.httpShouldHandleCookies = false
-        // RFC 6265 host-only cookie safety: strip Cookie on any host mismatch (including subdomains).
-        let targetHost = targetURL.host?.lowercased()
-        if originalHost == nil || targetHost != originalHost {
-            sanitized.setValue(nil, forHTTPHeaderField: "Cookie")
+
+        // Strip Referer across https -> http downgrades (checking both previous hop and Referer header).
+        if targetURL.scheme?.lowercased() == "http" {
+            if let previousURL, previousURL.scheme?.lowercased() == "https" {
+                sanitized.setValue(nil, forHTTPHeaderField: "Referer")
+            } else if let refHeader = sanitized.value(forHTTPHeaderField: "Referer"),
+                      let refURL = URL(string: refHeader),
+                      refURL.scheme?.lowercased() == "https" {
+                sanitized.setValue(nil, forHTTPHeaderField: "Referer")
+            }
         }
-        return sanitized
+
+        // RFC 6265 cookie safety: keep existing Cookie only on exact (scheme, host, directoryPath)
+        // match; strip and trigger cookieProvider refresh across host, scheme, or path changes.
+        let prevScope = previousURL.flatMap(HostCookieCache.scopeKey(for:))
+        let nextScope = HostCookieCache.scopeKey(for: targetURL)
+        if prevScope == nil || prevScope != nextScope {
+            sanitized.setValue(nil, forHTTPHeaderField: "Cookie")
+            return .allowed(sanitized, needsCookieRefresh: true)
+        }
+        return .allowed(sanitized, needsCookieRefresh: false)
+    }
+
+    static func sanitizeRedirectRequest(
+        _ proposed: URLRequest,
+        from previousURL: URL?,
+        originatingHostIsPublic: Bool,
+        cookieResolver: (@Sendable (URL) async -> String?)? = nil
+    ) async -> RedirectValidationResult {
+        let initial = validateAndSanitizeRedirectRequest(
+            proposed,
+            from: previousURL,
+            originatingHostIsPublic: originatingHostIsPublic
+        )
+        guard case .allowed(var sanitized, let needsCookieRefresh) = initial else {
+            return initial
+        }
+        if needsCookieRefresh, let cookieResolver, let targetURL = sanitized.url {
+            if let refreshed = await cookieResolver(targetURL)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !refreshed.isEmpty {
+                sanitized.setValue(refreshed, forHTTPHeaderField: "Cookie")
+            }
+        }
+        return .allowed(sanitized, needsCookieRefresh: false)
     }
 }
 
@@ -381,10 +711,15 @@ enum CuriumMediaNetworking {
 
 private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private struct ActiveFetch {
-        let originalHost: String?
+        let originatingHostIsPublic: Bool
         let maxBytes: Int
+        let expectedByteRange: (length: Int, offset: Int?)?
+        let cookieResolver: (@Sendable (URL) async -> String?)?
         var data = Data()
+        var currentURL: URL
         var finalURL: URL
+        var statusCode: Int = 0
+        var contentRangeHeader: String?
         var overrideError: (any Error)?
         var continuation: CheckedContinuation<(Data, URL), any Error>?
     }
@@ -394,24 +729,34 @@ private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @
     func fetchData(
         request: URLRequest,
         session: URLSession,
-        maxBytes: Int
+        maxBytes: Int,
+        expectedByteRange: (length: Int, offset: Int?)? = nil,
+        originatingHostIsPublic: Bool = false,
+        cookieResolver: (@Sendable (URL) async -> String?)? = nil
     ) async throws -> (Data, URL) {
         guard let url = request.url, CuriumHLSParser.isAllowedHTTPURL(url) else {
             throw CuriumMediaDownloadError.disallowedURLScheme(request.url?.scheme ?? "unknown")
         }
+        if originatingHostIsPublic && CuriumHLSParser.isPrivateOrLocalURL(url) {
+            throw CuriumMediaDownloadError.blockedPrivateNetworkHost(url.host ?? "private")
+        }
 
         let dataTask = session.dataTask(with: request)
         let taskID = dataTask.taskIdentifier
-        let requestHost = url.host?.lowercased()
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 state.withLock { map in
                     map[taskID] = ActiveFetch(
-                        originalHost: requestHost,
+                        originatingHostIsPublic: originatingHostIsPublic,
                         maxBytes: maxBytes,
+                        expectedByteRange: expectedByteRange,
+                        cookieResolver: cookieResolver,
                         data: Data(),
+                        currentURL: url,
                         finalURL: url,
+                        statusCode: 0,
+                        contentRangeHeader: nil,
                         overrideError: nil,
                         continuation: continuation
                     )
@@ -430,22 +775,70 @@ private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @
         newRequest request: URLRequest,
         completionHandler: @escaping @Sendable (URLRequest?) -> Void
     ) {
-        let originalHost = state.withLock { $0[task.taskIdentifier]?.originalHost }
-        guard let sanitized = CuriumMediaNetworking.sanitizeRedirectRequest(request, originalHost: originalHost),
-              let targetURL = sanitized.url else {
-            state.withLock { map in
-                map[task.taskIdentifier]?.overrideError = CuriumMediaDownloadError.disallowedURLScheme(
-                    request.url?.scheme ?? "unknown"
-                )
-            }
-            task.cancel()
+        let snapshot = state.withLock { map -> (URL?, Bool, (@Sendable (URL) async -> String?)?)? in
+            guard let entry = map[task.taskIdentifier] else { return nil }
+            return (response.url ?? entry.currentURL, entry.originatingHostIsPublic, entry.cookieResolver)
+        }
+        guard let (previousURL, originatingHostIsPublic, cookieResolver) = snapshot else {
             completionHandler(nil)
             return
         }
-        state.withLock { map in
-            map[task.taskIdentifier]?.finalURL = targetURL
+
+        let validation = CuriumMediaNetworking.validateAndSanitizeRedirectRequest(
+            request,
+            from: previousURL,
+            originatingHostIsPublic: originatingHostIsPublic
+        )
+        switch validation {
+        case .rejectedScheme(let scheme):
+            state.withLock { map in
+                map[task.taskIdentifier]?.overrideError = CuriumMediaDownloadError.disallowedURLScheme(scheme)
+            }
+            task.cancel()
+            completionHandler(nil)
+
+        case .rejectedPrivateNetwork(let host):
+            state.withLock { map in
+                map[task.taskIdentifier]?.overrideError = CuriumMediaDownloadError.blockedPrivateNetworkHost(host)
+            }
+            task.cancel()
+            completionHandler(nil)
+
+        case .allowed(let sanitized, let needsCookieRefresh):
+            guard let targetURL = sanitized.url else {
+                task.cancel()
+                completionHandler(nil)
+                return
+            }
+            guard needsCookieRefresh, let resolver = cookieResolver else {
+                state.withLock { map in
+                    map[task.taskIdentifier]?.currentURL = targetURL
+                    map[task.taskIdentifier]?.finalURL = targetURL
+                }
+                completionHandler(sanitized)
+                return
+            }
+            let taskID = task.taskIdentifier
+            Task { [weak self] in
+                guard let self else {
+                    completionHandler(nil)
+                    return
+                }
+                var updated = sanitized
+                if let refreshed = await resolver(targetURL)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !refreshed.isEmpty {
+                    updated.setValue(refreshed, forHTTPHeaderField: "Cookie")
+                }
+                let stillActive = self.state.withLock { map -> Bool in
+                    guard map[taskID] != nil else { return false }
+                    map[taskID]?.currentURL = targetURL
+                    map[taskID]?.finalURL = targetURL
+                    return true
+                }
+                completionHandler(stillActive ? updated : nil)
+            }
         }
-        completionHandler(sanitized)
     }
 
     func urlSession(
@@ -468,26 +861,72 @@ private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @
             completionHandler(.cancel)
             return
         }
-        if let responseURL = http.url {
-            guard CuriumHLSParser.isAllowedHTTPURL(responseURL) else {
-                state.withLock { map in
-                    map[dataTask.taskIdentifier]?.overrideError = CuriumMediaDownloadError.disallowedURLScheme(
-                        responseURL.scheme ?? "unknown"
-                    )
+
+        let responseCheckError: (any Error)? = state.withLock { map -> (any Error)? in
+            guard var entry = map[dataTask.taskIdentifier] else { return nil }
+            if let responseURL = http.url {
+                guard CuriumHLSParser.isAllowedHTTPURL(responseURL) else {
+                    let err = CuriumMediaDownloadError.disallowedURLScheme(responseURL.scheme ?? "unknown")
+                    entry.overrideError = err
+                    map[dataTask.taskIdentifier] = entry
+                    return err
                 }
-                completionHandler(.cancel)
-                return
+                if entry.originatingHostIsPublic && CuriumHLSParser.isPrivateOrLocalURL(responseURL) {
+                    let err = CuriumMediaDownloadError.blockedPrivateNetworkHost(responseURL.host ?? "private")
+                    entry.overrideError = err
+                    map[dataTask.taskIdentifier] = entry
+                    return err
+                }
+                entry.currentURL = responseURL
+                entry.finalURL = responseURL
             }
-            state.withLock { map in
-                map[dataTask.taskIdentifier]?.finalURL = responseURL
+
+            entry.statusCode = http.statusCode
+            entry.contentRangeHeader = http.value(forHTTPHeaderField: "Content-Range")
+
+            if http.expectedContentLength > Int64(entry.maxBytes) {
+                let err = CuriumMediaDownloadError.responseTooLarge(maxBytes: entry.maxBytes)
+                entry.overrideError = err
+                map[dataTask.taskIdentifier] = entry
+                return err
             }
+
+            if let byteRange = entry.expectedByteRange {
+                if http.statusCode == 206 {
+                    if http.expectedContentLength >= 0 && http.expectedContentLength != Int64(byteRange.length) {
+                        let err = CuriumMediaDownloadError.byteRangeMismatch(
+                            expected: byteRange.length,
+                            actual: Int(min(Int64(Int.max), http.expectedContentLength))
+                        )
+                        entry.overrideError = err
+                        map[dataTask.taskIdentifier] = entry
+                        return err
+                    }
+                } else if http.statusCode == 200 {
+                    let start = max(0, byteRange.offset ?? 0)
+                    let (endExclusive, overflow) = start.addingReportingOverflow(byteRange.length)
+                    if overflow || (http.expectedContentLength >= 0 && http.expectedContentLength < Int64(endExclusive)) {
+                        let actualAvail = http.expectedContentLength >= 0
+                            ? max(0, Int(min(Int64(Int.max), http.expectedContentLength)) - start)
+                            : 0
+                        let err = CuriumMediaDownloadError.byteRangeMismatch(expected: byteRange.length, actual: actualAvail)
+                        entry.overrideError = err
+                        map[dataTask.taskIdentifier] = entry
+                        return err
+                    }
+                } else {
+                    let err = CuriumMediaDownloadError.byteRangeMismatch(expected: byteRange.length, actual: 0)
+                    entry.overrideError = err
+                    map[dataTask.taskIdentifier] = entry
+                    return err
+                }
+            }
+
+            map[dataTask.taskIdentifier] = entry
+            return nil
         }
 
-        let maxBytes = state.withLock { $0[dataTask.taskIdentifier]?.maxBytes ?? Int.max }
-        if http.expectedContentLength > Int64(maxBytes) {
-            state.withLock { map in
-                map[dataTask.taskIdentifier]?.overrideError = CuriumMediaDownloadError.responseTooLarge(maxBytes: maxBytes)
-            }
+        if responseCheckError != nil {
             completionHandler(.cancel)
             return
         }
@@ -529,6 +968,20 @@ private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @
             }
             return
         }
+        if let byteRange = completed.expectedByteRange {
+            do {
+                let validated = try CuriumMediaNetworking.validateByteRangeResponse(
+                    data: completed.data,
+                    statusCode: completed.statusCode,
+                    contentRangeHeader: completed.contentRangeHeader,
+                    byteRange: byteRange
+                )
+                continuation.resume(returning: (validated, completed.finalURL))
+            } catch {
+                continuation.resume(throwing: error)
+            }
+            return
+        }
         continuation.resume(returning: (completed.data, completed.finalURL))
     }
 }
@@ -537,16 +990,34 @@ private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @
 
 @MainActor
 final class CuriumDirectMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
+    nonisolated static let resourceTimeoutInterval: TimeInterval = 86_400
+
     let downloadID: String
     let sourceTabID: String?
     let originalURL: URL?
     let suggestedFilename: String
     let mimeType: String?
     private let context: CuriumMediaRequestContext
+    private let cookieProvider: (@MainActor @Sendable (URL) async -> String?)?
 
-    private(set) var totalBytes: Int64
-    private(set) var receivedBytes: Int64 = 0
+    private var settledTotalBytes: Int64
+    private var settledReceivedBytes: Int64 = 0
     private(set) var state: CrIOSDownloadState = .pending
+
+    var totalBytes: Int64 {
+        if let coordinator, state == .inProgress {
+            let expected = coordinator.progressSnapshot().expected
+            return expected > 0 ? expected : settledTotalBytes
+        }
+        return settledTotalBytes
+    }
+
+    var receivedBytes: Int64 {
+        if let coordinator, state == .inProgress {
+            return coordinator.progressSnapshot().received
+        }
+        return settledReceivedBytes
+    }
 
     var isExplicitDownload: Bool { true }
     var isMainFrame: Bool { true }
@@ -563,15 +1034,17 @@ final class CuriumDirectMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         suggestedFilename: String,
         mimeType: String? = nil,
         expectedBytes: Int64 = -1,
-        context: CuriumMediaRequestContext
+        context: CuriumMediaRequestContext,
+        cookieProvider: (@MainActor @Sendable (URL) async -> String?)? = nil
     ) {
         self.downloadID = downloadID
         self.sourceTabID = sourceTabID
         self.originalURL = url
         self.suggestedFilename = suggestedFilename
         self.mimeType = mimeType
-        self.totalBytes = expectedBytes > 0 ? expectedBytes : -1
+        self.settledTotalBytes = expectedBytes > 0 ? expectedBytes : -1
         self.context = context
+        self.cookieProvider = cookieProvider
         super.init()
     }
 
@@ -588,22 +1061,45 @@ final class CuriumDirectMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
             completion(nil, CuriumMediaDownloadError.disallowedURLScheme(originalURL?.scheme ?? "unknown"))
             return
         }
+        if let referrer = context.referrer,
+           !CuriumHLSParser.isAllowedTargetURL(url, originatingURL: referrer) {
+            state = .failed
+            completion(nil, CuriumMediaDownloadError.blockedPrivateNetworkHost(url.host ?? "private"))
+            return
+        }
+        if let originURL = CuriumMediaNetworking.originURL(from: context.origin),
+           !CuriumHLSParser.isAllowedTargetURL(url, originatingURL: originURL) {
+            state = .failed
+            completion(nil, CuriumMediaDownloadError.blockedPrivateNetworkHost(url.host ?? "private"))
+            return
+        }
 
         self.destinationURL = destinationURL
         self.completionHandler = completion
         self.state = .inProgress
-        self.receivedBytes = 0
+        self.settledReceivedBytes = 0
+
+        let originatingHostIsPublic = CuriumMediaNetworking.isOriginatingHostPublic(
+            url: url,
+            referrer: context.referrer,
+            origin: context.origin
+        )
+        let provider = cookieProvider
+        let cookieCache = provider.map {
+            CuriumMediaNetworking.HostCookieCache(
+                baseURL: url,
+                baseCookie: context.cookieHeader,
+                provider: $0
+            )
+        }
 
         let coordinator = DirectDownloadCoordinator(
             destinationURL: destinationURL,
-            originalHost: url.host?.lowercased(),
-            onProgress: { [weak self] received, expected in
-                Task { @MainActor [weak self] in
-                    guard let self, self.state == .inProgress else { return }
-                    self.receivedBytes = received
-                    if expected > 0 {
-                        self.totalBytes = expected
-                    }
+            initialURL: url,
+            originatingHostIsPublic: originatingHostIsPublic,
+            cookieResolver: cookieCache.map { cache in
+                { @Sendable targetURL in
+                    await cache.cookieHeader(for: targetURL)
                 }
             },
             onFinished: { [weak self] result in
@@ -614,8 +1110,17 @@ final class CuriumDirectMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         )
         self.coordinator = coordinator
 
-        let session = CuriumMediaNetworking.makeEphemeralSession(proxy: context.proxy, delegate: coordinator)
-        let request = CuriumMediaNetworking.makeRequest(url: url, context: context)
+        let session = CuriumMediaNetworking.makeEphemeralSession(
+            proxy: context.proxy,
+            delegate: coordinator,
+            timeoutIntervalForResource: Self.resourceTimeoutInterval
+        )
+        // Direct <video>/<audio> fetches are non-CORS; omit `Origin:` so strict S3/CDN WAFs accept them.
+        let request = CuriumMediaNetworking.makeRequest(
+            url: url,
+            context: context,
+            includeOrigin: false
+        )
         let downloadTask = session.downloadTask(with: request)
         coordinator.attach(session: session, task: downloadTask)
         downloadTask.resume()
@@ -623,6 +1128,13 @@ final class CuriumDirectMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
 
     func cancel() {
         guard state == .pending || state == .inProgress else { return }
+        if let coordinator {
+            let snap = coordinator.progressSnapshot()
+            settledReceivedBytes = snap.received
+            if snap.expected > 0 {
+                settledTotalBytes = snap.expected
+            }
+        }
         state = .cancelled
         let activeCoordinator = coordinator
         coordinator = nil
@@ -635,6 +1147,13 @@ final class CuriumDirectMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
     }
 
     private func handleCoordinatorResult(_ result: Result<(URL, Int64), any Error>) {
+        if let coordinator {
+            let snap = coordinator.progressSnapshot()
+            settledReceivedBytes = snap.received
+            if snap.expected > 0 {
+                settledTotalBytes = snap.expected
+            }
+        }
         coordinator = nil
         switch result {
         case .success(let (savedURL, finalBytes)):
@@ -643,8 +1162,8 @@ final class CuriumDirectMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                 return
             }
             if finalBytes > 0 {
-                receivedBytes = finalBytes
-                totalBytes = finalBytes
+                settledReceivedBytes = finalBytes
+                settledTotalBytes = finalBytes
             }
             state = .completed
             finishOnce(savedURL: savedURL, error: nil)
@@ -670,29 +1189,34 @@ private final class DirectDownloadCoordinator: NSObject, URLSessionDownloadDeleg
     private struct MutableState {
         var session: URLSession?
         var task: URLSessionDownloadTask?
+        var currentURL: URL
         var cancelled = false
         var completed = false
         var movedSuccessfully = false
+        var receivedBytes: Int64 = 0
+        var expectedBytes: Int64 = -1
         var finalByteCount: Int64 = 0
         var recordedError: (any Error)?
     }
 
     private let destinationURL: URL
-    private let originalHost: String?
-    private let onProgress: @Sendable (Int64, Int64) -> Void
+    private let originatingHostIsPublic: Bool
+    private let cookieResolver: (@Sendable (URL) async -> String?)?
     private let onFinished: @Sendable (Result<(URL, Int64), any Error>) -> Void
-    private let lock = OSAllocatedUnfairLock<MutableState>(initialState: MutableState())
+    private let lock: OSAllocatedUnfairLock<MutableState>
 
     init(
         destinationURL: URL,
-        originalHost: String?,
-        onProgress: @escaping @Sendable (Int64, Int64) -> Void,
+        initialURL: URL,
+        originatingHostIsPublic: Bool,
+        cookieResolver: (@Sendable (URL) async -> String?)?,
         onFinished: @escaping @Sendable (Result<(URL, Int64), any Error>) -> Void
     ) {
         self.destinationURL = destinationURL
-        self.originalHost = originalHost
-        self.onProgress = onProgress
+        self.originatingHostIsPublic = originatingHostIsPublic
+        self.cookieResolver = cookieResolver
         self.onFinished = onFinished
+        self.lock = OSAllocatedUnfairLock(initialState: MutableState(currentURL: initialURL))
         super.init()
     }
 
@@ -701,6 +1225,10 @@ private final class DirectDownloadCoordinator: NSObject, URLSessionDownloadDeleg
             state.session = session
             state.task = task
         }
+    }
+
+    func progressSnapshot() -> (received: Int64, expected: Int64) {
+        lock.withLock { ($0.receivedBytes, $0.expectedBytes) }
     }
 
     func cancel() {
@@ -722,17 +1250,64 @@ private final class DirectDownloadCoordinator: NSObject, URLSessionDownloadDeleg
         newRequest request: URLRequest,
         completionHandler: @escaping @Sendable (URLRequest?) -> Void
     ) {
-        guard let sanitized = CuriumMediaNetworking.sanitizeRedirectRequest(request, originalHost: originalHost) else {
-            lock.withLock { state in
-                state.recordedError = CuriumMediaDownloadError.disallowedURLScheme(
-                    request.url?.scheme ?? "unknown"
-                )
-            }
-            task.cancel()
+        let (cancelled, previousURL) = lock.withLock { state in
+            (state.cancelled, response.url ?? state.currentURL)
+        }
+        guard !cancelled else {
             completionHandler(nil)
             return
         }
-        completionHandler(sanitized)
+
+        let validation = CuriumMediaNetworking.validateAndSanitizeRedirectRequest(
+            request,
+            from: previousURL,
+            originatingHostIsPublic: originatingHostIsPublic
+        )
+        switch validation {
+        case .rejectedScheme(let scheme):
+            lock.withLock { state in
+                state.recordedError = CuriumMediaDownloadError.disallowedURLScheme(scheme)
+            }
+            task.cancel()
+            completionHandler(nil)
+
+        case .rejectedPrivateNetwork(let host):
+            lock.withLock { state in
+                state.recordedError = CuriumMediaDownloadError.blockedPrivateNetworkHost(host)
+            }
+            task.cancel()
+            completionHandler(nil)
+
+        case .allowed(let sanitized, let needsCookieRefresh):
+            guard let targetURL = sanitized.url else {
+                task.cancel()
+                completionHandler(nil)
+                return
+            }
+            guard needsCookieRefresh, let resolver = cookieResolver else {
+                lock.withLock { $0.currentURL = targetURL }
+                completionHandler(sanitized)
+                return
+            }
+            Task { [weak self] in
+                guard let self else {
+                    completionHandler(nil)
+                    return
+                }
+                var updated = sanitized
+                if let refreshed = await resolver(targetURL)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !refreshed.isEmpty {
+                    updated.setValue(refreshed, forHTTPHeaderField: "Cookie")
+                }
+                let stillActive = self.lock.withLock { state -> Bool in
+                    guard !state.cancelled, !state.completed else { return false }
+                    state.currentURL = targetURL
+                    return true
+                }
+                completionHandler(stillActive ? updated : nil)
+            }
+        }
     }
 
     func urlSession(
@@ -742,9 +1317,13 @@ private final class DirectDownloadCoordinator: NSObject, URLSessionDownloadDeleg
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        let cancelled = lock.withLock { $0.cancelled }
-        guard !cancelled else { return }
-        onProgress(totalBytesWritten, totalBytesExpectedToWrite)
+        lock.withLock { state in
+            guard !state.cancelled else { return }
+            state.receivedBytes = totalBytesWritten
+            if totalBytesExpectedToWrite > 0 {
+                state.expectedBytes = totalBytesExpectedToWrite
+            }
+        }
     }
 
     func urlSession(
@@ -763,9 +1342,15 @@ private final class DirectDownloadCoordinator: NSObject, URLSessionDownloadDeleg
             lock.withLock { $0.recordedError = CuriumMediaDownloadError.httpStatusError(http.statusCode) }
             return
         }
-        if let finalURL = http.url, !CuriumHLSParser.isAllowedHTTPURL(finalURL) {
-            lock.withLock { $0.recordedError = CuriumMediaDownloadError.disallowedURLScheme(finalURL.scheme ?? "unknown") }
-            return
+        if let finalURL = http.url {
+            if !CuriumHLSParser.isAllowedHTTPURL(finalURL) {
+                lock.withLock { $0.recordedError = CuriumMediaDownloadError.disallowedURLScheme(finalURL.scheme ?? "unknown") }
+                return
+            }
+            if originatingHostIsPublic && CuriumHLSParser.isPrivateOrLocalURL(finalURL) {
+                lock.withLock { $0.recordedError = CuriumMediaDownloadError.blockedPrivateNetworkHost(finalURL.host ?? "private") }
+                return
+            }
         }
 
         let fm = FileManager.default
@@ -826,21 +1411,29 @@ private final class DirectDownloadCoordinator: NSObject, URLSessionDownloadDeleg
 final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
     nonisolated static let maxConcurrentSegments = 4
     private nonisolated static let maxSegmentRetries = 2
-    private nonisolated static let maxSegmentBytes = 256 * 1024 * 1024
+    nonisolated static let maxSegmentBytes = 64 * 1024 * 1024
     private nonisolated static let maxKeyBytes = 1024
 
     let downloadID: String
     let sourceTabID: String?
     let originalURL: URL?
     let audioPlaylistURL: URL?
+    let masterPlaylistURL: URL?
     let suggestedFilename: String
     let mimeType: String?
     private let context: CuriumMediaRequestContext
     private let cookieProvider: (@MainActor @Sendable (URL) async -> String?)?
 
-    private(set) var totalBytes: Int64 = -1
-    private(set) var receivedBytes: Int64 = 0
+    private let progressLock = OSAllocatedUnfairLock<(received: Int64, total: Int64)>(initialState: (0, -1))
     private(set) var state: CrIOSDownloadState = .pending
+
+    var totalBytes: Int64 {
+        progressLock.withLock { $0.total }
+    }
+
+    var receivedBytes: Int64 {
+        progressLock.withLock { $0.received }
+    }
 
     var isExplicitDownload: Bool { true }
     var isMainFrame: Bool { true }
@@ -854,6 +1447,7 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         sourceTabID: String? = nil,
         playlistURL: URL,
         audioPlaylistURL: URL? = nil,
+        masterPlaylistURL: URL? = nil,
         suggestedFilename: String,
         mimeType: String? = nil,
         context: CuriumMediaRequestContext,
@@ -863,6 +1457,7 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         self.sourceTabID = sourceTabID
         self.originalURL = playlistURL
         self.audioPlaylistURL = audioPlaylistURL
+        self.masterPlaylistURL = masterPlaylistURL
         self.suggestedFilename = suggestedFilename
         self.mimeType = mimeType
         self.context = context
@@ -883,20 +1478,42 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
             completion(nil, CuriumMediaDownloadError.disallowedURLScheme(originalURL?.scheme ?? "unknown"))
             return
         }
-        if let audioPlaylistURL, !CuriumHLSParser.isAllowedHTTPURL(audioPlaylistURL) {
+        let originURL = CuriumMediaNetworking.originURL(from: context.origin)
+        if let referrer = context.referrer,
+           !CuriumHLSParser.isAllowedTargetURL(playlistURL, originatingURL: referrer) {
             state = .failed
-            completion(nil, CuriumMediaDownloadError.disallowedURLScheme(audioPlaylistURL.scheme ?? "unknown"))
+            completion(nil, CuriumMediaDownloadError.blockedPrivateNetworkHost(playlistURL.host ?? "private"))
             return
+        }
+        if let originURL,
+           !CuriumHLSParser.isAllowedTargetURL(playlistURL, originatingURL: originURL) {
+            state = .failed
+            completion(nil, CuriumMediaDownloadError.blockedPrivateNetworkHost(playlistURL.host ?? "private"))
+            return
+        }
+        if let audioPlaylistURL {
+            guard CuriumHLSParser.isAllowedHTTPURL(audioPlaylistURL) else {
+                state = .failed
+                completion(nil, CuriumMediaDownloadError.disallowedURLScheme(audioPlaylistURL.scheme ?? "unknown"))
+                return
+            }
+            if !CuriumHLSParser.isAllowedTargetURL(audioPlaylistURL, originatingURL: playlistURL)
+                || (context.referrer != nil && !CuriumHLSParser.isAllowedTargetURL(audioPlaylistURL, originatingURL: context.referrer))
+                || (originURL != nil && !CuriumHLSParser.isAllowedTargetURL(audioPlaylistURL, originatingURL: originURL)) {
+                state = .failed
+                completion(nil, CuriumMediaDownloadError.blockedPrivateNetworkHost(audioPlaylistURL.host ?? "private"))
+                return
+            }
         }
 
         state = .inProgress
-        receivedBytes = 0
-        totalBytes = -1
+        progressLock.withLock { $0 = (0, -1) }
         completionHandler = completion
 
         let baseContext = context
         let initialAudioURL = audioPlaylistURL
         let provider = cookieProvider
+        let progressBox = progressLock
 
         runnerTask = Task.detached(priority: .utility) { [weak self] in
             do {
@@ -906,12 +1523,8 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                     destinationURL: destinationURL,
                     baseContext: baseContext,
                     cookieProvider: provider,
-                    onProgress: { [weak self] received, estimatedTotal in
-                        Task { @MainActor [weak self] in
-                            guard let self, self.state == .inProgress else { return }
-                            self.receivedBytes = received
-                            self.totalBytes = estimatedTotal
-                        }
+                    onProgress: { received, estimatedTotal in
+                        progressBox.withLock { $0 = (received, estimatedTotal) }
                     }
                 )
                 await MainActor.run { [weak self] in
@@ -923,8 +1536,7 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                         try? FileManager.default.removeItem(at: savedURL)
                         return
                     }
-                    self.receivedBytes = finalBytes
-                    self.totalBytes = finalBytes
+                    self.progressLock.withLock { $0 = (finalBytes, finalBytes) }
                     self.state = .completed
                     self.runnerTask = nil
                     self.finishOnce(savedURL: savedURL, error: nil)
@@ -968,6 +1580,11 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
 
     // MARK: - Off-Main Pipeline
 
+    private final class ExportSessionBox: @unchecked Sendable {
+        let session: AVAssetExportSession
+        init(_ session: AVAssetExportSession) { self.session = session }
+    }
+
     private struct MapFetchKey: Hashable, Sendable {
         let url: URL
         let length: Int?
@@ -1003,51 +1620,24 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         }
     }
 
-    /// Per-host cookie cache with exact-host matching (never forwards host-only cookies to
-    /// subdomains) and coalesced `@MainActor` lookups so large CDN playlists hop once per host.
-    private actor HostCookieCache {
-        private let baseHost: String?
-        private let baseCookie: String?
-        private let provider: (@MainActor @Sendable (URL) async -> String?)?
-        private var resolvedByHost: [String: String?] = [:]
-        private var inFlightByHost: [String: Task<String?, Never>] = [:]
-
-        init(
-            baseHost: String?,
-            baseCookie: String?,
-            provider: (@MainActor @Sendable (URL) async -> String?)?
-        ) {
-            self.baseHost = baseHost
-            self.baseCookie = baseCookie
-            self.provider = provider
+    /// Selects the container extension for an assembled separate HLS audio rendition:
+    /// `.m4a` for fMP4, packed RFC 8216 §3.4 extensions (`.aac`/`.ac3`/`.ec3`/`.mp3`)
+    /// when detected from segment URLs, otherwise `.ts`.
+    nonisolated static func preferredAudioTrackExtension(for playlist: CuriumHLSMediaPlaylist) -> String {
+        if playlist.isFMP4 {
+            return "m4a"
         }
-
-        func cookieHeader(for url: URL) async -> String? {
-            guard let targetHost = url.host?.lowercased(), !targetHost.isEmpty else {
-                return nil
+        let packedExtensions: Set<String> = ["aac", "ac3", "ec3", "mp3"]
+        for segment in playlist.segments {
+            let ext = segment.url.pathExtension.lowercased()
+            if ext == "adts" {
+                return "aac"
             }
-            if let baseHost, targetHost == baseHost {
-                return baseCookie
+            if packedExtensions.contains(ext) {
+                return ext
             }
-            if let cached = resolvedByHost[targetHost] {
-                return cached
-            }
-            if let existingTask = inFlightByHost[targetHost] {
-                return await existingTask.value
-            }
-            guard let provider else {
-                resolvedByHost[targetHost] = nil
-                return nil
-            }
-            let lookupTask = Task<String?, Never> {
-                await provider(url)
-            }
-            inFlightByHost[targetHost] = lookupTask
-            let resolved = await lookupTask.value
-            inFlightByHost.removeValue(forKey: targetHost)
-            resolvedByHost[targetHost] = resolved
-            return resolved
         }
+        return "ts"
     }
 
     private nonisolated static func executeDownload(
@@ -1064,14 +1654,13 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
             try fm.createDirectory(at: destinationDir, withIntermediateDirectories: true)
         }
 
-        // Dedicated staging directory beside destinationURL — always deleted in `defer`.
-        let stagingDir = destinationDir.appending(
-            path: ".curium-hls-\(UUID().uuidString)",
-            directoryHint: .isDirectory
-        )
-        try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        // Stage HLS work strictly under `<Caches>/CuriumDownloadStaging/<UUID>/` so crashes,
+        // Jetsam, or LiveContainer guest switches never leak multi-GB hidden folders inside
+        // durable `Documents/Curium/Downloads/`.
+        let stagedSession = try CuriumDownloadStorage.makeDownloadStagingDestination(filename: "hls-staging")
+        let stagingDir = stagedSession.sessionDirectory
         defer {
-            try? fm.removeItem(at: stagingDir)
+            CuriumDownloadStorage.removeDownloadStagingDirectory(stagingDir)
         }
 
         let coordinator = BoundedFetchCoordinator()
@@ -1080,10 +1669,15 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
             session.invalidateAndCancel()
         }
 
-        let cookieCache = HostCookieCache(
-            baseHost: playlistURL.host?.lowercased(),
+        let cookieCache = CuriumMediaNetworking.HostCookieCache(
+            baseURL: playlistURL,
             baseCookie: baseContext.cookieHeader,
             provider: cookieProvider
+        )
+        let originatingHostIsPublic = CuriumMediaNetworking.isOriginatingHostPublic(
+            url: playlistURL,
+            referrer: baseContext.referrer,
+            origin: baseContext.origin
         )
 
         try Task.checkCancellation()
@@ -1093,6 +1687,7 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
             url: playlistURL,
             byteRange: nil,
             maxBytes: CuriumHLSParser.maxPlaylistBytes,
+            originatingHostIsPublic: originatingHostIsPublic,
             baseContext: baseContext,
             cookieCache: cookieCache,
             session: session,
@@ -1120,6 +1715,7 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                 url: chosenVariant.url,
                 byteRange: nil,
                 maxBytes: CuriumHLSParser.maxPlaylistBytes,
+                originatingHostIsPublic: originatingHostIsPublic,
                 baseContext: baseContext,
                 cookieCache: cookieCache,
                 session: session,
@@ -1143,41 +1739,67 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
             throw CuriumMediaDownloadError.emptyPlaylist
         }
 
+        let hasSeparateAudio = audioURLToMux != nil
+        if let audioURL = audioURLToMux {
+            guard CuriumHLSParser.isAllowedHTTPURL(audioURL) else {
+                throw CuriumMediaDownloadError.disallowedURLScheme(audioURL.scheme ?? "unknown")
+            }
+            if originatingHostIsPublic && CuriumHLSParser.isPrivateOrLocalURL(audioURL) {
+                throw CuriumMediaDownloadError.blockedPrivateNetworkHost(audioURL.host ?? "private")
+            }
+        }
+
         // 2. Download & assemble primary video/muxed track.
         let videoStagingDir = stagingDir.appending(path: "video", directoryHint: .isDirectory)
         let videoExt = mediaPlaylist.isFMP4 ? "mp4" : "ts"
         let assembledVideoURL = stagingDir.appending(path: "primary.\(videoExt)", directoryHint: .notDirectory)
 
-        try await downloadAndAssembleTrack(
+        let videoProgress: @Sendable (Int64, Int64) -> Void = { received, estimated in
+            if hasSeparateAudio {
+                let scaledTotal = max(received + 1, Int64((Double(max(estimated, 1)) * 1.30).rounded()))
+                onProgress(received, scaledTotal)
+            } else {
+                onProgress(received, estimated)
+            }
+        }
+
+        let assembledVideoBytes = try await downloadAndAssembleTrack(
             playlist: mediaPlaylist,
             trackStagingDir: videoStagingDir,
             outputURL: assembledVideoURL,
+            originatingHostIsPublic: originatingHostIsPublic,
             baseContext: baseContext,
             cookieCache: cookieCache,
             session: session,
             coordinator: coordinator,
-            onProgress: onProgress
+            onProgress: videoProgress
         )
+        try? fm.removeItem(at: videoStagingDir)
 
         try Task.checkCancellation()
 
-        // 3. Optional separate audio rendition (fMP4 passthrough mux with graceful fallback to video-only).
+        // 3. Separate audio rendition: download, combine progress, mux cleanly, and surface failures
+        // (never silently discard audio or swallow CancellationError to emit a mute video).
         var readyArtifactURL = assembledVideoURL
         var finalExpectedExtension = videoExt
 
-        if let audioURL = audioURLToMux, CuriumHLSParser.isAllowedHTTPURL(audioURL) {
-            if let muxedURL = await attemptSeparateAudioMux(
+        if let audioURL = audioURLToMux {
+            let muxedURL = try await downloadAndMuxSeparateAudio(
                 audioPlaylistURL: audioURL,
                 videoTrackURL: assembledVideoURL,
+                videoBytes: assembledVideoBytes,
                 stagingDir: stagingDir,
+                originatingHostIsPublic: originatingHostIsPublic,
                 baseContext: baseContext,
                 cookieCache: cookieCache,
                 session: session,
-                coordinator: coordinator
-            ) {
-                readyArtifactURL = muxedURL
-                finalExpectedExtension = "mp4"
-            }
+                coordinator: coordinator,
+                onProgress: onProgress
+            )
+            // Immediately reclaim primary video staging bytes once muxed output is complete.
+            try? fm.removeItem(at: assembledVideoURL)
+            readyArtifactURL = muxedURL
+            finalExpectedExtension = "mp4"
         }
 
         try Task.checkCancellation()
@@ -1194,16 +1816,18 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         return (finalDestinationURL, finalByteCount)
     }
 
+    @discardableResult
     private nonisolated static func downloadAndAssembleTrack(
         playlist: CuriumHLSMediaPlaylist,
         trackStagingDir: URL,
         outputURL: URL,
+        originatingHostIsPublic: Bool,
         baseContext: CuriumMediaRequestContext,
-        cookieCache: HostCookieCache,
+        cookieCache: CuriumMediaNetworking.HostCookieCache,
         session: URLSession,
         coordinator: BoundedFetchCoordinator,
         onProgress: (@Sendable (Int64, Int64) -> Void)?
-    ) async throws {
+    ) async throws -> Int64 {
         let fm = FileManager.default
         try fm.createDirectory(at: trackStagingDir, withIntermediateDirectories: true)
 
@@ -1221,11 +1845,15 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                     guard CuriumHLSParser.isAllowedHTTPURL(keyURL) else {
                         throw CuriumMediaDownloadError.disallowedURLScheme(keyURL.scheme ?? "unknown")
                     }
+                    if originatingHostIsPublic && CuriumHLSParser.isPrivateOrLocalURL(keyURL) {
+                        throw CuriumMediaDownloadError.blockedPrivateNetworkHost(keyURL.host ?? "private")
+                    }
                     if keyCache[keyURL] == nil {
                         let (keyData, _) = try await fetchWithRetries(
                             url: keyURL,
                             byteRange: nil,
                             maxBytes: maxKeyBytes,
+                            originatingHostIsPublic: originatingHostIsPublic,
                             baseContext: baseContext,
                             cookieCache: cookieCache,
                             session: session,
@@ -1249,6 +1877,9 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
             guard CuriumHLSParser.isAllowedHTTPURL(mapURL) else {
                 throw CuriumMediaDownloadError.disallowedURLScheme(mapURL.scheme ?? "unknown")
             }
+            if originatingHostIsPublic && CuriumHLSParser.isPrivateOrLocalURL(mapURL) {
+                throw CuriumMediaDownloadError.blockedPrivateNetworkHost(mapURL.host ?? "private")
+            }
             let cacheKey = MapCacheKey(segment: segment, mapURL: mapURL)
             if mapCache[cacheKey] == nil {
                 let fetchKey = MapFetchKey(
@@ -1264,6 +1895,7 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                         url: mapURL,
                         byteRange: segment.mapByteRange,
                         maxBytes: maxSegmentBytes,
+                        originatingHostIsPublic: originatingHostIsPublic,
                         baseContext: baseContext,
                         cookieCache: cookieCache,
                         session: session,
@@ -1294,6 +1926,8 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                 }
             }
         }
+        // Release raw init-map buffers immediately before concurrent segment downloads begin.
+        rawMapCache.removeAll(keepingCapacity: false)
 
         let immutableKeys = keyCache
         let segments = playlist.segments
@@ -1317,6 +1951,7 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                         url: segment.url,
                         byteRange: segment.byteRange,
                         maxBytes: maxSegmentBytes,
+                        originatingHostIsPublic: originatingHostIsPublic,
                         baseContext: baseContext,
                         cookieCache: cookieCache,
                         session: session,
@@ -1380,6 +2015,7 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
 
         var lastMapKey: MapCacheKey?
         let copyChunkBytes = 256 * 1024
+        var writtenBytes: Int64 = 0
 
         for segment in segments {
             try Task.checkCancellation()
@@ -1387,6 +2023,7 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                 let mapKey = MapCacheKey(segment: segment, mapURL: mapURL)
                 if mapKey != lastMapKey, let mapBytes = mapCache[mapKey] {
                     try writer.write(contentsOf: mapBytes)
+                    writtenBytes += Int64(mapBytes.count)
                     lastMapKey = mapKey
                 }
             }
@@ -1401,87 +2038,130 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                     break
                 }
                 try writer.write(contentsOf: chunk)
+                writtenBytes += Int64(chunk.count)
             }
             try? reader.close()
             try? fm.removeItem(at: segFileURL)
         }
+        mapCache.removeAll(keepingCapacity: false)
         try writer.synchronize()
+        return max(writtenBytes, downloadedBytes)
     }
 
-    private nonisolated static func attemptSeparateAudioMux(
+    private nonisolated static func downloadAndMuxSeparateAudio(
         audioPlaylistURL: URL,
         videoTrackURL: URL,
+        videoBytes: Int64,
         stagingDir: URL,
+        originatingHostIsPublic: Bool,
         baseContext: CuriumMediaRequestContext,
-        cookieCache: HostCookieCache,
+        cookieCache: CuriumMediaNetworking.HostCookieCache,
         session: URLSession,
-        coordinator: BoundedFetchCoordinator
-    ) async -> URL? {
-        do {
-            try Task.checkCancellation()
-            let (audioPlaylistData, resolvedAudioURL) = try await fetchAuthorizedData(
-                url: audioPlaylistURL,
-                byteRange: nil,
-                maxBytes: CuriumHLSParser.maxPlaylistBytes,
-                baseContext: baseContext,
-                cookieCache: cookieCache,
-                session: session,
-                coordinator: coordinator
-            )
-            let audioText = String(data: audioPlaylistData, encoding: .utf8)
-                ?? String(data: audioPlaylistData, encoding: .isoLatin1)
-                ?? ""
-            let audioPlaylist = try CuriumHLSParser.parseMediaPlaylist(text: audioText, baseURL: resolvedAudioURL)
-            guard !audioPlaylist.isLiveStream,
-                  !audioPlaylist.segments.isEmpty else {
-                return nil
-            }
-            if case .unsupportedDRM = audioPlaylist.encryptionSummary {
-                return nil
-            }
-
-            let audioExt = audioPlaylist.isFMP4 ? "m4a" : "ts"
-            let audioStagingDir = stagingDir.appending(path: "audio", directoryHint: .isDirectory)
-            let audioTrackURL = stagingDir.appending(path: "audio.\(audioExt)", directoryHint: .notDirectory)
-
-            try await downloadAndAssembleTrack(
-                playlist: audioPlaylist,
-                trackStagingDir: audioStagingDir,
-                outputURL: audioTrackURL,
-                baseContext: baseContext,
-                cookieCache: cookieCache,
-                session: session,
-                coordinator: coordinator,
-                onProgress: nil
-            )
-
-            let muxedURL = stagingDir.appending(path: "muxed.mp4", directoryHint: .notDirectory)
-            try await muxFMP4Tracks(videoURL: videoTrackURL, audioURL: audioTrackURL, outputURL: muxedURL)
-            return muxedURL
-        } catch {
-            // Graceful fallback: keep the already-downloaded video track if muxing fails.
-            return nil
+        coordinator: BoundedFetchCoordinator,
+        onProgress: @escaping @Sendable (Int64, Int64) -> Void
+    ) async throws -> URL {
+        try Task.checkCancellation()
+        let (audioPlaylistData, resolvedAudioURL) = try await fetchAuthorizedData(
+            url: audioPlaylistURL,
+            byteRange: nil,
+            maxBytes: CuriumHLSParser.maxPlaylistBytes,
+            originatingHostIsPublic: originatingHostIsPublic,
+            baseContext: baseContext,
+            cookieCache: cookieCache,
+            session: session,
+            coordinator: coordinator
+        )
+        let audioText = String(data: audioPlaylistData, encoding: .utf8)
+            ?? String(data: audioPlaylistData, encoding: .isoLatin1)
+            ?? ""
+        let audioPlaylist = try CuriumHLSParser.parseMediaPlaylist(text: audioText, baseURL: resolvedAudioURL)
+        if case .unsupportedDRM(let method) = audioPlaylist.encryptionSummary {
+            throw CuriumMediaDownloadError.drmUnsupported(method)
         }
-    }
-
-    private nonisolated static func muxFMP4Tracks(
-        videoURL: URL,
-        audioURL: URL,
-        outputURL: URL
-    ) async throws {
-        let videoAsset = AVURLAsset(url: videoURL)
-        let audioAsset = AVURLAsset(url: audioURL)
-
-        let videoTracks = try await videoAsset.loadTracks(withMediaType: .video)
-        let audioTracks = try await audioAsset.loadTracks(withMediaType: .audio)
-        guard let sourceVideo = videoTracks.first, let sourceAudio = audioTracks.first else {
+        guard !audioPlaylist.isLiveStream else {
+            throw CuriumMediaDownloadError.liveStreamUnsupported
+        }
+        guard !audioPlaylist.segments.isEmpty else {
             throw CuriumMediaDownloadError.emptyPlaylist
         }
 
-        let videoDuration = try await videoAsset.load(.duration)
-        let audioDuration = try await audioAsset.load(.duration)
-        let composition = AVMutableComposition()
+        let fm = FileManager.default
+        let audioExt = preferredAudioTrackExtension(for: audioPlaylist)
+        let audioStagingDir = stagingDir.appending(path: "audio", directoryHint: .isDirectory)
+        let audioTrackURL = stagingDir.appending(path: "audio.\(audioExt)", directoryHint: .notDirectory)
+        defer {
+            try? fm.removeItem(at: audioStagingDir)
+            try? fm.removeItem(at: audioTrackURL)
+        }
 
+        let audioBytes = try await downloadAndAssembleTrack(
+            playlist: audioPlaylist,
+            trackStagingDir: audioStagingDir,
+            outputURL: audioTrackURL,
+            originatingHostIsPublic: originatingHostIsPublic,
+            baseContext: baseContext,
+            cookieCache: cookieCache,
+            session: session,
+            coordinator: coordinator,
+            onProgress: { audioReceived, audioEstimated in
+                let combinedReceived = videoBytes + audioReceived
+                let combinedBase = videoBytes + max(audioEstimated, audioReceived, 1)
+                let combinedTotal = max(combinedReceived + 1, Int64((Double(combinedBase) * 1.06).rounded()))
+                onProgress(combinedReceived, combinedTotal)
+            }
+        )
+        try? fm.removeItem(at: audioStagingDir)
+
+        try Task.checkCancellation()
+
+        let muxedURL = stagingDir.appending(path: "muxed.mp4", directoryHint: .notDirectory)
+        let combinedTrackBytes = max(1, videoBytes + audioBytes)
+        let muxTotal = max(combinedTrackBytes + 1, Int64((Double(combinedTrackBytes) * 1.06).rounded()))
+        let muxHeadroom = max(0, muxTotal - combinedTrackBytes - 1)
+        onProgress(combinedTrackBytes, muxTotal)
+
+        try await muxFMP4Tracks(
+            videoURL: videoTrackURL,
+            audioURL: audioTrackURL,
+            outputURL: muxedURL,
+            onProgress: { fraction in
+                let clamped = min(1.0, max(0.0, Double(fraction)))
+                let extra = Int64((Double(muxHeadroom) * clamped).rounded())
+                onProgress(min(muxTotal - 1, combinedTrackBytes + extra), muxTotal)
+            }
+        )
+        return muxedURL
+    }
+
+    nonisolated static func muxFMP4Tracks(
+        videoURL: URL,
+        audioURL: URL,
+        outputURL: URL,
+        onProgress: (@Sendable (Float) -> Void)? = nil
+    ) async throws {
+        try Task.checkCancellation()
+        let videoAsset = AVURLAsset(url: videoURL)
+        let audioAsset = AVURLAsset(url: audioURL)
+
+        let videoTracks: [AVAssetTrack]
+        let audioTracks: [AVAssetTrack]
+        do {
+            videoTracks = try await videoAsset.loadTracks(withMediaType: .video)
+            audioTracks = try await audioAsset.loadTracks(withMediaType: .audio)
+        } catch let error as CancellationError {
+            throw error
+        } catch {
+            throw CuriumMediaDownloadError.audioMuxFailed(error.localizedDescription)
+        }
+
+        guard let sourceVideo = videoTracks.first else {
+            throw CuriumMediaDownloadError.audioMuxFailed("No readable video track found in primary stream.")
+        }
+        guard let sourceAudio = audioTracks.first else {
+            throw CuriumMediaDownloadError.audioMuxFailed("No readable audio track found in separate audio stream.")
+        }
+
+        let composition = AVMutableComposition()
         guard let compVideo = composition.addMutableTrack(
             withMediaType: .video,
             preferredTrackID: kCMPersistentTrackID_Invalid
@@ -1490,36 +2170,97 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
             withMediaType: .audio,
             preferredTrackID: kCMPersistentTrackID_Invalid
         ) else {
-            throw CuriumMediaDownloadError.emptyPlaylist
+            throw CuriumMediaDownloadError.audioMuxFailed("Unable to allocate composition tracks.")
         }
 
-        try compVideo.insertTimeRange(
-            CMTimeRange(start: .zero, duration: videoDuration),
-            of: sourceVideo,
-            at: .zero
-        )
-        let effectiveAudioDuration = audioDuration > .zero ? min(audioDuration, videoDuration) : videoDuration
-        try compAudio.insertTimeRange(
-            CMTimeRange(start: .zero, duration: effectiveAudioDuration),
-            of: sourceAudio,
-            at: .zero
-        )
+        do {
+            let videoTimeRange = try await sourceVideo.load(.timeRange)
+            let audioTimeRange = try await sourceAudio.load(.timeRange)
+            let videoTransform = try await sourceVideo.load(.preferredTransform)
+
+            let effectiveVideoRange: CMTimeRange
+            if videoTimeRange.isValid && !videoTimeRange.isEmpty && videoTimeRange.duration > .zero {
+                effectiveVideoRange = videoTimeRange
+            } else {
+                let videoDuration = try await videoAsset.load(.duration)
+                guard videoDuration.isNumeric && videoDuration > .zero else {
+                    throw CuriumMediaDownloadError.audioMuxFailed("Video track has zero duration.")
+                }
+                effectiveVideoRange = CMTimeRange(start: .zero, duration: videoDuration)
+            }
+
+            let effectiveAudioRange: CMTimeRange
+            if audioTimeRange.isValid && !audioTimeRange.isEmpty && audioTimeRange.duration > .zero {
+                let clampedDuration = min(audioTimeRange.duration, effectiveVideoRange.duration)
+                effectiveAudioRange = CMTimeRange(start: audioTimeRange.start, duration: clampedDuration)
+            } else {
+                let audioDuration = try await audioAsset.load(.duration)
+                let clampedDuration = (audioDuration.isNumeric && audioDuration > .zero)
+                    ? min(audioDuration, effectiveVideoRange.duration)
+                    : effectiveVideoRange.duration
+                effectiveAudioRange = CMTimeRange(start: .zero, duration: clampedDuration)
+            }
+
+            let baseStart = CMTimeMinimum(effectiveVideoRange.start, effectiveAudioRange.start)
+            let videoInsertAt = CMTimeMaximum(.zero, CMTimeSubtract(effectiveVideoRange.start, baseStart))
+            let audioInsertAt = CMTimeMaximum(.zero, CMTimeSubtract(effectiveAudioRange.start, baseStart))
+
+            try compVideo.insertTimeRange(effectiveVideoRange, of: sourceVideo, at: videoInsertAt)
+            compVideo.preferredTransform = videoTransform
+            try compAudio.insertTimeRange(effectiveAudioRange, of: sourceAudio, at: audioInsertAt)
+        } catch let error as CancellationError {
+            throw error
+        } catch let error as CuriumMediaDownloadError {
+            throw error
+        } catch {
+            throw CuriumMediaDownloadError.audioMuxFailed(error.localizedDescription)
+        }
 
         guard let exporter = AVAssetExportSession(
             asset: composition,
             presetName: AVAssetExportPresetPassthrough
         ) else {
-            throw CuriumMediaDownloadError.emptyPlaylist
+            throw CuriumMediaDownloadError.audioMuxFailed("Passthrough MP4 export session unavailable.")
         }
-        try await exporter.export(to: outputURL, as: .mp4)
+
+        let box = ExportSessionBox(exporter)
+        let progressPoller: Task<Void, Never>? = onProgress.map { callback in
+            Task.detached(priority: .utility) {
+                while !Task.isCancelled {
+                    callback(box.session.progress)
+                    do { try await Task.sleep(for: .milliseconds(150)) } catch { break }
+                }
+            }
+        }
+        defer { progressPoller?.cancel() }
+
+        do {
+            try await withTaskCancellationHandler {
+                try await box.session.export(to: outputURL, as: .mp4)
+            } onCancel: {
+                box.session.cancelExport()
+            }
+            try Task.checkCancellation()
+            onProgress?(1.0)
+        } catch let error as CancellationError {
+            try? FileManager.default.removeItem(at: outputURL)
+            throw error
+        } catch {
+            try? FileManager.default.removeItem(at: outputURL)
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            throw CuriumMediaDownloadError.audioMuxFailed(error.localizedDescription)
+        }
     }
 
     private nonisolated static func fetchWithRetries(
         url: URL,
         byteRange: (length: Int, offset: Int?)?,
         maxBytes: Int,
+        originatingHostIsPublic: Bool,
         baseContext: CuriumMediaRequestContext,
-        cookieCache: HostCookieCache,
+        cookieCache: CuriumMediaNetworking.HostCookieCache,
         session: URLSession,
         coordinator: BoundedFetchCoordinator
     ) async throws -> (Data, URL) {
@@ -1531,6 +2272,7 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                     url: url,
                     byteRange: byteRange,
                     maxBytes: maxBytes,
+                    originatingHostIsPublic: originatingHostIsPublic,
                     baseContext: baseContext,
                     cookieCache: cookieCache,
                     session: session,
@@ -1540,7 +2282,8 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
                 throw error
             } catch let error as CuriumMediaDownloadError {
                 switch error {
-                case .disallowedURLScheme, .responseTooLarge, .cancelled, .drmUnsupported, .liveStreamUnsupported:
+                case .disallowedURLScheme, .blockedPrivateNetworkHost, .responseTooLarge,
+                     .byteRangeMismatch, .cancelled, .drmUnsupported, .liveStreamUnsupported:
                     throw error
                 case .httpStatusError(let code) where (400...499).contains(code) && code != 408 && code != 429:
                     throw error
@@ -1562,13 +2305,17 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         url: URL,
         byteRange: (length: Int, offset: Int?)?,
         maxBytes: Int,
+        originatingHostIsPublic: Bool,
         baseContext: CuriumMediaRequestContext,
-        cookieCache: HostCookieCache,
+        cookieCache: CuriumMediaNetworking.HostCookieCache,
         session: URLSession,
         coordinator: BoundedFetchCoordinator
     ) async throws -> (Data, URL) {
         guard CuriumHLSParser.isAllowedHTTPURL(url) else {
             throw CuriumMediaDownloadError.disallowedURLScheme(url.scheme ?? "unknown")
+        }
+        if originatingHostIsPublic && CuriumHLSParser.isPrivateOrLocalURL(url) {
+            throw CuriumMediaDownloadError.blockedPrivateNetworkHost(url.host ?? "private")
         }
 
         let resolvedCookie = await cookieCache.cookieHeader(for: url)
@@ -1584,7 +2331,16 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
             context: perRequestContext,
             byteRange: byteRange
         )
-        return try await coordinator.fetchData(request: request, session: session, maxBytes: maxBytes)
+        return try await coordinator.fetchData(
+            request: request,
+            session: session,
+            maxBytes: maxBytes,
+            expectedByteRange: byteRange,
+            originatingHostIsPublic: originatingHostIsPublic,
+            cookieResolver: { targetURL in
+                await cookieCache.cookieHeader(for: targetURL)
+            }
+        )
     }
 
     private nonisolated static func commitAlignedArtifact(
@@ -1598,7 +2354,7 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
             if fm.fileExists(atPath: requestedDestination.path) {
                 try fm.removeItem(at: requestedDestination)
             }
-            try fm.moveItem(at: artifactURL, to: requestedDestination)
+            try moveOrCopyItem(from: artifactURL, to: requestedDestination, fileManager: fm)
             return requestedDestination
         }
 
@@ -1612,7 +2368,24 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         defer {
             CuriumDownloadStorage.releaseDownloadReservation(at: uniqueURL)
         }
-        try fm.moveItem(at: artifactURL, to: uniqueURL)
+        try moveOrCopyItem(from: artifactURL, to: uniqueURL, fileManager: fm)
         return uniqueURL
+    }
+
+    private nonisolated static func moveOrCopyItem(
+        from sourceURL: URL,
+        to destinationURL: URL,
+        fileManager fm: FileManager
+    ) throws {
+        do {
+            try fm.moveItem(at: sourceURL, to: destinationURL)
+        } catch {
+            // Cross-volume boundary (e.g. Caches -> App Group / external volume): copy then unlink.
+            if fm.fileExists(atPath: destinationURL.path) {
+                try? fm.removeItem(at: destinationURL)
+            }
+            try fm.copyItem(at: sourceURL, to: destinationURL)
+            try? fm.removeItem(at: sourceURL)
+        }
     }
 }

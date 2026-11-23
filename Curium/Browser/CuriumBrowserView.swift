@@ -809,6 +809,7 @@ private struct CuriumBottomOverlayStack: View {
                             maxWidth: min(480, pane.maxWidth),
                             openDownloads: openDownloads
                         )
+                        .id(bannerDownload.id)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                 }
@@ -1049,8 +1050,15 @@ private struct CuriumDownloadBannerCard: View {
 private struct CuriumDownloadBannerProgressView: View {
     let download: CuriumDownload
     let tint: Color
+    @Environment(\.scenePhase) private var scenePhase
+
+    private struct PollKey: Equatable {
+        let downloadID: String
+        let shouldPoll: Bool
+    }
 
     var body: some View {
+        let shouldPoll = scenePhase == .active && download.isActive
         Group {
             if let fraction = download.fraction {
                 ProgressView(value: fraction)
@@ -1061,9 +1069,9 @@ private struct CuriumDownloadBannerProgressView: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .task(id: download.isActive) {
-            guard download.isActive else { return }
-            while !Task.isCancelled && download.isActive {
+        .task(id: PollKey(downloadID: download.id, shouldPoll: shouldPoll)) {
+            guard shouldPoll else { return }
+            while !Task.isCancelled && scenePhase == .active && download.isActive {
                 download.refresh()
                 do { try await Task.sleep(for: .milliseconds(250)) } catch { break }
             }

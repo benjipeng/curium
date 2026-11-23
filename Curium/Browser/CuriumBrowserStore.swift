@@ -530,10 +530,12 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     @ObservationIgnored private var onDemandSnapshotTokens: [String: UUID] = [:]
     @ObservationIgnored private var savedDownloadsGeneration = 0
     @ObservationIgnored private var mediaPermissions: CuriumMediaPermissionCoordinator!
-    @ObservationIgnored private let backgroundKeepAlive = CuriumBackgroundKeepAlive()
+    @ObservationIgnored private var backgroundKeepAlive: CuriumBackgroundKeepAlive!
     @ObservationIgnored private var cachedDOMScanByTabID: [String: (pageTitle: String?, entries: [CuriumDOMMediaEntry], blobVideoCount: Int, scannedAt: Date)] = [:]
     @ObservationIgnored private var cachedHLSInspections: [URL: CuriumHLSMasterInspection] = [:]
+    @ObservationIgnored private var lastMediaNavigationURLByTabID: [String: URL] = [:]
     @ObservationIgnored private let fingerprintStore: CuriumFingerprintStore
+    @ObservationIgnored private let initialLaunchProxy: CuriumProxyConfig
     @ObservationIgnored private let downloadsRootOverride: URL?
     @ObservationIgnored private let pdfPreviewCacheRootOverride: URL?
     @ObservationIgnored private let sessionDirectoryOverride: URL?
@@ -577,6 +579,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         self.host = host
         self.activeProfileID = resolvedProfileID
         self.fingerprintStore = resolvedFingerprintStore
+        self.initialLaunchProxy = resolvedFingerprintStore.profile(id: resolvedProfileID)?.proxy
+            ?? resolvedFingerprintStore.activeProfile.proxy
         self.library = library ?? CuriumLibrary(profileID: resolvedProfileID, fingerprintStore: resolvedFingerprintStore)
         self.downloadsRootOverride = downloadsRoot
         self.pdfPreviewCacheRootOverride = pdfPreviewCacheRoot
@@ -589,6 +593,10 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         )) == true
         extensions = CuriumExtensionStore(manager: host == nil ? nil : (extensionManager ?? CuriumSharedExtensionManager()))
         super.init()
+        backgroundKeepAlive = CuriumBackgroundKeepAlive(isMediaPlayingProvider: { [weak self] in
+            guard let self else { return false }
+            return self.tabs.contains { $0.hasPlayingVideo || $0.isPictureInPictureActive }
+        })
         mediaPermissions = CuriumMediaPermissionCoordinator(
             isRequestCurrent: { [weak self] tabID, originKey in
                 self?.isMediaPermissionRequestCurrent(tabID: tabID, originKey: originKey) == true
@@ -806,6 +814,10 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         guard switchProfileForNextLaunch(to: profileID) else {
             return false
         }
+        for item in downloads where item.isActive {
+            item.cancel()
+        }
+        syncBackgroundKeepAlive()
         saveOpenTabsSession()
         await library.checkpointAsync()
         CuriumDiagnostics.shared.flushSync()
@@ -1080,6 +1092,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         onDemandSnapshotTokens.removeValue(forKey: tab.id)
         mediaPermissions.invalidate(tabID: tab.id)
         clearMediaCaches(for: tab.id)
+        lastMediaNavigationURLByTabID.removeValue(forKey: tab.id)
         if let host {
             _ = host.closeTab(withID: tab.id)
             if tabsByID[tab.id] != nil { updateTabs(from: host) }
@@ -1090,6 +1103,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             snapshotLRU.removeAll { $0 == tab.id }
             if activeTab?.id == tab.id { setActiveTab(tabs.isEmpty ? nil : tabs[min(index, tabs.count - 1)]) }
         }
+        syncBackgroundKeepAlive()
         if tabs.isEmpty { newTab() }
         scheduleSessionSave()
     }
@@ -1112,8 +1126,13 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         guard let model = tabsByID[tab.tabID] else { return }
         let oldURL = model.url
         let oldExtID = model.extensionTabID
+        let oldHasPlayingVideo = model.hasPlayingVideo
+        let oldIsPiP = model.isPictureInPictureActive
         refresh(model, from: tab)
         mediaPermissions.invalidateIfOriginChanged(tabID: tab.tabID, currentURL: model.url)
+        if model.hasPlayingVideo != oldHasPlayingVideo || model.isPictureInPictureActive != oldIsPiP {
+            syncBackgroundKeepAlive()
+        }
         let urlChanged = model.url != oldURL
         let contextChanged = urlChanged || model.extensionTabID != oldExtID
         if urlChanged { scheduleSessionSave() }
@@ -1157,14 +1176,22 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         _ host: any CrIOSBrowserHostV1, tab: any CrIOSTabHostingV1,
         didCommitNavigationTo url: URL, navigationID _: Int64, isSameDocument: Bool, isReload _: Bool
     ) {
+        let tabID = tab.tabID
+        let previousMediaURL = committedHistoryByTabID[tabID]?.url
+            ?? lastMediaNavigationURLByTabID[tabID]
+            ?? tabsByID[tabID]?.url
+        lastMediaNavigationURLByTabID[tabID] = url
+
         if !isSameDocument {
-            mediaPermissions.invalidate(tabID: tab.tabID)
-            clearMediaCaches(for: tab.tabID)
-            tabsByID[tab.tabID]?.dismissPDFSession()
+            mediaPermissions.invalidate(tabID: tabID)
+            clearMediaCaches(for: tabID)
+            tabsByID[tabID]?.dismissPDFSession()
+            scheduleSessionSave()
+        } else if Self.changedPathOrQuery(from: previousMediaURL, to: url) {
+            clearMediaCaches(for: tabID)
             scheduleSessionSave()
         }
         guard reportsNavigationCommits else { return }
-        let tabID = tab.tabID
         let previous = committedHistoryByTabID[tabID]
         var history = CommittedHistory(url: url, visitURL: nil, title: "")
         // A fragment-only commit still belongs to the last recorded visit.
@@ -1384,8 +1411,22 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         guard CuriumHLSParser.isAllowedHTTPURL(candidate.url) else {
             throw CuriumMediaDownloadError.disallowedURLScheme(candidate.url.scheme ?? "unknown")
         }
+        let targetTab = tabsByID[tabID] ?? (activeTab?.id == tabID ? activeTab : nil)
+        let frameOriginURL = CuriumMediaNetworking.originURL(from: candidate.frameOrigin)
+        let blockedByTab = targetTab?.url.map { !CuriumHLSParser.isAllowedTargetURL(candidate.url, originatingURL: $0) } ?? false
+        let blockedByReferrer = candidate.referrer.map { !CuriumHLSParser.isAllowedTargetURL(candidate.url, originatingURL: $0) } ?? false
+        let blockedByOrigin = frameOriginURL.map { !CuriumHLSParser.isAllowedTargetURL(candidate.url, originatingURL: $0) } ?? false
+        guard !blockedByTab && !blockedByReferrer && !blockedByOrigin else {
+            throw CuriumMediaDownloadError.blockedPrivateNetworkHost(candidate.url.host ?? "private")
+        }
         let context = await makeMediaRequestContext(for: candidate.url, candidate: candidate, inTabID: tabID)
-        let inspection = try await CuriumMediaNetworking.inspectHLS(url: candidate.url, context: context)
+        let inspection = try await CuriumMediaNetworking.inspectHLS(
+            url: candidate.url,
+            context: context,
+            cookieProvider: { [weak self] url in
+                await self?.resolveCookieHeader(for: url, inTabID: tabID)
+            }
+        )
         if cachedHLSInspections.count >= 32 {
             cachedHLSInspections.removeAll(keepingCapacity: true)
         }
@@ -1420,6 +1461,26 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             return nil
         }
 
+        let targetTab = tabsByID[tabID] ?? (activeTab?.id == tabID ? activeTab : nil)
+        let frameOriginURL = CuriumMediaNetworking.originURL(from: candidate.frameOrigin)
+        let blockedByTab = targetTab?.url.map { !CuriumHLSParser.isAllowedTargetURL(targetURL, originatingURL: $0) } ?? false
+        let blockedByReferrer = candidate.referrer.map { !CuriumHLSParser.isAllowedTargetURL(targetURL, originatingURL: $0) } ?? false
+        let blockedByOrigin = frameOriginURL.map { !CuriumHLSParser.isAllowedTargetURL(targetURL, originatingURL: $0) } ?? false
+        guard !blockedByTab && !blockedByReferrer && !blockedByOrigin else {
+            errorMessage = CuriumMediaDownloadError.blockedPrivateNetworkHost(targetURL.host ?? "private").localizedDescription
+            return nil
+        }
+        if let audioURI = hlsVariant?.audioURI {
+            let audioBlockedByTab = targetTab?.url.map { !CuriumHLSParser.isAllowedTargetURL(audioURI, originatingURL: $0) } ?? false
+            let audioBlockedByRef = candidate.referrer.map { !CuriumHLSParser.isAllowedTargetURL(audioURI, originatingURL: $0) } ?? false
+            let audioBlockedByOrigin = frameOriginURL.map { !CuriumHLSParser.isAllowedTargetURL(audioURI, originatingURL: $0) } ?? false
+            let audioBlockedByTarget = !CuriumHLSParser.isAllowedTargetURL(audioURI, originatingURL: targetURL)
+            if audioBlockedByTab || audioBlockedByRef || audioBlockedByOrigin || audioBlockedByTarget {
+                errorMessage = CuriumMediaDownloadError.blockedPrivateNetworkHost(audioURI.host ?? "private").localizedDescription
+                return nil
+            }
+        }
+
         let context = await makeMediaRequestContext(for: targetURL, candidate: candidate, inTabID: tabID)
         let downloadTask: any CrIOSDownloadTaskV1
 
@@ -1443,6 +1504,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
                 sourceTabID: tabID,
                 playlistURL: targetURL,
                 audioPlaylistURL: hlsVariant?.audioURI,
+                masterPlaylistURL: hlsVariant != nil ? candidate.url : nil,
                 suggestedFilename: filename,
                 mimeType: prefersMP4 ? "video/mp4" : "video/mp2t",
                 context: context,
@@ -1458,7 +1520,10 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
                 suggestedFilename: candidate.suggestedFilename,
                 mimeType: candidate.mimeType,
                 expectedBytes: candidate.contentLength,
-                context: context
+                context: context,
+                cookieProvider: { [weak self] url in
+                    await self?.resolveCookieHeader(for: url, inTabID: tabID)
+                }
             )
 
         case .dash:
@@ -1483,18 +1548,33 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         return item
     }
 
-    private func makeMediaRequestContext(
+    func effectiveMediaLaunchProxy() -> CuriumProxyConfig {
+        if fingerprintStore === CuriumFingerprintStore.shared {
+            return CuriumFingerprintBootstrap.activeLaunchProxy
+        }
+        if let snapshot = CuriumFingerprintBootstrap.activeLaunchEngineSnapshot,
+           snapshot.profileID.lowercased() == activeProfileID.lowercased() {
+            return CuriumFingerprintBootstrap.activeLaunchProxy
+        }
+        return initialLaunchProxy
+    }
+
+    func makeMediaRequestContext(
         for url: URL,
         candidate: CuriumMediaCandidate?,
         inTabID tabID: String
     ) async -> CuriumMediaRequestContext {
+        // Capture the frozen launch proxy synchronously before awaiting cookies so
+        // mid-session profile edits never alter proxy egress for live session credentials.
+        let activeProxy = effectiveMediaLaunchProxy()
         let cookieHeader = await resolveCookieHeader(for: url, inTabID: tabID)
-        let activeProxy = fingerprintStore.profile(id: activeProfileID)?.proxy
-            ?? fingerprintStore.activeProfile.proxy
         let targetTab = tabsByID[tabID] ?? (activeTab?.id == tabID ? activeTab : nil)
         let userAgent = candidate?.effectiveUserAgent ?? (targetTab?.engine?.effectiveUserAgent ?? nil)
-        let referrer = candidate?.referrer ?? targetTab?.url
-        let origin = candidate?.frameOrigin ?? Self.originString(for: referrer)
+        let candidateReferrer = candidate?.referrer.flatMap { CuriumHLSParser.isAllowedHTTPURL($0) ? $0 : nil }
+        let tabURL = targetTab?.url.flatMap { CuriumHLSParser.isAllowedHTTPURL($0) ? $0 : nil }
+        let frameOriginURL = CuriumMediaNetworking.originURL(from: candidate?.frameOrigin)
+        let referrer = candidateReferrer ?? tabURL
+        let origin = Self.originString(for: frameOriginURL) ?? Self.originString(for: referrer)
 
         return CuriumMediaRequestContext(
             cookieHeader: cookieHeader,
@@ -1520,6 +1600,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     }
 
     private func syncBackgroundKeepAlive() {
+        let externalMediaActive = tabs.contains { $0.hasPlayingVideo || $0.isPictureInPictureActive }
+        backgroundKeepAlive.setExternalMediaPlaybackActive(externalMediaActive)
         let activeCount = downloads.reduce(into: 0) { count, item in
             if item.isActive && item.state != .cancelled && item.state != .completed && item.state != .failed {
                 count += 1
@@ -1710,6 +1792,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             onDemandSnapshotTokens.removeValue(forKey: evictedID)
             mediaPermissions.invalidate(tabID: evictedID)
             clearMediaCaches(for: evictedID)
+            lastMediaNavigationURLByTabID.removeValue(forKey: evictedID)
             evictedTab.invalidate()
             historyByTabID.removeValue(forKey: evictedID)
             committedHistoryByTabID.removeValue(forKey: evictedID)
@@ -1722,6 +1805,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         }
 
         setActiveTab(activeID.flatMap { nextIndex[$0] })
+        syncBackgroundKeepAlive()
         updateExtensionContext(force: !activeMatches || !activeViewportMatches)
         if !orderMatches || evictedAny {
             scheduleSessionSave()

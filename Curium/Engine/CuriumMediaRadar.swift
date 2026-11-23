@@ -90,9 +90,9 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
         let pathExt = url.pathExtension.lowercased()
         let mime = mimeType ?? ""
 
-        // Ignore segmented transport chunks (.ts/.m4s/mp2t) so HLS/DASH streams do not
+        // Ignore segmented transport chunks (.ts/.m4s/.cmfv/.cmfa/mp2t) so HLS/DASH streams do not
         // flood the bounded per-tab radar ahead of their master/media manifests.
-        if pathExt == "ts" || pathExt == "m4s" || mime.contains("mp2t") {
+        if pathExt == "ts" || pathExt == "m4s" || pathExt == "cmfv" || pathExt == "cmfa" || mime.contains("mp2t") {
             return nil
         }
 
@@ -179,7 +179,7 @@ final class CuriumMediaRadar {
         } else {
             list.insert(parsed, at: 0)
             if list.count > Self.maxEventsPerTab {
-                list.removeLast(list.count - Self.maxEventsPerTab)
+                Self.trimEvents(&list, maxCount: Self.maxEventsPerTab)
             }
         }
         eventsByTabID[tabID] = list
@@ -188,6 +188,31 @@ final class CuriumMediaRadar {
 
     func clear(tabID: String) {
         eventsByTabID.removeValue(forKey: tabID)
+    }
+
+    /// Bounded trimming that never lets non-DOM script-fetch chunk events (`empty`/`other`
+    /// destination `.video`/`.audio`) evict `.hls`/`.dash` manifests from the per-tab radar.
+    private static func trimEvents(_ list: inout [CuriumMediaResourceEvent], maxCount: Int) {
+        while list.count > maxCount {
+            if let chunkIndex = list.lastIndex(where: isScriptFetchChunkCandidate) {
+                list.remove(at: chunkIndex)
+            } else if let nonManifestIndex = list.lastIndex(where: { !isManifest($0) }) {
+                list.remove(at: nonManifestIndex)
+            } else {
+                list.removeLast()
+            }
+        }
+    }
+
+    private static func isScriptFetchChunkCandidate(_ event: CuriumMediaResourceEvent) -> Bool {
+        guard event.kind == .video || event.kind == .audio else { return false }
+        return event.requestDestination.isEmpty
+            || event.requestDestination == "empty"
+            || event.requestDestination == "other"
+    }
+
+    private static func isManifest(_ event: CuriumMediaResourceEvent) -> Bool {
+        event.kind == .hls || event.kind == .dash
     }
 }
 
@@ -437,15 +462,19 @@ enum CuriumMediaDOMScanner {
     ]
 
     /// Synchronous, read-only probe script for Build 42's isolated-world evaluator.
-    /// Wrapped in an IIFE + `try/catch`, collects `pageTitle`, `<video>`/`<audio>`/`<source>`
-    /// sources, `blob:` counts, dimensions, and finite durations (capped at 32 per frame).
+    /// Wrapped in an IIFE + `try/catch`, recursively walks `document` and open `shadowRoot`s,
+    /// collects `pageTitle`, `<video>`/`<audio>`/`<source>` sources (backfilling `<source type>`
+    /// onto `el.currentSrc`), `blob:` counts (without consuming `entries` slots), dimensions,
+    /// and finite durations (capped at 32 HTTP(S) entries per frame).
     static let probeScript: String = """
     (() => {
       try {
         const maxEntries = 32;
+        const maxShadowRoots = 64;
+        const maxVisitedNodes = 12000;
         const entries = [];
         let blobVideoCount = 0;
-        const seen = new Set();
+        const seen = new Map();
         const resolveURL = (raw) => {
           if (typeof raw !== "string") return "";
           const trimmed = raw.trim();
@@ -458,11 +487,58 @@ enum CuriumMediaDOMScanner {
           }
         };
         const cleanTitle = (el) => {
-          const raw = el.getAttribute("title") || el.getAttribute("aria-label") || "";
+          const raw = (el.getAttribute && (el.getAttribute("title") || el.getAttribute("aria-label"))) || "";
           return typeof raw === "string" ? raw.trim() : "";
         };
-        const mediaEls = document.querySelectorAll("video, audio");
-        for (let i = 0; i < mediaEls.length && entries.length < maxEntries; i++) {
+        const mediaEls = [];
+        const seenMediaEls = new Set();
+        const visitedRoots = new Set();
+        const rootQueue = [document];
+        let shadowRootCount = 0;
+        let visitedNodeCount = 0;
+        while (rootQueue.length > 0) {
+          const root = rootQueue.shift();
+          if (!root || visitedRoots.has(root)) continue;
+          visitedRoots.add(root);
+          if (typeof root.querySelectorAll === "function") {
+            const directMedia = root.querySelectorAll("video, audio");
+            for (let m = 0; m < directMedia.length; m++) {
+              const mediaNode = directMedia[m];
+              if (!seenMediaEls.has(mediaNode)) {
+                seenMediaEls.add(mediaNode);
+                mediaEls.push(mediaNode);
+              }
+            }
+          }
+          if (visitedNodeCount >= maxVisitedNodes || shadowRootCount >= maxShadowRoots) continue;
+          if (typeof document.createTreeWalker === "function") {
+            try {
+              const walker = document.createTreeWalker(root, 1);
+              let node = walker.nextNode();
+              while (node && visitedNodeCount < maxVisitedNodes) {
+                visitedNodeCount += 1;
+                if (node.shadowRoot && shadowRootCount < maxShadowRoots && !visitedRoots.has(node.shadowRoot)) {
+                  shadowRootCount += 1;
+                  rootQueue.push(node.shadowRoot);
+                }
+                node = walker.nextNode();
+              }
+              continue;
+            } catch (_) {}
+          }
+          if (typeof root.querySelectorAll === "function") {
+            const allNodes = root.querySelectorAll("*");
+            for (let n = 0; n < allNodes.length && visitedNodeCount < maxVisitedNodes; n++) {
+              visitedNodeCount += 1;
+              const node = allNodes[n];
+              if (node && node.shadowRoot && shadowRootCount < maxShadowRoots && !visitedRoots.has(node.shadowRoot)) {
+                shadowRootCount += 1;
+                rootQueue.push(node.shadowRoot);
+              }
+            }
+          }
+        }
+        for (let i = 0; i < mediaEls.length; i++) {
           const el = mediaEls[i];
           const tag = (el.tagName || "").toLowerCase();
           const width = tag === "video" && Number.isFinite(el.videoWidth) && el.videoWidth > 0 ? Math.round(el.videoWidth) : null;
@@ -471,16 +547,35 @@ enum CuriumMediaDOMScanner {
           const title = cleanTitle(el) || null;
           let countedBlobForElement = false;
           const rawSources = [];
-          if (el.currentSrc) rawSources.push({ src: el.currentSrc, type: null, tag });
-          if (el.src && el.src !== el.currentSrc) rawSources.push({ src: el.src, type: null, tag });
-          const children = el.querySelectorAll("source");
+          const sourceTypeByURL = new Map();
+          const children = typeof el.querySelectorAll === "function" ? el.querySelectorAll("source") : [];
           for (let j = 0; j < children.length; j++) {
             const srcNode = children[j];
-            if (srcNode.src) {
+            if (srcNode && srcNode.src) {
+              const resolvedChild = resolveURL(srcNode.src);
+              if (resolvedChild && srcNode.type && !sourceTypeByURL.has(resolvedChild)) {
+                sourceTypeByURL.set(resolvedChild, srcNode.type);
+              }
               rawSources.push({ src: srcNode.src, type: srcNode.type || null, tag });
             }
           }
-          for (let k = 0; k < rawSources.length && entries.length < maxEntries; k++) {
+          if (el.currentSrc) {
+            const resolvedCurrent = resolveURL(el.currentSrc);
+            rawSources.unshift({
+              src: el.currentSrc,
+              type: (resolvedCurrent && sourceTypeByURL.get(resolvedCurrent)) || null,
+              tag
+            });
+          }
+          if (el.src && el.src !== el.currentSrc) {
+            const resolvedAttr = resolveURL(el.src);
+            rawSources.push({
+              src: el.src,
+              type: (resolvedAttr && sourceTypeByURL.get(resolvedAttr)) || null,
+              tag
+            });
+          }
+          for (let k = 0; k < rawSources.length; k++) {
             const candidate = rawSources[k];
             const resolved = resolveURL(candidate.src);
             if (!resolved) continue;
@@ -489,21 +584,18 @@ enum CuriumMediaDOMScanner {
                 countedBlobForElement = true;
                 blobVideoCount += 1;
               }
-              entries.push({
-                url: null,
-                isBlob: true,
-                tag,
-                title,
-                width,
-                height,
-                duration,
-                mimeType: candidate.type || null
-              });
               continue;
             }
-            if (seen.has(resolved)) continue;
-            seen.add(resolved);
-            entries.push({
+            const resolvedType = candidate.type || sourceTypeByURL.get(resolved) || null;
+            if (seen.has(resolved)) {
+              const existing = seen.get(resolved);
+              if (existing && !existing.mimeType && resolvedType) {
+                existing.mimeType = resolvedType;
+              }
+              continue;
+            }
+            if (entries.length >= maxEntries) continue;
+            const entry = {
               url: resolved,
               isBlob: false,
               tag: candidate.tag,
@@ -511,8 +603,10 @@ enum CuriumMediaDOMScanner {
               width,
               height,
               duration,
-              mimeType: candidate.type || null
-            });
+              mimeType: resolvedType
+            };
+            seen.set(resolved, entry);
+            entries.push(entry);
           }
         }
         const pageTitle = typeof document.title === "string" ? document.title.trim() : "";
@@ -607,16 +701,25 @@ enum CuriumMediaDOMScanner {
                         entryTitle = nil
                     }
 
+                    let maxDimension = 65_536
                     let width: Int?
-                    if case .number(let w) = entryDict["width"], w.isFinite, w > 0 {
-                        width = Int(w.rounded())
+                    if case .number(let w) = entryDict["width"],
+                       w.isFinite,
+                       w > 0,
+                       w <= Double(maxDimension) {
+                        let rounded = Int(w.rounded())
+                        width = (1...maxDimension).contains(rounded) ? rounded : nil
                     } else {
                         width = nil
                     }
 
                     let height: Int?
-                    if case .number(let h) = entryDict["height"], h.isFinite, h > 0 {
-                        height = Int(h.rounded())
+                    if case .number(let h) = entryDict["height"],
+                       h.isFinite,
+                       h > 0,
+                       h <= Double(maxDimension) {
+                        let rounded = Int(h.rounded())
+                        height = (1...maxDimension).contains(rounded) ? rounded : nil
                     } else {
                         height = nil
                     }
@@ -876,8 +979,8 @@ enum CuriumMediaDOMScanner {
             if lhs.contentLength != rhs.contentLength {
                 return lhs.contentLength > rhs.contentLength
             }
-            let lhsPixels = (lhs.width ?? 0) * (lhs.height ?? 0)
-            let rhsPixels = (rhs.width ?? 0) * (rhs.height ?? 0)
+            let lhsPixels = safePixelArea(width: lhs.width, height: lhs.height)
+            let rhsPixels = safePixelArea(width: rhs.width, height: rhs.height)
             if lhsPixels != rhsPixels {
                 return lhsPixels > rhsPixels
             }
@@ -942,6 +1045,12 @@ enum CuriumMediaDOMScanner {
             return 2
         }
         return 1
+    }
+
+    private static func safePixelArea(width: Int?, height: Int?) -> Int64 {
+        guard let width, width > 0, let height, height > 0 else { return 0 }
+        let (area, overflow) = Int64(width).multipliedReportingOverflow(by: Int64(height))
+        return overflow ? Int64.max : area
     }
 
     private static func formatResolution(width: Int?, height: Int?) -> String? {

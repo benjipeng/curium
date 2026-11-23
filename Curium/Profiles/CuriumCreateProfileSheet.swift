@@ -494,7 +494,7 @@ struct CuriumCreateProfileSheet: View {
 
                     if !isFixedProxyRulesValid {
                         Label(
-                            "Enter valid proxy rules (e.g. socks5://127.0.0.1:1080 or http=127.0.0.1:8080).",
+                            "Enter valid proxy rules (e.g. socks5://127.0.0.1:1080 or http=127.0.0.1:8080;https=127.0.0.1:8080).",
                             systemImage: "exclamationmark.triangle.fill"
                         )
                         .font(.caption)

@@ -248,8 +248,8 @@ struct CuriumFingerprintEditorView: View {
         .scrollDismissesKeyboard(.interactively)
         .navigationTitle(draft.displayName.isEmpty ? "Customize Profile" : draft.displayName)
         .navigationBarTitleDisplayMode(.inline)
-        .navigationBarBackButtonHidden(hasUnsavedChanges)
-        .interactiveDismissDisabled(hasUnsavedChanges)
+        .navigationBarBackButtonHidden(hasUnsavedChanges || isWiping)
+        .interactiveDismissDisabled(hasUnsavedChanges || isWiping)
         .onChange(of: usage) { _, latest in
             currentUsage = latest
         }
@@ -264,13 +264,18 @@ struct CuriumFingerprintEditorView: View {
             cachedReport = Self.evaluateValidation(candidate: effectiveDraft)
         }
         .toolbar {
-            if hasUnsavedChanges {
+            if hasUnsavedChanges || isWiping {
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
-                        activeDialog = .discardChanges
+                        if hasUnsavedChanges {
+                            activeDialog = .discardChanges
+                        } else {
+                            dismiss()
+                        }
                     } label: {
                         Label("Back", systemImage: "chevron.backward")
                     }
+                    .disabled(isWiping)
                     .accessibilityIdentifier("curium.editor.back")
                 }
             }
@@ -281,7 +286,7 @@ struct CuriumFingerprintEditorView: View {
                 } label: {
                     Label("Save", systemImage: "checkmark")
                 }
-                .disabled(!cachedReport.isValid || store.loadError != nil)
+                .disabled(isWiping || !cachedReport.isValid || store.loadError != nil)
                 .accessibilityIdentifier("curium.editor.save")
             }
         }
@@ -299,12 +304,14 @@ struct CuriumFingerprintEditorView: View {
                 Button("Wipe Cookies, Bookmarks & Storage", role: .destructive) {
                     wipeStorage()
                 }
+                .disabled(isWiping)
                 Button("Cancel", role: .cancel) {}
 
             case .discardChanges:
                 Button("Discard Changes", role: .destructive) {
                     dismiss()
                 }
+                .disabled(isWiping)
                 Button("Keep Editing", role: .cancel) {}
 
             case .saveBeforeSelect:
@@ -314,10 +321,12 @@ struct CuriumFingerprintEditorView: View {
                             selectCurrentProfile()
                         }
                     }
+                    .disabled(isWiping)
                 }
                 Button("Use Previously Saved Version") {
                     selectCurrentProfile()
                 }
+                .disabled(isWiping)
                 Button("Cancel", role: .cancel) {}
             }
         } message: { dialog in
@@ -542,7 +551,7 @@ struct CuriumFingerprintEditorView: View {
                         systemImage: isSelectedForNextLaunch ? "checkmark.circle.fill" : "checkmark.circle"
                     )
                 }
-                .disabled((isSelectedForNextLaunch && !hasUnsavedChanges) || store.loadError != nil)
+                .disabled(isWiping || (isSelectedForNextLaunch && !hasUnsavedChanges) || store.loadError != nil)
                 .accessibilityIdentifier("curium.editor.select")
             }
 
@@ -1015,7 +1024,7 @@ struct CuriumFingerprintEditorView: View {
             } label: {
                 Label("Duplicate Profile", systemImage: "plus.square.on.square")
             }
-            .disabled(store.loadError != nil)
+            .disabled(isWiping || store.loadError != nil)
 
             Button {
                 copyProfileJSON()
@@ -1149,6 +1158,7 @@ struct CuriumFingerprintEditorView: View {
     }
 
     private func selectCurrentProfile() {
+        guard !isWiping else { return }
         let targetID: String? = (savedBaseline.isPrimaryDefault && savedBaseline.matchesBuild39EngineDefaults)
             ? nil
             : savedBaseline.id
@@ -1160,6 +1170,7 @@ struct CuriumFingerprintEditorView: View {
     }
 
     private func duplicateProfile() {
+        guard !isWiping else { return }
         guard let copy = store.duplicateProfile(
             from: draft.id,
             displayName: "\(draft.displayName) Copy"
@@ -1172,6 +1183,7 @@ struct CuriumFingerprintEditorView: View {
 
     @discardableResult
     private func saveProfile(dismissAfterSave: Bool) -> Bool {
+        guard !isWiping else { return false }
         let candidate = effectiveDraft
         let preflight = Self.evaluateValidation(candidate: candidate)
         cachedReport = preflight
@@ -1193,6 +1205,10 @@ struct CuriumFingerprintEditorView: View {
             defaults.set(saved.resolvedPalette.rawValue, forKey: "curium.palette")
             defaults.set(saved.resolvedSiteMode.rawValue, forKey: "curium.siteMode")
             defaults.set(saved.resolvedSearchEngine.rawValue, forKey: "curium.searchEngine")
+            if saved.supportsLegacyIdentityPickers {
+                defaults.set(saved.legacyUABrandRawValue, forKey: "curium.uaBrand")
+                defaults.set(saved.legacyMobileUARawValue, forKey: "curium.mobileUA")
+            }
         }
         onSaved?(saved)
         if dismissAfterSave {

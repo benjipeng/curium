@@ -37,15 +37,60 @@ struct CuriumMediaRadarSheet: View {
     }
 
     private var subsumedChildHLSIDs: Set<String> {
+        let loadedMasters = hlsStates.compactMapValues { state -> CuriumHLSMasterInspection? in
+            guard case .loaded(let inspection) = state, inspection.isMasterPlaylist else { return nil }
+            return inspection
+        }
+        return Self.computeSubsumedChildHLSIDs(
+            loadedMasters: loadedMasters,
+            localDownloadsByTargetKey: downloadsByTargetKey,
+            storeDownloads: store.downloads
+        )
+    }
+
+    /// Collapses redundant child `.m3u8` rows referenced by an inspected master playlist while
+    /// preserving standalone direct child downloads across sheet reopen (without un-subsuming
+    /// a child row whose download is already displayed inside a master's variant row).
+    static func computeSubsumedChildHLSIDs(
+        loadedMasters: [String: CuriumHLSMasterInspection],
+        localDownloadsByTargetKey: [String: CuriumDownload],
+        storeDownloads: [CuriumDownload]
+    ) -> Set<String> {
+        let liveStoreIDs = Set(storeDownloads.map(\.id))
+        let visibleDownloads = storeDownloads.filter { item in
+            item.isActive || item.state == .pending || item.state == .completed
+        }
+
         var subsumed: Set<String> = []
-        for (masterID, state) in hlsStates {
-            guard case .loaded(let inspection) = state, inspection.isMasterPlaylist else { continue }
+        for (masterID, inspection) in loadedMasters {
+            guard inspection.isMasterPlaylist else { continue }
+            let displayedVariantURLs: Set<String> = inspection.isDownloadable
+                ? Set(inspection.variants.map { $0.url.absoluteString })
+                : []
+
             for childURL in inspection.referencedPlaylistURLs {
                 let childID = childURL.absoluteString
                 guard childID != masterID else { continue }
-                if downloadsByTargetKey[childID] == nil {
-                    subsumed.insert(childID)
+
+                if let local = localDownloadsByTargetKey[childID], liveStoreIDs.contains(local.id) {
+                    continue
                 }
+
+                let matchingDownloads = visibleDownloads.filter { $0.originalURL == childURL }
+                let hasStandaloneDirectDownload = matchingDownloads.contains { $0.hlsMasterPlaylistURL == nil }
+                if hasStandaloneDirectDownload {
+                    continue
+                }
+
+                // If a child download exists (e.g. audio rendition or non-downloadable master) and
+                // is NOT already displayed inside this master's variant rows, do not hide the child row.
+                let displayedInMasterVariantRow = displayedVariantURLs.contains(childID)
+                    && matchingDownloads.contains { $0.hlsMasterPlaylistURL == inspection.sourceURL }
+                if !matchingDownloads.isEmpty && !displayedInMasterVariantRow {
+                    continue
+                }
+
+                subsumed.insert(childID)
             }
         }
         return subsumed
@@ -482,7 +527,7 @@ struct CuriumMediaRadarSheet: View {
     @ViewBuilder
     private func variantRow(candidate: CuriumMediaCandidate, variant: CuriumHLSVariant) -> some View {
         let targetKey = Self.variantTargetKey(candidateID: candidate.id, variantID: variant.id)
-        let tracked = resolvedDownload(for: targetKey, url: variant.url)
+        let tracked = resolvedDownload(for: targetKey, url: variant.url, masterPlaylistURL: candidate.url)
         let isStarting = startingDownloadKeys.contains(targetKey)
         let detail = variantDetailText(for: variant)
 
@@ -724,13 +769,24 @@ struct CuriumMediaRadarSheet: View {
         "\(candidateID)#\(variantID)"
     }
 
-    private func resolvedDownload(for targetKey: String, url: URL) -> CuriumDownload? {
+    private func resolvedDownload(
+        for targetKey: String,
+        url: URL,
+        masterPlaylistURL: URL? = nil
+    ) -> CuriumDownload? {
         if let tracked = downloadsByTargetKey[targetKey],
            store.downloads.contains(where: { $0.id == tracked.id }) {
             return tracked
         }
         return store.downloads.first { item in
-            item.originalURL == url && (item.isActive || item.state == .pending || item.state == .completed)
+            guard item.originalURL == url,
+                  item.isActive || item.state == .pending || item.state == .completed else {
+                return false
+            }
+            if let masterPlaylistURL {
+                return item.hlsMasterPlaylistURL == masterPlaylistURL
+            }
+            return item.hlsMasterPlaylistURL == nil
         }
     }
 
@@ -774,6 +830,14 @@ struct CuriumMediaRadarSheet: View {
             inspectionTasks.removeAll()
             hlsStates.removeAll()
             expandedHLSIDs.removeAll()
+        } else {
+            let validCandidateIDs = Set(updated.candidates.map(\.id))
+            for (candidateID, task) in inspectionTasks where !validCandidateIDs.contains(candidateID) {
+                task.cancel()
+                inspectionTasks.removeValue(forKey: candidateID)
+            }
+            hlsStates = hlsStates.filter { validCandidateIDs.contains($0.key) }
+            expandedHLSIDs.formIntersection(validCandidateIDs)
         }
         snapshot = updated
     }
