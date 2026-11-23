@@ -1271,9 +1271,9 @@ index ed51dca..f7ca156 100644
 +  if (std::optional<curium::ResolvedScreenMetrics> metrics =
 +          ResolveCuriumScreenMetrics(frame)) {
 +    const int inner_h = innerHeight();
-+    return metrics->is_desktop
-+               ? std::min(metrics->avail_height, base::ClampAdd(inner_h, 87))
-+               : std::min(metrics->avail_height, inner_h);
++    const int target_h =
++        metrics->is_desktop ? static_cast<int>(base::ClampAdd(inner_h, 87)) : inner_h;
++    return std::min(metrics->avail_height, target_h);
 +  }
 +#endif
 +
