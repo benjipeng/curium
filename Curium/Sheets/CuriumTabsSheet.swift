@@ -13,6 +13,11 @@ struct CuriumTabsSheet: View {
         let rightInset: CGFloat
     }
 
+    private struct TabRow: Identifiable {
+        let id: String
+        let tabs: [CuriumTabModel]
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             CuriumSheetHeader(title: "Tabs")
@@ -27,15 +32,12 @@ struct CuriumTabsSheet: View {
                 let contentHeight = max(above ?? proxy.size.height, below ?? 0)
                 let top = (below ?? 0) > (above ?? proxy.size.height) ? proxy.size.height - contentHeight : 0
                 let rowGeo = computeRowGeometry(width: width, count: count, fold: vertical)
-                let totalTabs = store.tabs.count
-                let rowCount = (totalTabs + count - 1) / count
+                let rows = makeRows(from: store.tabs, columns: count)
 
                 ScrollView {
                     LazyVStack(spacing: 14) {
-                        ForEach(0..<rowCount, id: \.self) { rowIndex in
-                            let start = rowIndex * count
-                            let end = min(totalTabs, start + count)
-                            tabRow(range: start..<end, geo: rowGeo)
+                        ForEach(rows) { row in
+                            tabRow(row.tabs, geo: rowGeo)
                         }
                     }
                     .padding(.vertical, 8)
@@ -66,6 +68,7 @@ struct CuriumTabsSheet: View {
         }
         .background(Color(uiColor: .systemGroupedBackground))
         .presentationDetents([.large])
+        .curiumSheetErrorAlert(store: store)
     }
 
     private func activeDivision(in proxy: GeometryProxy) -> CGRect? {
@@ -96,21 +99,33 @@ struct CuriumTabsSheet: View {
         return RowGeometry(count: count, leftWidth: group, rightWidth: group, leftInset: leftInset, rightInset: rightInset)
     }
 
-    private func tabRow(range: Range<Int>, geo: RowGeometry) -> some View {
-        let allTabs = store.tabs
-        let clampedLower = min(range.lowerBound, allTabs.count)
-        let clampedUpper = min(range.upperBound, allTabs.count)
+    private func makeRows(from allTabs: [CuriumTabModel], columns count: Int) -> [TabRow] {
+        guard count > 0, !allTabs.isEmpty else { return [] }
+        var rows: [TabRow] = []
+        rows.reserveCapacity((allTabs.count + count - 1) / count)
+        var start = 0
+        while start < allTabs.count {
+            let end = min(allTabs.count, start + count)
+            let slice = Array(allTabs[start..<end])
+            rows.append(TabRow(id: slice[0].id, tabs: slice))
+            start = end
+        }
+        return rows
+    }
+
+    private func tabRow(_ rowTabs: [CuriumTabModel], geo: RowGeometry) -> some View {
         let half = geo.count / 2
-        let mid = min(clampedUpper, clampedLower + half)
+        let mid = min(rowTabs.count, half)
         let leftToRight = layoutDirection == .leftToRight
 
         return HStack(spacing: 0) {
-            cards(tabs: allTabs[clampedLower..<mid], columns: half)
+            cards(tabs: rowTabs[0..<mid], columns: half)
                 .frame(width: leftToRight ? geo.leftWidth : geo.rightWidth)
             Spacer(minLength: 0)
-            cards(tabs: allTabs[mid..<clampedUpper], columns: half)
+            cards(tabs: rowTabs[mid..<rowTabs.count], columns: half)
                 .frame(width: leftToRight ? geo.rightWidth : geo.leftWidth)
         }
+        .fixedSize(horizontal: false, vertical: true)
         .padding(.leading, leftToRight ? geo.leftInset : geo.rightInset)
         .padding(.trailing, leftToRight ? geo.rightInset : geo.leftInset)
     }
@@ -124,14 +139,13 @@ struct CuriumTabsSheet: View {
                 } onClose: {
                     store.close(tab)
                 }
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             ForEach(0..<max(0, columns - rowTabs.count), id: \.self) { _ in
                 Color.clear.frame(maxWidth: .infinity)
                     .accessibilityHidden(true)
             }
         }
-        .frame(height: 162)
     }
 }
 
@@ -141,12 +155,14 @@ private struct CuriumTabCard: View {
     let onOpen: () -> Void
     let onClose: () -> Void
     @Environment(\.curiumPalette) private var palette
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         Button(action: onOpen) {
             VStack(alignment: .leading, spacing: 0) {
                 Color.clear
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 122)
                     .overlay(alignment: .top) {
                         if let snapshot = tab.thumbnail {
                             Image(uiImage: snapshot)
@@ -173,12 +189,16 @@ private struct CuriumTabCard: View {
                     if selected {
                         Image(systemName: "circle.fill").font(.system(size: 6)).foregroundStyle(palette.tint)
                     }
-                    Text(tab.displayTitle).lineLimit(1).font(.subheadline.weight(.medium))
+                    Text(tab.displayTitle)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                        .font(.subheadline.weight(.medium))
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(10)
             }
             .foregroundStyle(.primary)
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(Color(uiColor: .secondarySystemGroupedBackground))
             .clipShape(.rect(cornerRadius: 16))
             .overlay {

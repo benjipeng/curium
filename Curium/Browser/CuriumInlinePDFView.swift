@@ -10,14 +10,40 @@ struct CuriumInlinePDFView: View {
     let topInset: CGFloat
     let bottomPadding: CGFloat
     let palette: CuriumPalette
+    let downloadsRoot: URL?
     let onClose: () -> Void
     let onRetry: (() -> Void)?
     let onOpenLink: (URL) -> Void
     let onSavedToDownloads: (URL) -> Void
     let onSaveError: (String) -> Void
 
+    @Environment(\.layoutDirection) private var layoutDirection
     @State private var showingOutline = false
     @FocusState private var searchFieldFocused: Bool
+
+    init(
+        session: CuriumTabPDFSession,
+        topInset: CGFloat,
+        bottomPadding: CGFloat,
+        palette: CuriumPalette,
+        downloadsRoot: URL? = nil,
+        onClose: @escaping () -> Void,
+        onRetry: (() -> Void)?,
+        onOpenLink: @escaping (URL) -> Void,
+        onSavedToDownloads: @escaping (URL) -> Void,
+        onSaveError: @escaping (String) -> Void
+    ) {
+        self.session = session
+        self.topInset = topInset
+        self.bottomPadding = bottomPadding
+        self.palette = palette
+        self.downloadsRoot = downloadsRoot
+        self.onClose = onClose
+        self.onRetry = onRetry
+        self.onOpenLink = onOpenLink
+        self.onSavedToDownloads = onSavedToDownloads
+        self.onSaveError = onSaveError
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -93,7 +119,7 @@ struct CuriumInlinePDFView: View {
         }
     }
 
-    private struct PaneLayout {
+    struct PaneLayout: Equatable {
         let leadingInset: CGFloat
         let trailingInset: CGFloat
         let maxWidth: CGFloat
@@ -102,7 +128,33 @@ struct CuriumInlinePDFView: View {
     }
 
     private func activePaneLayout(in proxy: GeometryProxy) -> PaneLayout {
-        let width = proxy.size.width
+        guard #available(iOS 27.1, *) else {
+            return Self.resolvePaneLayout(
+                size: proxy.size,
+                topInset: topInset,
+                activeDivisions: [],
+                layoutDirection: layoutDirection
+            )
+        }
+        let activeDivisions = proxy
+            .reservedRegions(kind: .division, options: [.includeInactive])
+            .filter(\.isActive)
+            .map(\.frame)
+        return Self.resolvePaneLayout(
+            size: proxy.size,
+            topInset: topInset,
+            activeDivisions: activeDivisions,
+            layoutDirection: layoutDirection
+        )
+    }
+
+    static func resolvePaneLayout(
+        size: CGSize,
+        topInset: CGFloat,
+        activeDivisions: [CGRect],
+        layoutDirection: LayoutDirection = .leftToRight
+    ) -> PaneLayout {
+        let width = size.width
         let defaultLayout = PaneLayout(
             leadingInset: 16,
             trailingInset: 16,
@@ -110,35 +162,50 @@ struct CuriumInlinePDFView: View {
             alignment: .center,
             verticalOffset: 0
         )
-        guard #available(iOS 27.1, *) else { return defaultLayout }
 
-        for region in proxy.reservedRegions(kind: .division, options: [.includeInactive]) where region.isActive {
-            let frame = region.frame
+        for frame in activeDivisions {
             guard frame.minX < width - 2, frame.maxX > 2 else { continue }
             if frame.height > frame.width {
                 let leftRoom = max(0, frame.minX - 28)
                 let rightRoom = max(0, width - frame.maxX - 28)
-                if leftRoom >= rightRoom, leftRoom >= 220 {
+                let preferLeft = leftRoom > rightRoom || (leftRoom == rightRoom && layoutDirection == .leftToRight)
+                if preferLeft, leftRoom >= 220 {
+                    let physicalLeft: CGFloat = 16
+                    let physicalRight: CGFloat = width - frame.minX + 12
                     return PaneLayout(
-                        leadingInset: 16,
-                        trailingInset: width - frame.minX + 12,
+                        leadingInset: layoutDirection == .leftToRight ? physicalLeft : physicalRight,
+                        trailingInset: layoutDirection == .leftToRight ? physicalRight : physicalLeft,
                         maxWidth: leftRoom,
-                        alignment: .leading,
+                        alignment: layoutDirection == .leftToRight ? .leading : .trailing,
                         verticalOffset: 0
                     )
                 } else if rightRoom >= 220 {
+                    let physicalLeft: CGFloat = frame.maxX + 12
+                    let physicalRight: CGFloat = 16
                     return PaneLayout(
-                        leadingInset: frame.maxX + 12,
-                        trailingInset: 16,
+                        leadingInset: layoutDirection == .leftToRight ? physicalLeft : physicalRight,
+                        trailingInset: layoutDirection == .leftToRight ? physicalRight : physicalLeft,
                         maxWidth: rightRoom,
-                        alignment: .trailing,
+                        alignment: layoutDirection == .leftToRight ? .trailing : .leading,
+                        verticalOffset: 0
+                    )
+                } else if leftRoom >= 220 {
+                    let physicalLeft: CGFloat = 16
+                    let physicalRight: CGFloat = width - frame.minX + 12
+                    return PaneLayout(
+                        leadingInset: layoutDirection == .leftToRight ? physicalLeft : physicalRight,
+                        trailingInset: layoutDirection == .leftToRight ? physicalRight : physicalLeft,
+                        maxWidth: leftRoom,
+                        alignment: layoutDirection == .leftToRight ? .leading : .trailing,
                         verticalOffset: 0
                     )
                 }
             } else if frame.width > frame.height {
                 // Partially folded horizontal crease: lift centered empty/loading state into upper pane.
+                // Both `topInset` and `frame.minY` are window-top coordinates (root GeometryReader ignores top safe area).
                 let upperCenter = (topInset + frame.minY) / 2
-                let delta = upperCenter - (proxy.size.height / 2)
+                let contentCenter = (topInset + size.height) / 2
+                let delta = upperCenter - contentCenter
                 return PaneLayout(
                     leadingInset: 16,
                     trailingInset: 16,
@@ -204,7 +271,7 @@ struct CuriumInlinePDFView: View {
                 if session.localFileURL != nil, !session.isSavedToDownloads {
                     Button("Save File Anyway") {
                         Task {
-                            if let saved = await session.saveToDownloads() {
+                            if let saved = await session.saveToDownloads(downloadsRoot: downloadsRoot) {
                                 onSavedToDownloads(saved)
                             }
                         }
@@ -227,6 +294,8 @@ struct CuriumInlinePDFView: View {
                 Text("\(session.currentPageIndex + 1) / \(session.pageCount)")
                     .font(.footnote.monospacedDigit().weight(.medium))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
                     .padding(.horizontal, 10)
                     .accessibilityLabel("Page \(session.currentPageIndex + 1) of \(session.pageCount)")
                     .accessibilityIdentifier("curium.pdf.pageCounter")
@@ -263,7 +332,7 @@ struct CuriumInlinePDFView: View {
 
             Button {
                 Task {
-                    if let saved = await session.saveToDownloads() {
+                    if let saved = await session.saveToDownloads(downloadsRoot: downloadsRoot) {
                         onSavedToDownloads(saved)
                     }
                 }
@@ -330,6 +399,8 @@ struct CuriumInlinePDFView: View {
                 )
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
             }
 
             Button { session.previousSearchMatch() } label: {
@@ -362,6 +433,21 @@ struct CuriumInlinePDFView: View {
     }
 }
 
+private final class CuriumPDFView: PDFView {
+    var onBoundsSizeChanged: (() -> Void)?
+    private var lastBoundsSize: CGSize = .zero
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let size = bounds.size
+        guard size.width > 1, size.height > 1 else { return }
+        guard abs(size.width - lastBoundsSize.width) > 0.5
+            || abs(size.height - lastBoundsSize.height) > 0.5 else { return }
+        lastBoundsSize = size
+        onBoundsSizeChanged?()
+    }
+}
+
 private struct CuriumPDFKitCanvas: UIViewRepresentable {
     let document: PDFDocument
     let topInset: CGFloat
@@ -384,8 +470,8 @@ private struct CuriumPDFKitCanvas: UIViewRepresentable {
         )
     }
 
-    func makeUIView(context: Context) -> PDFView {
-        let view = PDFView()
+    func makeUIView(context: Context) -> CuriumPDFView {
+        let view = CuriumPDFView()
         view.autoScales = true
         view.displayMode = .singlePageContinuous
         view.displayDirection = .vertical
@@ -394,23 +480,30 @@ private struct CuriumPDFKitCanvas: UIViewRepresentable {
         view.backgroundColor = .secondarySystemBackground
         view.document = document
         view.delegate = context.coordinator
+        view.onBoundsSizeChanged = { [weak coordinator = context.coordinator, weak view] in
+            guard let coordinator, let view else { return }
+            coordinator.handleBoundsSizeChanged(in: view)
+        }
         applyInsets(to: view)
         context.coordinator.attach(to: view)
         return view
     }
 
-    static func dismantleUIView(_ view: PDFView, coordinator: Coordinator) {
+    static func dismantleUIView(_ view: CuriumPDFView, coordinator: Coordinator) {
+        coordinator.cancelPendingTasks()
+        view.onBoundsSizeChanged = nil
         view.delegate = nil
         view.document = nil
     }
 
-    func updateUIView(_ view: PDFView, context: Context) {
+    func updateUIView(_ view: CuriumPDFView, context: Context) {
         context.coordinator.onPageChanged = onPageChanged
         context.coordinator.onZoomChanged = onZoomChanged
         context.coordinator.onOpenLink = onOpenLink
 
         if view.document !== document {
             view.document = document
+            context.coordinator.hasCustomZoom = false
             view.autoScales = true
         }
 
@@ -427,17 +520,27 @@ private struct CuriumPDFKitCanvas: UIViewRepresentable {
         if let selection = requestedSelection {
             view.setCurrentSelection(selection, animate: true)
             view.go(to: selection)
-            keepSelectionClearOfTopChrome(selection, in: view)
+            context.coordinator.scheduleKeepSelectionClear(
+                selection,
+                in: view,
+                topInset: topInset,
+                navigationRequestID: navigationRequestID
+            )
         } else if let pageIndex = requestedPageIndex, let page = document.page(at: pageIndex) {
+            context.coordinator.cancelPendingTasks()
             view.go(to: page)
         }
 
         if let requestedZoomScale {
             let fit = max(0.1, view.scaleFactorForSizeToFit)
             let clamped = min(view.maxScaleFactor, max(view.minScaleFactor, fit * requestedZoomScale))
-            view.autoScales = abs(requestedZoomScale - 1.0) < 0.01
-            if !view.autoScales {
+            let resetsToFit = abs(requestedZoomScale - 1.0) < 0.01
+            context.coordinator.hasCustomZoom = !resetsToFit
+            view.autoScales = resetsToFit
+            if !resetsToFit {
                 view.scaleFactor = clamped
+            } else if fit > 0 {
+                view.scaleFactor = fit
             }
         }
     }
@@ -459,7 +562,11 @@ private struct CuriumPDFKitCanvas: UIViewRepresentable {
         }
     }
 
-    private func keepSelectionClearOfTopChrome(_ selection: PDFSelection, in view: PDFView) {
+    fileprivate static func keepSelectionClearOfTopChrome(
+        _ selection: PDFSelection,
+        in view: PDFView,
+        topInset: CGFloat
+    ) {
         guard let page = selection.pages.first,
               let scrollView = view.subviews.compactMap({ $0 as? UIScrollView }).first else { return }
         let selectionRect = view.convert(selection.bounds(for: page), from: page)
@@ -478,6 +585,9 @@ private struct CuriumPDFKitCanvas: UIViewRepresentable {
         var onOpenLink: (URL) -> Void
         var lastNavigationRequestID = 0
         var lastHighlightRevision = -1
+        var hasCustomZoom = false
+        private var isRefittingBounds = false
+        private var pendingSelectionClearTask: Task<Void, Never>?
         private weak var pdfView: PDFView?
 
         init(
@@ -492,6 +602,40 @@ private struct CuriumPDFKitCanvas: UIViewRepresentable {
 
         deinit {
             NotificationCenter.default.removeObserver(self)
+        }
+
+        func cancelPendingTasks() {
+            pendingSelectionClearTask?.cancel()
+            pendingSelectionClearTask = nil
+        }
+
+        func scheduleKeepSelectionClear(
+            _ selection: PDFSelection,
+            in view: PDFView,
+            topInset: CGFloat,
+            navigationRequestID: Int
+        ) {
+            pendingSelectionClearTask?.cancel()
+            pendingSelectionClearTask = Task { @MainActor [weak self, weak view] in
+                await Task.yield()
+                guard !Task.isCancelled,
+                      let self,
+                      let view,
+                      self.lastNavigationRequestID == navigationRequestID else { return }
+                CuriumPDFKitCanvas.keepSelectionClearOfTopChrome(selection, in: view, topInset: topInset)
+                self.pendingSelectionClearTask = nil
+            }
+        }
+
+        func handleBoundsSizeChanged(in view: PDFView) {
+            guard !hasCustomZoom else { return }
+            isRefittingBounds = true
+            defer { isRefittingBounds = false }
+            view.autoScales = true
+            let fit = view.scaleFactorForSizeToFit
+            if fit > 0 {
+                view.scaleFactor = fit
+            }
         }
 
         func attach(to view: PDFView) {
@@ -532,7 +676,11 @@ private struct CuriumPDFKitCanvas: UIViewRepresentable {
         @objc private func handleScaleChanged(_ notification: Notification) {
             guard let view = pdfView else { return }
             let fit = max(0.1, view.scaleFactorForSizeToFit)
-            onZoomChanged(view.scaleFactor / fit)
+            let ratio = view.scaleFactor / fit
+            if !isRefittingBounds {
+                hasCustomZoom = !view.autoScales && abs(ratio - 1.0) >= 0.02
+            }
+            onZoomChanged(ratio)
         }
     }
 }

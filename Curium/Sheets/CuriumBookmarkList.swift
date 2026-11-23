@@ -6,22 +6,37 @@ struct CuriumBookmarkList: View {
     /// The page the sheet was opened from; it can be saved into the level on screen.
     let currentPage: CuriumBookmarkPage?
     let open: (URL, Bool) -> Void
+    var onDismissSheet: (() -> Void)? = nil
 
+    @Environment(\.dismiss) private var dismiss
     @State private var editMode: EditMode = .inactive
     @State private var editor: Editor?
-    @State private var deletingFolder: CuriumBookmarkFolder?
+    @State private var alertState: AlertState?
+    @State private var isSavingCurrentPage = false
 
     private struct Editor: Identifiable {
         let id = UUID()
         let subject: CuriumBookmarkEditor.Subject
     }
 
+    private enum AlertState {
+        case deleteFolder(CuriumBookmarkFolder)
+        case saveFailed(String)
+
+        var title: String {
+            switch self {
+            case .deleteFolder: "Delete Folder?"
+            case .saveFailed: "Couldn’t Save"
+            }
+        }
+    }
+
     var body: some View {
         let items = library.bookmarks.items(in: folderID)
 
         VStack(spacing: 0) {
-            if folderID == nil {
-                CuriumSheetHeader(title: "Bookmarks")
+            if library.storageUnavailable {
+                CuriumStorageUnavailableBanner()
             }
             List {
                 if let currentPage, !editMode.isEditing {
@@ -49,8 +64,18 @@ struct CuriumBookmarkList: View {
         .background(Color(uiColor: .systemGroupedBackground))
         .navigationTitle(folderID.flatMap(library.bookmarks.folder)?.title ?? "Bookmarks")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarVisibility(folderID == nil ? .hidden : .visible, for: .navigationBar)
         .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button {
+                    if let onDismissSheet {
+                        onDismissSheet()
+                    } else {
+                        dismiss()
+                    }
+                } label: {
+                    Label("Done", systemImage: "checkmark")
+                }
+            }
             ToolbarItemGroup(placement: .bottomBar) {
                 Button {
                     editor = Editor(subject: .newFolder(parentID: folderID))
@@ -64,7 +89,7 @@ struct CuriumBookmarkList: View {
                     withAnimation { editMode = editMode.isEditing ? .inactive : .active }
                 } label: {
                     if editMode.isEditing {
-                        Label("Done", systemImage: "checkmark")
+                        Label("Done Editing", systemImage: "checkmark.circle")
                     } else {
                         Label("Edit", systemImage: "pencil")
                     }
@@ -75,14 +100,28 @@ struct CuriumBookmarkList: View {
         .sheet(item: $editor) { editor in
             CuriumBookmarkEditor(library: library, subject: editor.subject)
         }
-        .alert("Delete Folder?", isPresented: Binding(
-            get: { deletingFolder != nil },
-            set: { if !$0 { deletingFolder = nil } }
-        ), presenting: deletingFolder) { folder in
-            Button("Delete", role: .destructive) { library.deleteBookmarkItem(.folder(folder)) }
-            Button("Cancel", role: .cancel) {}
-        } message: { folder in
-            Text("“\(folder.title)” and all its bookmarks and folders will be deleted.")
+        .alert(
+            alertState?.title ?? "",
+            isPresented: Binding(
+                get: { alertState != nil },
+                set: { if !$0 { alertState = nil } }
+            ),
+            presenting: alertState
+        ) { state in
+            switch state {
+            case .deleteFolder(let folder):
+                Button("Delete", role: .destructive) { library.deleteBookmarkItem(.folder(folder)) }
+                Button("Cancel", role: .cancel) {}
+            case .saveFailed:
+                Button("OK", role: .cancel) {}
+            }
+        } message: { state in
+            switch state {
+            case .deleteFolder(let folder):
+                Text("“\(folder.title)” and all its bookmarks and folders will be deleted.")
+            case .saveFailed(let message):
+                Text(message)
+            }
         }
     }
 
@@ -104,7 +143,19 @@ struct CuriumBookmarkList: View {
             .accessibilityIdentifier("curium.bookmarks.current")
         } else {
             Button {
-                Task { _ = await library.saveBookmark(url: page.url, title: saved?.title ?? page.title, in: folderID) }
+                guard !isSavingCurrentPage else { return }
+                isSavingCurrentPage = true
+                Task {
+                    let ok = await library.saveBookmark(url: page.url, title: saved?.title ?? page.title, in: folderID)
+                    isSavingCurrentPage = false
+                    if !ok {
+                        alertState = .saveFailed(
+                            library.storageUnavailable
+                                ? "Bookmarks can’t be saved right now because storage is unavailable."
+                                : "Couldn’t save this bookmark. Please try again."
+                        )
+                    }
+                }
             } label: {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
@@ -122,6 +173,7 @@ struct CuriumBookmarkList: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .disabled(isSavingCurrentPage)
             .accessibilityIdentifier("curium.bookmarks.current")
         }
     }
@@ -225,7 +277,7 @@ struct CuriumBookmarkList: View {
     private func deleteButton(_ item: CuriumBookmarkItem) -> some View {
         Button(role: .destructive) {
             switch item {
-            case .folder(let folder): deletingFolder = folder
+            case .folder(let folder): alertState = .deleteFolder(folder)
             case .bookmark: library.deleteBookmarkItem(item)
             }
         } label: {

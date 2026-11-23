@@ -176,6 +176,8 @@ final class CuriumMediaPermissionCoordinator {
     private var phase: Phase = .idle
     private var queue: [Entry] = []
     private var presentationBlocked = false
+    private var recentlyRequeuedPromptID: UUID?
+    private var suspendedDrainTask: Task<Void, Never>?
 
     private(set) var activePrompt: CuriumMediaPermissionPrompt? {
         didSet {
@@ -193,6 +195,10 @@ final class CuriumMediaPermissionCoordinator {
         self.isRequestCurrent = isRequestCurrent
         self.authorizeCapture = authorizeCapture
         self.onPromptChange = onPromptChange
+    }
+
+    isolated deinit {
+        suspendedDrainTask?.cancel()
     }
 
     static func liveCaptureAuthorizer(_ kind: CuriumCaptureMediaKind) async -> Bool {
@@ -265,13 +271,39 @@ final class CuriumMediaPermissionCoordinator {
     func setPresentationBlocked(_ blocked: Bool) {
         guard presentationBlocked != blocked else { return }
         presentationBlocked = blocked
-        if !blocked {
+        if blocked {
+            suspendedDrainTask?.cancel()
+            suspendedDrainTask = nil
+            recentlyRequeuedPromptID = nil
+            if case .presentingAlert(let entry) = phase {
+                requeueActivePrompt(entry)
+            }
+        } else {
+            suspendedDrainTask?.cancel()
+            suspendedDrainTask = nil
+            recentlyRequeuedPromptID = nil
             drainQueue()
         }
     }
 
     func respondToActivePrompt(allowed: Bool) {
-        guard case .presentingAlert(let entry) = phase else { return }
+        let entry: Entry
+        if case .presentingAlert(let active) = phase {
+            entry = active
+            recentlyRequeuedPromptID = nil
+            suspendedDrainTask?.cancel()
+            suspendedDrainTask = nil
+        } else if let recentID = recentlyRequeuedPromptID,
+                  let idx = queue.firstIndex(where: { $0.prompt.id == recentID }) {
+            // SwiftUI can invoke the isPresented binding setter right before the alert
+            // button action in the same event turn; honor the user's explicit choice.
+            recentlyRequeuedPromptID = nil
+            suspendedDrainTask?.cancel()
+            suspendedDrainTask = nil
+            entry = queue.remove(at: idx)
+        } else {
+            return
+        }
 
         if !allowed || entry.invalidated || !isRequestCurrent(entry.prompt.tabID, entry.prompt.originKey) {
             phase = .idle
@@ -296,8 +328,20 @@ final class CuriumMediaPermissionCoordinator {
     }
 
     func dismissActivePromptWithoutAction() {
-        guard case .presentingAlert = phase else { return }
-        respondToActivePrompt(allowed: false)
+        guard case .presentingAlert(let entry) = phase else { return }
+        requeueActivePrompt(entry)
+        guard !entry.invalidated else { return }
+        recentlyRequeuedPromptID = entry.prompt.id
+        suspendedDrainTask?.cancel()
+        suspendedDrainTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            self.recentlyRequeuedPromptID = nil
+            self.suspendedDrainTask = nil
+            if !self.presentationBlocked {
+                self.drainQueue()
+            }
+        }
     }
 
     func invalidate(tabID: String) {
@@ -305,6 +349,9 @@ final class CuriumMediaPermissionCoordinator {
         remaining.reserveCapacity(queue.count)
         for entry in queue {
             if entry.prompt.tabID == tabID {
+                if recentlyRequeuedPromptID == entry.prompt.id {
+                    recentlyRequeuedPromptID = nil
+                }
                 entry.invalidated = true
                 entry.finishAll(with: [])
             } else {
@@ -312,10 +359,18 @@ final class CuriumMediaPermissionCoordinator {
             }
         }
         queue = remaining
+        var cancelledSuspendedDrain = false
+        if recentlyRequeuedPromptID == nil, suspendedDrainTask != nil {
+            suspendedDrainTask?.cancel()
+            suspendedDrainTask = nil
+            cancelledSuspendedDrain = true
+        }
 
         switch phase {
         case .idle:
-            break
+            if cancelledSuspendedDrain {
+                drainQueue()
+            }
         case .presentingAlert(let entry) where entry.prompt.tabID == tabID:
             entry.invalidated = true
             phase = .idle
@@ -348,6 +403,9 @@ final class CuriumMediaPermissionCoordinator {
     }
 
     func cancelAll() {
+        suspendedDrainTask?.cancel()
+        suspendedDrainTask = nil
+        recentlyRequeuedPromptID = nil
         let queued = queue
         queue.removeAll()
         for entry in queued {
@@ -369,6 +427,16 @@ final class CuriumMediaPermissionCoordinator {
             activePrompt = nil
             entry.finishAll(with: [])
         }
+    }
+
+    private func requeueActivePrompt(_ entry: Entry) {
+        phase = .idle
+        activePrompt = nil
+        if entry.invalidated {
+            entry.finishAll(with: [])
+            return
+        }
+        queue.insert(entry, at: 0)
     }
 
     private var currentEntry: Entry? {

@@ -23,6 +23,93 @@ struct CuriumSheetHeader: View {
     }
 }
 
+/// Compact inline notice shown inside Library sheets when SQLite storage is unavailable,
+/// keeping bottom toolbars, search bars, and the software keyboard unobstructed.
+struct CuriumStorageUnavailableBanner: View {
+    var body: some View {
+        Label("Bookmarks and history can’t be saved right now.", systemImage: "exclamationmark.triangle")
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .overlay(alignment: .bottom) {
+                Divider()
+            }
+    }
+}
+
+/// Presents `store.sheetErrorMessage` inside the active modal sheet and clears it on
+/// dismiss so errors never get dropped behind sheets or wedge media permission prompts.
+struct CuriumSheetErrorAlertModifier: ViewModifier {
+    let store: CuriumBrowserStore
+    let presentationDelay: Duration
+
+    @State private var activeMessage: String?
+    @State private var isReady = false
+    @State private var promoteTask: Task<Void, Never>?
+
+    func body(content: Content) -> some View {
+        content
+            .task {
+                // Allow a newly presented sheet's transition animation to finish before
+                // showing an error queued when the sheet opened (e.g. 24-tab guard).
+                if store.sheetErrorMessage != nil {
+                    try? await Task.sleep(for: .milliseconds(350))
+                }
+                guard !Task.isCancelled else { return }
+                isReady = true
+                promotePendingErrorIfNeeded()
+            }
+            .onChange(of: store.sheetErrorMessage) { _, newValue in
+                guard isReady, newValue != nil else { return }
+                promoteTask?.cancel()
+                if presentationDelay > .zero {
+                    promoteTask = Task {
+                        try? await Task.sleep(for: presentationDelay)
+                        guard !Task.isCancelled else { return }
+                        promoteTask = nil
+                        promotePendingErrorIfNeeded()
+                    }
+                } else {
+                    promotePendingErrorIfNeeded()
+                }
+            }
+            .onDisappear {
+                promoteTask?.cancel()
+                promoteTask = nil
+            }
+            .alert("Curium", isPresented: Binding(
+                get: { activeMessage != nil },
+                set: { if !$0 { dismissAlert() } }
+            )) {
+                Button("OK", role: .cancel) { dismissAlert() }
+            } message: {
+                Text(activeMessage ?? "")
+            }
+    }
+
+    private func promotePendingErrorIfNeeded() {
+        guard activeMessage == nil, let message = store.sheetErrorMessage else { return }
+        activeMessage = message
+    }
+
+    private func dismissAlert() {
+        activeMessage = nil
+        store.sheetErrorMessage = nil
+    }
+}
+
+extension View {
+    func curiumSheetErrorAlert(
+        store: CuriumBrowserStore,
+        presentationDelay: Duration = .zero
+    ) -> some View {
+        modifier(CuriumSheetErrorAlertModifier(store: store, presentationDelay: presentationDelay))
+    }
+}
+
 enum CuriumJitPreference: String, CaseIterable, Identifiable {
     case automatic
     case jitless
@@ -77,8 +164,9 @@ struct CuriumSettingsSheet: View {
     @State private var hooksSummary = ""
     @State private var hasHookFailure = false
     @State private var diagnosticLineCount = 0
-    @State private var fingerprintStore = CuriumFingerprintStore.loadShared()
     @State private var engineFingerprintStatus: CuriumEngineFingerprintStatus?
+
+    private var fingerprintStore: CuriumFingerprintStore { CuriumFingerprintStore.shared }
 
     private var activeV8RuntimeLabel: String {
         guard engineReady else { return "Standby" }
@@ -298,6 +386,7 @@ private struct CuriumDiagnosticsSheet: View {
     @State private var fingerprintStatus: CuriumEngineFingerprintStatus?
     @State private var fingerprintCapabilities: CuriumEngineFingerprintCapabilities?
     @State private var nextLaunchProfileLabel = "Default (Build 39)"
+    @State private var reloadTask: Task<Void, Never>?
 
     private var environmentLabel: String {
         ProcessInfo.processInfo.environment["LC_HOME_PATH"] != nil
@@ -321,8 +410,7 @@ private struct CuriumDiagnosticsSheet: View {
                         Label("Share Diagnostics Report", systemImage: "square.and.arrow.up")
                     }
                     Button {
-                        CuriumDiagnostics.shared.flushAsync()
-                        reload()
+                        reload(flushFirst: true)
                     } label: {
                         Label("Refresh", systemImage: "arrow.clockwise")
                     }
@@ -425,17 +513,20 @@ private struct CuriumDiagnosticsSheet: View {
             .listStyle(.insetGrouped)
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .onAppear { reload() }
+        .onAppear { reload(flushFirst: true) }
+        .onDisappear {
+            reloadTask?.cancel()
+            reloadTask = nil
+        }
     }
 
-    private func reload() {
+    private func reload(flushFirst: Bool = false) {
         let diag = CuriumDiagnostics.shared
         let hooks = diag.hookStatuses()
         let current = diag.currentLines()
         let status = CuriumFingerprintBootstrap.activeEngineStatus()
         let caps = CuriumFingerprintBootstrap.engineCapabilities()
-        let store = CuriumFingerprintStore.loadShared()
-        let nextLabel = store.selectedProfileID ?? "default (Build 39)"
+        let nextLabel = CuriumFingerprintStore.shared.selectedProfileID ?? "default (Build 39)"
 
         hookStatuses = hooks
         lines = current
@@ -453,14 +544,29 @@ private struct CuriumDiagnosticsSheet: View {
             fromByteCount: Int64(CuriumAvailableMemoryBytes()),
             countStyle: .memory
         )
-        if let url = diag.logFileURL {
-            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            let formattedSize = ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
-            logFileSummary = "\(url.lastPathComponent) (\(formattedSize))"
-        } else {
-            logFileSummary = "Memory only"
-        }
         copied = false
+
+        let logURL = diag.logFileURL
+        reloadTask?.cancel()
+        reloadTask = Task {
+            let summary: String
+            if let logURL {
+                let size = await Task.detached(priority: .utility) {
+                    if flushFirst {
+                        diag.flushSync()
+                    }
+                    return (try? logURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                }.value
+                guard !Task.isCancelled else { return }
+                let formattedSize = ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+                summary = "\(logURL.lastPathComponent) (\(formattedSize))"
+            } else {
+                summary = "Memory only"
+            }
+            guard !Task.isCancelled else { return }
+            logFileSummary = summary
+            reloadTask = nil
+        }
     }
 
     private func statusColor(for hook: CuriumDiagnostics.HookStatus) -> Color {

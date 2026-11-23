@@ -1663,7 +1663,15 @@ struct CuriumBuild41ContractTests {
         #expect(desktopV1["webglProfile"] == nil)
         #expect(desktopV1["pdfViewerEnabled"] == nil)
 
-        let privacy = CuriumFingerprintPresets.privacyHardened
+        // Static template ships without a hardcoded public seed; store materializes a unique 64-hex seed per install.
+        let privacyTemplate = CuriumFingerprintPresets.privacyHardened
+        #expect(privacyTemplate.fingerprintSeed == nil)
+        #expect(privacyTemplate.farbling == .allEnabled)
+        let privacyDir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-privacy-seed-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: privacyDir) }
+        let privacyStore = CuriumFingerprintStore(fileURL: privacyDir.appending(path: "profiles.json"))
+        let privacy = try #require(privacyStore.profiles.first { $0.id == "privacy-hardened" })
         #expect(privacy.isFarblingActive)
         let privData = try privacy.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US"], schemaVersion: 2)
         let privObj = try #require(JSONSerialization.jsonObject(with: privData) as? [String: Any])
@@ -2056,5 +2064,207 @@ struct CuriumAddressBarAndClearanceTests {
         container.updateTrailingState(isFocused: false, canReload: true, isLoading: false, isInteractive: false)
         #expect(!container.isUserInteractionEnabled)
         #expect(container.hitTest(CGPoint(x: 200, y: 22), with: nil) == nil)
+    }
+}
+
+@Suite("Wave 1 Hardening")
+@MainActor
+struct CuriumWave1HardeningTests {
+    @Test("Corrupt fingerprint-profiles.json fails closed without overwriting and recovers via .bak")
+    func corruptStoreFailsClosedAndRecovers() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-w1-corrupt-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let storeURL = dir.appending(path: "fingerprint-profiles.json")
+        let corruptPayload = Data("{ truncated json".utf8)
+        try corruptPayload.write(to: storeURL)
+
+        let store = CuriumFingerprintStore(fileURL: storeURL)
+        #expect(store.loadError != nil)
+        #expect(!store.selectProfile(id: "default"))
+        #expect(!store.resetToBuild39Default())
+        #expect(try Data(contentsOf: storeURL) == corruptPayload)
+
+        let outcome = CuriumFingerprintBootstrap.prepareEngineLaunch(store: store)
+        if case .rejected(let profileID, _) = outcome {
+            #expect(profileID == "store")
+        } else {
+            Issue.record("Expected .rejected for corrupt store, got \(outcome)")
+        }
+
+        #expect(store.backupCorruptStoreAndReset())
+        #expect(store.loadError == nil)
+        let backupFiles = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.contains(".corrupt-") && $0.pathExtension == "bak" }
+        #expect(backupFiles.count == 1)
+        #expect(try Data(contentsOf: backupFiles[0]) == corruptPayload)
+        #expect(CuriumFingerprintBootstrap.prepareEngineLaunch(store: store) == .defaultBuild39)
+    }
+
+    @Test("Duplicating a farbled profile rotates fingerprintSeed and blocks orphaned slug reuse")
+    func seedRotationAndOrphanGuard() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-w1-seed-orphan-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let supportRoot = dir.appending(path: "Support", directoryHint: .isDirectory)
+        let cachesRoot = dir.appending(path: "Caches", directoryHint: .isDirectory)
+        let orphanA = supportRoot.appending(path: "ChromiumProfiles/orphan-2", directoryHint: .isDirectory)
+        let orphanB = cachesRoot.appending(path: "ChromiumProfiles/orphan-b", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: orphanA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: orphanB, withIntermediateDirectories: true)
+
+        let store1 = CuriumFingerprintStore(
+            fileURL: dir.appending(path: "p1.json"),
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot
+        )
+        let store2 = CuriumFingerprintStore(
+            fileURL: dir.appending(path: "p2.json"),
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot
+        )
+
+        let priv1 = try #require(store1.profiles.first { $0.id == "privacy-hardened" })
+        let priv2 = try #require(store2.profiles.first { $0.id == "privacy-hardened" })
+        let seed1 = try #require(priv1.fingerprintSeed)
+        let seed2 = try #require(priv2.fingerprintSeed)
+        #expect(CuriumFingerprintSchema.isValidSeedHex(seed1))
+        #expect(CuriumFingerprintSchema.isValidSeedHex(seed2))
+        #expect(seed1 != seed2)
+
+        let cloned = try #require(
+            store1.duplicateProfile(from: "privacy-hardened", newID: "work-private", displayName: "Work Private")
+        )
+        let clonedSeed = try #require(cloned.fingerprintSeed)
+        #expect(CuriumFingerprintSchema.isValidSeedHex(clonedSeed))
+        #expect(clonedSeed != seed1)
+
+        let orphans = CuriumFingerprintProfileStorage.discoverOrphanedProfiles(
+            knownIDs: Set(store1.profiles.map(\.id)),
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot
+        )
+        #expect(orphans == ["orphan-2", "orphan-b"])
+        #expect(store1.nextAvailableID(base: "orphan") == "orphan-3")
+        #expect(store1.duplicateProfile(from: "privacy-hardened", newID: "orphan-2", displayName: "Collide") == nil)
+    }
+
+    @Test("RTL top clearance keeps physical pillShift and unedited Row 0 direct-open is suppressed")
+    func rtlClearanceAndDirectOpenSuppression() {
+        let ltr = CuriumBrowserView.resolveTopChromeClearance(
+            width: 669,
+            safeTop: 82,
+            remLeading: 59,
+            remTrailing: 59,
+            origin: .zero,
+            occlusions: [CGRect(x: 525, y: 0, width: 144, height: 82)],
+            activeDivisions: [],
+            layoutDirection: .leftToRight,
+            ignoresTopSafeArea: true
+        )
+        #expect(ltr.leading == 24)
+        #expect(ltr.trailing == 152)
+        #expect(ltr.pillShift == 64)
+
+        let rtl = CuriumBrowserView.resolveTopChromeClearance(
+            width: 669,
+            safeTop: 82,
+            remLeading: 59,
+            remTrailing: 59,
+            origin: .zero,
+            occlusions: [CGRect(x: 0, y: 0, width: 144, height: 82)],
+            activeDivisions: [],
+            layoutDirection: .rightToLeft,
+            ignoresTopSafeArea: true
+        )
+        #expect(rtl.leading == 24)
+        #expect(rtl.trailing == 152)
+        #expect(rtl.pillShift == -64)
+
+        #expect(CuriumAddressMatches.shouldSuppressDirectOpenRow(
+            text: "https://www.youtube.com/watch?v=8_xmC3_UkyM",
+            currentAddress: "https://www.youtube.com/watch?v=8_xmC3_UkyM"
+        ))
+        #expect(!CuriumAddressMatches.shouldSuppressDirectOpenRow(
+            text: "https://www.youtube.com/watch?v=edited",
+            currentAddress: "https://www.youtube.com/watch?v=8_xmC3_UkyM"
+        ))
+        #expect(!CuriumAddressMatches.shouldSuppressDirectOpenRow(text: "", currentAddress: ""))
+    }
+
+    @Test("Media permission preemption re-queues prompt without auto-denying and sheet errors unblock queue")
+    func mediaPermissionPreemptionRequeueAndSheetErrors() async {
+        var presented: CuriumMediaPermissionPrompt?
+        var results: [CuriumMediaPermissions] = []
+        let coordinator = CuriumMediaPermissionCoordinator(
+            isRequestCurrent: { _, _ in true },
+            authorizeCapture: { _ in true },
+            onPromptChange: { presented = $0 }
+        )
+
+        coordinator.enqueue(
+            permissions: .camera,
+            originURL: URL(string: "https://meet.example")!,
+            tabID: "t1"
+        ) { granted in
+            results.append(granted)
+        }
+        #expect(presented != nil)
+        #expect(results.isEmpty)
+
+        // Sheet presentation preempts the active alert: prompt hides without failing closed.
+        coordinator.setPresentationBlocked(true)
+        #expect(presented == nil)
+        #expect(results.isEmpty)
+
+        // Sheet dismissal re-presents the exact same prompt so the user can still grant it.
+        coordinator.setPresentationBlocked(false)
+        #expect(presented != nil)
+        #expect(results.isEmpty)
+
+        coordinator.respondToActivePrompt(allowed: true)
+        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(results == [.camera])
+
+        // Sheet-local error routing keeps root errorMessage clear and exposes downloadsRoot.
+        let customRoot = FileManager.default.temporaryDirectory
+            .appending(path: "curium-w1-dl-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let host = MockBrowserHost()
+        let store = CuriumBrowserStore(host: host, downloadsRoot: customRoot)
+        #expect(store.downloadsRoot == customRoot)
+        store.setSheetPresented(true)
+        for _ in 0..<25 {
+            _ = store.newTab()
+        }
+        #expect(store.errorMessage == nil)
+        #expect(store.sheetErrorMessage != nil)
+        store.setSheetPresented(false)
+        #expect(store.sheetErrorMessage == nil)
+    }
+
+    @Test("Offscreen outgoing tab snapshot captures via engine even when webView.window is nil")
+    func offscreenOutgoingTabSnapshotCaptures() async throws {
+        let host = MockBrowserHost()
+        let t1 = MockTabHost(tabID: "t1", url: URL(string: "https://a.example"))
+        let t2 = MockTabHost(tabID: "t2", url: URL(string: "https://b.example"))
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 40, height: 40))
+        t1.snapshotImageToReturn = renderer.image { ctx in
+            UIColor.systemIndigo.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 40, height: 40))
+        }
+        host.tabs = [t1, t2]
+        host.activeTab = t1
+
+        let store = CuriumBrowserStore(host: host)
+        let model1 = try #require(store.tabs.first { $0.id == "t1" })
+        let model2 = try #require(store.tabs.first { $0.id == "t2" })
+        #expect(t1.webView.window == nil)
+
+        store.select(model2)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(model1.thumbnail != nil)
     }
 }

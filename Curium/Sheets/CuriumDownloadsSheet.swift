@@ -104,13 +104,13 @@ struct CuriumDownloadsSheet: View {
                 do { try await Task.sleep(for: .milliseconds(350)) } catch { break }
             }
         }
+        .curiumSheetErrorAlert(store: store)
         .sheet(item: Binding(
             get: { quickLookURL.map(QuickLookItem.init(url:)) },
             set: { quickLookURL = $0?.url }
         )) { item in
             NavigationStack {
                 CuriumQuickLookPreview(url: item.url)
-                    .ignoresSafeArea()
                     .navigationTitle(item.url.lastPathComponent)
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
@@ -171,7 +171,7 @@ struct CuriumDownloadsSheet: View {
                         Label("Save Download", systemImage: "arrow.down.circle")
                     }
                 case .completed:
-                    if let url = item.savedURL {
+                    if let url = store.savedURL(for: item) {
                         HStack(spacing: 16) {
                             Button {
                                 openFile(url: url, filename: item.filename, isPDF: item.isPDF)
@@ -186,6 +186,8 @@ struct CuriumDownloadsSheet: View {
                             .buttonStyle(.borderless)
                         }
                         .font(.subheadline)
+                    } else if item.savedURL != nil {
+                        Text("Deleted").font(.footnote).foregroundStyle(.secondary)
                     } else {
                         Text("Saved").font(.footnote).foregroundStyle(.secondary)
                     }
@@ -282,10 +284,15 @@ private struct CuriumQuickLookPreview: UIViewControllerRepresentable {
         return controller
     }
 
-    func updateUIViewController(_ controller: QLPreviewController, context: Context) {}
+    func updateUIViewController(_ controller: QLPreviewController, context: Context) {
+        if context.coordinator.url != url {
+            context.coordinator.url = url
+            controller.reloadData()
+        }
+    }
 
     final class Coordinator: NSObject, QLPreviewControllerDataSource {
-        let url: URL
+        var url: URL
 
         init(url: URL) { self.url = url }
 

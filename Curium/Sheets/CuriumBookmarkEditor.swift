@@ -23,21 +23,24 @@ struct CuriumBookmarkEditor: View {
         self.library = library
         self.subject = subject
         let excludedID: Int64?
+        let preferredFolderID: Int64?
         switch subject {
         case .bookmark(_, let title):
             _title = State(initialValue: title)
-            _folderID = State(initialValue: CuriumBookmarkFolder.favoritesID)
+            preferredFolderID = CuriumBookmarkFolder.favoritesID
             excludedID = nil
         case .newFolder(let parentID):
             _title = State(initialValue: "")
-            _folderID = State(initialValue: parentID)
+            preferredFolderID = parentID
             excludedID = nil
         case .folder(let folder):
             _title = State(initialValue: folder.title)
-            _folderID = State(initialValue: folder.parentID)
+            preferredFolderID = folder.parentID
             excludedID = folder.id
         }
-        _destinations = State(initialValue: library.bookmarks.destinations(excluding: excludedID))
+        let initialDestinations = library.bookmarks.destinations(excluding: excludedID)
+        _destinations = State(initialValue: initialDestinations)
+        _folderID = State(initialValue: Self.validFolderID(preferredFolderID, in: initialDestinations))
     }
 
     var body: some View {
@@ -73,25 +76,47 @@ struct CuriumBookmarkEditor: View {
             .alert("Couldn’t Save", isPresented: $saveFailed) {
                 Button("OK", role: .cancel) {}
             } message: {
-                Text("Check that the destination folder still exists and try again.")
+                Text(
+                    library.storageUnavailable
+                        ? "Bookmarks can’t be saved right now because storage is unavailable."
+                        : "Check that the destination folder still exists and try again."
+                )
             }
         }
         .interactiveDismissDisabled(isSaving)
         .presentationDetents([.medium, .large])
         .onChange(of: library.bookmarkRevision) {
-            destinations = library.bookmarks.destinations(excluding: editedFolderID)
+            let updated = library.bookmarks.destinations(excluding: editedFolderID)
+            destinations = updated
+            folderID = Self.validFolderID(folderID, in: updated)
         }
         .task {
             guard !isReady else { return }
-            if case .bookmark(let url, _) = subject,
-               let bookmark = await library.bookmark(for: url) {
-                title = bookmark.title
-                folderID = bookmark.parentID
-                isEditingBookmark = true
+            var desiredFolderID = folderID
+            if case .bookmark(let url, _) = subject {
+                if let bookmark = await library.bookmark(for: url) {
+                    title = bookmark.title
+                    desiredFolderID = bookmark.parentID
+                    isEditingBookmark = true
+                } else {
+                    desiredFolderID = CuriumBookmarkFolder.favoritesID
+                }
             }
-            destinations = library.bookmarks.destinations(excluding: editedFolderID)
+            let updated = library.bookmarks.destinations(excluding: editedFolderID)
+            destinations = updated
+            folderID = Self.validFolderID(desiredFolderID, in: updated)
             isReady = true
         }
+    }
+
+    private static func validFolderID(
+        _ candidate: Int64?,
+        in destinations: [CuriumBookmarkTree.Destination]
+    ) -> Int64? {
+        if destinations.contains(where: { $0.id == candidate }) {
+            return candidate
+        }
+        return destinations.first?.id
     }
 
     private var heading: String {

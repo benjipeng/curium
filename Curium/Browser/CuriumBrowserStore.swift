@@ -355,7 +355,7 @@ final class CuriumTabModel: Identifiable {
         }
         guard let engine, let webView, url != nil, !isLoading, !isFullscreen, thumbnail == nil else { return false }
         let bounds = webView.bounds
-        guard webView.window != nil, bounds.width > 1, bounds.height > 1 else { return false }
+        guard bounds.width > 1, bounds.height > 1 else { return false }
         guard UIApplication.shared.applicationState == .active else { return false }
 
         let revision = snapshotRevision
@@ -484,10 +484,24 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     private(set) var activeDownloadBanner: CuriumDownload?
     private(set) var backgroundEpoch = 0
     private(set) var activeMediaPermissionPrompt: CuriumMediaPermissionPrompt?
+    private var rootErrorMessage: String?
+    /// Error triggered while a modal sheet is presented; surfaced inside the active sheet
+    /// so UIKit never drops it behind the modal or leaves root `errorMessage` wedged.
+    var sheetErrorMessage: String?
     var errorMessage: String? {
-        didSet { syncMediaPermissionPresentationGate() }
+        get { rootErrorMessage }
+        set {
+            if isSheetPresented, let message = newValue {
+                if rootErrorMessage != nil { rootErrorMessage = nil }
+                sheetErrorMessage = message
+            } else {
+                rootErrorMessage = newValue
+            }
+            syncMediaPermissionPresentationGate()
+        }
     }
     var requestShowTabs = false
+    private(set) var deletedDownloadIDs: Set<String> = []
 
     @ObservationIgnored private var tabsByID: [String: CuriumTabModel] = [:]
     @ObservationIgnored private var historyByTabID: [String: ObservedVisit] = [:]
@@ -500,12 +514,16 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     @ObservationIgnored private var isRecoveringEmptyTabs = false
     @ObservationIgnored private var hasSyncedInitialViewportWidth = false
     @ObservationIgnored private var idleSnapshotTask: Task<Void, Never>?
-    @ObservationIgnored private var onDemandSnapshotTask: Task<Void, Never>?
+    @ObservationIgnored private var idleSnapshotToken: UUID?
+    @ObservationIgnored private var onDemandSnapshotTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var onDemandSnapshotTokens: [String: UUID] = [:]
+    @ObservationIgnored private var savedDownloadsGeneration = 0
     @ObservationIgnored private var mediaPermissions: CuriumMediaPermissionCoordinator!
     @ObservationIgnored private let downloadsRootOverride: URL?
     @ObservationIgnored private let pdfPreviewCacheRootOverride: URL?
     @ObservationIgnored private(set) var viewportWidth: CGFloat = 669
 
+    var downloadsRoot: URL? { downloadsRootOverride }
     var isEngineReady: Bool { host != nil }
     var pendingOrActiveDownloadCount: Int {
         downloads.reduce(into: 0) { count, item in
@@ -611,12 +629,21 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func setSheetPresented(_ presented: Bool) {
         isSheetPresented = presented
-        syncMediaPermissionPresentationGate()
         if presented {
+            if let pending = rootErrorMessage {
+                rootErrorMessage = nil
+                sheetErrorMessage = pending
+            }
             cancelIdleSnapshotCapture()
-        } else if let activeTab {
-            scheduleSnapshot(for: activeTab)
+        } else {
+            if sheetErrorMessage != nil {
+                sheetErrorMessage = nil
+            }
+            if let activeTab {
+                scheduleSnapshot(for: activeTab)
+            }
         }
+        syncMediaPermissionPresentationGate()
     }
 
     func respondToActiveMediaPermissionPrompt(allowed: Bool) {
@@ -629,7 +656,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     private func syncMediaPermissionPresentationGate() {
         mediaPermissions?.setPresentationBlocked(
-            isSheetPresented || isSceneBackgrounded || errorMessage != nil
+            isSheetPresented || isSceneBackgrounded || rootErrorMessage != nil
         )
     }
 
@@ -650,8 +677,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         captureSnapshotOnDemand(for: tab)
     }
 
-    /// Schedules a single calm idle snapshot after navigation settles. Does not poll while
-    /// scrolling; tab switches and opening the Tabs sheet trigger on-demand captures instead.
+    /// Schedules a single calm idle snapshot after navigation settles. Reschedules calmly
+    /// while the user is actively scrolling so snapshots are captured once scroll settles.
     func scheduleSnapshot(for tab: CuriumTabModel) {
         guard activeTab === tab else { return }
         cancelIdleSnapshotCapture()
@@ -663,47 +690,73 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
               tab.thumbnail == nil else { return }
         let targetID = tab.id
         let revision = tab.snapshotRevision
+        let token = UUID()
         let initialOffset = tab.scrollView?.contentOffset
+        idleSnapshotToken = token
         idleSnapshotTask = Task(priority: .utility) { @MainActor [weak self] in
-            do { try await Task.sleep(for: Self.idleSnapshotDelay) } catch { return }
-            guard !Task.isCancelled, let self else { return }
-            self.idleSnapshotTask = nil
-            guard !self.isUnderMemoryPressure, !self.isSceneBackgrounded, !self.isSheetPresented,
-                  UIApplication.shared.applicationState == .active,
-                  let current = self.activeTab,
-                  current.id == targetID, current.snapshotRevision == revision else { return }
-            if !current.isShowingPDF {
-                let scroll = current.scrollView
-                if scroll?.isTracking == true || scroll?.isDecelerating == true || scroll?.contentOffset != initialOffset {
-                    return
+            defer {
+                if let self, self.idleSnapshotToken == token {
+                    self.idleSnapshotToken = nil
+                    self.idleSnapshotTask = nil
                 }
             }
-            if await current.captureSnapshotAsync() {
-                self.recordSnapshot(for: targetID)
+            var lastOffset = initialOffset
+            let maxScrollRetries = 8
+            for attempt in 0...maxScrollRetries {
+                do { try await Task.sleep(for: Self.idleSnapshotDelay) } catch { return }
+                guard !Task.isCancelled, let self else { return }
+                guard !self.isUnderMemoryPressure, !self.isSceneBackgrounded, !self.isSheetPresented,
+                      UIApplication.shared.applicationState == .active,
+                      let current = self.activeTab,
+                      current.id == targetID,
+                      current.snapshotRevision == revision,
+                      current.thumbnail == nil else { return }
+                if !current.isShowingPDF, let scroll = current.scrollView {
+                    let currentOffset = scroll.contentOffset
+                    if scroll.isTracking || scroll.isDecelerating || currentOffset != lastOffset {
+                        lastOffset = currentOffset
+                        if attempt < maxScrollRetries {
+                            continue
+                        }
+                        return
+                    }
+                }
+                if await current.captureSnapshotAsync() {
+                    guard !Task.isCancelled, self.tabsByID[targetID] === current else { return }
+                    self.recordSnapshot(for: targetID)
+                }
+                return
             }
         }
     }
 
     private func captureSnapshotOnDemand(for tab: CuriumTabModel) {
         let pdfReady = tab.isShowingPDF && tab.pdfSession?.phase == .ready
-        let pageReady = !tab.isShowingPDF && tab.engine != nil && tab.webView?.window != nil && tab.url != nil && !tab.isLoading && !tab.isFullscreen
+        let pageReady = !tab.isShowingPDF && tab.engine != nil && tab.webView != nil && tab.url != nil && !tab.isLoading && !tab.isFullscreen
         guard !isUnderMemoryPressure, !isSceneBackgrounded,
               UIApplication.shared.applicationState == .active,
               pdfReady || pageReady,
               tab.thumbnail == nil else { return }
         let targetID = tab.id
         let revision = tab.snapshotRevision
-        onDemandSnapshotTask?.cancel()
-        onDemandSnapshotTask = Task(priority: .utility) { @MainActor [weak self] in
+        let token = UUID()
+        onDemandSnapshotTasks[targetID]?.cancel()
+        onDemandSnapshotTokens[targetID] = token
+        onDemandSnapshotTasks[targetID] = Task(priority: .utility) { @MainActor [weak self] in
+            defer {
+                if let self, self.onDemandSnapshotTokens[targetID] == token {
+                    self.onDemandSnapshotTokens.removeValue(forKey: targetID)
+                    self.onDemandSnapshotTasks.removeValue(forKey: targetID)
+                }
+            }
             guard !Task.isCancelled, let self else { return }
             guard !self.isUnderMemoryPressure, !self.isSceneBackgrounded,
                   UIApplication.shared.applicationState == .active,
+                  self.tabsByID[targetID] === tab,
                   tab.snapshotRevision == revision else { return }
             if await tab.captureSnapshotAsync() {
+                guard !Task.isCancelled, self.tabsByID[targetID] === tab else { return }
                 self.recordSnapshot(for: targetID)
-            }
-            if !Task.isCancelled {
-                self.onDemandSnapshotTask = nil
             }
         }
     }
@@ -711,12 +764,16 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     private func cancelIdleSnapshotCapture() {
         idleSnapshotTask?.cancel()
         idleSnapshotTask = nil
+        idleSnapshotToken = nil
     }
 
     private func cancelAllSnapshotCaptures() {
         cancelIdleSnapshotCapture()
-        onDemandSnapshotTask?.cancel()
-        onDemandSnapshotTask = nil
+        for task in onDemandSnapshotTasks.values {
+            task.cancel()
+        }
+        onDemandSnapshotTasks.removeAll()
+        onDemandSnapshotTokens.removeAll()
     }
 
     private func setActiveTab(_ tab: CuriumTabModel?) {
@@ -755,7 +812,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     private func canAdmitNewTab() -> Bool {
         if tabs.count >= Self.maxLiveTabs {
             errorMessage = "Single-process memory guard: close an unused tab before opening more than \(Self.maxLiveTabs) live tabs."
-            requestShowTabs = true
+            if !isSheetPresented { requestShowTabs = true }
             return false
         }
         let avail = CuriumAvailableMemoryBytes()
@@ -764,7 +821,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             let recheck = CuriumAvailableMemoryBytes()
             if recheck > 0 && recheck < Self.minTabAdmissionHeadroomBytes {
                 errorMessage = "Low device memory headroom. Close an existing tab to keep Blink responsive."
-                requestShowTabs = true
+                if !isSheetPresented { requestShowTabs = true }
                 return false
             }
         }
@@ -822,6 +879,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     }
 
     func close(_ tab: CuriumTabModel) {
+        onDemandSnapshotTasks.removeValue(forKey: tab.id)?.cancel()
+        onDemandSnapshotTokens.removeValue(forKey: tab.id)
         mediaPermissions.invalidate(tabID: tab.id)
         mediaRadar.clear(tabID: tab.id)
         if let host {
@@ -1060,12 +1119,20 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         targetTab.presentPDFSession(session)
     }
 
+    /// Returns the saved file URL for an in-session download only if it has not been deleted.
+    func savedURL(for item: CuriumDownload) -> URL? {
+        guard !deletedDownloadIDs.contains(item.id) else { return nil }
+        return item.savedURL
+    }
+
     func refreshSavedDownloads() {
+        savedDownloadsGeneration += 1
+        let generation = savedDownloadsGeneration
         let rootOverride = downloadsRootOverride
         Task.detached(priority: .utility) {
             let items = CuriumDownloadStorage.listSavedDownloads(in: rootOverride)
             await MainActor.run { [weak self] in
-                guard let self else { return }
+                guard let self, self.savedDownloadsGeneration == generation else { return }
                 if self.savedDownloads != items {
                     self.savedDownloads = items
                 }
@@ -1077,7 +1144,18 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         let rootOverride = downloadsRootOverride
         do {
             try CuriumDownloadStorage.deleteSavedDownload(at: item.url, downloadsRoot: rootOverride)
+            savedDownloadsGeneration += 1
             savedDownloads.removeAll { $0.id == item.id }
+            let deletedCanonical = item.url.resolvingSymlinksInPath().standardizedFileURL
+            for download in downloads {
+                if let saved = download.savedURL,
+                   saved.resolvingSymlinksInPath().standardizedFileURL == deletedCanonical {
+                    deletedDownloadIDs.insert(download.id)
+                    if activeDownloadBanner?.id == download.id {
+                        activeDownloadBanner = nil
+                    }
+                }
+            }
             for tab in tabs {
                 if tab.pdfSession?.handleSavedFileDeleted(at: item.url) == true {
                     tab.dismissPDFSession()
@@ -1090,7 +1168,9 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func clearFinishedDownloadTasks() {
         downloads.removeAll { !$0.isActive && $0.state != .pending }
-        if let banner = activeDownloadBanner, !downloads.contains(where: { $0.id == banner.id }) {
+        let remainingIDs = Set(downloads.map(\.id))
+        deletedDownloadIDs.formIntersection(remainingIDs)
+        if let banner = activeDownloadBanner, !remainingIDs.contains(banner.id) {
             activeDownloadBanner = nil
         }
     }
@@ -1155,6 +1235,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         var evictedAny = false
         for (evictedID, evictedTab) in tabsByID where nextIndex[evictedID] == nil {
             evictedAny = true
+            onDemandSnapshotTasks.removeValue(forKey: evictedID)?.cancel()
+            onDemandSnapshotTokens.removeValue(forKey: evictedID)
             mediaPermissions.invalidate(tabID: evictedID)
             mediaRadar.clear(tabID: evictedID)
             evictedTab.invalidate()

@@ -8,18 +8,47 @@ struct CuriumFingerprintStudioSheet: View {
     @Bindable var store: CuriumFingerprintStore
     let onDismissCallback: () -> Void
 
+    init(store: CuriumFingerprintStore, onDismissCallback: @escaping () -> Void = {}) {
+        self.store = store
+        self.onDismissCallback = onDismissCallback
+    }
+
     @Environment(\.dismiss) private var dismiss
     @State private var engineStatus: CuriumEngineFingerprintStatus?
     @State private var engineCapabilities: CuriumEngineFingerprintCapabilities?
     @State private var usageByProfileID: [String: CuriumFingerprintProfileStorage.UsageSnapshot] = [:]
+    @State private var orphanedProfiles: [String] = []
+    @State private var orphanUsageBySlug: [String: CuriumFingerprintProfileStorage.UsageSnapshot] = [:]
     @State private var activeProfileIDInProcess: String?
     @State private var navigationPath: [Route] = []
     @State private var showingImportSheet = false
-    @State private var pendingDeleteProfile: CuriumFingerprintProfile?
-    @State private var pendingWipeProfile: CuriumFingerprintProfile?
-    @State private var isWiping = false
+    @State private var activeDialog: StudioDialog?
+    @State private var wipingTargetID: String?
     @State private var alertMessage: String?
     @State private var copiedToastID: String?
+    @State private var usageTask: Task<Void, Never>?
+    @State private var copiedToastTask: Task<Void, Never>?
+
+    private var isWiping: Bool { wipingTargetID != nil }
+
+    private enum StudioDialog: Identifiable {
+        case deleteProfile(CuriumFingerprintProfile)
+        case wipeProfile(CuriumFingerprintProfile)
+
+        var id: String {
+            switch self {
+            case .deleteProfile(let profile): return "delete:\(profile.id)"
+            case .wipeProfile(let profile): return "wipe:\(profile.id)"
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .deleteProfile: return "Delete Custom Profile?"
+            case .wipeProfile: return "Wipe Isolated Profile Storage?"
+            }
+        }
+    }
 
     private func isActiveInProcess(_ profileID: String) -> Bool {
         activeProfileIDInProcess?.lowercased() == profileID.lowercased()
@@ -53,25 +82,53 @@ struct CuriumFingerprintStudioSheet: View {
         return "Default (Build 39 Authentic Chrome)"
     }
 
-    private var hasPendingLaunchSwitch: Bool {
-        let activeID = (activeProfileIDInProcess ?? "default").lowercased()
-        let nextID = (store.selectedProfileID ?? "default").lowercased()
-        if store.selectedProfileID == nil && engineStatus?.state == "default_0105" {
-            return false
+    private var isEngineRunningBuild39: Bool {
+        if let status = engineStatus {
+            return status.state == "default_0105"
         }
-        if store.selectedProfileID == "default" && engineStatus?.state == "default_0105" {
+        if case .defaultBuild39 = CuriumFingerprintBootstrap.lastOutcome {
             return true
         }
-        return activeID != nextID
+        return false
+    }
+
+    private var runningLaunchIdentity: (isBuild39Baseline: Bool, profileID: String)? {
+        if isEngineRunningBuild39 {
+            return (true, "default")
+        }
+        if let active = activeProfileIDInProcess {
+            return (false, active.lowercased())
+        }
+        return nil
+    }
+
+    private var nextLaunchIdentity: (isBuild39Baseline: Bool, profileID: String) {
+        if let selectedID = store.selectedProfileID {
+            return (false, selectedID.lowercased())
+        }
+        return (true, "default")
+    }
+
+    private var hasPendingLaunchSwitch: Bool {
+        guard let running = runningLaunchIdentity else { return true }
+        let next = nextLaunchIdentity
+        return running.isBuild39Baseline != next.isBuild39Baseline
+            || running.profileID != next.profileID
     }
 
     var body: some View {
         NavigationStack(path: $navigationPath) {
             List {
+                if let loadError = store.loadError {
+                    corruptStoreSection(loadError)
+                }
                 engineSessionSection
                 defaultBuild39Section
                 builtInPresetsSection
                 customProfilesSection
+                if !orphanedProfiles.isEmpty {
+                    orphanedStorageSection
+                }
             }
             .listStyle(.insetGrouped)
             .navigationTitle("Identity & Profiles")
@@ -98,6 +155,11 @@ struct CuriumFingerprintStudioSheet: View {
                                 copy.displayName = "\(copy.displayName) Copy"
                                 copy.isBuiltIn = false
                                 copy.revision = 1
+                                if copy.fingerprintSeed != nil || copy.hasFarblingEnabled {
+                                    copy.fingerprintSeed = CuriumFingerprintStore.mintFreshSeed(
+                                        differentFrom: copy.fingerprintSeed
+                                    )
+                                }
                                 navigationPath.append(.createNew(copy))
                             }
                         } label: {
@@ -112,6 +174,7 @@ struct CuriumFingerprintStudioSheet: View {
                     } label: {
                         Label("Add Profile", systemImage: "plus")
                     }
+                    .disabled(store.loadError != nil)
                     .accessibilityIdentifier("curium.studio.add")
                 }
 
@@ -136,17 +199,24 @@ struct CuriumFingerprintStudioSheet: View {
                             isActiveInProcess: isActiveInProcess(profile.id),
                             usage: usageByProfileID[profile.id],
                             onDuplicateToEdit: { copy in
-                                navigationPath.removeLast()
+                                if !navigationPath.isEmpty {
+                                    navigationPath.removeLast()
+                                }
                                 navigationPath.append(.editCustom(copy.id))
-                                Task { await refreshUsage() }
+                                scheduleRefreshUsage(onlyProfileIDs: [copy.id])
                             },
                             onSaved: {
-                                Task { await refreshUsage() }
+                                scheduleRefreshUsage(onlyProfileIDs: [profile.id])
                             },
                             onWiped: {
-                                Task { await refreshUsage() }
+                                usageByProfileID[profile.id] = CuriumFingerprintProfileStorage.UsageSnapshot(
+                                    supportBytes: 0, cacheBytes: 0, exists: false
+                                )
+                                scheduleRefreshUsage(onlyProfileIDs: [profile.id])
                             }
                         )
+                    } else {
+                        missingProfileView(id: id)
                     }
                 case .editCustom(let id):
                     if let profile = store.profiles.first(where: { $0.id == id }) {
@@ -158,15 +228,20 @@ struct CuriumFingerprintStudioSheet: View {
                             usage: usageByProfileID[profile.id],
                             onDuplicateToEdit: { copy in
                                 navigationPath.append(.editCustom(copy.id))
-                                Task { await refreshUsage() }
+                                scheduleRefreshUsage(onlyProfileIDs: [copy.id])
                             },
                             onSaved: {
-                                Task { await refreshUsage() }
+                                scheduleRefreshUsage(onlyProfileIDs: [profile.id])
                             },
                             onWiped: {
-                                Task { await refreshUsage() }
+                                usageByProfileID[profile.id] = CuriumFingerprintProfileStorage.UsageSnapshot(
+                                    supportBytes: 0, cacheBytes: 0, exists: false
+                                )
+                                scheduleRefreshUsage(onlyProfileIDs: [profile.id])
                             }
                         )
+                    } else {
+                        missingProfileView(id: id)
                     }
                 case .createNew(let draft):
                     CuriumFingerprintEditorView(
@@ -177,8 +252,10 @@ struct CuriumFingerprintStudioSheet: View {
                         usage: nil,
                         onDuplicateToEdit: { _ in },
                         onSaved: {
-                            navigationPath.removeLast()
-                            Task { await refreshUsage() }
+                            if !navigationPath.isEmpty {
+                                navigationPath.removeLast()
+                            }
+                            scheduleRefreshUsage()
                         },
                         onWiped: {}
                     )
@@ -187,50 +264,61 @@ struct CuriumFingerprintStudioSheet: View {
         }
         .task {
             refreshEngineInfo()
-            await refreshUsage()
+            scheduleRefreshUsage()
+        }
+        .onDisappear {
+            usageTask?.cancel()
+            usageTask = nil
+            copiedToastTask?.cancel()
+            copiedToastTask = nil
         }
         .sheet(isPresented: $showingImportSheet) {
             CuriumFingerprintImportSheet(store: store) { importedID in
-                Task { await refreshUsage() }
-                if let importedID {
+                scheduleRefreshUsage(onlyProfileIDs: importedID.map { [$0] })
+                if let importedID, store.profiles.contains(where: { $0.id == importedID }) {
                     navigationPath.append(.editCustom(importedID))
                 }
             }
         }
         .confirmationDialog(
-            "Delete Custom Profile?",
+            activeDialog?.title ?? "",
             isPresented: Binding(
-                get: { pendingDeleteProfile != nil },
-                set: { if !$0 { pendingDeleteProfile = nil } }
+                get: { activeDialog != nil },
+                set: { if !$0 { activeDialog = nil } }
             ),
             titleVisibility: .visible,
-            presenting: pendingDeleteProfile
-        ) { profile in
-            Button("Delete Profile & Wipe Storage", role: .destructive) {
-                deleteProfile(profile, wipeStorage: true)
+            presenting: activeDialog
+        ) { dialog in
+            switch dialog {
+            case .deleteProfile(let profile):
+                if !isActiveInProcess(profile.id) {
+                    Button("Delete Profile & Wipe Storage", role: .destructive) {
+                        deleteProfile(profile, wipeStorage: true)
+                    }
+                    Button("Delete Profile Entry Only", role: .destructive) {
+                        deleteProfile(profile, wipeStorage: false)
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            case .wipeProfile(let profile):
+                Button("Wipe Cookies, Cache & Storage", role: .destructive) {
+                    wipeProfileStorage(profile)
+                }
+                Button("Cancel", role: .cancel) {}
             }
-            Button("Delete Profile Entry Only", role: .destructive) {
-                deleteProfile(profile, wipeStorage: false)
+        } message: { dialog in
+            switch dialog {
+            case .deleteProfile(let profile):
+                if isActiveInProcess(profile.id) {
+                    Text("\"\(profile.displayName)\" (\(profile.id)) is currently active in this running session. Switch to another profile and relaunch Curium before deleting it.")
+                } else if store.selectedProfileID == profile.id {
+                    Text("Removes \"\(profile.displayName)\" (\(profile.id)) from Curium and resets next launch selection to Default (Build 39). Wiping storage permanently deletes its isolated cookies and site data.")
+                } else {
+                    Text("Removes \"\(profile.displayName)\" (\(profile.id)) from Curium. Wiping storage permanently deletes its isolated cookies, site data, and HTTP cache.")
+                }
+            case .wipeProfile(let profile):
+                Text("Permanently clears isolated cookies, localStorage, IndexedDB, CacheStorage, and HTTP cache for \"\(profile.displayName)\" (\(profile.id)). The profile configuration itself is kept.")
             }
-            Button("Cancel", role: .cancel) {}
-        } message: { profile in
-            Text("Removes \"\(profile.displayName)\" (\(profile.id)) from Curium. Isolated cookies and site data can be wiped now if this profile is not currently running.")
-        }
-        .confirmationDialog(
-            "Wipe Isolated Profile Storage?",
-            isPresented: Binding(
-                get: { pendingWipeProfile != nil },
-                set: { if !$0 { pendingWipeProfile = nil } }
-            ),
-            titleVisibility: .visible,
-            presenting: pendingWipeProfile
-        ) { profile in
-            Button("Wipe Cookies, Cache & Storage", role: .destructive) {
-                wipeProfileStorage(profile)
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: { profile in
-            Text("Permanently clears isolated cookies, localStorage, IndexedDB, CacheStorage, and HTTP cache for \"\(profile.displayName)\" (\(profile.id)). The profile configuration itself is kept.")
         }
         .alert("Identity & Profiles", isPresented: Binding(
             get: { alertMessage != nil },
@@ -243,6 +331,37 @@ struct CuriumFingerprintStudioSheet: View {
     }
 
     // MARK: - Sections
+
+    private func corruptStoreSection(_ loadError: String) -> some View {
+        Section {
+            Label(loadError, systemImage: "exclamationmark.octagon.fill")
+                .font(.footnote)
+                .foregroundStyle(.red)
+            Button(role: .destructive) {
+                if store.backupCorruptStoreAndReset() {
+                    scheduleRefreshUsage()
+                } else {
+                    alertMessage = store.lastPersistError ?? "Unable to back up and reset corrupt profile store."
+                }
+            } label: {
+                Label("Back Up Corrupt Store & Reset", systemImage: "arrow.counterclockwise")
+            }
+        } header: {
+            Text("Store Recovery Required")
+        } footer: {
+            Text("Saving is blocked to protect your existing fingerprint-profiles.json from being overwritten. Backing up moves it aside to a .bak file before resetting.")
+        }
+    }
+
+    private func missingProfileView(id: String) -> some View {
+        ContentUnavailableView(
+            "Profile Unavailable",
+            systemImage: "person.crop.circle.badge.exclamationmark",
+            description: Text("Profile \"\(id)\" is no longer present in the profile store.")
+        )
+        .navigationTitle("Unavailable")
+        .navigationBarTitleDisplayMode(.inline)
+    }
 
     private var engineSessionSection: some View {
         Section {
@@ -306,7 +425,8 @@ struct CuriumFingerprintStudioSheet: View {
                         HStack(spacing: 6) {
                             Text("Default (Build 39 Authentic Chrome)")
                                 .foregroundStyle(.primary)
-                            if activeProfileIDInProcess == "default" && engineStatus?.state == "default_0105" {
+                                .lineLimit(2)
+                            if isEngineRunningBuild39 {
                                 statusBadge("LIVE", color: .green)
                             }
                         }
@@ -324,6 +444,7 @@ struct CuriumFingerprintStudioSheet: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .disabled(store.loadError != nil)
             .accessibilityAddTraits(store.selectedProfileID == nil ? .isSelected : [])
             .accessibilityIdentifier("curium.studio.profile.defaultBuild39")
         } header: {
@@ -341,12 +462,14 @@ struct CuriumFingerprintStudioSheet: View {
                 }
                 .accessibilityIdentifier("curium.studio.profile.\(profile.id)")
                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                    Button {
-                        selectProfile(profile)
-                    } label: {
-                        Label("Select", systemImage: "checkmark.circle")
+                    if store.selectedProfileID != profile.id {
+                        Button {
+                            selectProfile(profile)
+                        } label: {
+                            Label("Select", systemImage: "checkmark.circle")
+                        }
+                        .tint(.accentColor)
                     }
-                    .tint(.accentColor)
                 }
                 .contextMenu {
                     profileContextMenu(profile)
@@ -372,18 +495,29 @@ struct CuriumFingerprintStudioSheet: View {
                     }
                     .accessibilityIdentifier("curium.studio.profile.\(profile.id)")
                     .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                        Button {
-                            selectProfile(profile)
-                        } label: {
-                            Label("Select", systemImage: "checkmark.circle")
+                        if store.selectedProfileID != profile.id {
+                            Button {
+                                selectProfile(profile)
+                            } label: {
+                                Label("Select", systemImage: "checkmark.circle")
+                            }
+                            .tint(.accentColor)
                         }
-                        .tint(.accentColor)
                     }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        Button(role: .destructive) {
-                            pendingDeleteProfile = profile
-                        } label: {
-                            Label("Delete", systemImage: "trash")
+                        if isActiveInProcess(profile.id) {
+                            Button {
+                                alertMessage = "\"\(profile.displayName)\" (\(profile.id)) is currently active in this running session. Switch to another profile and relaunch Curium before deleting it."
+                            } label: {
+                                Label("Active", systemImage: "lock.fill")
+                            }
+                            .tint(.secondary)
+                        } else {
+                            Button(role: .destructive) {
+                                activeDialog = .deleteProfile(profile)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
                         }
                     }
                     .contextMenu {
@@ -396,19 +530,71 @@ struct CuriumFingerprintStudioSheet: View {
         }
     }
 
+    private var orphanedStorageSection: some View {
+        Section {
+            ForEach(orphanedProfiles, id: \.self) { slug in
+                let active = isActiveInProcess(slug)
+                let wipingThis = wipingTargetID == slug
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(slug)
+                                .font(.subheadline.monospaced())
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            if active {
+                                statusBadge("LIVE", color: .green)
+                            }
+                        }
+                        if let usage = orphanUsageBySlug[slug], usage.exists {
+                            Text("ChromiumProfiles/\(slug) · \(formatBytes(usage.totalBytes))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("ChromiumProfiles/\(slug)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    if wipingThis {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Button(role: .destructive) {
+                            wipeOrphanedProfile(slug)
+                        } label: {
+                            Text("Wipe")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(active || isWiping)
+                        .accessibilityIdentifier("curium.studio.orphan.wipe.\(slug)")
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        } header: {
+            Text("Orphaned Storage (\(orphanedProfiles.count))")
+        } footer: {
+            Text("Isolated ChromiumProfiles/ directories remain on disk without a profile entry. Wipe them to reclaim disk space and prevent accidental cookie reuse if an ID is recreated.")
+        }
+    }
+
     // MARK: - Row & Menu Builders
 
     private func profileRowContent(_ profile: CuriumFingerprintProfile) -> some View {
         let isSelected = store.selectedProfileID == profile.id
-        let isLive = isActiveInProcess(profile.id)
-            && !(profile.id == "default" && engineStatus?.state == "default_0105")
+        let isLive = !isEngineRunningBuild39 && isActiveInProcess(profile.id)
         let usage = usageByProfileID[profile.id]
+        let wipingThis = wipingTargetID == profile.id
 
-        return HStack(spacing: 12) {
+        return HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(profile.displayName)
                         .foregroundStyle(.primary)
+                        .lineLimit(2)
                     if isLive {
                         statusBadge("LIVE", color: .green)
                     }
@@ -425,16 +611,23 @@ struct CuriumFingerprintStudioSheet: View {
                     .lineLimit(2)
             }
             Spacer(minLength: 4)
+            if wipingThis {
+                ProgressView()
+                    .controlSize(.small)
+            }
         }
         .padding(.vertical, 2)
     }
 
     @ViewBuilder
     private func profileContextMenu(_ profile: CuriumFingerprintProfile) -> some View {
-        Button {
-            selectProfile(profile)
-        } label: {
-            Label("Select for Next Launch", systemImage: "checkmark.circle")
+        if store.selectedProfileID != profile.id {
+            Button {
+                selectProfile(profile)
+            } label: {
+                Label("Select for Next Launch", systemImage: "checkmark.circle")
+            }
+            .disabled(store.loadError != nil)
         }
 
         Button {
@@ -442,6 +635,7 @@ struct CuriumFingerprintStudioSheet: View {
         } label: {
             Label("Duplicate & Customize", systemImage: "plus.square.on.square")
         }
+        .disabled(store.loadError != nil)
 
         Button {
             copyProfileJSON(profile)
@@ -453,7 +647,7 @@ struct CuriumFingerprintStudioSheet: View {
            usageByProfileID[profile.id]?.exists == true
         {
             Button(role: .destructive) {
-                pendingWipeProfile = profile
+                activeDialog = .wipeProfile(profile)
             } label: {
                 Label("Wipe Isolated Storage", systemImage: "externaldrive.badge.xmark")
             }
@@ -461,10 +655,17 @@ struct CuriumFingerprintStudioSheet: View {
 
         if !profile.isBuiltIn {
             Divider()
-            Button(role: .destructive) {
-                pendingDeleteProfile = profile
-            } label: {
-                Label("Delete Profile", systemImage: "trash")
+            if isActiveInProcess(profile.id) {
+                Button(role: .destructive) {} label: {
+                    Label("Delete Profile (Switch & Relaunch First)", systemImage: "lock.fill")
+                }
+                .disabled(true)
+            } else {
+                Button(role: .destructive) {
+                    activeDialog = .deleteProfile(profile)
+                } label: {
+                    Label("Delete Profile", systemImage: "trash")
+                }
             }
         }
     }
@@ -476,6 +677,8 @@ struct CuriumFingerprintStudioSheet: View {
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
             .background(color.opacity(0.14), in: Capsule())
+            .fixedSize(horizontal: true, vertical: false)
+            .layoutPriority(1)
     }
 
     private var defaultUsageSubtitle: String {
@@ -520,16 +723,41 @@ struct CuriumFingerprintStudioSheet: View {
         }
     }
 
-    private func refreshUsage() async {
-        let ids = Array(Set(["default"] + store.profiles.map(\.id)))
-        let snapshot = await Task.detached(priority: .utility) {
-            var map: [String: CuriumFingerprintProfileStorage.UsageSnapshot] = [:]
-            for id in ids {
-                map[id] = CuriumFingerprintProfileStorage.measureUsage(for: id)
+    private func scheduleRefreshUsage(onlyProfileIDs: Set<String>? = nil) {
+        usageTask?.cancel()
+        let knownIDs = Set(store.profiles.map(\.id))
+        let targetIDs: [String]
+        if let onlyProfileIDs {
+            targetIDs = Array(onlyProfileIDs)
+        } else {
+            targetIDs = Array(Set(["default"] + store.profiles.map(\.id)))
+        }
+        usageTask = Task {
+            let result = await Task.detached(priority: .utility) {
+                var usageMap: [String: CuriumFingerprintProfileStorage.UsageSnapshot] = [:]
+                for id in targetIDs {
+                    if Task.isCancelled { return (usageMap, [String](), [String: CuriumFingerprintProfileStorage.UsageSnapshot]()) }
+                    usageMap[id] = CuriumFingerprintProfileStorage.measureUsage(for: id)
+                }
+                let orphans = CuriumFingerprintProfileStorage.discoverOrphanedProfiles(knownIDs: knownIDs)
+                var orphanMap: [String: CuriumFingerprintProfileStorage.UsageSnapshot] = [:]
+                for slug in orphans {
+                    if Task.isCancelled { return (usageMap, orphans, orphanMap) }
+                    orphanMap[slug] = CuriumFingerprintProfileStorage.measureUsage(for: slug)
+                }
+                return (usageMap, orphans, orphanMap)
+            }.value
+            guard !Task.isCancelled else { return }
+            if onlyProfileIDs != nil {
+                for (id, snap) in result.0 {
+                    usageByProfileID[id] = snap
+                }
+            } else {
+                usageByProfileID = result.0
             }
-            return map
-        }.value
-        usageByProfileID = snapshot
+            orphanedProfiles = result.1
+            orphanUsageBySlug = result.2
+        }
     }
 
     private func selectProfile(_ profile: CuriumFingerprintProfile) {
@@ -549,7 +777,7 @@ struct CuriumFingerprintStudioSheet: View {
             return
         }
         navigationPath.append(.editCustom(copy.id))
-        Task { await refreshUsage() }
+        scheduleRefreshUsage(onlyProfileIDs: [copy.id])
     }
 
     private func copyProfileJSON(_ profile: CuriumFingerprintProfile) {
@@ -558,6 +786,14 @@ struct CuriumFingerprintStudioSheet: View {
             if let text = String(data: data, encoding: .utf8) {
                 UIPasteboard.general.string = text
                 copiedToastID = profile.id
+                copiedToastTask?.cancel()
+                copiedToastTask = Task {
+                    try? await Task.sleep(for: .seconds(2))
+                    guard !Task.isCancelled else { return }
+                    if copiedToastID == profile.id {
+                        copiedToastID = nil
+                    }
+                }
             }
         } catch {
             alertMessage = "Failed to export profile JSON: \(error.localizedDescription)"
@@ -566,21 +802,54 @@ struct CuriumFingerprintStudioSheet: View {
 
     private func wipeProfileStorage(_ profile: CuriumFingerprintProfile) {
         guard !isWiping else { return }
-        isWiping = true
+        wipingTargetID = profile.id
         let isActive = CuriumFingerprintProfileStorage.isProfileActiveInCurrentProcess(profile.id)
+        let targetID = profile.id
         Task.detached(priority: .userInitiated) {
             do {
                 try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
-                    profile.id,
+                    targetID,
                     isActiveInCurrentProcess: isActive
                 )
                 await MainActor.run {
-                    isWiping = false
-                    Task { await refreshUsage() }
+                    wipingTargetID = nil
+                    usageByProfileID[targetID] = CuriumFingerprintProfileStorage.UsageSnapshot(
+                        supportBytes: 0, cacheBytes: 0, exists: false
+                    )
+                    scheduleRefreshUsage(onlyProfileIDs: [targetID])
                 }
             } catch {
                 await MainActor.run {
-                    isWiping = false
+                    wipingTargetID = nil
+                    alertMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func wipeOrphanedProfile(_ slug: String) {
+        guard !isWiping else { return }
+        let isActive = CuriumFingerprintProfileStorage.isProfileActiveInCurrentProcess(slug)
+        guard !isActive else {
+            alertMessage = "Orphaned directory \"\(slug)\" is currently active in this session. Relaunch Curium on another profile first."
+            return
+        }
+        wipingTargetID = slug
+        Task.detached(priority: .userInitiated) {
+            do {
+                try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
+                    slug,
+                    isActiveInCurrentProcess: false
+                )
+                await MainActor.run {
+                    wipingTargetID = nil
+                    orphanedProfiles.removeAll { $0 == slug }
+                    orphanUsageBySlug.removeValue(forKey: slug)
+                    scheduleRefreshUsage(onlyProfileIDs: [])
+                }
+            } catch {
+                await MainActor.run {
+                    wipingTargetID = nil
                     alertMessage = error.localizedDescription
                 }
             }
@@ -589,31 +858,186 @@ struct CuriumFingerprintStudioSheet: View {
 
     private func deleteProfile(_ profile: CuriumFingerprintProfile, wipeStorage: Bool) {
         let isActive = CuriumFingerprintProfileStorage.isProfileActiveInCurrentProcess(profile.id)
+        if isActive {
+            alertMessage = "\"\(profile.displayName)\" (\(profile.id)) is currently active in this session. Switch to another profile and relaunch Curium before deleting it."
+            return
+        }
+        let wasSelected = store.selectedProfileID == profile.id
         guard store.deleteProfile(id: profile.id) else {
             alertMessage = store.lastPersistError ?? "Could not delete profile \"\(profile.id)\"."
             return
         }
-        if wipeStorage && !isActive && profile.id != "default" {
+        let targetID = profile.id
+        if wipeStorage && targetID != "default" {
+            wipingTargetID = targetID
             Task.detached(priority: .userInitiated) {
                 do {
                     try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
-                        profile.id,
+                        targetID,
                         isActiveInCurrentProcess: false
                     )
+                    await MainActor.run {
+                        wipingTargetID = nil
+                        usageByProfileID.removeValue(forKey: targetID)
+                        if wasSelected {
+                            alertMessage = "Deleted \"\(profile.displayName)\" and wiped its isolated storage. Next launch was reset to Default (Build 39)."
+                        }
+                        scheduleRefreshUsage(onlyProfileIDs: [])
+                    }
                 } catch {
                     await MainActor.run {
-                        alertMessage = "Profile entry deleted, but storage wipe skipped: \(error.localizedDescription)"
+                        wipingTargetID = nil
+                        alertMessage = "Profile entry deleted, but storage wipe skipped: \(error.localizedDescription). You can wipe it later under Orphaned Storage."
+                        scheduleRefreshUsage(onlyProfileIDs: [])
                     }
                 }
-                await refreshUsage()
             }
         } else {
-            if wipeStorage && isActive {
-                alertMessage = "Profile entry deleted. Its storage directory is active in this session and can be cleared after relaunch."
+            usageByProfileID.removeValue(forKey: targetID)
+            if wasSelected {
+                alertMessage = "Deleted \"\(profile.displayName)\" entry. Next launch was reset to Default (Build 39)."
             }
-            Task { await refreshUsage() }
+            scheduleRefreshUsage(onlyProfileIDs: [])
         }
     }
+}
+
+// MARK: - Narrow-Width-Safe Form Controls
+
+/// Stacked label + multi-line `TextField` that stays readable at iPhone Duo's
+/// `382 pt` outer portrait safe width and Dynamic Type XL without horizontal clipping.
+/// In read-only mode, renders selectable text so users can copy technical fields.
+private struct CuriumStackedTextFieldRow: View {
+    let title: String
+    let placeholder: String
+    @Binding var text: String
+    let isReadOnly: Bool
+    var monospaced: Bool = true
+    var font: Font = .callout
+    var keyboardType: UIKeyboardType = .default
+    var autocapitalization: TextInputAutocapitalization = .never
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            if isReadOnly {
+                Text(text.isEmpty ? placeholder : text)
+                    .font(monospaced ? font.monospaced() : font)
+                    .foregroundStyle(text.isEmpty ? .tertiary : .primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                TextField(placeholder, text: $text, axis: .vertical)
+                    .lineLimit(1...4)
+                    .font(monospaced ? font.monospaced() : font)
+                    .keyboardType(keyboardType)
+                    .textInputAutocapitalization(autocapitalization)
+                    .autocorrectionDisabled()
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+/// Preserves the 3-way Client Hint distinction between `nil` (Engine Auto),
+/// `""` (Explicit Empty string, e.g. Linux `platformVersion` / Android `architecture`),
+/// and a non-empty custom value.
+private struct CuriumTriStateTextField: View {
+    let title: String
+    let emptyLabel: String
+    let customPlaceholder: String
+    @Binding var value: String?
+    let isReadOnly: Bool
+    var monospaced: Bool = true
+
+    private enum Mode: String, CaseIterable, Identifiable {
+        case auto
+        case explicitEmpty
+        case custom
+
+        var id: String { rawValue }
+    }
+
+    @State private var mode: Mode
+    @State private var customText: String
+
+    init(
+        title: String,
+        emptyLabel: String = "Empty (\"\")",
+        customPlaceholder: String,
+        value: Binding<String?>,
+        isReadOnly: Bool,
+        monospaced: Bool = true
+    ) {
+        self.title = title
+        self.emptyLabel = emptyLabel
+        self.customPlaceholder = customPlaceholder
+        self._value = value
+        self.isReadOnly = isReadOnly
+        self.monospaced = monospaced
+        if let current = value.wrappedValue {
+            if current.isEmpty {
+                _mode = State(initialValue: .explicitEmpty)
+                _customText = State(initialValue: "")
+            } else {
+                _mode = State(initialValue: .custom)
+                _customText = State(initialValue: current)
+            }
+        } else {
+            _mode = State(initialValue: .auto)
+            _customText = State(initialValue: "")
+        }
+    }
+
+    var body: some View {
+        Picker(title, selection: $mode) {
+            Text("Auto").tag(Mode.auto)
+            Text(emptyLabel).tag(Mode.explicitEmpty)
+            Text("Custom").tag(Mode.custom)
+        }
+        .disabled(isReadOnly)
+        .onChange(of: mode) { _, next in
+            switch next {
+            case .auto:
+                value = nil
+            case .explicitEmpty:
+                value = ""
+            case .custom:
+                value = customText
+            }
+        }
+
+        if mode == .custom {
+            CuriumStackedTextFieldRow(
+                title: "\(title) Value",
+                placeholder: customPlaceholder,
+                text: $customText,
+                isReadOnly: isReadOnly,
+                monospaced: monospaced
+            )
+            .onChange(of: customText) { _, next in
+                guard mode == .custom else { return }
+                value = next
+            }
+        }
+    }
+}
+
+private struct CuriumShareDocument: Identifiable {
+    let id = UUID()
+    let text: String
+}
+
+private struct CuriumActivityShareSheet: UIViewControllerRepresentable {
+    let text: String
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [text], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 // MARK: - Profile Editor / Built-In Inspector
@@ -623,6 +1047,37 @@ private struct CuriumFingerprintEditorView: View {
         case inspectBuiltIn
         case editCustom
         case createNew
+    }
+
+    private enum EditorDialog: Identifiable {
+        case wipeStorage
+        case discardChanges
+        case saveBeforeSelect
+
+        var id: String {
+            switch self {
+            case .wipeStorage: return "wipeStorage"
+            case .discardChanges: return "discardChanges"
+            case .saveBeforeSelect: return "saveBeforeSelect"
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .wipeStorage: return "Wipe Isolated Storage?"
+            case .discardChanges: return "Discard Unsaved Changes?"
+            case .saveBeforeSelect: return "Save Changes Before Selecting?"
+            }
+        }
+    }
+
+    private struct ValidationTrigger: Equatable {
+        let draft: CuriumFingerprintProfile
+        let useSystemLanguages: Bool
+        let languagesText: String
+        let proxyModeSelection: ProxyModeChoice
+        let fixedProxyRules: String
+        let fixedProxyBypass: String
     }
 
     @Bindable var store: CuriumFingerprintStore
@@ -635,18 +1090,22 @@ private struct CuriumFingerprintEditorView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var draft: CuriumFingerprintProfile
+    @State private var savedBaseline: CuriumFingerprintProfile
+    @State private var currentUsage: CuriumFingerprintProfileStorage.UsageSnapshot?
     @State private var hardwareOverrideEnabled: Bool
     @State private var useSystemLanguages: Bool
     @State private var languagesText: String
     @State private var proxyModeSelection: ProxyModeChoice
     @State private var fixedProxyRules: String
     @State private var fixedProxyBypass: String
+    @State private var cachedReport: CuriumFingerprintValidationReport
     @State private var copiedLabel: String?
-    @State private var confirmingWipe = false
+    @State private var activeDialog: EditorDialog?
     @State private var isWiping = false
     @State private var alertMessage: String?
+    @State private var pendingShareDocument: CuriumShareDocument?
 
-    private enum ProxyModeChoice: String, CaseIterable, Identifiable {
+    private enum ProxyModeChoice: String, CaseIterable, Identifiable, Equatable {
         case system, direct, fixed
         var id: String { rawValue }
         var title: String {
@@ -674,6 +1133,18 @@ private struct CuriumFingerprintEditorView: View {
 
     private var isReadOnly: Bool { mode == .inspectBuiltIn }
     private var isSelectedForNextLaunch: Bool { store.selectedProfileID == draft.id }
+    private var hasUnsavedChanges: Bool { !isReadOnly && effectiveDraft != savedBaseline }
+
+    private var validationTrigger: ValidationTrigger {
+        ValidationTrigger(
+            draft: draft,
+            useSystemLanguages: useSystemLanguages,
+            languagesText: languagesText,
+            proxyModeSelection: proxyModeSelection,
+            fixedProxyRules: fixedProxyRules,
+            fixedProxyBypass: fixedProxyBypass
+        )
+    }
 
     init(
         store: CuriumFingerprintStore,
@@ -693,6 +1164,8 @@ private struct CuriumFingerprintEditorView: View {
         self.onSaved = onSaved
         self.onWiped = onWiped
         _draft = State(initialValue: initialProfile)
+        _savedBaseline = State(initialValue: initialProfile.normalizedForPersistence())
+        _currentUsage = State(initialValue: usage)
         _hardwareOverrideEnabled = State(initialValue: !initialProfile.usesNativeHardwareAndGPU)
         _useSystemLanguages = State(initialValue: initialProfile.languages == nil)
         _languagesText = State(initialValue: (initialProfile.languages ?? []).joined(separator: ", "))
@@ -710,49 +1183,17 @@ private struct CuriumFingerprintEditorView: View {
             _fixedProxyRules = State(initialValue: rules)
             _fixedProxyBypass = State(initialValue: bypass ?? "")
         }
-    }
-
-    private static func trimmedOptional(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func normalizedSlot(_ slot: CuriumIdentitySlot) -> CuriumIdentitySlot {
-        var copy = slot
-        copy.uaString = trimmedOptional(slot.uaString)
-        copy.osCpu = trimmedOptional(slot.osCpu)
-        copy.productVersion = trimmedOptional(slot.productVersion)
-        if let brand = slot.primaryBrand {
-            // Preserve explicit empty string ("") for Chromium-only 2-brand mode; trim non-empty brands.
-            copy.primaryBrand = brand.isEmpty ? "" : brand.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        copy.majorVersion = trimmedOptional(slot.majorVersion)
-        copy.fullVersion = trimmedOptional(slot.fullVersion)
-        copy.platform = trimmedOptional(slot.platform)
-        if let pv = slot.platformVersion {
-            copy.platformVersion = pv.isEmpty ? "" : trimmedOptional(pv)
-        }
-        if let arch = slot.architecture {
-            copy.architecture = arch.isEmpty ? "" : trimmedOptional(arch)
-        }
-        if let model = slot.model {
-            copy.model = model.isEmpty ? "" : trimmedOptional(model)
-        }
-        copy.navigatorPlatform = trimmedOptional(slot.navigatorPlatform)
-        copy.webglVendor = trimmedOptional(slot.webglVendor)
-        copy.webglRenderer = trimmedOptional(slot.webglRenderer)
-        return copy
+        let initialNormalized = initialProfile.normalizedForPersistence()
+        let initialReport = Self.evaluateValidation(
+            candidate: initialNormalized,
+            mode: mode,
+            store: store
+        )
+        _cachedReport = State(initialValue: initialReport)
     }
 
     private var effectiveDraft: CuriumFingerprintProfile {
         var profile = draft
-        profile.id = draft.id.trimmingCharacters(in: .whitespacesAndNewlines)
-        profile.displayName = draft.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        profile.notes = draft.notes.trimmingCharacters(in: .whitespacesAndNewlines)
-        profile.hardware.timezone = Self.trimmedOptional(draft.hardware.timezone)
-        profile.mobile = Self.normalizedSlot(draft.mobile)
-        profile.desktop = Self.normalizedSlot(draft.desktop)
         if useSystemLanguages {
             profile.languages = nil
         } else {
@@ -774,70 +1215,141 @@ private struct CuriumFingerprintEditorView: View {
                 bypassRules: trimmedBypass.isEmpty ? nil : trimmedBypass
             )
         }
-        return profile
+        return profile.normalizedForPersistence()
     }
 
-    private var validationReport: CuriumFingerprintValidationReport {
-        let candidate = effectiveDraft
-        var report = CuriumFingerprintValidator.validate(candidate)
+    private static func evaluateValidation(
+        candidate: CuriumFingerprintProfile,
+        mode: Mode,
+        store: CuriumFingerprintStore
+    ) -> CuriumFingerprintValidationReport {
         if mode == .createNew {
+            var report = store.validateForUpsert(candidate)
             let lowered = candidate.id.lowercased()
-            let builtInLowered = Set(CuriumFingerprintPresets.builtInIDs.map { $0.lowercased() })
-            if store.profiles.contains(where: { $0.id.lowercased() == lowered }) {
+            if store.profiles.contains(where: { $0.id.lowercased() == lowered })
+                && !report.errors.contains(where: { $0.contains("already exists") || $0.contains("Built-in profile") })
+            {
                 report.errors.append("A profile with ID \"\(candidate.id)\" already exists (APFS IDs are case-insensitive).")
             }
-            if builtInLowered.contains(lowered) {
-                report.errors.append("\"\(candidate.id)\" is reserved for a built-in preset.")
-            }
+            return report
         }
-        return report
+        return CuriumFingerprintValidator.validate(candidate)
+    }
+
+    private var storageFolderDisplayName: String? {
+        let trimmed = draft.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard CuriumFingerprintValidator.isValidProfileID(trimmed) else { return nil }
+        return trimmed == "default" ? "Chromium/" : "ChromiumProfiles/\(trimmed)"
     }
 
     var body: some View {
-        let report = validationReport
         Form {
             quickActionSection
-            if !report.errors.isEmpty || !report.warnings.isEmpty {
-                validationSection(report)
-            }
             profileMetadataSection
             identitySlotsSection
             antiFingerprintingSection
             hardwareAndGPUSection
             networkAndPrivacySection
             storageAndJSONSection
+            if !cachedReport.errors.isEmpty || !cachedReport.warnings.isEmpty {
+                validationSection(cachedReport)
+            }
         }
+        .scrollDismissesKeyboard(.interactively)
         .navigationTitle(mode == .createNew ? "New Profile" : draft.displayName)
         .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(hasUnsavedChanges)
+        .interactiveDismissDisabled(hasUnsavedChanges)
+        .onChange(of: usage) { _, latest in
+            currentUsage = latest
+        }
         .onChange(of: draft.usesNativeHardwareAndGPU) { _, isNative in
             if !isNative && !hardwareOverrideEnabled {
                 hardwareOverrideEnabled = true
             }
         }
+        .task(id: validationTrigger) {
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            cachedReport = Self.evaluateValidation(
+                candidate: effectiveDraft,
+                mode: mode,
+                store: store
+            )
+        }
         .toolbar {
+            if hasUnsavedChanges {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        activeDialog = .discardChanges
+                    } label: {
+                        Label("Back", systemImage: "chevron.backward")
+                    }
+                    .accessibilityIdentifier("curium.studio.editor.back")
+                }
+            }
             if !isReadOnly {
                 ToolbarItem(placement: .confirmationAction) {
                     Button {
-                        saveProfile()
+                        saveProfile(dismissAfterSave: true)
                     } label: {
                         Label("Save", systemImage: "checkmark")
                     }
-                    .disabled(!report.isValid)
+                    .disabled(!cachedReport.isValid || store.loadError != nil)
                     .accessibilityIdentifier("curium.studio.editor.save")
                 }
             }
         }
         .confirmationDialog(
-            "Wipe Isolated Storage?",
-            isPresented: $confirmingWipe,
-            titleVisibility: .visible
-        ) {
-            Button("Wipe Cookies, Cache & Storage", role: .destructive) {
-                wipeStorage()
+            activeDialog?.title ?? "",
+            isPresented: Binding(
+                get: { activeDialog != nil },
+                set: { if !$0 { activeDialog = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: activeDialog
+        ) { dialog in
+            switch dialog {
+            case .wipeStorage:
+                Button("Wipe Cookies, Cache & Storage", role: .destructive) {
+                    wipeStorage()
+                }
+                Button("Cancel", role: .cancel) {}
+            case .discardChanges:
+                Button("Discard Changes", role: .destructive) {
+                    dismiss()
+                }
+                Button("Keep Editing", role: .cancel) {}
+            case .saveBeforeSelect:
+                if cachedReport.isValid {
+                    Button("Save & Use for Next Launch") {
+                        if saveProfile(dismissAfterSave: false) {
+                            selectCurrentProfile()
+                        }
+                    }
+                }
+                Button("Use Previously Saved Version") {
+                    selectCurrentProfile()
+                }
+                Button("Cancel", role: .cancel) {}
             }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Clears isolated cookies, localStorage, IndexedDB, CacheStorage, and HTTP cache for \"\(draft.id)\".")
+        } message: { dialog in
+            switch dialog {
+            case .wipeStorage:
+                Text("Clears isolated cookies, localStorage, IndexedDB, CacheStorage, and HTTP cache for \"\(draft.id)\".")
+            case .discardChanges:
+                Text("Your unsaved edits to \"\(draft.displayName.isEmpty ? draft.id : draft.displayName)\" will be lost.")
+            case .saveBeforeSelect:
+                if cachedReport.isValid {
+                    Text("You have unsaved edits. Save them before selecting this profile for next launch, or select the previously saved version.")
+                } else {
+                    Text("Your current edits have validation errors and cannot be saved yet. You can fix them first or select the previously saved version.")
+                }
+            }
+        }
+        .sheet(item: $pendingShareDocument) { doc in
+            CuriumActivityShareSheet(text: doc.text)
+                .presentationDetents([.medium, .large])
         }
         .alert("Profile Editor", isPresented: Binding(
             get: { alertMessage != nil },
@@ -855,8 +1367,10 @@ private struct CuriumFingerprintEditorView: View {
         Section {
             if mode != .createNew {
                 Button {
-                    if !store.selectProfile(id: draft.id) {
-                        alertMessage = store.lastPersistError ?? "Unable to select profile."
+                    if hasUnsavedChanges {
+                        activeDialog = .saveBeforeSelect
+                    } else {
+                        selectCurrentProfile()
                     }
                 } label: {
                     Label(
@@ -864,7 +1378,7 @@ private struct CuriumFingerprintEditorView: View {
                         systemImage: isSelectedForNextLaunch ? "checkmark.circle.fill" : "checkmark.circle"
                     )
                 }
-                .disabled(isSelectedForNextLaunch)
+                .disabled((isSelectedForNextLaunch && !hasUnsavedChanges) || store.loadError != nil)
                 .accessibilityIdentifier("curium.studio.editor.select")
             }
 
@@ -874,13 +1388,41 @@ private struct CuriumFingerprintEditorView: View {
                 } label: {
                     Label("Duplicate & Customize", systemImage: "plus.square.on.square")
                 }
+                .disabled(store.loadError != nil)
                 .accessibilityIdentifier("curium.studio.editor.duplicate")
+            } else {
+                // Constant-height validation status anchor so typing never shifts TextFields below.
+                validationSummaryRow
             }
         } footer: {
             if isReadOnly {
                 Text("Built-in presets are immutable templates. Duplicate this preset to edit its identity, proxy, language, or hardware overrides.")
             } else if isActiveInProcess {
                 Text("This profile is active in the current session. Saved edits bump revision and apply on the next cold launch.")
+            }
+        }
+    }
+
+    private var validationSummaryRow: some View {
+        Group {
+            if !cachedReport.errors.isEmpty {
+                Label(
+                    "\(cachedReport.errors.count) validation \(cachedReport.errors.count == 1 ? "error" : "errors") — see Validation below",
+                    systemImage: "xmark.octagon.fill"
+                )
+                .font(.footnote)
+                .foregroundStyle(.red)
+            } else if !cachedReport.warnings.isEmpty {
+                Label(
+                    "\(cachedReport.warnings.count) coherence \(cachedReport.warnings.count == 1 ? "warning" : "warnings") — see Validation below",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.footnote)
+                .foregroundStyle(.orange)
+            } else {
+                Label("Configuration valid", systemImage: "checkmark.seal.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.green)
             }
         }
     }
@@ -903,32 +1445,42 @@ private struct CuriumFingerprintEditorView: View {
     private var profileMetadataSection: some View {
         Section("Profile") {
             if mode == .createNew {
-                LabeledContent("Profile ID") {
-                    TextField("work-us-01", text: $draft.id)
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.body.monospaced())
-                }
+                CuriumStackedTextFieldRow(
+                    title: "Profile ID",
+                    placeholder: "work-us-01",
+                    text: $draft.id,
+                    isReadOnly: false,
+                    monospaced: true,
+                    font: .body
+                )
             } else {
                 LabeledContent("Profile ID") {
                     Text(draft.id)
                         .font(.body.monospaced())
                         .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
             }
 
-            LabeledContent("Display Name") {
-                TextField("Display Name", text: $draft.displayName)
-                    .multilineTextAlignment(.trailing)
-                    .disabled(isReadOnly)
-            }
+            CuriumStackedTextFieldRow(
+                title: "Display Name",
+                placeholder: "Display Name",
+                text: $draft.displayName,
+                isReadOnly: isReadOnly,
+                monospaced: false,
+                font: .body,
+                autocapitalization: .words
+            )
 
-            LabeledContent("Notes") {
-                TextField("Optional notes", text: $draft.notes)
-                    .multilineTextAlignment(.trailing)
-                    .disabled(isReadOnly)
-            }
+            CuriumStackedTextFieldRow(
+                title: "Notes",
+                placeholder: "Optional notes",
+                text: $draft.notes,
+                isReadOnly: isReadOnly,
+                monospaced: false,
+                font: .callout,
+                autocapitalization: .sentences
+            )
 
             Picker("Default Slot", selection: $draft.defaultSlot) {
                 ForEach(CuriumDefaultSlot.allCases) { slot in
@@ -948,6 +1500,7 @@ private struct CuriumFingerprintEditorView: View {
             NavigationLink {
                 CuriumIdentitySlotEditorView(
                     title: "Mobile Slot",
+                    slotKey: "mobile",
                     slot: $draft.mobile,
                     isReadOnly: isReadOnly
                 )
@@ -964,6 +1517,7 @@ private struct CuriumFingerprintEditorView: View {
             NavigationLink {
                 CuriumIdentitySlotEditorView(
                     title: "Desktop Slot",
+                    slotKey: "desktop",
                     slot: $draft.desktop,
                     isReadOnly: isReadOnly
                 )
@@ -1006,14 +1560,25 @@ private struct CuriumFingerprintEditorView: View {
 
             if let seed = draft.fingerprintSeed {
                 LabeledContent("Seed (HMAC-SHA256)") {
-                    Text("\(seed.prefix(12))…\(seed.suffix(8))")
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text("\(seed.prefix(12))…\(seed.suffix(8))")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                        Button {
+                            UIPasteboard.general.string = seed
+                            copiedLabel = "seed"
+                        } label: {
+                            Image(systemName: copiedLabel == "seed" ? "checkmark.circle" : "doc.on.doc")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("Copy Farbling Seed")
+                    }
                 }
 
                 if !isReadOnly {
                     Button {
-                        draft.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
+                        draft.fingerprintSeed = CuriumFingerprintStore.mintFreshSeed(differentFrom: seed)
                     } label: {
                         Label("Rotate Farbling Seed", systemImage: "arrow.triangle.2.circlepath")
                     }
@@ -1115,14 +1680,12 @@ private struct CuriumFingerprintEditorView: View {
                 }
                 .disabled(isReadOnly)
 
-                LabeledContent("Custom IANA TZ") {
-                    TextField("e.g. Europe/Berlin", text: optionalStringBinding(\.hardware.timezone))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.callout.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "Custom IANA Timezone",
+                    placeholder: "e.g. Europe/Berlin",
+                    text: optionalStringBinding(\.hardware.timezone),
+                    isReadOnly: isReadOnly
+                )
 
                 if !isReadOnly {
                     Menu {
@@ -1152,45 +1715,41 @@ private struct CuriumFingerprintEditorView: View {
                     }
                 }
 
-                LabeledContent("Desktop WebGL Vendor") {
-                    TextField("Native", text: optionalStringBinding(\.desktop.webglVendor))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.caption.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "Desktop WebGL Vendor",
+                    placeholder: "Native Apple",
+                    text: optionalStringBinding(\.desktop.webglVendor),
+                    isReadOnly: isReadOnly,
+                    font: .caption
+                )
 
-                LabeledContent("Desktop WebGL Renderer") {
-                    TextField("Native", text: optionalStringBinding(\.desktop.webglRenderer))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.caption.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "Desktop WebGL Renderer",
+                    placeholder: "Native Apple Metal",
+                    text: optionalStringBinding(\.desktop.webglRenderer),
+                    isReadOnly: isReadOnly,
+                    font: .caption
+                )
 
                 if draft.mobile.hasWebGLOverride
                     || draft.mobile.webglVendor != draft.desktop.webglVendor
                     || draft.mobile.webglRenderer != draft.desktop.webglRenderer
                 {
-                    LabeledContent("Mobile WebGL Vendor") {
-                        TextField("Native", text: optionalStringBinding(\.mobile.webglVendor))
-                            .multilineTextAlignment(.trailing)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .font(.caption.monospaced())
-                            .disabled(isReadOnly)
-                    }
+                    CuriumStackedTextFieldRow(
+                        title: "Mobile WebGL Vendor",
+                        placeholder: "Native Apple",
+                        text: optionalStringBinding(\.mobile.webglVendor),
+                        isReadOnly: isReadOnly,
+                        font: .caption
+                    )
 
-                    LabeledContent("Mobile WebGL Renderer") {
-                        TextField("Native", text: optionalStringBinding(\.mobile.webglRenderer))
-                            .multilineTextAlignment(.trailing)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .font(.caption.monospaced())
-                            .disabled(isReadOnly)
-                    }
+                    CuriumStackedTextFieldRow(
+                        title: "Mobile WebGL Renderer",
+                        placeholder: "Native Apple Metal",
+                        text: optionalStringBinding(\.mobile.webglRenderer),
+                        isReadOnly: isReadOnly,
+                        font: .caption
+                    )
                 }
             }
         } header: {
@@ -1214,14 +1773,12 @@ private struct CuriumFingerprintEditorView: View {
             .disabled(isReadOnly)
 
             if !useSystemLanguages {
-                LabeledContent("BCP-47 Tags") {
-                    TextField("en-US, en", text: $languagesText)
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.callout.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "BCP-47 Language Tags",
+                    placeholder: "en-US, en",
+                    text: $languagesText,
+                    isReadOnly: isReadOnly
+                )
 
                 if !isReadOnly {
                     Menu {
@@ -1244,24 +1801,20 @@ private struct CuriumFingerprintEditorView: View {
             .disabled(isReadOnly)
 
             if proxyModeSelection == .fixed {
-                LabeledContent("Proxy Rules") {
-                    TextField("socks5://127.0.0.1:1080", text: $fixedProxyRules)
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                        .font(.callout.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "Proxy Rules",
+                    placeholder: "socks5://127.0.0.1:1080",
+                    text: $fixedProxyRules,
+                    isReadOnly: isReadOnly,
+                    keyboardType: .URL
+                )
 
-                LabeledContent("Bypass Rules") {
-                    TextField("Optional (e.g. <-loopback>)", text: $fixedProxyBypass)
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.callout.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "Bypass Rules",
+                    placeholder: "Optional (e.g. <-loopback>)",
+                    text: $fixedProxyBypass,
+                    isReadOnly: isReadOnly
+                )
 
                 Toggle("Proxy Loopback Traffic (<-loopback>)", isOn: Binding(
                     get: { fixedProxyBypass.contains("<-loopback>") },
@@ -1294,18 +1847,19 @@ private struct CuriumFingerprintEditorView: View {
 
     private var storageAndJSONSection: some View {
         Section("Storage & JSON Export") {
-            if let loc = CuriumFingerprintProfileStorage.locations(for: draft.id) {
+            if let folder = storageFolderDisplayName {
                 LabeledContent("Storage Folder") {
-                    Text(loc.isDefault ? "Chromium/" : "ChromiumProfiles/\(draft.id)")
+                    Text(folder)
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
             }
 
-            if let usage {
+            if let currentUsage {
                 LabeledContent("Disk Footprint") {
-                    Text(usage.exists
-                        ? ByteCountFormatter.string(fromByteCount: usage.totalBytes, countStyle: .file)
+                    Text(currentUsage.exists
+                        ? ByteCountFormatter.string(fromByteCount: currentUsage.totalBytes, countStyle: .file)
                         : "Not created yet")
                         .foregroundStyle(.secondary)
                 }
@@ -1328,24 +1882,35 @@ private struct CuriumFingerprintEditorView: View {
                     systemImage: copiedLabel == "wire" ? "checkmark.circle" : "curlybraces"
                 )
             }
-            .disabled(!validationReport.isValid)
+            .disabled(!cachedReport.isValid)
 
-            if let shareText = exportJSONString() {
-                ShareLink(item: shareText) {
-                    Label("Share Profile JSON", systemImage: "square.and.arrow.up")
+            Button {
+                if let text = exportJSONString() {
+                    pendingShareDocument = CuriumShareDocument(text: text)
+                } else {
+                    alertMessage = "Failed to encode profile JSON for sharing."
                 }
+            } label: {
+                Label("Share Profile JSON", systemImage: "square.and.arrow.up")
             }
 
             if mode != .createNew && draft.id != "default" {
                 Button(role: .destructive) {
-                    confirmingWipe = true
+                    activeDialog = .wipeStorage
                 } label: {
-                    Label(
-                        isWiping ? "Wiping Isolated Storage…" : "Wipe Isolated Storage",
-                        systemImage: "externaldrive.badge.xmark"
-                    )
+                    HStack {
+                        Label(
+                            isWiping ? "Wiping Isolated Storage…" : "Wipe Isolated Storage",
+                            systemImage: "externaldrive.badge.xmark"
+                        )
+                        if isWiping {
+                            Spacer()
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
                 }
-                .disabled(isActiveInProcess || isWiping || usage?.exists != true)
+                .disabled(isActiveInProcess || isWiping || currentUsage?.exists != true)
             }
         }
     }
@@ -1375,6 +1940,12 @@ private struct CuriumFingerprintEditorView: View {
         draft.desktop.webglRenderer = renderer
     }
 
+    private func selectCurrentProfile() {
+        if !store.selectProfile(id: draft.id) {
+            alertMessage = store.lastPersistError ?? "Unable to select profile."
+        }
+    }
+
     private func duplicateBuiltIn() {
         let newID = store.nextAvailableID(base: draft.id)
         guard let copy = store.duplicateProfile(
@@ -1388,20 +1959,32 @@ private struct CuriumFingerprintEditorView: View {
         onDuplicateToEdit(copy)
     }
 
-    private func saveProfile() {
+    @discardableResult
+    private func saveProfile(dismissAfterSave: Bool) -> Bool {
         let candidate = effectiveDraft
+        let preflight = Self.evaluateValidation(candidate: candidate, mode: mode, store: store)
+        cachedReport = preflight
+        guard preflight.isValid else {
+            alertMessage = preflight.errors.joined(separator: "\n")
+            return false
+        }
         let report = store.upsert(candidate)
+        cachedReport = report
         guard report.isValid else {
             alertMessage = report.errors.joined(separator: "\n")
-            return
+            return false
         }
         if let updated = store.profiles.first(where: { $0.id == candidate.id }) {
             draft = updated
+            savedBaseline = updated.normalizedForPersistence()
+        } else {
+            savedBaseline = candidate
         }
         onSaved()
-        if mode == .editCustom {
+        if dismissAfterSave && mode == .editCustom {
             dismiss()
         }
+        return true
     }
 
     private func exportJSONString() -> String? {
@@ -1442,6 +2025,9 @@ private struct CuriumFingerprintEditorView: View {
                 )
                 await MainActor.run {
                     isWiping = false
+                    currentUsage = CuriumFingerprintProfileStorage.UsageSnapshot(
+                        supportBytes: 0, cacheBytes: 0, exists: false
+                    )
                     onWiped()
                 }
             } catch {
@@ -1458,11 +2044,14 @@ private struct CuriumFingerprintEditorView: View {
 
 private struct CuriumIdentitySlotEditorView: View {
     let title: String
+    let slotKey: String
     @Binding var slot: CuriumIdentitySlot
     let isReadOnly: Bool
 
     @State private var brandMode: PrimaryBrandMode
     @State private var customBrandText: String
+    @State private var cachedSlotReport: CuriumFingerprintValidationReport
+    @FocusState private var isNumberPadFocused: Bool
 
     private enum PrimaryBrandMode: String, CaseIterable, Identifiable {
         case defaultChrome
@@ -1479,8 +2068,9 @@ private struct CuriumIdentitySlotEditorView: View {
         }
     }
 
-    init(title: String, slot: Binding<CuriumIdentitySlot>, isReadOnly: Bool) {
+    init(title: String, slotKey: String, slot: Binding<CuriumIdentitySlot>, isReadOnly: Bool) {
         self.title = title
+        self.slotKey = slotKey
         self._slot = slot
         self.isReadOnly = isReadOnly
         let currentBrand = slot.wrappedValue.primaryBrand
@@ -1496,28 +2086,32 @@ private struct CuriumIdentitySlotEditorView: View {
             _brandMode = State(initialValue: .defaultChrome)
             _customBrandText = State(initialValue: "Google Chrome")
         }
+        _cachedSlotReport = State(
+            initialValue: CuriumFingerprintValidator.validateSlot(
+                slot.wrappedValue.normalizedForPersistence(),
+                name: slotKey
+            )
+        )
     }
 
     var body: some View {
         Form {
             Section("User-Agent") {
-                LabeledContent("OS / CPU Token") {
-                    TextField("Auto", text: optText(\.osCpu))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.caption.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "OS / CPU Token",
+                    placeholder: "Auto",
+                    text: optText(\.osCpu),
+                    isReadOnly: isReadOnly,
+                    font: .caption
+                )
 
-                LabeledContent("Full UA Override") {
-                    TextField("Leave blank to synthesize", text: optText(\.uaString))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.caption.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "Full UA Override",
+                    placeholder: "Leave blank to synthesize",
+                    text: optText(\.uaString),
+                    isReadOnly: isReadOnly,
+                    font: .caption
+                )
 
                 Picker("Append Mobile Token", selection: $slot.appendMobileToken) {
                     Text("Auto").tag(Bool?.none)
@@ -1552,63 +2146,69 @@ private struct CuriumIdentitySlotEditorView: View {
                 }
 
                 if brandMode == .custom {
-                    LabeledContent("Custom Brand") {
-                        TextField("Google Chrome", text: $customBrandText)
-                            .multilineTextAlignment(.trailing)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .disabled(isReadOnly)
-                            .onChange(of: customBrandText) { _, value in
-                                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                                slot.primaryBrand = trimmed.isEmpty ? nil : value
-                            }
+                    CuriumStackedTextFieldRow(
+                        title: "Custom Brand",
+                        placeholder: "Google Chrome",
+                        text: $customBrandText,
+                        isReadOnly: isReadOnly,
+                        monospaced: false
+                    )
+                    .onChange(of: customBrandText) { _, value in
+                        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                        slot.primaryBrand = trimmed.isEmpty ? nil : value
                     }
                 }
 
-                LabeledContent("Major Version") {
-                    TextField("Engine default (160)", text: optText(\.majorVersion))
-                        .multilineTextAlignment(.trailing)
-                        .keyboardType(.numberPad)
-                        .font(.callout.monospaced())
-                        .disabled(isReadOnly)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Major Version")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    if isReadOnly {
+                        Text(slot.majorVersion ?? "Engine default (160)")
+                            .font(.callout.monospaced())
+                            .foregroundStyle(slot.majorVersion == nil ? .tertiary : .primary)
+                            .textSelection(.enabled)
+                    } else {
+                        TextField("Engine default (160)", text: optText(\.majorVersion))
+                            .keyboardType(.numberPad)
+                            .focused($isNumberPadFocused)
+                            .font(.callout.monospaced())
+                    }
                 }
+                .padding(.vertical, 2)
 
-                LabeledContent("Full Version") {
-                    TextField("Auto from major", text: optText(\.fullVersion))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.callout.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "Full Version",
+                    placeholder: "Auto from major",
+                    text: optText(\.fullVersion),
+                    isReadOnly: isReadOnly
+                )
             }
 
             Section {
-                LabeledContent("CH Platform") {
-                    TextField("macOS / Windows / Android / Linux", text: optText(\.platform))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "CH Platform",
+                    placeholder: "macOS / Windows / Android / Linux",
+                    text: optText(\.platform),
+                    isReadOnly: isReadOnly,
+                    monospaced: false
+                )
 
-                LabeledContent("Platform Version") {
-                    TextField("Auto (empty for Linux)", text: optText(\.platformVersion))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.callout.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumTriStateTextField(
+                    title: "Platform Version",
+                    emptyLabel: "Empty (\"\" — Linux)",
+                    customPlaceholder: "e.g. 15.0.0 or 19.0.0",
+                    value: $slot.platformVersion,
+                    isReadOnly: isReadOnly
+                )
 
-                LabeledContent("Architecture") {
-                    TextField("Auto (arm / x86)", text: optText(\.architecture))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.callout.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumTriStateTextField(
+                    title: "Architecture",
+                    emptyLabel: "Empty (\"\" — Android)",
+                    customPlaceholder: "e.g. arm or x86",
+                    value: $slot.architecture,
+                    isReadOnly: isReadOnly
+                )
 
                 Picker("Bitness", selection: $slot.bitness) {
                     Text("Auto").tag(String?.none)
@@ -1618,12 +2218,14 @@ private struct CuriumIdentitySlotEditorView: View {
                 }
                 .disabled(isReadOnly)
 
-                LabeledContent("Device Model") {
-                    TextField("Auto (empty or e.g. Pixel 9)", text: optText(\.model))
-                        .multilineTextAlignment(.trailing)
-                        .autocorrectionDisabled()
-                        .disabled(isReadOnly)
-                }
+                CuriumTriStateTextField(
+                    title: "Device Model",
+                    emptyLabel: "Empty (\"\")",
+                    customPlaceholder: "e.g. Pixel 9",
+                    value: $slot.model,
+                    isReadOnly: isReadOnly,
+                    monospaced: false
+                )
 
                 Picker("CH Mobile (?1 / ?0)", selection: $slot.mobile) {
                     Text("Auto").tag(Bool?.none)
@@ -1639,18 +2241,16 @@ private struct CuriumIdentitySlotEditorView: View {
                 }
                 .disabled(isReadOnly)
 
-                LabeledContent("navigator.platform") {
-                    TextField("MacIntel / Win32 / Linux armv81", text: optText(\.navigatorPlatform))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.callout.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "navigator.platform",
+                    placeholder: "MacIntel / Win32 / Linux armv81",
+                    text: optText(\.navigatorPlatform),
+                    isReadOnly: isReadOnly
+                )
             } header: {
                 Text("Client Hints & Navigator")
             } footer: {
-                Text("Leave Platform Version, Architecture, or Device Model blank to let the engine auto-resolve platform defaults (e.g. empty platformVersion on Linux and empty architecture on Android).")
+                Text("Choose Auto to let the engine resolve defaults, Empty (\"\") to emit an explicit empty Client Hint header (e.g. Linux platformVersion or Android architecture), or Custom.")
             }
 
             Section("Optional Input & WebGL Slot Overrides") {
@@ -1678,23 +2278,21 @@ private struct CuriumIdentitySlotEditorView: View {
                 }
                 .disabled(isReadOnly)
 
-                LabeledContent("WebGL Vendor") {
-                    TextField("Native Apple", text: optText(\.webglVendor))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.caption.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "WebGL Vendor",
+                    placeholder: "Native Apple",
+                    text: optText(\.webglVendor),
+                    isReadOnly: isReadOnly,
+                    font: .caption
+                )
 
-                LabeledContent("WebGL Renderer") {
-                    TextField("Native Apple Metal", text: optText(\.webglRenderer))
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.caption.monospaced())
-                        .disabled(isReadOnly)
-                }
+                CuriumStackedTextFieldRow(
+                    title: "WebGL Renderer",
+                    placeholder: "Native Apple Metal",
+                    text: optText(\.webglRenderer),
+                    isReadOnly: isReadOnly,
+                    font: .caption
+                )
 
                 Picker("WebGL Capability Profile", selection: $slot.webglProfile) {
                     Text("Auto (Match Platform)").tag(CuriumWebGLProfile?.none)
@@ -1735,9 +2333,45 @@ private struct CuriumIdentitySlotEditorView: View {
             } footer: {
                 Text("Applies strictly to Web Screen/MediaValues/outerHeight APIs without changing native iPhone Duo display layout.")
             }
+
+            if !cachedSlotReport.errors.isEmpty || !cachedSlotReport.warnings.isEmpty {
+                Section("Slot Validation") {
+                    ForEach(cachedSlotReport.errors, id: \.self) { error in
+                        Label(error, systemImage: "xmark.octagon.fill")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                    ForEach(cachedSlotReport.warnings, id: \.self) { warning in
+                        Label(warning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
         }
+        .scrollDismissesKeyboard(.interactively)
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") {
+                    isNumberPadFocused = false
+                    UIApplication.shared.sendAction(
+                        #selector(UIResponder.resignFirstResponder),
+                        to: nil, from: nil, for: nil
+                    )
+                }
+            }
+        }
+        .task(id: slot) {
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            cachedSlotReport = CuriumFingerprintValidator.validateSlot(
+                slot.normalizedForPersistence(),
+                name: slotKey
+            )
+        }
     }
 
     private func optText(_ keyPath: WritableKeyPath<CuriumIdentitySlot, String?>) -> Binding<String> {
@@ -1756,20 +2390,49 @@ private struct CuriumFingerprintImportSheet: View {
     @Bindable var store: CuriumFingerprintStore
     let onImported: (String?) -> Void
 
+    private struct PendingOverwrite: Identifiable {
+        let id = UUID()
+        let parsed: CuriumFingerprintStore.ParsedImport
+        let existingDisplayName: String
+    }
+
     @Environment(\.dismiss) private var dismiss
     @State private var jsonText = ""
     @State private var errorMessages: [String] = []
     @State private var warningMessages: [String] = []
+    @State private var pendingOverwrite: PendingOverwrite?
+    @State private var importedWithWarningsID: String?
 
     var body: some View {
         NavigationStack {
             Form {
+                if let importedID = importedWithWarningsID {
+                    Section {
+                        Label(
+                            "Imported \"\(importedID)\" with warnings. Review the items below before continuing.",
+                            systemImage: "checkmark.circle.fill"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.green)
+
+                        Button {
+                            onImported(importedID)
+                            dismiss()
+                        } label: {
+                            Label("Open Imported Profile", systemImage: "arrow.right.circle")
+                        }
+                    } header: {
+                        Text("Import Completed")
+                    }
+                }
+
                 Section {
                     Button {
                         if let paste = UIPasteboard.general.string {
                             jsonText = paste
                             errorMessages = []
                             warningMessages = []
+                            importedWithWarningsID = nil
                         }
                     } label: {
                         Label("Paste from Clipboard", systemImage: "doc.on.clipboard")
@@ -1801,16 +2464,42 @@ private struct CuriumFingerprintImportSheet: View {
                     }
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Import Profile JSON")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button { dismiss() } label: { Label("Cancel", systemImage: "xmark") }
+                    Button {
+                        if let importedID = importedWithWarningsID {
+                            onImported(importedID)
+                        }
+                        dismiss()
+                    } label: {
+                        Label(importedWithWarningsID == nil ? "Cancel" : "Done", systemImage: importedWithWarningsID == nil ? "xmark" : "checkmark")
+                    }
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button { performImport() } label: { Label("Import", systemImage: "square.and.arrow.down") }
-                        .disabled(jsonText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if importedWithWarningsID == nil {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button { performImport() } label: { Label("Import", systemImage: "square.and.arrow.down") }
+                            .disabled(jsonText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.loadError != nil)
+                    }
                 }
+            }
+            .confirmationDialog(
+                "Overwrite Existing Profile?",
+                isPresented: Binding(
+                    get: { pendingOverwrite != nil },
+                    set: { if !$0 { pendingOverwrite = nil } }
+                ),
+                titleVisibility: .visible,
+                presenting: pendingOverwrite
+            ) { pending in
+                Button("Overwrite \"\(pending.parsed.profile.id)\"", role: .destructive) {
+                    commitImport(pending.parsed)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { pending in
+                Text("A custom profile named \"\(pending.existingDisplayName)\" (\(pending.parsed.profile.id)) already exists. Overwriting replaces its configuration and bumps its revision.")
             }
         }
     }
@@ -1818,19 +2507,44 @@ private struct CuriumFingerprintImportSheet: View {
     private func performImport() {
         let data = Data(jsonText.utf8)
         do {
-            let previousIDs = Set(store.profiles.map(\.id))
-            let report = try store.importProfileJSON(data)
-            errorMessages = report.errors
-            warningMessages = report.warnings
-            guard report.isValid else { return }
-            let importedID = store.profiles.first { !previousIDs.contains($0.id) }?.id
-                ?? (try? JSONSerialization.jsonObject(with: data) as? [String: Any]).flatMap {
-                    ($0["id"] as? String) ?? ($0["profileId"] as? String)
-                }
-            onImported(importedID)
-            dismiss()
+            let parsed = try store.parseImportJSON(data)
+            if let schemaError = parsed.schemaError {
+                errorMessages = [schemaError]
+                warningMessages = parsed.warnings
+                return
+            }
+            let preflight = store.validateForUpsert(parsed.profile)
+            guard preflight.isValid else {
+                errorMessages = preflight.errors
+                warningMessages = preflight.warnings + parsed.warnings
+                return
+            }
+            if let existing = store.profiles.first(where: { !$0.isBuiltIn && $0.id == parsed.profile.id }) {
+                pendingOverwrite = PendingOverwrite(
+                    parsed: parsed,
+                    existingDisplayName: existing.displayName
+                )
+                return
+            }
+            commitImport(parsed)
         } catch {
-            errorMessages = ["Invalid JSON: \(error.localizedDescription)"]
+            errorMessages = ["Invalid JSON: \(CuriumFingerprintStore.describeDecodingError(error))"]
+            warningMessages = []
+        }
+    }
+
+    private func commitImport(_ parsed: CuriumFingerprintStore.ParsedImport) {
+        let report = store.upsert(parsed.profile)
+        let combinedWarnings = report.warnings + parsed.warnings
+        errorMessages = report.errors
+        warningMessages = combinedWarnings
+        guard report.isValid else { return }
+
+        if combinedWarnings.isEmpty {
+            onImported(parsed.profile.id)
+            dismiss()
+        } else {
+            importedWithWarningsID = parsed.profile.id
         }
     }
 }

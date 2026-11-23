@@ -10,7 +10,6 @@ import UIKit
 struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
     let tab: CuriumTabModel?
     let restingTopInset: CGFloat
-    let viewportSize: CGSize
     let isChromePinned: Bool
     let standby: CuriumStandbyPage
     let scheduleSnapshot: (CuriumTabModel) -> Void
@@ -19,7 +18,7 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
 
     func updateUIViewController(_ controller: Controller, context: Context) {
         controller.update(
-            tab: tab, restingTopInset: restingTopInset, viewportSize: viewportSize,
+            tab: tab, restingTopInset: restingTopInset,
             isChromePinned: isChromePinned, standby: standby, scheduleSnapshot: scheduleSnapshot
         )
     }
@@ -119,7 +118,6 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
         private var pinnedScrollY: CGFloat?
         private var mountGeneration = 0
         private var restingTopInset: CGFloat = 0
-        private var viewportSize: CGSize = .zero
         private var originalInsets: UIEdgeInsets = .zero
         private var originalIndicatorInsets: UIEdgeInsets = .zero
         private var originalAdjustment: UIScrollView.ContentInsetAdjustmentBehavior = .automatic
@@ -149,13 +147,12 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
         }
 
         func update(
-            tab: CuriumTabModel?, restingTopInset: CGFloat, viewportSize: CGSize,
+            tab: CuriumTabModel?, restingTopInset: CGFloat,
             isChromePinned: Bool, standby: CuriumStandbyPage,
             scheduleSnapshot: (CuriumTabModel) -> Void
         ) {
             browserTab = tab
             self.restingTopInset = restingTopInset
-            self.viewportSize = viewportSize
 
             guard let tab, let engine = tab.engine, let webView = tab.webView else {
                 if mountedTabID != nil { unmount() }
@@ -318,7 +315,13 @@ struct CuriumBlinkViewportHost: UIViewControllerRepresentable {
             }
             if abs(scrollView.contentOffset.y - start) > Self.unpinTravel {
                 pinnedScrollY = nil
-                tab.unpinChrome(.scrolled)
+                if UIAccessibility.isReduceMotionEnabled {
+                    tab.unpinChrome(.scrolled)
+                } else {
+                    withAnimation(.smooth(duration: 0.22)) {
+                        tab.unpinChrome(.scrolled)
+                    }
+                }
                 syncScrollObservation(isPinned: false)
             }
         }

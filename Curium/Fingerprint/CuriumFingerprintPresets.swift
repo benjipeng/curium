@@ -311,6 +311,7 @@ enum CuriumFingerprintPresets {
     )
 
     /// Privacy-hardened profile keeping native Apple hardware while enabling deterministic per-site C++ farbling, WebRTC UDP lockdown & GPC.
+    /// `fingerprintSeed` is intentionally `nil` here; `CuriumFingerprintStore` materializes and persists a fresh per-install 256-bit random seed.
     static let privacyHardened = CuriumFingerprintProfile(
         id: "privacy-hardened",
         displayName: "Privacy Hardened",
@@ -326,7 +327,7 @@ enum CuriumFingerprintPresets {
         enableDoNotTrack: false,
         enableGlobalPrivacyControl: true,
         hardware: .native,
-        fingerprintSeed: "96c0a17d4f2b8e5319046c72a8f5e31d6b04927a5e8c3f104d9b6a27e0c51384",
+        fingerprintSeed: nil,
         farbling: .allEnabled
     )
 }

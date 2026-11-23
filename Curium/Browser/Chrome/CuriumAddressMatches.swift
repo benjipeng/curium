@@ -38,20 +38,42 @@ private enum CuriumAddressInput {
 struct CuriumAddressMatches: View {
     let library: CuriumLibrary
     let text: String
+    let currentAddress: String
     let submit: () -> Void
     let open: (URL) -> Void
 
     @State private var result: (query: String, matches: [CuriumAddressMatch])?
     @ScaledMetric(relativeTo: .body) private var symbolWidth: CGFloat = 24
 
+    init(
+        library: CuriumLibrary,
+        text: String,
+        currentAddress: String = "",
+        submit: @escaping () -> Void,
+        open: @escaping (URL) -> Void
+    ) {
+        self.library = library
+        self.text = text
+        self.currentAddress = currentAddress
+        self.submit = submit
+        self.open = open
+    }
+
     private struct Request: Equatable {
         let query: String
         let bookmarkRevision: Int
     }
 
+    nonisolated static func shouldSuppressDirectOpenRow(text: String, currentAddress: String) -> Bool {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedCurrent = currentAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmedText.isEmpty && trimmedText == trimmedCurrent
+    }
+
     var body: some View {
-        let input = CuriumAddressInput(text)
-        let matches = visibleMatches
+        let suppressesCurrent = Self.shouldSuppressDirectOpenRow(text: text, currentAddress: currentAddress)
+        let input = suppressesCurrent ? nil : CuriumAddressInput(text)
+        let matches = visibleMatches(suppressingCurrent: suppressesCurrent)
 
         Group {
             if input != nil || !matches.isEmpty {
@@ -85,13 +107,16 @@ struct CuriumAddressMatches: View {
         }
     }
 
-    private var visibleMatches: [CuriumAddressMatch] {
+    private func visibleMatches(suppressingCurrent: Bool) -> [CuriumAddressMatch] {
         if text.isEmpty {
             return library.favoriteBookmarks.prefix(8).map {
                 CuriumAddressMatch(kind: .bookmark, url: $0.url, title: $0.title)
             }
         }
-        return result?.matches ?? []
+        guard let result, result.query == text else { return [] }
+        guard suppressingCurrent else { return result.matches }
+        let trimmedCurrent = currentAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        return result.matches.filter { $0.url.absoluteString != trimmedCurrent }
     }
 
     private func rows(input: CuriumAddressInput?, matches: [CuriumAddressMatch]) -> some View {

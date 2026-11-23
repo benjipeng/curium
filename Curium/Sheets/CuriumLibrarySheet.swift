@@ -15,30 +15,33 @@ struct CuriumLibrarySheet: View {
         NavigationStack {
             switch section {
             case .bookmarks:
-                CuriumBookmarkList(library: store.library, folderID: nil, currentPage: currentPage, open: open)
-                    .navigationDestination(for: Int64.self) { folderID in
-                        CuriumBookmarkList(library: store.library, folderID: folderID, currentPage: currentPage, open: open)
-                    }
-            case .history:
-                VStack(spacing: 0) {
-                    CuriumSheetHeader(title: "History")
-                    CuriumHistoryList(library: store.library, open: open) { await store.clearWebsiteData(since: $0) }
+                CuriumBookmarkList(
+                    library: store.library,
+                    folderID: nil,
+                    currentPage: currentPage,
+                    open: open,
+                    onDismissSheet: { dismiss() }
+                )
+                .navigationDestination(for: Int64.self) { folderID in
+                    CuriumBookmarkList(
+                        library: store.library,
+                        folderID: folderID,
+                        currentPage: currentPage,
+                        open: open,
+                        onDismissSheet: { dismiss() }
+                    )
                 }
-                .background(Color(uiColor: .systemGroupedBackground))
-                .toolbarVisibility(.hidden, for: .navigationBar)
+            case .history:
+                CuriumHistoryList(
+                    library: store.library,
+                    open: open,
+                    onDone: { dismiss() }
+                ) {
+                    await store.clearWebsiteData(since: $0)
+                }
             }
         }
-        .safeAreaInset(edge: .bottom) {
-            if store.library.storageUnavailable {
-                Label("Bookmarks and history can’t be saved right now.", systemImage: "exclamationmark.triangle")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .glassEffect(.regular, in: Capsule())
-                    .padding(.bottom, 8)
-            }
-        }
+        .curiumSheetErrorAlert(store: store, presentationDelay: .milliseconds(350))
     }
 
     private func open(_ url: URL, _ inNewTab: Bool) {
@@ -54,6 +57,7 @@ struct CuriumLibrarySheet: View {
 private struct CuriumHistoryList: View {
     let library: CuriumLibrary
     let open: (URL, Bool) -> Void
+    let onDone: () -> Void
     let clearWebsiteData: (Date?) async -> Void
 
     @State private var search = ""
@@ -78,41 +82,54 @@ private struct CuriumHistoryList: View {
         let today = calendar.startOfDay(for: .now)
         let weekAgo = calendar.date(byAdding: .day, value: -7, to: today)
 
-        List {
-            ForEach(result?.days ?? []) { day in
-                Section {
-                    ForEach(day.entries) { entry in
-                        CuriumHistoryRow(entry: entry, library: library, open: open) {
-                            editingBookmark = entry
+        VStack(spacing: 0) {
+            if library.storageUnavailable {
+                CuriumStorageUnavailableBanner()
+            }
+            List {
+                ForEach(result?.days ?? []) { day in
+                    Section {
+                        ForEach(day.entries) { entry in
+                            CuriumHistoryRow(entry: entry, library: library, open: open) {
+                                editingBookmark = entry
+                            }
+                        }
+                    } header: {
+                        dayLabel(day.day, calendar: calendar, today: today, weekAgo: weekAgo)
+                            .textCase(nil)
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .overlay {
+                if let result {
+                    if result.days.isEmpty && result.query == request.query {
+                        if result.query.isEmpty {
+                            ContentUnavailableView {
+                                Label("No History", systemImage: "clock")
+                            } description: {
+                                Text("Pages you visit will appear here.")
+                            }
+                        } else {
+                            ContentUnavailableView.search(text: result.query)
                         }
                     }
-                } header: {
-                    dayLabel(day.day, calendar: calendar, today: today, weekAgo: weekAgo)
-                        .textCase(nil)
+                } else {
+                    ProgressView()
                 }
             }
         }
-        .listStyle(.insetGrouped)
-        .overlay {
-            if let result {
-                if result.days.isEmpty && result.query == request.query {
-                    if result.query.isEmpty {
-                        ContentUnavailableView {
-                            Label("No History", systemImage: "clock")
-                        } description: {
-                            Text("Pages you visit will appear here.")
-                        }
-                    } else {
-                        ContentUnavailableView.search(text: result.query)
-                    }
-                }
-            } else {
-                ProgressView()
-            }
-        }
+        .background(Color(uiColor: .systemGroupedBackground))
+        .navigationTitle("History")
+        .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $search, prompt: "Search History")
         .searchPresentationToolbarBehavior(.avoidHidingContent)
         .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button(action: onDone) {
+                    Label("Done", systemImage: "checkmark")
+                }
+            }
             DefaultToolbarItem(kind: .search, placement: .bottomBar)
             ToolbarItem(placement: .bottomBar) {
                 Button {

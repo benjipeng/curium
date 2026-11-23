@@ -3,9 +3,10 @@ import Foundation
 import Observation
 import PDFKit
 import UIKit
+import os
 
 /// Single flattened entry from a PDF's embedded Table of Contents (`PDFOutline`).
-struct CuriumPDFOutlineItem: Identifiable, Equatable {
+struct CuriumPDFOutlineItem: Identifiable, Equatable, Sendable {
     let id: Int
     let title: String
     let pageIndex: Int
@@ -20,29 +21,96 @@ private final class CuriumPDFTransferBox<Value>: @unchecked Sendable {
 
 /// Nonisolated `PDFDocumentDelegate` bridge so PDFKit's background find callbacks never
 /// trigger Swift 6 dynamic `@MainActor` isolation traps, tagged with a generation token
-/// to drop callbacks from cancelled queries.
+/// to drop callbacks from cancelled queries and coalescing matches into ~50 ms batches.
 private final class CuriumPDFSearchDelegate: NSObject, PDFDocumentDelegate, @unchecked Sendable {
+    private struct BufferState: Sendable {
+        var pending: [CuriumPDFTransferBox<PDFSelection>] = []
+        var totalDelivered = 0
+        var flushScheduled = false
+        var ended = false
+    }
+
     private weak var session: CuriumTabPDFSession?
     private let generation: UInt64
+    private let maxMatches: Int
+    private let batchInterval: Duration
+    private let state = OSAllocatedUnfairLock(initialState: BufferState())
 
-    init(session: CuriumTabPDFSession, generation: UInt64) {
+    init(
+        session: CuriumTabPDFSession,
+        generation: UInt64,
+        maxMatches: Int,
+        batchInterval: Duration = .milliseconds(50)
+    ) {
         self.session = session
         self.generation = generation
+        self.maxMatches = maxMatches
+        self.batchInterval = batchInterval
     }
 
     func didMatchString(_ instance: PDFSelection) {
         guard let copy = instance.copy() as? PDFSelection else { return }
-        let box = CuriumPDFTransferBox(copy)
-        let gen = generation
-        Task { @MainActor [weak session] in
-            session?.recordSearchMatch(box.value, generation: gen)
+        let boxedCopy = CuriumPDFTransferBox(copy)
+        enum Action { case none, scheduleFlush, flushNowAndCap }
+        let action: Action = state.withLock { s in
+            guard !s.ended, s.totalDelivered < maxMatches else { return .none }
+            s.pending.append(boxedCopy)
+            s.totalDelivered += 1
+            if s.totalDelivered >= maxMatches {
+                s.ended = true
+                return .flushNowAndCap
+            }
+            if !s.flushScheduled {
+                s.flushScheduled = true
+                return .scheduleFlush
+            }
+            return .none
+        }
+        switch action {
+        case .none:
+            break
+        case .scheduleFlush:
+            let interval = batchInterval
+            Task.detached(priority: .userInitiated) { [weak self] in
+                try? await Task.sleep(for: interval)
+                self?.flushPendingToMain(finished: false, hitCap: false)
+            }
+        case .flushNowAndCap:
+            flushPendingToMain(finished: true, hitCap: true)
         }
     }
 
     func documentDidEndDocumentFind(_ notification: Notification) {
+        let shouldFlush = state.withLock { s -> Bool in
+            if s.ended && s.pending.isEmpty { return false }
+            s.ended = true
+            return true
+        }
+        guard shouldFlush else { return }
+        flushPendingToMain(finished: true, hitCap: false)
+    }
+
+    private func flushPendingToMain(finished: Bool, hitCap: Bool) {
+        let drained: [CuriumPDFTransferBox<PDFSelection>] = state.withLock { s in
+            s.flushScheduled = false
+            let batch = s.pending
+            s.pending.removeAll(keepingCapacity: !finished)
+            return batch
+        }
+        guard !drained.isEmpty || finished else { return }
         let gen = generation
-        Task { @MainActor [weak session] in
-            session?.finishSearch(generation: gen)
+        DispatchQueue.main.async { [weak session] in
+            MainActor.assumeIsolated {
+                guard let session else { return }
+                if !drained.isEmpty {
+                    session.recordSearchMatches(drained.map(\.value), generation: gen)
+                }
+                if hitCap {
+                    session.cancelFindAtCap(generation: gen)
+                } else if finished {
+                    session.finishSearch(generation: gen)
+                }
+            }
         }
     }
 }
@@ -62,9 +130,16 @@ final class CuriumTabPDFSession: Identifiable {
         case failed(String)
     }
 
-    private static let maxOutlineDepth = 32
-    private static let maxOutlineItems = 400
+    private nonisolated static let maxOutlineDepth = 32
+    private nonisolated static let maxOutlineItems = 400
     private static let maxSearchMatches = 500
+    private static let searchDebounceDelay: Duration = .milliseconds(150)
+    private static let defaultThumbnailMaxPixels: CGFloat = 768
+
+    private struct ParsedDocumentPayload: @unchecked Sendable {
+        let document: PDFDocument
+        let outline: [CuriumPDFOutlineItem]
+    }
 
     let id = UUID()
     let filename: String
@@ -101,6 +176,9 @@ final class CuriumTabPDFSession: Identifiable {
     @ObservationIgnored private let onReady: (@MainActor () -> Void)?
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var progressTask: Task<Void, Never>?
+    @ObservationIgnored private var searchDebounceTask: Task<Void, Never>?
+    @ObservationIgnored private var thumbnailTask: Task<Void, Never>?
+    @ObservationIgnored private var cachedThumbnail: (pageIndex: Int, maxPixels: CGFloat, image: UIImage)?
     @ObservationIgnored private var searchDelegate: CuriumPDFSearchDelegate?
     @ObservationIgnored private var searchGeneration: UInt64 = 0
     @ObservationIgnored private var isCleanedUp = false
@@ -165,6 +243,11 @@ final class CuriumTabPDFSession: Identifiable {
         loadTask = nil
         progressTask?.cancel()
         progressTask = nil
+        searchDebounceTask?.cancel()
+        searchDebounceTask = nil
+        thumbnailTask?.cancel()
+        thumbnailTask = nil
+        cachedThumbnail = nil
         searchGeneration &+= 1
         document?.cancelFindString()
         document?.delegate = nil
@@ -231,11 +314,29 @@ final class CuriumTabPDFSession: Identifiable {
         searchQuery = query
         cancelSearch()
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let document else { return }
+        guard !trimmed.isEmpty, document != nil else { return }
 
         isSearchInProgress = true
         let generation = searchGeneration
-        let delegate = CuriumPDFSearchDelegate(session: self, generation: generation)
+        searchDebounceTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: Self.searchDebounceDelay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.searchDebounceTask = nil
+            self.startSearch(trimmed, generation: generation)
+        }
+    }
+
+    private func startSearch(_ trimmed: String, generation: UInt64) {
+        guard generation == searchGeneration, !isCleanedUp, let document else { return }
+        let delegate = CuriumPDFSearchDelegate(
+            session: self,
+            generation: generation,
+            maxMatches: Self.maxSearchMatches
+        )
         searchDelegate = delegate
         document.delegate = delegate
         document.beginFindString(trimmed, withOptions: [.caseInsensitive, .diacriticInsensitive])
@@ -301,11 +402,69 @@ final class CuriumTabPDFSession: Identifiable {
         return false
     }
 
-    /// Renders a compact thumbnail of the current PDF page for the Tabs grid.
+    /// Renders a compact thumbnail of the current PDF page for the Tabs grid, returning
+    /// an off-main pre-rendered image when available to keep `@MainActor` free.
     func makeTabThumbnail(maxPixels: CGFloat = 768) -> UIImage? {
+        if let cached = cachedThumbnail,
+           cached.pageIndex == currentPageIndex,
+           abs(cached.maxPixels - maxPixels) < 0.5 {
+            return cached.image
+        }
         guard let document, let page = document.page(at: currentPageIndex) ?? document.page(at: 0) else {
             return nil
         }
+        return Self.renderThumbnail(from: page, maxPixels: maxPixels)
+    }
+
+    /// Renders a compact thumbnail off `@MainActor` from the backing PDF file on disk.
+    func makeTabThumbnailAsync(maxPixels: CGFloat = 768) async -> UIImage? {
+        if let cached = cachedThumbnail,
+           cached.pageIndex == currentPageIndex,
+           abs(cached.maxPixels - maxPixels) < 0.5 {
+            return cached.image
+        }
+        guard let fileURL = localFileURL else {
+            return makeTabThumbnail(maxPixels: maxPixels)
+        }
+        let targetPage = currentPageIndex
+        let rendered = await Task.detached(priority: .utility) {
+            Self.renderThumbnail(from: fileURL, pageIndex: targetPage, maxPixels: maxPixels)
+        }.value
+        guard !Task.isCancelled, !isCleanedUp else { return nil }
+        if let rendered {
+            cachedThumbnail = (pageIndex: targetPage, maxPixels: maxPixels, image: rendered)
+        }
+        return rendered
+    }
+
+    private func prewarmTabThumbnail(forPage pageIndex: Int, maxPixels: CGFloat) {
+        guard let fileURL = localFileURL else { return }
+        thumbnailTask?.cancel()
+        thumbnailTask = Task { @MainActor [weak self] in
+            let rendered = await Task.detached(priority: .utility) {
+                Self.renderThumbnail(from: fileURL, pageIndex: pageIndex, maxPixels: maxPixels)
+            }.value
+            guard !Task.isCancelled, let self, !self.isCleanedUp else { return }
+            if let rendered {
+                self.cachedThumbnail = (pageIndex: pageIndex, maxPixels: maxPixels, image: rendered)
+            }
+            self.thumbnailTask = nil
+        }
+    }
+
+    private nonisolated static func renderThumbnail(
+        from fileURL: URL,
+        pageIndex: Int,
+        maxPixels: CGFloat
+    ) -> UIImage? {
+        guard let doc = PDFDocument(url: fileURL),
+              let page = doc.page(at: pageIndex) ?? doc.page(at: 0) else {
+            return nil
+        }
+        return renderThumbnail(from: page, maxPixels: maxPixels)
+    }
+
+    private nonisolated static func renderThumbnail(from page: PDFPage, maxPixels: CGFloat) -> UIImage? {
         let bounds = page.bounds(for: .cropBox)
         guard bounds.width > 1, bounds.height > 1 else { return nil }
         let longest = max(bounds.width, bounds.height)
@@ -372,7 +531,10 @@ final class CuriumTabPDFSession: Identifiable {
                 let nextFraction: Double? = total > 0
                     ? min(1, max(0, Double(task.receivedBytes) / Double(total)))
                     : nil
-                self.phase = .loading(progress: nextFraction)
+                let next: Phase = .loading(progress: nextFraction)
+                if self.phase != next {
+                    self.phase = next
+                }
                 if task.state != .inProgress && task.state != .pending {
                     break
                 }
@@ -382,26 +544,30 @@ final class CuriumTabPDFSession: Identifiable {
     }
 
     private func openParsedDocument(at fileURL: URL) async {
-        let box = await Task.detached(priority: .userInitiated) { () -> CuriumPDFTransferBox<PDFDocument?> in
+        let payload = await Task.detached(priority: .userInitiated) { () -> ParsedDocumentPayload? in
             guard let doc = PDFDocument(url: fileURL), doc.pageCount > 0 else {
-                return CuriumPDFTransferBox(nil)
+                return nil
             }
-            return CuriumPDFTransferBox(doc)
+            let outline = Self.flattenOutline(from: doc)
+            return ParsedDocumentPayload(document: doc, outline: outline)
         }.value
         guard !Task.isCancelled, !isCleanedUp else { return }
-        guard let parsed = box.value else {
+        guard let payload else {
             phase = .failed("Curium couldn’t read this file as a PDF.")
             return
         }
-        document = parsed
-        pageCount = parsed.pageCount
+        document = payload.document
+        pageCount = payload.document.pageCount
         currentPageIndex = 0
-        outlineItems = Self.flattenOutline(from: parsed)
+        outlineItems = payload.outline
         phase = .ready
+        prewarmTabThumbnail(forPage: 0, maxPixels: Self.defaultThumbnailMaxPixels)
         onReady?()
     }
 
     private func cancelSearch() {
+        searchDebounceTask?.cancel()
+        searchDebounceTask = nil
         searchGeneration &+= 1
         document?.cancelFindString()
         document?.delegate = nil
@@ -415,20 +581,36 @@ final class CuriumTabPDFSession: Identifiable {
         requestedSelection = nil
     }
 
-    fileprivate func recordSearchMatch(_ selection: PDFSelection, generation: UInt64) {
+    fileprivate func recordSearchMatches(_ selections: [PDFSelection], generation: UInt64) {
         guard generation == searchGeneration, !isCleanedUp else { return }
-        guard searchMatches.count < Self.maxSearchMatches else {
+        let remaining = Self.maxSearchMatches - searchMatches.count
+        guard remaining > 0 else {
             document?.cancelFindString()
             isSearchInProgress = false
             return
         }
-        selection.color = UIColor.systemYellow.withAlphaComponent(0.45)
-        searchMatches.append(selection)
+        let hadMatches = !searchMatches.isEmpty
+        let accepted = selections.prefix(remaining)
+        for selection in accepted {
+            selection.color = UIColor.systemYellow.withAlphaComponent(0.45)
+            searchMatches.append(selection)
+        }
+        guard !accepted.isEmpty else { return }
         highlightRevision &+= 1
-        if searchMatches.count == 1 {
+        if !hadMatches {
             activeMatchIndex = 0
             focusActiveSearchMatch()
         }
+        if searchMatches.count >= Self.maxSearchMatches {
+            document?.cancelFindString()
+            isSearchInProgress = false
+        }
+    }
+
+    fileprivate func cancelFindAtCap(generation: UInt64) {
+        guard generation == searchGeneration, !isCleanedUp else { return }
+        document?.cancelFindString()
+        isSearchInProgress = false
     }
 
     fileprivate func finishSearch(generation: UInt64) {
@@ -451,7 +633,7 @@ final class CuriumTabPDFSession: Identifiable {
         navigationRequestID &+= 1
     }
 
-    private static func flattenOutline(from document: PDFDocument) -> [CuriumPDFOutlineItem] {
+    private nonisolated static func flattenOutline(from document: PDFDocument) -> [CuriumPDFOutlineItem] {
         guard let root = document.outlineRoot else { return [] }
         var items: [CuriumPDFOutlineItem] = []
 

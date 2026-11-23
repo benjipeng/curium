@@ -88,6 +88,8 @@ enum CuriumFingerprintValidator {
         if let seed = profile.fingerprintSeed {
             if !CuriumFingerprintSchema.isValidSeedHex(seed) {
                 report.errors.append("fingerprintSeed must be a 64-character hexadecimal string.")
+            } else if CuriumFingerprintSchema.isRetiredStaticSeed(seed) {
+                report.warnings.append("This profile uses a retired public farbling seed. Rotate the seed for per-profile uniqueness.")
             }
         }
 
@@ -98,6 +100,15 @@ enum CuriumFingerprintValidator {
         // Coherence warnings (non-blocking).
         checkCoherence(profile, into: &report)
 
+        return report
+    }
+
+    /// Validates a single identity slot (structural rules + per-slot coherence warnings),
+    /// suitable for inline feedback in the slot editor without serializing the full profile.
+    static func validateSlot(_ slot: CuriumIdentitySlot, name: String) -> CuriumFingerprintValidationReport {
+        var report = CuriumFingerprintValidationReport()
+        validateSlot(slot, name: name, into: &report)
+        checkSlotCoherence(slot, name: name, into: &report)
         return report
     }
 
@@ -200,25 +211,31 @@ enum CuriumFingerprintValidator {
         }
     }
 
+    private static func checkSlotCoherence(
+        _ slot: CuriumIdentitySlot,
+        name: String,
+        into report: inout CuriumFingerprintValidationReport
+    ) {
+        if slot.platform == "Windows" && !slot.hasWebGLOverride {
+            report.warnings.append("\(name): Windows identity with native Apple Metal GPU strings may look inconsistent to GPU-aware detectors.")
+        }
+        if slot.platform == "Linux" && !slot.hasWebGLOverride {
+            report.warnings.append("\(name): Linux identity with native Apple Metal GPU strings may look inconsistent to GPU-aware detectors.")
+        }
+        if slot.mobile == true && (slot.navigatorPlatform == "MacIntel" || slot.navigatorPlatform == "Win32" || slot.navigatorPlatform == "Linux x86_64") {
+            report.warnings.append("\(name): mobile=true paired with desktop navigator.platform (\(slot.navigatorPlatform ?? "")).")
+        }
+        if slot.mobile == false && (slot.navigatorPlatform == "Linux armv81" || slot.navigatorPlatform == "iPhone") {
+            report.warnings.append("\(name): mobile=false paired with mobile navigator.platform (\(slot.navigatorPlatform ?? "")).")
+        }
+    }
+
     private static func checkCoherence(
         _ profile: CuriumFingerprintProfile,
         into report: inout CuriumFingerprintValidationReport
     ) {
-        let slots: [(String, CuriumIdentitySlot)] = [("mobile", profile.mobile), ("desktop", profile.desktop)]
-        for (name, slot) in slots {
-            if slot.platform == "Windows" && !slot.hasWebGLOverride {
-                report.warnings.append("\(name): Windows identity with native Apple Metal GPU strings may look inconsistent to GPU-aware detectors.")
-            }
-            if slot.platform == "Linux" && !slot.hasWebGLOverride {
-                report.warnings.append("\(name): Linux identity with native Apple Metal GPU strings may look inconsistent to GPU-aware detectors.")
-            }
-            if slot.mobile == true && (slot.navigatorPlatform == "MacIntel" || slot.navigatorPlatform == "Win32" || slot.navigatorPlatform == "Linux x86_64") {
-                report.warnings.append("\(name): mobile=true paired with desktop navigator.platform (\(slot.navigatorPlatform ?? "")).")
-            }
-            if slot.mobile == false && (slot.navigatorPlatform == "Linux armv81" || slot.navigatorPlatform == "iPhone") {
-                report.warnings.append("\(name): mobile=false paired with mobile navigator.platform (\(slot.navigatorPlatform ?? "")).")
-            }
-        }
+        checkSlotCoherence(profile.mobile, name: "mobile", into: &report)
+        checkSlotCoherence(profile.desktop, name: "desktop", into: &report)
         let defaultPlatform = profile.defaultSlot == .desktop
             ? (profile.desktop.platform ?? "macOS")
             : (profile.mobile.platform ?? "Android")

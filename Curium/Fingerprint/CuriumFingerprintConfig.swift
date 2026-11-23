@@ -11,6 +11,12 @@ enum CuriumFingerprintSchema {
     static let validFormFactors: Set<String> = [
         "Desktop", "Automotive", "Mobile", "Tablet", "XR", "EInk", "Watch",
     ]
+    /// Retired public static seeds shipped in earlier preset drafts; never reused across
+    /// installs, duplicates, or imports.
+    static let retiredStaticSeeds: Set<String> = [
+        "96c0a17d4f2b8e5319046c72a8f5e31d6b04927a5e8c3f104d9b6a27e0c51384",
+        "96c0a17d8c334a28922f6c79c5be7e8e441c4a0d54c86182c4f6794d3b0b89e1",
+    ]
 
     /// Generates a cryptographically random 32-byte (64 lowercase hex character)
     /// deterministic farbling seed for Build 41+ profiles.
@@ -31,6 +37,11 @@ enum CuriumFingerprintSchema {
             let v = scalar.value
             return (v >= 48 && v <= 57) || (v >= 65 && v <= 70) || (v >= 97 && v <= 102)
         }
+    }
+
+    static func isRetiredStaticSeed(_ hex: String?) -> Bool {
+        guard let hex else { return false }
+        return retiredStaticSeeds.contains(hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 }
 
@@ -230,6 +241,59 @@ struct CuriumIdentitySlot: Codable, Equatable, Sendable {
         copy.pdfViewerEnabled = nil
         return copy
     }
+
+    /// Trims surrounding whitespace from string fields while preserving explicit empty strings
+    /// (`""`) for fields where empty carries Client Hint semantics (`primaryBrand`,
+    /// `platformVersion`, `architecture`, `bitness`, `model`).
+    func normalizedForPersistence() -> CuriumIdentitySlot {
+        func trimmedNonEmpty(_ value: String?) -> String? {
+            guard let value else { return nil }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        func trimmedPreservingExplicitEmpty(_ value: String?) -> String? {
+            guard let value else { return nil }
+            if value.isEmpty { return "" }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
+        var copy = self
+        copy.uaString = trimmedNonEmpty(uaString)
+        copy.osCpu = trimmedNonEmpty(osCpu)
+        copy.productVersion = trimmedNonEmpty(productVersion)
+        copy.primaryBrand = trimmedPreservingExplicitEmpty(primaryBrand)
+        copy.majorVersion = trimmedNonEmpty(majorVersion)
+        copy.fullVersion = trimmedNonEmpty(fullVersion)
+        if let brands {
+            copy.brands = brands.map {
+                CuriumBrandVersion(
+                    brand: $0.brand.trimmingCharacters(in: .whitespacesAndNewlines),
+                    version: $0.version.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }
+        }
+        if let fullVersionBrands {
+            copy.fullVersionBrands = fullVersionBrands.map {
+                CuriumBrandVersion(
+                    brand: $0.brand.trimmingCharacters(in: .whitespacesAndNewlines),
+                    version: $0.version.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }
+        }
+        copy.platform = trimmedNonEmpty(platform)
+        copy.platformVersion = trimmedPreservingExplicitEmpty(platformVersion)
+        copy.architecture = trimmedPreservingExplicitEmpty(architecture)
+        copy.bitness = trimmedPreservingExplicitEmpty(bitness)
+        copy.model = trimmedPreservingExplicitEmpty(model)
+        if let formFactors {
+            copy.formFactors = formFactors.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        }
+        copy.navigatorPlatform = trimmedNonEmpty(navigatorPlatform)
+        copy.webglVendor = trimmedNonEmpty(webglVendor)
+        copy.webglRenderer = trimmedNonEmpty(webglRenderer)
+        return copy
+    }
 }
 
 /// Strictly mutually exclusive 3-way proxy policy matching Chromium NetworkContext + Patch 0009.
@@ -341,6 +405,52 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
     var isFarblingActive: Bool {
         guard let seed = fingerprintSeed, !seed.isEmpty else { return false }
         return (farbling ?? .allEnabled).enabledCount > 0
+    }
+
+    /// True when the profile requests deterministic farbling (either via non-empty
+    /// `farbling` toggles or an explicit `fingerprintSeed`).
+    var hasFarblingEnabled: Bool {
+        if let farbling {
+            return farbling.enabledCount > 0
+        }
+        return fingerprintSeed != nil
+    }
+
+    /// Normalizes user-entered or imported string fields (trimming whitespace on IDs,
+    /// metadata, slots, languages, proxy rules, timezone, and seed) while preserving
+    /// explicit empty Client Hint strings (`""`).
+    func normalizedForPersistence() -> CuriumFingerprintProfile {
+        var copy = self
+        copy.id = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.displayName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.notes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.mobile = mobile.normalizedForPersistence()
+        copy.desktop = desktop.normalizedForPersistence()
+        if let languages {
+            copy.languages = languages
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        }
+        switch proxy {
+        case .system, .direct:
+            break
+        case .fixed(let rules, let bypassRules):
+            let trimmedRules = rules.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedBypass = bypassRules?.trimmingCharacters(in: .whitespacesAndNewlines)
+            copy.proxy = .fixed(
+                rules: trimmedRules,
+                bypassRules: (trimmedBypass?.isEmpty ?? true) ? nil : trimmedBypass
+            )
+        }
+        if let tz = hardware.timezone {
+            let trimmedTZ = tz.trimmingCharacters(in: .whitespacesAndNewlines)
+            copy.hardware.timezone = trimmedTZ.isEmpty ? nil : trimmedTZ
+        }
+        if let seed = fingerprintSeed {
+            let trimmedSeed = seed.trimmingCharacters(in: .whitespacesAndNewlines)
+            copy.fingerprintSeed = trimmedSeed.isEmpty ? nil : trimmedSeed
+        }
+        return copy
     }
 
     /// Serializes strictly the engine wire schema (`schemaVersion: 2` by default, or `1` when

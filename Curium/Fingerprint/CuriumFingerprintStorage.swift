@@ -95,6 +95,61 @@ enum CuriumFingerprintProfileStorage {
         )
     }
 
+    /// Scans `<Application Support>/ChromiumProfiles/` and `<Caches>/ChromiumProfiles/`
+    /// with symlink-safe `lstat` checks and returns all valid non-default directory slugs
+    /// currently present on disk (case-insensitively deduplicated, sorted).
+    static func existingIsolatedProfileSlugs(
+        applicationSupportRoot: URL? = nil,
+        cachesRoot: URL? = nil
+    ) -> [String] {
+        let fm = FileManager.default
+        let supportBase = applicationSupportRoot ?? (try? fm.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: false))
+        let cachesBase = cachesRoot ?? (try? fm.url(
+            for: .cachesDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: false))
+
+        var discoveredByLowered: [String: String] = [:]
+        for base in [supportBase, cachesBase].compactMap({ $0 }) {
+            let profilesDir = base.appending(path: "ChromiumProfiles", directoryHint: .isDirectory)
+            guard inspectPathWithLstat(profilesDir.path) == .directory else { continue }
+            guard let entries = try? fm.contentsOfDirectory(atPath: profilesDir.path) else { continue }
+            for entry in entries {
+                guard !entry.hasPrefix("."),
+                      entry.lowercased() != "default",
+                      CuriumFingerprintValidator.isValidProfileID(entry)
+                else { continue }
+                let entryURL = profilesDir.appending(path: entry, directoryHint: .isDirectory)
+                guard inspectPathWithLstat(entryURL.path) == .directory else { continue }
+                let key = entry.lowercased()
+                if discoveredByLowered[key] == nil {
+                    discoveredByLowered[key] = entry
+                }
+            }
+        }
+        return discoveredByLowered.values.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }
+    }
+
+    /// Discovers isolated `ChromiumProfiles/<slug>` directories on disk under
+    /// Application Support and Caches that are not present in `knownIDs`
+    /// (compared case-insensitively for APFS safety), skipping symlinks via `lstat`.
+    static func discoverOrphanedProfiles(
+        knownIDs: Set<String>,
+        applicationSupportRoot: URL? = nil,
+        cachesRoot: URL? = nil
+    ) -> [String] {
+        let knownLowered = Set(knownIDs.map { $0.lowercased() })
+        return existingIsolatedProfileSlugs(
+            applicationSupportRoot: applicationSupportRoot,
+            cachesRoot: cachesRoot
+        ).filter { slug in
+            !knownLowered.contains(slug.lowercased())
+        }
+    }
+
     /// Returns true if the given profile ID matches the currently open engine session
     /// or the outcome chosen for this process launch.
     @MainActor

@@ -1,4 +1,5 @@
 import CuriumEngineContract
+import os
 import SwiftUI
 import UIKit
 
@@ -85,46 +86,183 @@ private final class CuriumRecoverySceneDelegate: UIResponder, UIWindowSceneDeleg
 private struct CuriumProfileLaunchRecoveryView: View {
     let profileID: String
     let reason: String
-    @State private var store = CuriumFingerprintStore.loadShared()
+
+    @Environment(\.layoutDirection) private var layoutDirection
+    @State private var store = CuriumFingerprintStore.shared
     @State private var statusMessage: String?
     @State private var persistFailed = false
     @State private var copiedDetails = false
+    @State private var blockedProfileUsage: CuriumFingerprintProfileStorage.UsageSnapshot?
+    @State private var confirmingWipe = false
+    @State private var isWiping = false
+
+    private enum RecoveryFoldLayout {
+        case centered
+        case sidePane(leftInset: CGFloat, rightInset: CGFloat, maxWidth: CGFloat)
+        case tabletopSplit(topHeight: CGFloat, creaseHeight: CGFloat, bottomHeight: CGFloat)
+    }
+
+    private var isStoreCorrupt: Bool {
+        store.loadError != nil
+    }
+
+    private var engineSupportsProfiles: Bool {
+        CuriumFingerprintBootstrap.engineCapabilities().supportsLaunchFingerprintConfig
+    }
+
+    private var canOfferIsolatedWipe: Bool {
+        !isStoreCorrupt
+            && profileID != "default"
+            && profileID != "store"
+            && CuriumFingerprintValidator.isValidProfileID(profileID)
+    }
 
     private var alternativeProfiles: [CuriumFingerprintProfile] {
-        store.profiles.filter {
+        guard !isStoreCorrupt, engineSupportsProfiles else { return [] }
+        return store.profiles.filter {
             $0.id != profileID && CuriumFingerprintValidator.validate($0).isValid
         }
     }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 16) {
-                Image(systemName: "shield.lefthalf.filled.trianglebadge.exclamationmark")
-                    .font(.system(size: 44))
-                    .foregroundStyle(.orange)
-                    .accessibilityHidden(true)
-                Text("Profile Launch Blocked")
-                    .font(.title2.weight(.semibold))
-                Text("Profile \"\(profileID)\" could not be opened safely, so Curium stopped before loading the default profile.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                Text(reason)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.primary)
-                    .textSelection(.enabled)
-                    .padding(12)
-                    .frame(maxWidth: 440, alignment: .leading)
-                    .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
-
-                if let statusMessage {
-                    Text(statusMessage)
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(persistFailed ? .red : .green)
-                        .multilineTextAlignment(.center)
+        GeometryReader { proxy in
+            switch foldLayout(in: proxy) {
+            case .centered:
+                ScrollView {
+                    VStack(spacing: 16) {
+                        headerAndDetailsSection(maxReasonWidth: 440)
+                        statusAndActionsSection
+                    }
+                    .frame(maxWidth: 480)
+                    .padding(24)
+                    .frame(maxWidth: .infinity)
                 }
+                .defaultScrollAnchor(.center, for: .alignment)
+                .scrollBounceBehavior(.basedOnSize)
 
-                VStack(spacing: 10) {
+            case .sidePane(let leftInset, let rightInset, let maxWidth):
+                let isLTR = layoutDirection == .leftToRight
+                ScrollView {
+                    VStack(spacing: 16) {
+                        headerAndDetailsSection(maxReasonWidth: maxWidth)
+                        statusAndActionsSection
+                    }
+                    .frame(maxWidth: maxWidth)
+                    .padding(.vertical, 24)
+                    .padding(.leading, isLTR ? leftInset : rightInset)
+                    .padding(.trailing, isLTR ? rightInset : leftInset)
+                    .frame(maxWidth: .infinity)
+                }
+                .defaultScrollAnchor(.center, for: .alignment)
+                .scrollBounceBehavior(.basedOnSize)
+
+            case .tabletopSplit(let topHeight, let creaseHeight, let bottomHeight):
+                VStack(spacing: 0) {
+                    ScrollView {
+                        headerAndDetailsSection(maxReasonWidth: 440)
+                            .frame(maxWidth: 480)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 16)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .defaultScrollAnchor(.center, for: .alignment)
+                    .scrollBounceBehavior(.basedOnSize)
+                    .frame(height: topHeight)
+
+                    Color.clear
+                        .frame(height: creaseHeight)
+                        .accessibilityHidden(true)
+
+                    ScrollView {
+                        statusAndActionsSection
+                            .frame(maxWidth: 480)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 16)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .defaultScrollAnchor(.center, for: .alignment)
+                    .scrollBounceBehavior(.basedOnSize)
+                    .frame(height: bottomHeight)
+                }
+            }
+        }
+        .background(Color(uiColor: .systemGroupedBackground))
+        .task(id: profileID) {
+            guard canOfferIsolatedWipe else {
+                blockedProfileUsage = nil
+                return
+            }
+            let targetID = profileID
+            let snapshot = await Task.detached(priority: .utility) {
+                CuriumFingerprintProfileStorage.measureUsage(for: targetID)
+            }.value
+            blockedProfileUsage = snapshot
+        }
+        .confirmationDialog(
+            "Wipe Isolated Profile Storage?",
+            isPresented: $confirmingWipe,
+            titleVisibility: .visible
+        ) {
+            Button("Wipe Cookies, Cache & Storage", role: .destructive) {
+                wipeBlockedProfileStorage()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Permanently clears isolated cookies, site data, and HTTP cache in ChromiumProfiles/\(profileID). Your profile settings remain in the store.")
+        }
+    }
+
+    private func headerAndDetailsSection(maxReasonWidth: CGFloat) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: "shield.lefthalf.filled.trianglebadge.exclamationmark")
+                .font(.system(size: 44))
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text(isStoreCorrupt ? "Profile Store Unreadable" : "Profile Launch Blocked")
+                .font(.title2.weight(.semibold))
+                .multilineTextAlignment(.center)
+            Text(
+                isStoreCorrupt
+                    ? "Curium could not read fingerprint-profiles.json safely, so it stopped before loading the default profile or overwriting your saved profiles."
+                    : "Profile \"\(profileID)\" could not be opened safely, so Curium stopped before loading the default profile."
+            )
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            Text(store.loadError ?? reason)
+                .font(.caption.monospaced())
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+                .padding(12)
+                .frame(maxWidth: maxReasonWidth, alignment: .leading)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    private var statusAndActionsSection: some View {
+        VStack(spacing: 12) {
+            if let statusMessage {
+                Text(statusMessage)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(persistFailed ? .red : .green)
+                    .multilineTextAlignment(.center)
+            }
+
+            VStack(spacing: 10) {
+                if isStoreCorrupt {
+                    Button {
+                        if store.backupCorruptStoreAndReset() {
+                            persistFailed = false
+                            statusMessage = "Corrupt store backed up to a .bak file and reset to Default (Build 39). Close and relaunch Curium."
+                        } else {
+                            persistFailed = true
+                            statusMessage = store.lastPersistError ?? "Could not back up corrupt store."
+                        }
+                    } label: {
+                        Label("Back Up Corrupt Store & Reset", systemImage: "arrow.counterclockwise")
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else {
                     Button("Reset to Default Profile for Next Launch") {
                         if store.resetToBuild39Default() {
                             persistFailed = false
@@ -155,25 +293,99 @@ private struct CuriumProfileLaunchRecoveryView: View {
                         .buttonStyle(.bordered)
                     }
 
-                    Button {
-                        UIPasteboard.general.string = "Curium Profile Launch Blocked\nProfile: \(profileID)\nReason: \(reason)"
-                        copiedDetails = true
-                    } label: {
-                        Label(
-                            copiedDetails ? "Error Details Copied" : "Copy Error Details",
-                            systemImage: copiedDetails ? "checkmark.circle" : "doc.on.doc"
-                        )
+                    if canOfferIsolatedWipe, let usage = blockedProfileUsage, usage.exists {
+                        Button(role: .destructive) {
+                            confirmingWipe = true
+                        } label: {
+                            let sizeText = ByteCountFormatter.string(fromByteCount: usage.totalBytes, countStyle: .file)
+                            Label(
+                                isWiping ? "Wiping Storage…" : "Wipe Isolated Storage (\(sizeText))",
+                                systemImage: "externaldrive.badge.xmark"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(isWiping)
                     }
-                    .buttonStyle(.borderless)
+                }
+
+                Button {
+                    let detailText = store.loadError ?? reason
+                    UIPasteboard.general.string = "Curium Profile Launch Blocked\nProfile: \(profileID)\nReason: \(detailText)"
+                    copiedDetails = true
+                } label: {
+                    Label(
+                        copiedDetails ? "Error Details Copied" : "Copy Error Details",
+                        systemImage: copiedDetails ? "checkmark.circle" : "doc.on.doc"
+                    )
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+    }
+
+    private func foldLayout(in proxy: GeometryProxy) -> RecoveryFoldLayout {
+        guard #available(iOS 27.1, *) else { return .centered }
+        let width = proxy.size.width
+        let height = proxy.size.height
+        for region in proxy.reservedRegions(kind: .division, options: [.includeInactive]) where region.isActive {
+            let frame = region.frame
+            if frame.height > frame.width, frame.minX < width - 2, frame.maxX > 2 {
+                let leftRoom = max(0, frame.minX - 24)
+                let rightRoom = max(0, width - frame.maxX - 24)
+                if leftRoom >= rightRoom, leftRoom >= 260 {
+                    return .sidePane(
+                        leftInset: 16,
+                        rightInset: width - frame.minX + 16,
+                        maxWidth: min(440, leftRoom - 8)
+                    )
+                } else if rightRoom >= 260 {
+                    return .sidePane(
+                        leftInset: frame.maxX + 16,
+                        rightInset: 16,
+                        maxWidth: min(440, rightRoom - 8)
+                    )
+                }
+            } else if frame.width > frame.height, frame.minY < height - 2, frame.maxY > 2 {
+                let topHeight = max(0, frame.minY)
+                let bottomHeight = max(0, height - frame.maxY)
+                if topHeight >= 180, bottomHeight >= 160 {
+                    return .tabletopSplit(
+                        topHeight: topHeight,
+                        creaseHeight: frame.height,
+                        bottomHeight: bottomHeight
+                    )
                 }
             }
-            .frame(maxWidth: 480)
-            .padding(24)
-            .frame(maxWidth: .infinity)
         }
-        .defaultScrollAnchor(.center, for: .alignment)
-        .scrollBounceBehavior(.basedOnSize)
-        .background(Color(uiColor: .systemGroupedBackground))
+        return .centered
+    }
+
+    private func wipeBlockedProfileStorage() {
+        guard !isWiping, canOfferIsolatedWipe else { return }
+        isWiping = true
+        let targetID = profileID
+        Task.detached(priority: .userInitiated) {
+            do {
+                try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
+                    targetID,
+                    isActiveInCurrentProcess: false
+                )
+                await MainActor.run {
+                    isWiping = false
+                    persistFailed = false
+                    blockedProfileUsage = CuriumFingerprintProfileStorage.UsageSnapshot(
+                        supportBytes: 0, cacheBytes: 0, exists: false
+                    )
+                    statusMessage = "Isolated storage for \"\(targetID)\" was wiped. Close and relaunch Curium to retry."
+                }
+            } catch {
+                await MainActor.run {
+                    isWiping = false
+                    persistFailed = true
+                    statusMessage = error.localizedDescription
+                }
+            }
+        }
     }
 }
 
@@ -200,27 +412,65 @@ private struct CuriumStandbyWindow: View {
     }
 }
 
-@MainActor
-private final class CuriumBackgroundTask {
-    private var identifier: UIBackgroundTaskIdentifier = .invalid
+private final class CuriumBackgroundTask: Sendable {
+    private struct State: Sendable {
+        var rawIdentifier: Int = UIBackgroundTaskIdentifier.invalid.rawValue
+        var ended = false
+    }
 
+    private let lock = OSAllocatedUnfairLock<State>(initialState: State())
+
+    @MainActor
     init(name: String) {
-        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
-            if Thread.isMainThread {
-                MainActor.assumeIsolated { self?.end() }
-            } else {
-                DispatchQueue.main.sync {
-                    MainActor.assumeIsolated { self?.end() }
-                }
+        let id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            self?.endFromAnyThread()
+        }
+        let shouldEndImmediately = lock.withLock { state -> Bool in
+            if state.ended {
+                return true
             }
+            state.rawIdentifier = id.rawValue
+            return false
+        }
+        if shouldEndImmediately && id != .invalid {
+            UIApplication.shared.endBackgroundTask(id)
         }
     }
 
+    deinit {
+        endFromAnyThread()
+    }
+
+    @MainActor
     func end() {
-        guard identifier != .invalid else { return }
-        let current = identifier
-        identifier = .invalid
-        UIApplication.shared.endBackgroundTask(current)
+        let rawID = takeRawIdentifier()
+        guard rawID != UIBackgroundTaskIdentifier.invalid.rawValue else { return }
+        UIApplication.shared.endBackgroundTask(UIBackgroundTaskIdentifier(rawValue: rawID))
+    }
+
+    private func takeRawIdentifier() -> Int {
+        lock.withLock { state in
+            state.ended = true
+            let current = state.rawIdentifier
+            state.rawIdentifier = UIBackgroundTaskIdentifier.invalid.rawValue
+            return current
+        }
+    }
+
+    private func endFromAnyThread() {
+        let rawID = takeRawIdentifier()
+        guard rawID != UIBackgroundTaskIdentifier.invalid.rawValue else { return }
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                UIApplication.shared.endBackgroundTask(UIBackgroundTaskIdentifier(rawValue: rawID))
+            }
+        } else {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    UIApplication.shared.endBackgroundTask(UIBackgroundTaskIdentifier(rawValue: rawID))
+                }
+            }
+        }
     }
 }
 

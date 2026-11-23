@@ -1,4 +1,5 @@
 import CuriumEngineContract
+import Observation
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -7,12 +8,37 @@ struct CuriumExtensionsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @State private var choosingFile = false
-    @State private var enteringLink = false
+    @State private var pendingCRXURL: URL?
     @State private var storeLink = ""
+    @State private var activeAlert: AlertState?
+    @State private var sheetReady = false
+    @State private var isAwaitingModalDismissal = false
+    @State private var deferredAlertTask: Task<Void, Never>?
     @State private var removing: CuriumExtension?
     @State private var popup: CuriumPopup?
 
     private var store: CuriumExtensionStore { browser.extensions }
+
+    private enum ErrorSource: Equatable {
+        case extensionStore
+        case browser
+    }
+
+    private enum AlertState: Equatable {
+        case storeLink
+        case error(source: ErrorSource, message: String)
+
+        var title: String {
+            switch self {
+            case .storeLink: "Chrome Web Store Link"
+            case .error(let source, _):
+                switch source {
+                case .extensionStore: "Extension"
+                case .browser: "Curium"
+                }
+            }
+        }
+    }
 
     private struct BlockedPollKey: Equatable {
         let active: Bool
@@ -34,6 +60,14 @@ struct CuriumExtensionsSheet: View {
         .background(Color(uiColor: .systemGroupedBackground))
         .onAppear {
             store.refresh(tabID: browser.activeTab?.extensionTabID ?? -1, includeBlockedCounts: true)
+        }
+        .task {
+            if store.operationError != nil || browser.sheetErrorMessage != nil {
+                try? await Task.sleep(for: .milliseconds(350))
+            }
+            guard !Task.isCancelled else { return }
+            sheetReady = true
+            presentPendingErrorIfNeeded()
         }
         .task(id: BlockedPollKey(
             active: scenePhase == .active && popup == nil && store.hasEnabledExtensions
@@ -78,39 +112,76 @@ struct CuriumExtensionsSheet: View {
             let stillValid = installed.contains { $0.id == activePopup.host.extensionID && $0.canShowPopup }
             if !stillValid { setPopup(nil) }
         }
+        .onChange(of: store.operationError) { _, _ in
+            presentPendingErrorIfNeeded()
+        }
+        .onChange(of: browser.sheetErrorMessage) { _, _ in
+            presentPendingErrorIfNeeded()
+        }
         .onDisappear {
+            deferredAlertTask?.cancel()
+            deferredAlertTask = nil
+            pendingCRXURL = nil
             setPopup(nil)
             store.endInstallSession()
         }
-        .sheet(isPresented: $choosingFile) {
+        .sheet(isPresented: $choosingFile, onDismiss: {
+            if let url = pendingCRXURL {
+                pendingCRXURL = nil
+                store.prepareSignedFile(url)
+            }
+            presentPendingErrorIfNeeded()
+        }) {
             CuriumCRXPicker { url in
+                pendingCRXURL = url
                 choosingFile = false
-                if let url { store.prepareSignedFile(url) }
             }
             .ignoresSafeArea()
         }
         .sheet(item: Binding(
             get: { popup },
             set: { if $0 == nil { setPopup(nil) } }
-        )) { activePopup in
+        ), onDismiss: {
+            presentPendingErrorIfNeeded()
+        }) { activePopup in
             CuriumPopupView(presentation: activePopup)
                 .presentationSizing(.fitted)
         }
-        .alert("Chrome Web Store Link", isPresented: $enteringLink) {
-            TextField("https://chromewebstore.google.com/…", text: $storeLink)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .keyboardType(.URL)
-            Button("Continue") { store.prepareStoreLink(storeLink) }
-            Button("Cancel", role: .cancel) {}
-        }
-        .alert("Extension", isPresented: Binding(
-            get: { store.operationError != nil },
-            set: { if !$0 { store.operationError = nil } }
-        )) {
-            Button("OK") { store.operationError = nil }
-        } message: {
-            Text(store.operationError ?? "")
+        .alert(
+            activeAlert?.title ?? "",
+            isPresented: Binding(
+                get: { activeAlert != nil },
+                set: { if !$0 { dismissActiveAlert() } }
+            ),
+            presenting: activeAlert
+        ) { state in
+            switch state {
+            case .storeLink:
+                TextField("https://chromewebstore.google.com/…", text: $storeLink)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                Button("Continue") {
+                    let submitted = storeLink
+                    activeAlert = nil
+                    scheduleDeferredErrorSync(delay: .milliseconds(350))
+                    store.prepareStoreLink(submitted)
+                }
+                Button("Cancel", role: .cancel) {
+                    activeAlert = nil
+                }
+            case .error:
+                Button("OK", role: .cancel) {
+                    dismissActiveAlert()
+                }
+            }
+        } message: { state in
+            switch state {
+            case .storeLink:
+                EmptyView()
+            case .error(_, let message):
+                Text(message)
+            }
         }
         .confirmationDialog("Remove Extension?", isPresented: Binding(
             get: { removing != nil },
@@ -173,7 +244,7 @@ struct CuriumExtensionsSheet: View {
                 }
                 Button {
                     storeLink = ""
-                    enteringLink = true
+                    activeAlert = .storeLink
                 } label: {
                     Label("Install from Chrome Web Store Link…", systemImage: "link")
                 }
@@ -243,6 +314,50 @@ struct CuriumExtensionsSheet: View {
         popup?.close()
         popup = newValue
     }
+
+    private func presentPendingErrorIfNeeded() {
+        guard sheetReady,
+              !isAwaitingModalDismissal,
+              activeAlert == nil,
+              !choosingFile,
+              popup == nil else { return }
+        if let message = store.operationError {
+            activeAlert = .error(source: .extensionStore, message: message)
+        } else if let message = browser.sheetErrorMessage {
+            activeAlert = .error(source: .browser, message: message)
+        }
+    }
+
+    private func scheduleDeferredErrorSync(delay: Duration) {
+        deferredAlertTask?.cancel()
+        isAwaitingModalDismissal = true
+        deferredAlertTask = Task {
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            isAwaitingModalDismissal = false
+            deferredAlertTask = nil
+            presentPendingErrorIfNeeded()
+        }
+    }
+
+    private func dismissActiveAlert() {
+        let previous = activeAlert
+        activeAlert = nil
+        switch previous {
+        case .error(let source, _):
+            switch source {
+            case .extensionStore:
+                store.operationError = nil
+            case .browser:
+                browser.sheetErrorMessage = nil
+            }
+            if store.operationError != nil || browser.sheetErrorMessage != nil {
+                scheduleDeferredErrorSync(delay: .milliseconds(350))
+            }
+        case .storeLink, nil:
+            break
+        }
+    }
 }
 
 private struct CuriumCRXPicker: UIViewControllerRepresentable {
@@ -272,22 +387,95 @@ private struct CuriumCRXPicker: UIViewControllerRepresentable {
     }
 }
 
+/// Safe KVO observer for `CrIOSExtensionPopupHostingV1.preferredContentSize` updates.
+private final class PreferredContentSizeObserver: NSObject {
+    private nonisolated(unsafe) static var kvoContext: UInt8 = 0
+    private var target: NSObject?
+    private let onChange: @MainActor @Sendable () -> Void
+
+    @MainActor
+    init(target: NSObject, onChange: @escaping @MainActor @Sendable () -> Void) {
+        self.target = target
+        self.onChange = onChange
+        super.init()
+        target.addObserver(
+            self,
+            forKeyPath: "preferredContentSize",
+            options: [.new],
+            context: &Self.kvoContext
+        )
+    }
+
+    func invalidate() {
+        guard let target else { return }
+        self.target = nil
+        target.removeObserver(self, forKeyPath: "preferredContentSize", context: &Self.kvoContext)
+    }
+
+    deinit {
+        invalidate()
+    }
+
+    override func observeValue(
+        forKeyPath keyPath: String?,
+        of object: Any?,
+        change: [NSKeyValueChangeKey: Any]?,
+        context: UnsafeMutableRawPointer?
+    ) {
+        guard context == &Self.kvoContext else {
+            super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
+            return
+        }
+        let callback = onChange
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { callback() }
+        } else {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { callback() }
+            }
+        }
+    }
+}
+
 @MainActor
+@Observable
 private final class CuriumPopup: Identifiable {
     let host: any CrIOSExtensionPopupHostingV1
     let view: UIView
     let name: String
-    private var isClosed = false
+    private(set) var preferredContentSize: CGSize
+    @ObservationIgnored private var isClosed = false
+    @ObservationIgnored private var sizeObserver: PreferredContentSizeObserver?
 
     init(host: any CrIOSExtensionPopupHostingV1, name: String) {
         self.host = host
         view = host.view
         self.name = name
+        preferredContentSize = host.preferredContentSize
+        if let object = host as? NSObject {
+            sizeObserver = PreferredContentSizeObserver(target: object) { [weak self] in
+                self?.refreshPreferredContentSize()
+            }
+        }
+    }
+
+    isolated deinit {
+        close()
+    }
+
+    func refreshPreferredContentSize() {
+        guard !isClosed else { return }
+        let latest = host.preferredContentSize
+        if preferredContentSize != latest {
+            preferredContentSize = latest
+        }
     }
 
     func close() {
         guard !isClosed else { return }
         isClosed = true
+        sizeObserver?.invalidate()
+        sizeObserver = nil
         host.onRequestClose = nil
         view.removeFromSuperview()
         host.close()
@@ -296,23 +484,63 @@ private final class CuriumPopup: Identifiable {
 
 private struct CuriumPopupView: View {
     let presentation: CuriumPopup
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        let size = presentation.host.preferredContentSize
-        let width = min(480, max(320, size.width))
-        let height = min(560, max(440, size.height))
-        VStack(spacing: 0) {
-            CuriumSheetHeader(title: presentation.name)
-            Surface(content: presentation.view)
-                .frame(minWidth: width, idealWidth: width, minHeight: height, idealHeight: height)
+        let size = presentation.preferredContentSize
+        let rawWidth = size.width.isFinite && size.width > 0 ? size.width : 360
+        let rawHeight = size.height.isFinite && size.height > 0 ? size.height : 440
+        let idealWidth = min(480, max(280, rawWidth))
+        let idealHeight = min(560, max(240, rawHeight))
+
+        NavigationStack {
+            Surface(content: presentation.view) {
+                let latest = presentation.host.preferredContentSize
+                guard latest != presentation.preferredContentSize else { return }
+                Task { @MainActor in
+                    presentation.refreshPreferredContentSize()
+                }
+            }
+            .frame(
+                idealWidth: idealWidth,
+                maxWidth: .infinity,
+                idealHeight: idealHeight,
+                maxHeight: .infinity
+            )
+            .navigationTitle(presentation.name)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button { dismiss() } label: {
+                        Label("Done", systemImage: "checkmark")
+                    }
+                }
+            }
+        }
+        .frame(
+            idealWidth: idealWidth,
+            maxWidth: .infinity,
+            idealHeight: idealHeight + 44,
+            maxHeight: .infinity
+        )
+    }
+
+    private final class ContainerView: UIView {
+        var onLayout: (() -> Void)?
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            onLayout?()
         }
     }
 
     private struct Surface: UIViewRepresentable {
         let content: UIView
+        let onLayout: () -> Void
 
-        func makeUIView(context: Context) -> UIView {
-            let wrapper = UIView()
+        func makeUIView(context: Context) -> ContainerView {
+            let wrapper = ContainerView()
+            wrapper.onLayout = onLayout
             content.frame = wrapper.bounds
             content.autoresizingMask = [.flexibleWidth, .flexibleHeight]
             content.translatesAutoresizingMaskIntoConstraints = true
@@ -320,9 +548,18 @@ private struct CuriumPopupView: View {
             return wrapper
         }
 
-        func updateUIView(_ uiView: UIView, context: Context) {}
+        func updateUIView(_ uiView: ContainerView, context: Context) {
+            uiView.onLayout = onLayout
+            if content.superview !== uiView {
+                content.frame = uiView.bounds
+                content.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                content.translatesAutoresizingMaskIntoConstraints = true
+                uiView.addSubview(content)
+            }
+        }
 
-        static func dismantleUIView(_ uiView: UIView, coordinator: Void) {
+        static func dismantleUIView(_ uiView: ContainerView, coordinator: Void) {
+            uiView.onLayout = nil
             uiView.subviews.forEach { $0.removeFromSuperview() }
         }
     }

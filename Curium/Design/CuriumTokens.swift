@@ -111,8 +111,15 @@ enum CuriumSpace {
     static let compactPillTop: CGFloat = 8
     /// The pill's site name; the UIFont twin measures it so the capsule fits the text.
     static let pillFont = Font.footnote.weight(.medium)
+    static let pillMaxDynamicTypeSize: DynamicTypeSize = .xxxLarge
+    static let pillMaxContentSizeCategory: UIContentSizeCategory = .extraExtraExtraLarge
     static var pillUIFont: UIFont {
-        UIFont.systemFont(ofSize: UIFont.preferredFont(forTextStyle: .footnote).pointSize, weight: .medium)
+        let live = UIFont.preferredFont(forTextStyle: .footnote).pointSize
+        let capped = UIFont.preferredFont(
+            forTextStyle: .footnote,
+            compatibleWith: UITraitCollection(preferredContentSizeCategory: pillMaxContentSizeCategory)
+        ).pointSize
+        return UIFont.systemFont(ofSize: min(live, capped), weight: .medium)
     }
     static let secondaryInk = Color(uiColor: CuriumPalette.dynamic(light: 0x565260, dark: 0xB9B5C4))
 }

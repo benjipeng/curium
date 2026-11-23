@@ -2,15 +2,15 @@ import OSLog
 import SwiftUI
 import UIKit
 
-/// The system's active occlusion regions (status cluster, Dynamic Island, cameras),
-/// in window coordinates.
+/// The system's active occlusion regions (status cluster, Dynamic Island, cameras)
+/// and live top safe-area inset, in window coordinates.
 ///
 /// UIKit tracks `reservedRegions(kind:)` queries made inside `updateConstraints()` and
 /// runs that pass again whenever a region changes, for example when a Live Activity
 /// widens the island. Reading them there, instead of from a SwiftUI geometry pass,
 /// keeps the bar in step with the island as it grows and shrinks.
 struct CuriumOcclusionReader: UIViewRepresentable {
-    let onChange: ([CGRect], Bool) -> Void
+    let onChange: ([CGRect], CGFloat, Bool) -> Void
 
     func makeUIView(context: Context) -> Reader {
         let reader = Reader()
@@ -23,8 +23,9 @@ struct CuriumOcclusionReader: UIViewRepresentable {
     }
 
     final class Reader: UIView {
-        var onChange: (([CGRect], Bool) -> Void)?
-        private var published: [CGRect]?
+        var onChange: (([CGRect], CGFloat, Bool) -> Void)?
+        private var publishedFrames: [CGRect]?
+        private var publishedSafeTop: CGFloat?
         private var lastBoundsSize: CGSize = .zero
         private var pendingSizeSnap = false
 
@@ -45,6 +46,11 @@ struct CuriumOcclusionReader: UIViewRepresentable {
             setNeedsUpdateConstraints()
         }
 
+        override func safeAreaInsetsDidChange() {
+            super.safeAreaInsetsDidChange()
+            setNeedsUpdateConstraints()
+        }
+
         override func layoutSubviews() {
             super.layoutSubviews()
             guard bounds.size != lastBoundsSize else { return }
@@ -55,29 +61,48 @@ struct CuriumOcclusionReader: UIViewRepresentable {
 
         override func updateConstraints() {
             defer { super.updateConstraints() }
-            guard #available(iOS 27.1, *), let window else { return }
-            let regions = reservedRegions(kind: .occlusion)
-                .filter(\.isActive)
-                .map { (frame: convert($0.frame, to: window).integral, margins: $0.margins) }
-                .sorted { ($0.frame.minX, $0.frame.minY) < ($1.frame.minX, $1.frame.minY) }
-            var frames = regions.map(\.frame)
+            guard let window else { return }
+            // UIKit runs updateConstraints() before layoutSubviews() on rotation passes,
+            // so detect size changes right here to keep posture transitions snap-clean.
+            if bounds.size != lastBoundsSize {
+                lastBoundsSize = bounds.size
+                pendingSizeSnap = true
+            }
+
+            let safeTop = window.safeAreaInsets.top
+            var frames: [CGRect] = []
+            var described: [String] = []
+            if #available(iOS 27.1, *) {
+                let regions = reservedRegions(kind: .occlusion)
+                    .filter(\.isActive)
+                    .map { (frame: convert($0.frame, to: window).integral, margins: $0.margins) }
+                    .sorted { ($0.frame.minX, $0.frame.minY) < ($1.frame.minX, $1.frame.minY) }
+                frames = regions.map(\.frame)
+                // The frame includes the margins; log them, since the Simulator reports zero.
+                described = regions.map {
+                    "\(NSCoder.string(for: $0.frame)) margins \(NSCoder.string(for: $0.margins))"
+                }
+            }
             #if DEBUG
             if let simulated = Self.simulatedFrames { frames = simulated }
             #endif
-            let shouldAnimate = published != nil && !pendingSizeSnap
+
+            let safeTopChanged = publishedSafeTop.map { abs($0 - safeTop) > 0.5 } ?? true
+            let framesChanged = frames != publishedFrames
+            let shouldAnimate = publishedFrames != nil && !pendingSizeSnap && !safeTopChanged
             pendingSizeSnap = false
-            guard frames != published else { return }
-            published = frames
-            // The frame includes the margins; log them, since the Simulator reports zero.
-            let described = regions.map {
-                "\(NSCoder.string(for: $0.frame)) margins \(NSCoder.string(for: $0.margins))"
+            guard framesChanged || safeTopChanged else { return }
+            publishedFrames = frames
+            publishedSafeTop = safeTop
+
+            if framesChanged {
+                let summary = described.isEmpty ? "none" : described.joined(separator: "; ")
+                Self.log.notice("occlusion: \(summary, privacy: .public)")
+                CuriumDiagnostics.shared.record("layout", "occlusion: \(summary) safeTop=\(Int(safeTop.rounded()))")
             }
-            let summary = described.isEmpty ? "none" : described.joined(separator: "; ")
-            Self.log.notice("occlusion: \(summary, privacy: .public)")
-            CuriumDiagnostics.shared.record("layout", "occlusion: \(summary)")
             Task { @MainActor [weak self] in
-                guard let self, self.published == frames else { return }
-                self.onChange?(frames, shouldAnimate)
+                guard let self, self.publishedFrames == frames, self.publishedSafeTop == safeTop else { return }
+                self.onChange?(frames, safeTop, shouldAnimate)
             }
         }
 
