@@ -143,13 +143,13 @@ enum CuriumFingerprintPresets {
         hardware: .native
     )
 
-    /// Example profile with opt-in non-Apple hardware & GPU overrides (Windows 11 x64 workstation).
+    /// Example profile with opt-in non-Apple hardware, GPU, font, and web screen overrides (Windows 11 x64 workstation).
     static let windowsWorkstation = CuriumFingerprintProfile(
         id: "win11-workstation",
         displayName: "Windows 11 Workstation",
-        notes: "Isolated Windows 11 x64 Desktop profile with opt-in CPU, memory, desktop pointer, and Intel ANGLE WebGL overrides.",
+        notes: "Isolated Windows 11 x64 Desktop profile with opt-in CPU, memory, desktop pointer, Windows font filtering, 1080p web screen, and Intel ANGLE WebGL overrides.",
         isBuiltIn: true,
-        revision: 1,
+        revision: 2,
         defaultSlot: .desktop,
         mobile: CuriumIdentitySlot(
             osCpu: "Windows NT 10.0; Win64; x64",
@@ -168,7 +168,10 @@ enum CuriumFingerprintPresets {
             pointerType: .fine,
             hoverType: .hover,
             webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"
+            webglRenderer: "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            screen: .desktop1080pWindows,
+            webglProfile: .desktopWindows,
+            pdfViewerEnabled: true
         ),
         desktop: CuriumIdentitySlot(
             osCpu: "Windows NT 10.0; Win64; x64",
@@ -187,7 +190,10 @@ enum CuriumFingerprintPresets {
             pointerType: .fine,
             hoverType: .hover,
             webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"
+            webglRenderer: "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            screen: .desktop1080pWindows,
+            webglProfile: .desktopWindows,
+            pdfViewerEnabled: true
         ),
         languages: ["en-US", "en"],
         proxy: .system,
@@ -198,16 +204,18 @@ enum CuriumFingerprintPresets {
             hardwareConcurrency: 8,
             deviceMemoryGB: 8,
             timezone: nil
-        )
+        ),
+        fontProfile: .windows,
+        hideSpeechVoices: true
     )
 
-    /// Desktop-first Linux x86_64 profile with coherent Mesa/Intel WebGL & desktop input capabilities.
+    /// Desktop-first Linux x86_64 profile with coherent Mesa/Intel WebGL, Linux font filtering & desktop input capabilities.
     static let linuxDesktop = CuriumFingerprintProfile(
         id: "linux-desktop",
         displayName: "Linux Desktop (x86_64)",
-        notes: "Isolated Linux x86_64 Chrome workstation with empty Sec-CH-UA-Platform-Version (matching upstream Linux Chrome), desktop pointer, and Mesa Intel WebGL.",
+        notes: "Isolated Linux x86_64 Chrome workstation with empty Sec-CH-UA-Platform-Version (matching upstream Linux Chrome), Linux font filtering, 1080p web screen, and Mesa Intel WebGL.",
         isBuiltIn: true,
-        revision: 1,
+        revision: 2,
         defaultSlot: .desktop,
         mobile: CuriumIdentitySlot(
             osCpu: "X11; Linux x86_64",
@@ -226,7 +234,10 @@ enum CuriumFingerprintPresets {
             pointerType: .fine,
             hoverType: .hover,
             webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL 4.6)"
+            webglRenderer: "ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL 4.6)",
+            screen: .desktop1080pLinux,
+            webglProfile: .desktopLinux,
+            pdfViewerEnabled: true
         ),
         desktop: CuriumIdentitySlot(
             osCpu: "X11; Linux x86_64",
@@ -245,7 +256,10 @@ enum CuriumFingerprintPresets {
             pointerType: .fine,
             hoverType: .hover,
             webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL 4.6)"
+            webglRenderer: "ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL 4.6)",
+            screen: .desktop1080pLinux,
+            webglProfile: .desktopLinux,
+            pdfViewerEnabled: true
         ),
         languages: ["en-US", "en"],
         proxy: .system,
@@ -256,16 +270,18 @@ enum CuriumFingerprintPresets {
             hardwareConcurrency: 8,
             deviceMemoryGB: 8,
             timezone: nil
-        )
+        ),
+        fontProfile: .linux,
+        hideSpeechVoices: true
     )
 
-    /// Pixel 9 Android 15 mobile profile with Chrome Reduced UA, Pixel 9 CH model, and native hardware (auto-capped at 8 GB).
+    /// Pixel 9 Android 15 mobile profile with Chrome Reduced UA, Pixel 9 CH model, Android font filtering, and native hardware (auto-capped at 8 GB).
     static let pixelAndroid = CuriumFingerprintProfile(
         id: "pixel-android",
         displayName: "Pixel 9 (Android 15)",
-        notes: "Isolated Pixel 9 Android 15 mobile identity (Reduced UA with Pixel 9 Client Hint model) and macOS Desktop slot, keeping native hardware.",
+        notes: "Isolated Pixel 9 Android 15 mobile identity (Reduced UA with Pixel 9 Client Hint model, Android font filtering) and macOS Desktop slot, keeping native hardware.",
         isBuiltIn: true,
-        revision: 1,
+        revision: 2,
         defaultSlot: .mobile,
         mobile: CuriumIdentitySlot(
             osCpu: "Linux; Android 10; K",
@@ -279,7 +295,9 @@ enum CuriumFingerprintPresets {
             mobile: true,
             wow64: false,
             formFactors: ["Mobile"],
-            navigatorPlatform: "Linux armv81"
+            navigatorPlatform: "Linux armv81",
+            screen: .mobilePixel9,
+            webglProfile: .mobileAndroid
         ),
         desktop: defaultAuthenticChrome.desktop,
         languages: nil,
@@ -287,16 +305,18 @@ enum CuriumFingerprintPresets {
         webrtcIpHandlingPolicy: .default,
         enableDoNotTrack: false,
         enableGlobalPrivacyControl: false,
-        hardware: .native
+        hardware: .native,
+        fontProfile: .android,
+        hideSpeechVoices: true
     )
 
-    /// Privacy-hardened profile keeping native Apple hardware while locking down WebRTC UDP & enabling GPC.
+    /// Privacy-hardened profile keeping native Apple hardware while enabling deterministic per-site C++ farbling, WebRTC UDP lockdown & GPC.
     static let privacyHardened = CuriumFingerprintProfile(
         id: "privacy-hardened",
         displayName: "Privacy Hardened",
-        notes: "Isolated profile with native Apple hardware, non-proxied WebRTC UDP disabled, and Global Privacy Control enabled.",
+        notes: "Isolated profile with native Apple hardware, deterministic per-site Canvas/Audio/WebGL/TextMetrics farbling, non-proxied WebRTC UDP disabled, and Global Privacy Control enabled.",
         isBuiltIn: true,
-        revision: 1,
+        revision: 2,
         defaultSlot: .mobile,
         mobile: defaultAuthenticChrome.mobile,
         desktop: defaultAuthenticChrome.desktop,
@@ -305,6 +325,8 @@ enum CuriumFingerprintPresets {
         webrtcIpHandlingPolicy: .disableNonProxiedUdp,
         enableDoNotTrack: false,
         enableGlobalPrivacyControl: true,
-        hardware: .native
+        hardware: .native,
+        fingerprintSeed: "96c0a17d4f2b8e5319046c72a8f5e31d6b04927a5e8c3f104d9b6a27e0c51384",
+        farbling: .allEnabled
     )
 }

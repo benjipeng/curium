@@ -7,14 +7,13 @@ import OSLog
 /// `TrustedUnpackedExtensions` directory at startup and hidden from user-facing
 /// extension lists.
 ///
-/// Two content scripts cooperate across Blink worlds on every HTTP(S) frame:
-/// - `pip_guard.js` (`MAIN`, `document_start`): locks `disablePictureInPicture = false`,
-///   blocks unsolicited `exitPictureInPicture()`, and shields active PiP playback from
-///   `visibilitychange` / `blur` background-pause handlers without altering normal tabs.
-/// - `pip_overlay.js` (`ISOLATED`, `document_idle`): mounts a closed ShadowDOM floating
-///   PiP pill button anchored to each eligible playing/recently-paused `<video>`.
+/// Build 41 (`0109`) implements the anti-PiP & background-pause guard natively in
+/// Blink C++ with zero `MAIN`-world JS prototype footprint, so this extension now
+/// runs only a single `ISOLATED`-world content script (`pip_overlay.js`) mounting
+/// a closed ShadowDOM floating PiP pill anchored to each eligible `<video>`.
 enum CuriumVideoPiPExtension {
     static let directoryName = "curium_video_pip"
+    static let manifestVersion = "1.1.0"
     static let versionStampFileName = ".curium_version"
 
     /// Static RSA-2048 SubjectPublicKeyInfo (DER, base64-encoded).
@@ -70,17 +69,9 @@ enum CuriumVideoPiPExtension {
         let manifest: [String: Any] = [
             "manifest_version": 3,
             "name": "Curium Video PiP",
-            "version": "1.0.0",
+            "version": manifestVersion,
             "key": publicKeyBase64,
             "content_scripts": [
-                [
-                    "matches": ["http://*/*", "https://*/*"],
-                    "js": ["pip_guard.js"],
-                    "run_at": "document_start",
-                    "world": "MAIN",
-                    "all_frames": true,
-                    "match_about_blank": true,
-                ],
                 [
                     "matches": ["http://*/*", "https://*/*"],
                     "js": ["pip_overlay.js"],
@@ -100,254 +91,6 @@ enum CuriumVideoPiPExtension {
         }
         return text + "\n"
     }
-
-    static let guardScript: String = #"""
-(() => {
-  'use strict';
-
-  const GUARD_KEY = Symbol.for('com.appautomaton.curium.pipGuard');
-  if (window[GUARD_KEY]) return;
-  try {
-    Object.defineProperty(window, GUARD_KEY, {
-      value: true,
-      configurable: false,
-      enumerable: false,
-      writable: false,
-    });
-  } catch (_) {
-    return;
-  }
-
-  const ElementProto = typeof Element !== 'undefined' ? Element.prototype : null;
-  const HTMLVideoProto = typeof HTMLVideoElement !== 'undefined' ? HTMLVideoElement.prototype : null;
-  const HTMLMediaProto = typeof HTMLMediaElement !== 'undefined' ? HTMLMediaElement.prototype : null;
-  const DocProto = typeof Document !== 'undefined' ? Document.prototype : null;
-  const NavProto = typeof Navigator !== 'undefined' ? Navigator.prototype : null;
-
-  if (!ElementProto || !HTMLVideoProto || !HTMLMediaProto || !DocProto) return;
-
-  const origSetAttribute = ElementProto.setAttribute;
-  const origSetAttributeNS = ElementProto.setAttributeNS;
-  const origToggleAttribute = ElementProto.toggleAttribute;
-  const origRemoveAttribute = ElementProto.removeAttribute;
-  const origRequestPiP = HTMLVideoProto.requestPictureInPicture;
-  const origExitPiP = DocProto.exitPictureInPicture;
-  const origMediaPause = HTMLMediaProto.pause;
-
-  const origHiddenDesc = Object.getOwnPropertyDescriptor(DocProto, 'hidden');
-  const origVisStateDesc = Object.getOwnPropertyDescriptor(DocProto, 'visibilityState');
-  const origWebkitHiddenDesc = Object.getOwnPropertyDescriptor(DocProto, 'webkitHidden');
-  const origWebkitVisStateDesc = Object.getOwnPropertyDescriptor(DocProto, 'webkitVisibilityState');
-  const origPiPElementDesc = Object.getOwnPropertyDescriptor(DocProto, 'pictureInPictureElement');
-  const origUserActivationDesc = NavProto ? Object.getOwnPropertyDescriptor(NavProto, 'userActivation') : null;
-
-  let lastPiPIntentAt = -1e9;
-  let lastPiPEnterAt = -1e9;
-  let lastBlurAt = -1e9;
-
-  const isVideo = (el) => {
-    if (!el || el.nodeType !== 1) return false;
-    if (el instanceof HTMLVideoElement) return true;
-    return el.localName === 'video' && el.namespaceURI === 'http://www.w3.org/1999/xhtml';
-  };
-
-  const getPiPElement = (doc) => {
-    const target = doc || document;
-    try {
-      if (origPiPElementDesc && origPiPElementDesc.get) {
-        return origPiPElementDesc.get.call(target);
-      }
-      return target.pictureInPictureElement || null;
-    } catch (_) {
-      return null;
-    }
-  };
-
-  const isHiddenRaw = (doc) => {
-    const target = doc || document;
-    try {
-      if (origHiddenDesc && origHiddenDesc.get) {
-        return !!origHiddenDesc.get.call(target);
-      }
-      return false;
-    } catch (_) {
-      return false;
-    }
-  };
-
-  const hasActiveUserActivation = () => {
-    try {
-      const ua = origUserActivationDesc && origUserActivationDesc.get
-        ? origUserActivationDesc.get.call(navigator)
-        : navigator.userActivation;
-      return !!(ua && ua.isActive);
-    } catch (_) {
-      return false;
-    }
-  };
-
-  const isPiPActive = (doc) => {
-    if (getPiPElement(doc) != null) return true;
-    return performance.now() - lastPiPIntentAt < 1200;
-  };
-
-  const stripDisablePiPAttr = (el) => {
-    try {
-      if (origRemoveAttribute && isVideo(el)) {
-        origRemoveAttribute.call(el, 'disablepictureinpicture');
-      }
-    } catch (_) {}
-  };
-
-  const stripAllDisablePiP = (root) => {
-    try {
-      if (!root || typeof root.querySelectorAll !== 'function') return;
-      const videos = root.querySelectorAll('video[disablepictureinpicture]');
-      for (let i = 0; i < videos.length; i++) {
-        stripDisablePiPAttr(videos[i]);
-      }
-    } catch (_) {}
-  };
-
-  // Permanently lock disablePictureInPicture = false across all <video> elements.
-  try {
-    Object.defineProperty(HTMLVideoProto, 'disablePictureInPicture', {
-      configurable: false,
-      enumerable: true,
-      get() { return false; },
-      set() { stripDisablePiPAttr(this); },
-    });
-  } catch (_) {}
-
-  if (origSetAttribute) {
-    ElementProto.setAttribute = function(name, value) {
-      if (typeof name === 'string' && name.toLowerCase() === 'disablepictureinpicture' && isVideo(this)) {
-        stripDisablePiPAttr(this);
-        return;
-      }
-      return origSetAttribute.apply(this, arguments);
-    };
-  }
-
-  if (origSetAttributeNS) {
-    ElementProto.setAttributeNS = function(ns, name, value) {
-      if (typeof name === 'string') {
-        const colon = name.indexOf(':');
-        const local = colon >= 0 ? name.slice(colon + 1) : name;
-        if (local.toLowerCase() === 'disablepictureinpicture' && isVideo(this)) {
-          stripDisablePiPAttr(this);
-          return;
-        }
-      }
-      return origSetAttributeNS.apply(this, arguments);
-    };
-  }
-
-  if (origToggleAttribute) {
-    ElementProto.toggleAttribute = function(name, force) {
-      if (typeof name === 'string' && name.toLowerCase() === 'disablepictureinpicture' && isVideo(this)) {
-        stripDisablePiPAttr(this);
-        return false;
-      }
-      return origToggleAttribute.apply(this, arguments);
-    };
-  }
-
-  if (origRequestPiP) {
-    HTMLVideoProto.requestPictureInPicture = function() {
-      stripDisablePiPAttr(this);
-      lastPiPIntentAt = performance.now();
-      return origRequestPiP.apply(this, arguments);
-    };
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => stripAllDisablePiP(document), { capture: true, once: true });
-  } else {
-    stripAllDisablePiP(document);
-  }
-
-  // Cross-world PiP intent signal from pip_overlay.js and native PiP enter/leave lifecycle.
-  document.addEventListener('__curium_pip_intent', () => {
-    lastPiPIntentAt = performance.now();
-  }, true);
-
-  document.addEventListener('enterpictureinpicture', () => {
-    lastPiPEnterAt = performance.now();
-  }, true);
-
-  document.addEventListener('leavepictureinpicture', () => {
-    lastPiPIntentAt = -1e9;
-  }, true);
-
-  // Block hostile script-driven exitPictureInPicture() right after entering or without user gesture.
-  if (origExitPiP) {
-    DocProto.exitPictureInPicture = function() {
-      if (getPiPElement(this) != null) {
-        const now = performance.now();
-        if (now - lastPiPEnterAt < 3500 || now - lastPiPIntentAt < 3500 || !hasActiveUserActivation()) {
-          return Promise.resolve();
-        }
-      }
-      return origExitPiP.apply(this, arguments);
-    };
-  }
-
-  // Shield active PiP videos from visibilitychange / blur background-pause traps
-  // while leaving normal non-PiP background tabs completely untouched.
-  const overrideVisibilityGetter = (prop, origDesc, pipValue) => {
-    if (!origDesc || typeof origDesc.get !== 'function') return;
-    try {
-      Object.defineProperty(DocProto, prop, {
-        configurable: origDesc.configurable,
-        enumerable: origDesc.enumerable,
-        get() {
-          if (isPiPActive(this)) return pipValue;
-          return origDesc.get.call(this);
-        },
-      });
-    } catch (_) {}
-  };
-
-  overrideVisibilityGetter('hidden', origHiddenDesc, false);
-  overrideVisibilityGetter('visibilityState', origVisStateDesc, 'visible');
-  overrideVisibilityGetter('webkitHidden', origWebkitHiddenDesc, false);
-  overrideVisibilityGetter('webkitVisibilityState', origWebkitVisStateDesc, 'visible');
-
-  const swallowVisibilityIfPiP = (e) => {
-    if (isPiPActive(document)) {
-      e.stopImmediatePropagation();
-    }
-  };
-  window.addEventListener('visibilitychange', swallowVisibilityIfPiP, true);
-  document.addEventListener('visibilitychange', swallowVisibilityIfPiP, true);
-  window.addEventListener('webkitvisibilitychange', swallowVisibilityIfPiP, true);
-  document.addEventListener('webkitvisibilitychange', swallowVisibilityIfPiP, true);
-
-  window.addEventListener('blur', () => {
-    if (getPiPElement(document) != null) {
-      lastBlurAt = performance.now();
-    }
-  }, true);
-
-  if (origMediaPause) {
-    HTMLMediaProto.pause = function() {
-      const doc = (this && this.ownerDocument) || document;
-      const activeEl = getPiPElement(doc);
-      if (activeEl && this === activeEl) {
-        const now = performance.now();
-        const inEnterTrapWindow = (now - lastPiPEnterAt < 400) || (now - lastPiPIntentAt < 400);
-        const inBackgroundTrap = !hasActiveUserActivation() &&
-          (isHiddenRaw(doc) || (now - lastBlurAt < 1000));
-        if (inEnterTrapWindow || inBackgroundTrap) {
-          return;
-        }
-      }
-      return origMediaPause.apply(this, arguments);
-    };
-  }
-})();
-"""#
 
     static let overlayScript: String = #"""
 (() => {
@@ -571,15 +314,6 @@ enum CuriumVideoPiPExtension {
       e.stopPropagation();
       state.lastBrightAt = performance.now();
       btn.classList.remove('dimmed');
-
-      try {
-        video.removeAttribute('disablepictureinpicture');
-      } catch (_) {}
-      try {
-        video.disablePictureInPicture = false;
-      } catch (_) {}
-
-      document.dispatchEvent(new CustomEvent('__curium_pip_intent'));
 
       try {
         if (typeof video.requestPictureInPicture === 'function') {
@@ -1021,14 +755,14 @@ enum CuriumVideoPiPExtension {
 """#
 
     private static var contentSignature: String {
-        let combined = Data((manifestJSON + "\n---\n" + guardScript + "\n---\n" + overlayScript).utf8)
+        let combined = Data((manifestJSON + "\n---\n" + overlayScript).utf8)
         let digest = SHA256.hash(data: combined)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Materializes `manifest.json`, `pip_guard.js`, and `pip_overlay.js` into
+    /// Materializes `manifest.json` and `pip_overlay.js` into
     /// `<trustedUnpackedRoot>/curium_video_pip/`. Skips disk writes when an existing
-    /// directory already matches the current content signature.
+    /// directory already matches the current content signature and has no legacy `pip_guard.js`.
     @discardableResult
     static func materialize(into trustedUnpackedRoot: URL) throws -> URL {
         let fm = FileManager.default
@@ -1036,15 +770,15 @@ enum CuriumVideoPiPExtension {
 
         let targetDir = trustedUnpackedRoot.appending(path: directoryName, directoryHint: .isDirectory)
         let manifestURL = targetDir.appending(path: "manifest.json", directoryHint: .notDirectory)
-        let guardURL = targetDir.appending(path: "pip_guard.js", directoryHint: .notDirectory)
+        let legacyGuardURL = targetDir.appending(path: "pip_guard.js", directoryHint: .notDirectory)
         let overlayURL = targetDir.appending(path: "pip_overlay.js", directoryHint: .notDirectory)
         let stampURL = targetDir.appending(path: versionStampFileName, directoryHint: .notDirectory)
 
         let signature = contentSignature
         if fm.fileExists(atPath: targetDir.path),
            fm.fileExists(atPath: manifestURL.path),
-           fm.fileExists(atPath: guardURL.path),
            fm.fileExists(atPath: overlayURL.path),
+           !fm.fileExists(atPath: legacyGuardURL.path),
            let existingStamp = try? String(contentsOf: stampURL, encoding: .utf8),
            existingStamp == signature {
             return targetDir
@@ -1059,10 +793,6 @@ enum CuriumVideoPiPExtension {
         try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
         try Data(manifestJSON.utf8).write(
             to: stagingDir.appending(path: "manifest.json", directoryHint: .notDirectory),
-            options: .atomic
-        )
-        try Data(guardScript.utf8).write(
-            to: stagingDir.appending(path: "pip_guard.js", directoryHint: .notDirectory),
             options: .atomic
         )
         try Data(overlayScript.utf8).write(
@@ -1142,19 +872,20 @@ enum CuriumVideoPiPExtension {
                 return false
             }
 
-            if let existing = (try? manager.extensions())?.first(where: { ($0["id"] as? String) == extensionID }) {
-                if (existing["enabled"] as? Bool) != true {
-                    try? manager.setExtensionWithID(extensionID, enabled: true)
-                }
-                return true
-            }
-
             let extDir: URL
             do {
                 extDir = try materialize(into: URL(fileURLWithPath: rootPath, isDirectory: true))
             } catch {
                 log.error("CuriumVideoPiP materialize failed: \(error.localizedDescription, privacy: .public)")
                 return false
+            }
+
+            if let existing = (try? manager.extensions())?.first(where: { ($0["id"] as? String) == extensionID }),
+               (existing["version"] as? String) == manifestVersion {
+                if (existing["enabled"] as? Bool) != true {
+                    try? manager.setExtensionWithID(extensionID, enabled: true)
+                }
+                return true
             }
 
             let outcome = await installTrustedDirectory(extDir.path, using: manager)

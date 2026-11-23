@@ -443,6 +443,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     private let reportsNavigationCommits: Bool
     let extensions: CuriumExtensionStore
     let library = CuriumLibrary()
+    let mediaRadar = CuriumMediaRadar()
     private(set) var tabs: [CuriumTabModel] = []
     private(set) var activeTab: CuriumTabModel?
     private(set) var downloads: [CuriumDownload] = []
@@ -789,6 +790,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func close(_ tab: CuriumTabModel) {
         mediaPermissions.invalidate(tabID: tab.id)
+        mediaRadar.clear(tabID: tab.id)
         if let host {
             _ = host.closeTab(withID: tab.id)
             if tabsByID[tab.id] != nil { updateTabs(from: host) }
@@ -843,11 +845,29 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     }
 
     func browserHost(
+        _ host: any CrIOSBrowserHostV1,
+        tab: any CrIOSTabHostingV1,
+        didLoadResourceEvent event: [String: Any]
+    ) {
+        if let captured = mediaRadar.ingest(
+            rawEvent: event,
+            tabID: tab.tabID,
+            effectiveUserAgent: tab.effectiveUserAgent ?? nil
+        ) {
+            CuriumDiagnostics.shared.record(
+                "media-radar",
+                "[\(captured.kind.rawValue)] \(captured.url.host() ?? "")\(captured.url.path) mime=\(captured.mimeType ?? "-") status=\(captured.httpStatusCode) len=\(captured.contentLength)"
+            )
+        }
+    }
+
+    func browserHost(
         _ host: any CrIOSBrowserHostV1, tab: any CrIOSTabHostingV1,
         didCommitNavigationTo url: URL, navigationID _: Int64, isSameDocument: Bool, isReload _: Bool
     ) {
         if !isSameDocument {
             mediaPermissions.invalidate(tabID: tab.tabID)
+            mediaRadar.clear(tabID: tab.tabID)
             tabsByID[tab.tabID]?.dismissPDFSession()
         }
         guard reportsNavigationCommits else { return }
@@ -938,13 +958,23 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func browserHost(_ host: any CrIOSBrowserHostV1, didCreateDownload download: any CrIOSDownloadTaskV1) {
         let filename = CuriumDownloadStorage.sanitizedFilename(download.suggestedFilename)
-        if CuriumDownloadStorage.isPDF(
+        let isExplicit = download.isExplicitDownload ?? false
+        let isMainFrame = download.isMainFrame ?? true
+        let httpMethod = (download.httpMethod ?? "GET")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        let shouldPreviewPDFInline = CuriumDownloadStorage.isPDF(
             mimeType: download.mimeType,
             filename: filename,
             url: download.originalURL
-        ), let targetTab = (download.sourceTabID.flatMap { tabsByID[$0] }) ?? activeTab {
-            // Stream PDFs into an isolated temporary preview cache inside the tab so
-            // casually viewing a PDF never pollutes Documents/Curium/Downloads/.
+        ) && !isExplicit && isMainFrame && (httpMethod.isEmpty || httpMethod == "GET")
+
+        if shouldPreviewPDFInline,
+           let targetTab = (download.sourceTabID.flatMap { tabsByID[$0] }) ?? activeTab {
+            // Stream implicit main-frame GET PDFs into an isolated temporary preview cache
+            // inside the tab so casually viewing a PDF never pollutes Documents/Curium/Downloads/.
+            // Explicit downloads (<a download> / Content-Disposition: attachment), subframe
+            // downloads, and POST responses fall through to the explicit download banner.
             let session = CuriumTabPDFSession(
                 downloadTask: download,
                 cacheRoot: pdfPreviewCacheRootOverride,
@@ -1093,6 +1123,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         for (evictedID, evictedTab) in tabsByID where nextIndex[evictedID] == nil {
             evictedAny = true
             mediaPermissions.invalidate(tabID: evictedID)
+            mediaRadar.clear(tabID: evictedID)
             evictedTab.invalidate()
             historyByTabID.removeValue(forKey: evictedID)
             committedHistoryByTabID.removeValue(forKey: evictedID)

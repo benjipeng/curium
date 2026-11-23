@@ -287,7 +287,7 @@ struct CuriumFingerprintStudioSheet: View {
             Text("Active Engine Session")
         } footer: {
             if let caps = engineCapabilities, caps.supportsLaunchFingerprintConfig {
-                Text("Build 40 contract v\(caps.contractVersion) active (max \(caps.maxConfigBytes / 1024) KiB). One isolated profile runs per cold launch.")
+                Text("Engine contract v\(caps.contractVersion) active (max \(caps.maxConfigBytes / 1024) KiB). One isolated profile runs per cold launch.")
             } else {
                 Text("Profile changes are persisted locally and validated before Blink launches.")
             }
@@ -804,6 +804,7 @@ private struct CuriumFingerprintEditorView: View {
             }
             profileMetadataSection
             identitySlotsSection
+            antiFingerprintingSection
             hardwareAndGPUSection
             networkAndPrivacySection
             storageAndJSONSection
@@ -982,6 +983,84 @@ private struct CuriumFingerprintEditorView: View {
         } footer: {
             Text("Mobile and Desktop slots are frozen at launch; Request Desktop Site toggles between the two slots without mutating history.")
         }
+    }
+
+    private var antiFingerprintingSection: some View {
+        Section {
+            Toggle("Deterministic Per-Site Farbling", isOn: Binding(
+                get: { draft.fingerprintSeed != nil },
+                set: { enabled in
+                    if enabled {
+                        if draft.fingerprintSeed == nil {
+                            draft.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
+                        }
+                        if draft.farbling == nil {
+                            draft.farbling = .allEnabled
+                        }
+                    } else {
+                        draft.fingerprintSeed = nil
+                        draft.farbling = nil
+                    }
+                }
+            ))
+            .disabled(isReadOnly)
+            .accessibilityIdentifier("curium.studio.editor.farbling")
+
+            if let seed = draft.fingerprintSeed {
+                LabeledContent("Seed (HMAC-SHA256)") {
+                    Text("\(seed.prefix(12))…\(seed.suffix(8))")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+
+                if !isReadOnly {
+                    Button {
+                        draft.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
+                    } label: {
+                        Label("Rotate Farbling Seed", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
+
+                Toggle("Canvas 2D & OffscreenCanvas", isOn: farblingBinding(\.canvas))
+                    .disabled(isReadOnly)
+                Toggle("WebAudio (Offline & Analyser)", isOn: farblingBinding(\.audio))
+                    .disabled(isReadOnly)
+                Toggle("WebGL readPixels", isOn: farblingBinding(\.webgl))
+                    .disabled(isReadOnly)
+                Toggle("Canvas TextMetrics", isOn: farblingBinding(\.textMetrics))
+                    .disabled(isReadOnly)
+            }
+
+            Picker("Font Profile", selection: $draft.fontProfile) {
+                Text("Auto (Match Platform)").tag(CuriumFontProfile?.none)
+                ForEach(CuriumFontProfile.allCases) { option in
+                    Text(option.title).tag(CuriumFontProfile?.some(option))
+                }
+            }
+            .disabled(isReadOnly)
+
+            Picker("Speech Synthesis Voices", selection: $draft.hideSpeechVoices) {
+                Text("Auto (Hide on Non-Apple)").tag(Bool?.none)
+                Text("Hide Apple Voices").tag(Bool?.some(true))
+                Text("Native Voices").tag(Bool?.some(false))
+            }
+            .disabled(isReadOnly)
+        } header: {
+            Text("Native Anti-Fingerprinting (Build 41)")
+        } footer: {
+            Text("Perturbations are deterministic per top-level site in Blink C++ with zero JS prototype footprint. Non-Apple font profiles hide Apple-exclusive fonts while preserving CJK & Emoji glyph fallback.")
+        }
+    }
+
+    private func farblingBinding(_ keyPath: WritableKeyPath<CuriumFarblingSettings, Bool>) -> Binding<Bool> {
+        Binding(
+            get: { (draft.farbling ?? .allEnabled)[keyPath: keyPath] },
+            set: { newValue in
+                var current = draft.farbling ?? .allEnabled
+                current[keyPath: keyPath] = newValue
+                draft.farbling = current
+            }
+        )
     }
 
     private var hardwareAndGPUSection: some View {
@@ -1247,7 +1326,7 @@ private struct CuriumFingerprintEditorView: View {
                 copyEngineWireJSON()
             } label: {
                 Label(
-                    copiedLabel == "wire" ? "Copied Engine Wire JSON" : "Copy Engine Wire JSON (v1)",
+                    copiedLabel == "wire" ? "Copied Engine Wire JSON" : "Copy Engine Wire JSON (v\(CuriumFingerprintSchema.version))",
                     systemImage: copiedLabel == "wire" ? "checkmark.circle" : "curlybraces"
                 )
             }
@@ -1618,6 +1697,45 @@ private struct CuriumIdentitySlotEditorView: View {
                         .font(.caption.monospaced())
                         .disabled(isReadOnly)
                 }
+
+                Picker("WebGL Capability Profile", selection: $slot.webglProfile) {
+                    Text("Auto (Match Platform)").tag(CuriumWebGLProfile?.none)
+                    ForEach(CuriumWebGLProfile.allCases) { option in
+                        Text(option.title).tag(CuriumWebGLProfile?.some(option))
+                    }
+                }
+                .disabled(isReadOnly)
+
+                Picker("PDF Viewer Metadata", selection: $slot.pdfViewerEnabled) {
+                    Text("Auto (Desktop Only)").tag(Bool?.none)
+                    Text("Expose PDF Viewer").tag(Bool?.some(true))
+                    Text("Disabled").tag(Bool?.some(false))
+                }
+                .disabled(isReadOnly)
+            }
+
+            Section {
+                if let screen = slot.screen {
+                    LabeledContent("Web Screen", value: screen.summary)
+                } else {
+                    LabeledContent("Web Screen", value: "Native Device")
+                }
+
+                if !isReadOnly {
+                    Menu {
+                        Button("Native Device Screen") { slot.screen = nil }
+                        Button("1920×1080 Windows Desktop (avail 1040)") { slot.screen = .desktop1080pWindows }
+                        Button("1920×1080 Linux Desktop (avail 1050)") { slot.screen = .desktop1080pLinux }
+                        Button("1440×900 Laptop Desktop (avail 875)") { slot.screen = .desktop1440x900 }
+                        Button("412×915 Mobile Android (Pixel 9)") { slot.screen = .mobilePixel9 }
+                    } label: {
+                        Label("Choose Web Screen Preset…", systemImage: "display")
+                    }
+                }
+            } header: {
+                Text("Web-Exposed Screen Metrics")
+            } footer: {
+                Text("Applies strictly to Web Screen/MediaValues/outerHeight APIs without changing native iPhone Duo display layout.")
             }
         }
         .navigationTitle(title)
@@ -1667,7 +1785,7 @@ private struct CuriumFingerprintImportSheet: View {
                 } header: {
                     Text("Profile or Engine Wire JSON")
                 } footer: {
-                    Text("Accepts exported Curium profile JSON or Build 40 schemaVersion 1 engine payloads. Built-in IDs are protected from overwrite.")
+                    Text("Accepts exported Curium profile JSON or engine wire payloads (schemaVersion 1 or 2). Built-in IDs are protected from overwrite.")
                 }
 
                 if !errorMessages.isEmpty || !warningMessages.isEmpty {

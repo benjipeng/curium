@@ -1,13 +1,37 @@
 import Foundation
+import Security
 
-/// Schema version shared with `third_party/blink/public/common/curium/curium_fingerprint_config.h`.
+/// Schema versions shared with `third_party/blink/public/common/curium/curium_fingerprint_config.h`.
 enum CuriumFingerprintSchema {
-    static let version = 1
+    static let minSupportedVersion = 1
+    static let version = 2
     static let maxPayloadBytes = 65_536
     static let validDeviceMemoryBuckets: [Double] = [0.25, 0.5, 1, 2, 4, 8, 16, 32]
+    static let validColorDepths: Set<Int> = [24, 30, 32]
     static let validFormFactors: Set<String> = [
         "Desktop", "Automotive", "Mobile", "Tablet", "XR", "EInk", "Watch",
     ]
+
+    /// Generates a cryptographically random 32-byte (64 lowercase hex character)
+    /// deterministic farbling seed for Build 41+ profiles.
+    static func generateRandomSeedHex() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        if status != errSecSuccess {
+            for idx in bytes.indices {
+                bytes[idx] = UInt8.random(in: 0...255)
+            }
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func isValidSeedHex(_ hex: String) -> Bool {
+        guard hex.utf8.count == 64 else { return false }
+        return hex.unicodeScalars.allSatisfy { scalar in
+            let v = scalar.value
+            return (v >= 48 && v <= 57) || (v >= 65 && v <= 70) || (v >= 97 && v <= 102)
+        }
+    }
 }
 
 enum CuriumDefaultSlot: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -51,6 +75,85 @@ enum CuriumHoverType: String, Codable, CaseIterable, Identifiable, Sendable {
     }
 }
 
+enum CuriumFontProfile: String, Codable, CaseIterable, Identifiable, Sendable {
+    case native
+    case apple
+    case windows
+    case linux
+    case android
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .native: return "Native (Unfiltered)"
+        case .apple: return "Apple (macOS / iOS)"
+        case .windows: return "Windows (Filter Apple Fonts)"
+        case .linux: return "Linux (Filter Apple Fonts)"
+        case .android: return "Android (Filter Apple Fonts)"
+        }
+    }
+}
+
+enum CuriumWebGLProfile: String, Codable, CaseIterable, Identifiable, Sendable {
+    case native
+    case desktopWindows = "desktop_windows"
+    case desktopMacOS = "desktop_macos"
+    case desktopLinux = "desktop_linux"
+    case mobileAndroid = "mobile_android"
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .native: return "Native Apple Metal"
+        case .desktopWindows: return "Desktop Windows (D3D11)"
+        case .desktopMacOS: return "Desktop macOS"
+        case .desktopLinux: return "Desktop Linux (Mesa)"
+        case .mobileAndroid: return "Mobile Android"
+        }
+    }
+}
+
+struct CuriumScreenOverride: Codable, Equatable, Sendable {
+    var width: Int
+    var height: Int
+    var availWidth: Int?
+    var availHeight: Int?
+    var colorDepth: Int?
+
+    static let desktop1080pWindows = CuriumScreenOverride(
+        width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, colorDepth: 24
+    )
+    static let desktop1080pLinux = CuriumScreenOverride(
+        width: 1920, height: 1080, availWidth: 1920, availHeight: 1050, colorDepth: 24
+    )
+    static let desktop1440x900 = CuriumScreenOverride(
+        width: 1440, height: 900, availWidth: 1440, availHeight: 875, colorDepth: 24
+    )
+    static let mobilePixel9 = CuriumScreenOverride(
+        width: 412, height: 915, availWidth: 412, availHeight: 915, colorDepth: 24
+    )
+
+    var summary: String {
+        let aw = availWidth ?? width
+        let ah = availHeight ?? height
+        let depth = colorDepth ?? 24
+        return "\(width)×\(height) (avail \(aw)×\(ah), \(depth)-bit)"
+    }
+}
+
+struct CuriumFarblingSettings: Codable, Equatable, Sendable {
+    var canvas: Bool = true
+    var audio: Bool = true
+    var webgl: Bool = true
+    var textMetrics: Bool = true
+
+    static let allEnabled = CuriumFarblingSettings()
+
+    var enabledCount: Int {
+        [canvas, audio, webgl, textMetrics].filter { $0 }.count
+    }
+}
+
 enum CuriumWebRTCPolicy: String, Codable, CaseIterable, Identifiable, Sendable {
     case `default` = "default"
     case defaultPublicAndPrivateInterfaces = "default_public_and_private_interfaces"
@@ -73,8 +176,8 @@ struct CuriumBrandVersion: Codable, Equatable, Sendable {
     var version: String
 }
 
-/// Optional per-slot identity, input capability, and WebGL debug string spec.
-/// Any `nil` hardware/GPU/input field preserves authentic native device behavior.
+/// Optional per-slot identity, input capability, WebGL, and web-screen spec.
+/// Any `nil` hardware/GPU/input/screen field preserves authentic native device behavior.
 struct CuriumIdentitySlot: Codable, Equatable, Sendable {
     var uaString: String?
     var osCpu: String?
@@ -100,6 +203,13 @@ struct CuriumIdentitySlot: Codable, Equatable, Sendable {
     var hoverType: CuriumHoverType?
     var webglVendor: String?
     var webglRenderer: String?
+    // Build 41 (schemaVersion >= 2) per-slot web-exposed surfaces.
+    var screen: CuriumScreenOverride?
+    var webglProfile: CuriumWebGLProfile?
+    var webglMaxTextureSize: Int?
+    var webglMaxRenderbufferSize: Int?
+    var webglMaxCubeMapTextureSize: Int?
+    var pdfViewerEnabled: Bool?
 
     var hasWebGLOverride: Bool {
         webglVendor != nil || webglRenderer != nil
@@ -107,6 +217,18 @@ struct CuriumIdentitySlot: Codable, Equatable, Sendable {
 
     var hasInputOverride: Bool {
         maxTouchPoints != nil || pointerType != nil || hoverType != nil
+    }
+
+    /// Returns a Build 40 (`schemaVersion: 1`) compatible copy with v2-only keys stripped.
+    func strippedForSchemaV1() -> CuriumIdentitySlot {
+        var copy = self
+        copy.screen = nil
+        copy.webglProfile = nil
+        copy.webglMaxTextureSize = nil
+        copy.webglMaxRenderbufferSize = nil
+        copy.webglMaxCubeMapTextureSize = nil
+        copy.pdfViewerEnabled = nil
+        return copy
     }
 }
 
@@ -206,13 +328,27 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
     var enableDoNotTrack: Bool
     var enableGlobalPrivacyControl: Bool
     var hardware: CuriumHardwareOverrides
+    // Build 41 (schemaVersion >= 2) anti-fingerprinting configuration.
+    var fingerprintSeed: String? = nil
+    var farbling: CuriumFarblingSettings? = nil
+    var fontProfile: CuriumFontProfile? = nil
+    var hideSpeechVoices: Bool? = nil
 
     var usesNativeHardwareAndGPU: Bool {
         hardware.isNative && !mobile.hasWebGLOverride && !desktop.hasWebGLOverride
     }
 
-    /// Serializes strictly the engine wire schema (`schemaVersion: 1`) without UI metadata.
-    func makeEngineLaunchJSON(preferredSystemLanguages: [String] = Locale.preferredLanguages) throws -> Data {
+    var isFarblingActive: Bool {
+        guard let seed = fingerprintSeed, !seed.isEmpty else { return false }
+        return (farbling ?? .allEnabled).enabledCount > 0
+    }
+
+    /// Serializes strictly the engine wire schema (`schemaVersion: 2` by default, or `1` when
+    /// targeting a legacy Build 40 engine) without UI metadata.
+    func makeEngineLaunchJSON(
+        preferredSystemLanguages: [String] = Locale.preferredLanguages,
+        schemaVersion: Int = CuriumFingerprintSchema.version
+    ) throws -> Data {
         let resolvedLanguages: [String]
         if let explicit = languages, !explicit.isEmpty {
             resolvedLanguages = explicit
@@ -221,19 +357,28 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
             resolvedLanguages = normalized.split(separator: ",").map(String.init)
         }
 
+        let targetVersion = min(
+            CuriumFingerprintSchema.version,
+            max(CuriumFingerprintSchema.minSupportedVersion, schemaVersion)
+        )
+        let emitV2 = targetVersion >= 2
         let payload = EngineWirePayload(
-            schemaVersion: CuriumFingerprintSchema.version,
+            schemaVersion: targetVersion,
             revision: revision,
             profileId: id,
             defaultSlot: defaultSlot,
-            mobile: mobile,
-            desktop: desktop,
+            mobile: emitV2 ? mobile : mobile.strippedForSchemaV1(),
+            desktop: emitV2 ? desktop : desktop.strippedForSchemaV1(),
             languages: resolvedLanguages,
             proxy: proxy,
             webrtcIpHandlingPolicy: webrtcIpHandlingPolicy,
             enableDoNotTrack: enableDoNotTrack,
             enableGlobalPrivacyControl: enableGlobalPrivacyControl,
-            hardware: hardware
+            hardware: hardware,
+            fingerprintSeed: emitV2 ? fingerprintSeed : nil,
+            farbling: (emitV2 && fingerprintSeed != nil) ? (farbling ?? .allEnabled) : nil,
+            fontProfile: emitV2 ? fontProfile : nil,
+            hideSpeechVoices: emitV2 ? hideSpeechVoices : nil
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -253,6 +398,10 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
         let enableDoNotTrack: Bool
         let enableGlobalPrivacyControl: Bool
         let hardware: CuriumHardwareOverrides
+        let fingerprintSeed: String?
+        let farbling: CuriumFarblingSettings?
+        let fontProfile: CuriumFontProfile?
+        let hideSpeechVoices: Bool?
     }
 }
 
@@ -285,23 +434,36 @@ struct CuriumEngineFingerprintStatus: Equatable, Sendable {
 
 struct CuriumEngineFingerprintCapabilities: Equatable, Sendable {
     let contractVersion: Int
+    let supportedSchemaVersions: [Int]
     let maxConfigBytes: Int
     let features: [String: Bool]
     let activationScopes: [String: String]
 
     var supportsLaunchFingerprintConfig: Bool {
-        contractVersion >= CuriumFingerprintSchema.version
+        contractVersion >= CuriumFingerprintSchema.minSupportedVersion
+    }
+
+    var supportsNativeAntiFingerprinting: Bool {
+        contractVersion >= 2 || supportedSchemaVersions.contains(2)
     }
 
     init(dictionary: [String: Any]?) {
         guard let dictionary else {
             contractVersion = 0
+            supportedSchemaVersions = []
             maxConfigBytes = 0
             features = [:]
             activationScopes = [:]
             return
         }
         contractVersion = (dictionary["contractVersion"] as? NSNumber)?.intValue ?? 0
+        if let rawVersions = dictionary["supportedSchemaVersions"] as? [NSNumber] {
+            supportedSchemaVersions = rawVersions.map(\.intValue)
+        } else if contractVersion >= 1 {
+            supportedSchemaVersions = [contractVersion]
+        } else {
+            supportedSchemaVersions = []
+        }
         maxConfigBytes = (dictionary["maxConfigBytes"] as? NSNumber)?.intValue ?? 0
         if let rawFeatures = dictionary["features"] as? [String: Any] {
             var parsed: [String: Bool] = [:]

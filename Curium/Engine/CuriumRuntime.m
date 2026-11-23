@@ -238,12 +238,6 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
     changed |= CuriumMergeListSwitch(args, @"--disable-features", @",", @"SkiaGraphite");
 #endif
 
-    // Build 40 omits the strings for Blink's in-page permission controls.
-    // Disable the affected elements until the engine ships those strings.
-    // The standard media capture and geolocation APIs do not use these flags.
-    changed |= CuriumMergeListSwitch(args, @"--disable-blink-features", @",",
-                                    @"CameraAndMicrophoneElements,UserMediaElement,GeolocationElement");
-
     // Keep the engine from contacting Google unprompted: AI Mode eligibility
     // (www.google.com/async/folae) and the translate ranker stay off.
     changed |= CuriumMergeListSwitch(args, @"--disable-features", @",",
@@ -468,7 +462,6 @@ static void CuriumInstallHeadlessRuntimeGuards(void) {
         [[[NSUserDefaults standardUserDefaults] stringForKey:@"curium.jitMode"] copy];
     CuriumInstallCommandLineGuard();
     CuriumPrepareEarlyV8Jit(jitPref);
-    CuriumInstallPiPSkipHooks();
     Class metricsMediator = NSClassFromString(@"MetricsMediator");
     if (!metricsMediator) {
         CuriumRecordHookStatus(@"MetricsMediator No-Op", @"skipped",

@@ -85,6 +85,12 @@ enum CuriumFingerprintValidator {
             }
         }
 
+        if let seed = profile.fingerprintSeed {
+            if !CuriumFingerprintSchema.isValidSeedHex(seed) {
+                report.errors.append("fingerprintSeed must be a 64-character hexadecimal string.")
+            }
+        }
+
         if let data = try? profile.makeEngineLaunchJSON(), data.count > CuriumFingerprintSchema.maxPayloadBytes {
             report.errors.append("Serialized fingerprint payload exceeds 64 KiB engine limit.")
         }
@@ -168,6 +174,29 @@ enum CuriumFingerprintValidator {
         }
         if (slot.webglVendor == nil) != (slot.webglRenderer == nil) {
             report.warnings.append("\(name): set both webglVendor and webglRenderer together, or leave both empty for native Apple GPU.")
+        }
+        if let screen = slot.screen {
+            if !(240...16384).contains(screen.width) || !(240...16384).contains(screen.height) {
+                report.errors.append("\(name).screen width and height must be integers in 240...16384.")
+            }
+            let availW = screen.availWidth ?? screen.width
+            let availH = screen.availHeight ?? screen.height
+            if availW < 240 || availW > screen.width || availH < 240 || availH > screen.height {
+                report.errors.append("\(name).screen availWidth/availHeight must be in 240...width/height.")
+            }
+            let depth = screen.colorDepth ?? 24
+            if !CuriumFingerprintSchema.validColorDepths.contains(depth) {
+                report.errors.append("\(name).screen colorDepth must be 24, 30, or 32.")
+            }
+        }
+        for (limitName, limitVal) in [
+            ("webglMaxTextureSize", slot.webglMaxTextureSize),
+            ("webglMaxRenderbufferSize", slot.webglMaxRenderbufferSize),
+            ("webglMaxCubeMapTextureSize", slot.webglMaxCubeMapTextureSize),
+        ] {
+            if let limitVal, !(512...65536).contains(limitVal) {
+                report.errors.append("\(name).\(limitName) must be in 512...65536.")
+            }
         }
     }
 

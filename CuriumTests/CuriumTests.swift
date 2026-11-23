@@ -161,6 +161,9 @@ private final class MockDownloadTask: NSObject, CrIOSDownloadTaskV1 {
     let originalURL: URL?
     let suggestedFilename: String
     let mimeType: String?
+    var isExplicitDownload: Bool
+    var isMainFrame: Bool
+    var httpMethod: String
     var totalBytes: Int64
     var receivedBytes: Int64
     var state: CrIOSDownloadState
@@ -179,6 +182,9 @@ private final class MockDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         originalURL: URL? = nil,
         suggestedFilename: String,
         mimeType: String? = nil,
+        isExplicitDownload: Bool = false,
+        isMainFrame: Bool = true,
+        httpMethod: String = "GET",
         totalBytes: Int64 = -1,
         payloadToWrite: Data? = nil,
         errorToReturn: (any Error)? = nil,
@@ -189,6 +195,9 @@ private final class MockDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         self.originalURL = originalURL
         self.suggestedFilename = suggestedFilename
         self.mimeType = mimeType
+        self.isExplicitDownload = isExplicitDownload
+        self.isMainFrame = isMainFrame
+        self.httpMethod = httpMethod
         self.totalBytes = totalBytes >= 0 ? totalBytes : Int64(payloadToWrite?.count ?? -1)
         self.receivedBytes = 0
         self.state = .pending
@@ -518,7 +527,7 @@ struct CuriumFingerprintTests {
             let wireData = try preset.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US", "zh-Hans-CN"])
             #expect(wireData.count <= CuriumFingerprintSchema.maxPayloadBytes)
             let obj = try #require(JSONSerialization.jsonObject(with: wireData) as? [String: Any])
-            #expect((obj["schemaVersion"] as? Int) == 1)
+            #expect((obj["schemaVersion"] as? Int) == CuriumFingerprintSchema.version)
             #expect((obj["profileId"] as? String) == preset.id)
             // UI-only keys must never leak into the strict engine wire payload.
             #expect(obj["displayName"] == nil)
@@ -1611,425 +1620,238 @@ struct CuriumInlinePDFAndDownloadsTests {
     }
 }
 
-@Suite("PiP Skip Controls")
-struct CuriumPiPSkipHookTests {
+@Suite("Build 41 Contracts: Schema v2, PDFKit Handoff & Media Radar")
+struct CuriumBuild41ContractTests {
+    @Test("Schema v2 wire serialization includes anti-fingerprinting fields and v1 downgrade strips them cleanly")
+    func schemaV2WireAndV1Downgrade() throws {
+        let win = CuriumFingerprintPresets.windowsWorkstation
+        let v2Data = try win.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US"], schemaVersion: 2)
+        let v2Obj = try #require(JSONSerialization.jsonObject(with: v2Data) as? [String: Any])
+        #expect((v2Obj["schemaVersion"] as? Int) == 2)
+        #expect((v2Obj["fontProfile"] as? String) == "windows")
+        #expect((v2Obj["hideSpeechVoices"] as? Bool) == true)
+        let desktopV2 = try #require(v2Obj["desktop"] as? [String: Any])
+        #expect((desktopV2["webglProfile"] as? String) == "desktop_windows")
+        #expect((desktopV2["pdfViewerEnabled"] as? Bool) == true)
+        let screenV2 = try #require(desktopV2["screen"] as? [String: Any])
+        #expect((screenV2["width"] as? Int) == 1920)
+        #expect((screenV2["availHeight"] as? Int) == 1040)
 
-    @Test("Seekable duration classifies VOD vs live streams accurately")
-    func seekableDurationClassification() {
-        #expect(CuriumPiPIsSeekableDuration(120.5))
-        #expect(CuriumPiPIsSeekableDuration(0.5))
-        #expect(!CuriumPiPIsSeekableDuration(.nan))
-        #expect(!CuriumPiPIsSeekableDuration(.infinity))
-        #expect(!CuriumPiPIsSeekableDuration(-.infinity))
-        #expect(!CuriumPiPIsSeekableDuration(0.0))
-        #expect(!CuriumPiPIsSeekableDuration(-10.0))
+        let v1Data = try win.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US"], schemaVersion: 1)
+        let v1Obj = try #require(JSONSerialization.jsonObject(with: v1Data) as? [String: Any])
+        #expect((v1Obj["schemaVersion"] as? Int) == 1)
+        #expect(v1Obj["fontProfile"] == nil)
+        #expect(v1Obj["hideSpeechVoices"] == nil)
+        #expect(v1Obj["fingerprintSeed"] == nil)
+        let desktopV1 = try #require(v1Obj["desktop"] as? [String: Any])
+        #expect(desktopV1["screen"] == nil)
+        #expect(desktopV1["webglProfile"] == nil)
+        #expect(desktopV1["pdfViewerEnabled"] == nil)
+
+        let privacy = CuriumFingerprintPresets.privacyHardened
+        #expect(privacy.isFarblingActive)
+        let privData = try privacy.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US"], schemaVersion: 2)
+        let privObj = try #require(JSONSerialization.jsonObject(with: privData) as? [String: Any])
+        #expect((privObj["fingerprintSeed"] as? String)?.count == 64)
+        let farbling = try #require(privObj["farbling"] as? [String: Bool])
+        #expect(farbling["canvas"] == true)
+        #expect(farbling["audio"] == true)
+        #expect(farbling["webgl"] == true)
+        #expect(farbling["textMetrics"] == true)
     }
 
-    @Test("Position estimation handles playback rates, pause, clamping, and uninitialized timestamps")
-    func positionEstimationAndSkipTargetClamping() {
-        // Playing at 1.5x for 4 seconds from 10 s -> 16 s.
-        let playing = CuriumPiPEstimateMediaPosition(10.0, 120.0, false, 1.5, 100.0, 104.0)
-        #expect(abs(playing - 16.0) < 0.001)
+    @Test("Validator rejects bad fingerprintSeed, out-of-range screen metrics, and invalid WebGL limits")
+    func validatorEnforcesSchemaV2Bounds() {
+        var bad = CuriumFingerprintPresets.defaultAuthenticChrome
+        bad.id = "custom-v2-bad"
+        bad.isBuiltIn = false
+        bad.fingerprintSeed = "not-64-hex"
+        bad.desktop.screen = CuriumScreenOverride(width: 100, height: 800, availWidth: 900, availHeight: 800, colorDepth: 16)
+        bad.desktop.webglMaxTextureSize = 256
 
-        // Paused does not advance.
-        let paused = CuriumPiPEstimateMediaPosition(10.0, 120.0, true, 1.5, 100.0, 120.0)
-        #expect(abs(paused - 10.0) < 0.001)
+        let report = CuriumFingerprintValidator.validate(bad)
+        #expect(!report.isValid)
+        #expect(report.errors.contains { $0.contains("fingerprintSeed") })
+        #expect(report.errors.contains { $0.contains("desktop.screen width and height") })
+        #expect(report.errors.contains { $0.contains("availWidth/availHeight") })
+        #expect(report.errors.contains { $0.contains("colorDepth") })
+        #expect(report.errors.contains { $0.contains("webglMaxTextureSize") })
 
-        // Uninitialized wall time does not extrapolate.
-        let noWall = CuriumPiPEstimateMediaPosition(25.0, 120.0, false, 1.0, 0.0, 500.0)
-        #expect(abs(noWall - 25.0) < 0.001)
-
-        // Extrapolation clamps at duration.
-        let clamped = CuriumPiPEstimateMediaPosition(115.0, 120.0, false, 2.0, 100.0, 110.0)
-        #expect(abs(clamped - 120.0) < 0.001)
-
-        // Skip target clamps cleanly to [0, duration].
-        #expect(abs(CuriumPiPComputeSkipTarget(5.0, 120.0, -15.0) - 0.0) < 0.001)
-        #expect(abs(CuriumPiPComputeSkipTarget(112.0, 120.0, 15.0) - 120.0) < 0.001)
-        #expect(abs(CuriumPiPComputeSkipTarget(40.0, 120.0, 10.0) - 50.0) < 0.001)
+        let generatedSeed = CuriumFingerprintSchema.generateRandomSeedHex()
+        #expect(CuriumFingerprintSchema.isValidSeedHex(generatedSeed))
     }
 
-    @Test("Playable time range always contains controlTimebase across standard, live, and small/medium/high-PTS HLS epochs")
-    func playableTimeRangeContainment() {
-        // Live stream -> [0, +Inf)
-        let live = CuriumPiPComputePlayableTimeRange(.infinity, 10.0, 10.0)
-        #expect(CMTimeCompare(live.start, .zero) == 0)
-        #expect(live.duration == .positiveInfinity)
+    @Test("Store imports both schemaVersion 1 and schemaVersion 2 engine wire payloads")
+    func storeImportsV1AndV2Wire() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-v2-import-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = CuriumFingerprintStore(fileURL: dir.appending(path: "profiles.json"))
 
-        // Standard 0-based VOD -> [0, dur]
-        let standard = CuriumPiPComputePlayableTimeRange(600.0, 120.0, 120.2)
-        #expect(abs(CMTimeGetSeconds(standard.start) - 0.0) < 0.01)
-        #expect(abs(CMTimeGetSeconds(standard.duration) - 600.0) < 0.01)
-
-        // Small-PTS HLS offset (+15 s while dur = 600 s, estPos = 10 s, tb = 25 s).
-        let smallHLS = CuriumPiPComputePlayableTimeRange(600.0, 10.0, 25.0)
-        let smallStart = CMTimeGetSeconds(smallHLS.start)
-        let smallEnd = CMTimeGetSeconds(CMTimeRangeGetEnd(smallHLS))
-        #expect(abs(smallStart - 15.0) < 0.01)
-        #expect(abs(smallEnd - 615.0) < 0.01)
-        #expect(25.0 >= smallStart && 25.0 <= smallEnd)
-
-        // Medium-PTS HLS offset (+500 s while dur = 1200 s > tb, estPos = 10 s, tb = 510 s).
-        let medHLS = CuriumPiPComputePlayableTimeRange(1200.0, 10.0, 510.0)
-        let medStart = CMTimeGetSeconds(medHLS.start)
-        let medEnd = CMTimeGetSeconds(CMTimeRangeGetEnd(medHLS))
-        #expect(abs(medStart - 500.0) < 0.01)
-        #expect(abs(medEnd - 1700.0) < 0.01)
-        #expect(510.0 >= medStart && 510.0 <= medEnd)
-
-        // High-PTS CNN HLS/DVR stream (timebase at 46791 s while MediaPosition is 10 s / 120 s).
-        let cnnHLS = CuriumPiPComputePlayableTimeRange(120.0, 10.0, 46791.0)
-        let cnnStart = CMTimeGetSeconds(cnnHLS.start)
-        let cnnEnd = CMTimeGetSeconds(CMTimeRangeGetEnd(cnnHLS))
-        #expect(abs(cnnStart - 46781.0) < 0.01)
-        #expect(abs(cnnEnd - 46901.0) < 0.01)
-        #expect(46791.0 >= cnnStart && 46791.0 <= cnnEnd)
-
-        // High-PTS DVR stream (timebase at 36100 s while MediaPosition is 100 s / 600 s).
-        let dvr = CuriumPiPComputePlayableTimeRange(600.0, 100.0, 36100.0)
-        let dvrStart = CMTimeGetSeconds(dvr.start)
-        let dvrEnd = CMTimeGetSeconds(CMTimeRangeGetEnd(dvr))
-        #expect(abs(dvrStart - 36000.0) < 0.01)
-        #expect(abs(dvrEnd - 36600.0) < 0.01)
-        #expect(36100.0 >= dvrStart && 36100.0 <= dvrEnd)
-
-        // Slight end-of-stream overshoot never snaps range off controlTimebase.
-        let overshoot = CuriumPiPComputePlayableTimeRange(60.0, 60.0, 62.5)
-        #expect(62.5 >= CMTimeGetSeconds(overshoot.start) && 62.5 <= CMTimeGetSeconds(CMTimeRangeGetEnd(overshoot)))
-
-        // Unprimed 0 s timebase mid-stream (estPos = 45 s / 600 s) MUST keep start == 0 (never negative!).
-        let unprimed = CuriumPiPComputePlayableTimeRange(600.0, 45.0, 0.0)
-        #expect(abs(CMTimeGetSeconds(unprimed.start) - 0.0) < 0.01)
-        #expect(abs(CMTimeGetSeconds(unprimed.duration) - 600.0) < 0.01)
-
-        // Negative initial PTS stays clamped at non-negative start 0.
-        let neg = CuriumPiPComputePlayableTimeRange(60.0, 0.0, -0.05)
-        #expect(CMTimeGetSeconds(neg.start) >= 0.0)
-        #expect(CMTimeGetSeconds(CMTimeRangeGetEnd(neg)) >= 59.99)
-
-        // Unprimed 0 s timebase at 100 s does not fabricate a negative offset.
-        #expect(abs(CuriumPiPInferTimebaseOffset(0.0, 100.0) - 0.0) < 0.001)
-        #expect(abs(CuriumPiPInferTimebaseOffset(36100.0, 100.0) - 36000.0) < 0.001)
-        #expect(abs(CuriumPiPInferTimebaseOffset(46791.0, 10.0) - 46781.0) < 0.001)
+        let seed = CuriumFingerprintSchema.generateRandomSeedHex()
+        let v2JSON = """
+        {
+          "schemaVersion": 2,
+          "revision": 3,
+          "profileId": "lab-v2",
+          "defaultSlot": "desktop",
+          "mobile": {},
+          "desktop": {
+            "platform": "Windows",
+            "navigatorPlatform": "Win32",
+            "webglProfile": "desktop_windows",
+            "pdfViewerEnabled": true,
+            "screen": { "width": 1920, "height": 1080, "availWidth": 1920, "availHeight": 1040, "colorDepth": 24 }
+          },
+          "languages": ["en-US", "en"],
+          "proxy": { "mode": "system" },
+          "webrtcIpHandlingPolicy": "default_public_interface_only",
+          "enableDoNotTrack": false,
+          "enableGlobalPrivacyControl": true,
+          "hardware": {},
+          "fingerprintSeed": "\(seed)",
+          "farbling": { "canvas": true, "audio": true, "webgl": true, "textMetrics": false },
+          "fontProfile": "windows",
+          "hideSpeechVoices": true
+        }
+        """
+        let report = try store.importProfileJSON(Data(v2JSON.utf8))
+        #expect(report.isValid, "Errors: \(report.errors)")
+        let imported = try #require(store.profiles.first { $0.id == "lab-v2" })
+        #expect(imported.fingerprintSeed == seed)
+        #expect(imported.farbling?.textMetrics == false)
+        #expect(imported.fontProfile == .windows)
+        #expect(imported.hideSpeechVoices == true)
+        #expect(imported.desktop.screen?.availHeight == 1040)
+        #expect(imported.desktop.webglProfile == .desktopWindows)
+        #expect(imported.desktop.pdfViewerEnabled == true)
     }
 
-    @Test("Skip tracker coalesces rapid multi-taps across 3.5 s guard, preserves preSeekPts, and resets across generations")
-    func skipTrackerCoalescingAndSnapBackGuard() {
-        let tracker = CuriumPiPSkipTracker()
-        tracker.noteGeneration(1)
+    @Test("Build 41 PDFKit handoff honors isExplicitDownload, isMainFrame, and httpMethod")
+    @MainActor
+    func pdfDownloadMetadataRouting() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-b41-pdf-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
 
-        #expect(tracker.evaluateRenderFramePTS(100.0, forGeneration: 1, now: 999.9) == .renderNormal)
-        #expect(abs(tracker.lastRenderedPts - 100.0) < 0.001)
-
-        tracker.recordPlaybackUpdate(
-            withGeneration: 1,
-            paused: false,
-            rate: 1.0,
-            hasPosition: true,
-            positionSeconds: 100.0,
-            durationSeconds: 600.0,
-            now: 1000.0
+        let host = MockBrowserHost()
+        let tab = MockTabHost(tabID: "t1", url: URL(string: "https://example.com"))
+        host.tabs = [tab]
+        host.activeTab = tab
+        let store = CuriumBrowserStore(
+            host: host,
+            downloadsRoot: dir.appending(path: "Downloads", directoryHint: .isDirectory),
+            pdfPreviewCacheRoot: dir.appending(path: "PDFCache", directoryHint: .isDirectory)
         )
 
-        // Rapid 3x +10 s multi-tap while playing (100 -> ~110 -> ~120.2 -> ~130.4).
-        // Original preSeekPts (100.0) must be preserved across all three taps while
-        // expectedTargetPts advances cleanly.
-        var tb1 = 0.0
-        let t1 = tracker.beginSkip(
-            withGeneration: 1, deltaSeconds: 10.0, fallbackPositionSec: 100.0,
-            durationSeconds: 600.0, paused: false, playbackRate: 1.0,
-            timebaseSeconds: 100.0, now: 1000.0, outTargetTimebaseSeconds: &tb1
+        // 1. Explicit download (<a download> / Content-Disposition: attachment) -> Download Banner, NOT inline preview.
+        let explicitPDF = MockDownloadTask(
+            sourceTabID: "t1",
+            originalURL: URL(string: "https://example.com/invoice.pdf"),
+            suggestedFilename: "invoice.pdf",
+            mimeType: "application/pdf",
+            isExplicitDownload: true,
+            isMainFrame: true,
+            httpMethod: "GET"
         )
-        #expect(abs(t1 - 110.0) < 0.01)
-        #expect(abs(tb1 - 110.0) < 0.01)
-        #expect(tracker.hasPendingSeek)
-        #expect(tracker.isSeekGuardActive)
-        #expect(tracker.isRenderSeekGuardActive)
-        #expect(abs(tracker.preSeekPts - 100.0) < 0.01)
-        #expect(abs(tracker.expectedTargetPts - 110.0) < 0.01)
+        store.browserHost(host, didCreateDownload: explicitPDF)
+        #expect(store.activeTab?.pdfSession == nil)
+        #expect(store.activeDownloadBanner?.id == explicitPDF.downloadID)
+        #expect(store.activeDownloadBanner?.isExplicitDownload == true)
 
-        var tb2 = 0.0
-        let t2 = tracker.beginSkip(
-            withGeneration: 1, deltaSeconds: 10.0, fallbackPositionSec: 100.0,
-            durationSeconds: 600.0, paused: false, playbackRate: 1.0,
-            timebaseSeconds: 110.2, now: 1000.2, outTargetTimebaseSeconds: &tb2
+        // 2. Subframe PDF download -> Download Banner, never hijacks main tab.
+        let subframePDF = MockDownloadTask(
+            sourceTabID: "t1",
+            originalURL: URL(string: "https://example.com/embed.pdf"),
+            suggestedFilename: "embed.pdf",
+            mimeType: "application/pdf",
+            isExplicitDownload: false,
+            isMainFrame: false,
+            httpMethod: "GET"
         )
-        #expect(abs(t2 - 120.2) < 0.01)
-        #expect(abs(tracker.preSeekPts - 100.0) < 0.01)
-        #expect(abs(tracker.expectedTargetPts - 120.2) < 0.01)
+        store.browserHost(host, didCreateDownload: subframePDF)
+        #expect(store.activeTab?.pdfSession == nil)
+        #expect(store.activeDownloadBanner?.id == subframePDF.downloadID)
+        #expect(store.activeDownloadBanner?.isMainFrame == false)
 
-        var tb3 = 0.0
-        let t3 = tracker.beginSkip(
-            withGeneration: 1, deltaSeconds: 10.0, fallbackPositionSec: 100.0,
-            durationSeconds: 600.0, paused: false, playbackRate: 1.0,
-            timebaseSeconds: 120.4, now: 1000.4, outTargetTimebaseSeconds: &tb3
+        // 3. POST PDF response -> Download Banner (never lost on Back/reload).
+        let postPDF = MockDownloadTask(
+            sourceTabID: "t1",
+            originalURL: URL(string: "https://example.com/report.pdf"),
+            suggestedFilename: "report.pdf",
+            mimeType: "application/pdf",
+            isExplicitDownload: false,
+            isMainFrame: true,
+            httpMethod: "POST"
         )
-        #expect(abs(t3 - 130.4) < 0.01)
-        #expect(abs(tracker.preSeekPts - 100.0) < 0.01)
-        #expect(abs(tracker.expectedTargetPts - 130.4) < 0.01)
+        store.browserHost(host, didCreateDownload: postPDF)
+        #expect(store.activeTab?.pdfSession == nil)
+        #expect(store.activeDownloadBanner?.id == postPDF.downloadID)
+        #expect(store.activeDownloadBanner?.httpMethod == "POST")
 
-        // In-flight stale pre-seek MediaPosition (100.5 s) does not poison estimatedPosition.
-        tracker.recordPlaybackUpdate(
-            withGeneration: 1, paused: false, rate: 1.0, hasPosition: true,
-            positionSeconds: 100.5, durationSeconds: 600.0, now: 1000.5
+        // 4. Implicit main-frame GET PDF -> inline PDFKit preview.
+        let inlinePDF = MockDownloadTask(
+            sourceTabID: "t1",
+            originalURL: URL(string: "https://example.com/paper.pdf"),
+            suggestedFilename: "paper.pdf",
+            mimeType: "application/pdf",
+            isExplicitDownload: false,
+            isMainFrame: true,
+            httpMethod: "GET",
+            holdInProgressUntilCancelled: true
         )
-        #expect(tracker.hasPendingSeek)
-        let estDuringGuard = tracker.estimatedPosition(
-            withGeneration: 1, fallbackPositionSec: 100.5, durationSeconds: 600.0,
-            paused: false, playbackRate: 1.0, now: 1000.5
-        )
-        #expect(abs(estDuringGuard - 130.5) < 0.05)
-
-        // Guard remains active across real HLS segment latency (e.g., +2.2 s inside 3.5 s window),
-        // continuing to drop stale pre-seek frames near 100 s.
-        #expect(tracker.evaluateRenderFramePTS(101.8, forGeneration: 1, now: 1002.6) == .dropStalePreSeek)
-        #expect(tracker.isRenderSeekGuardActive)
-
-        // Post-seek frame near target (132.7 s) lands, flushes, and disarms render guard.
-        #expect(tracker.evaluateRenderFramePTS(132.7, forGeneration: 1, now: 1002.7) == .flushAndRenderPostSeek)
-        #expect(!tracker.isRenderSeekGuardActive)
-        #expect(abs(tracker.lastRenderedPts - 132.7) < 0.01)
-
-        // Post-seek MediaPosition landing at 132.8 s clears optimistic seek & guard.
-        tracker.recordPlaybackUpdate(
-            withGeneration: 1, paused: false, rate: 1.0, hasPosition: true,
-            positionSeconds: 132.8, durationSeconds: 600.0, now: 1002.8
-        )
-        #expect(!tracker.hasPendingSeek)
-        #expect(!tracker.isSeekGuardActive)
-
-        // Guard expires cleanly after 3.5 s and generation change resets active guards.
-        _ = tracker.beginSkip(
-            withGeneration: 1, deltaSeconds: -10.0, fallbackPositionSec: 132.8,
-            durationSeconds: 600.0, paused: true, playbackRate: 0.0,
-            timebaseSeconds: 132.8, now: 1010.0, outTargetTimebaseSeconds: nil
-        )
-        #expect(tracker.isRenderSeekGuardActive)
-        #expect(tracker.evaluateRenderFramePTS(132.8, forGeneration: 1, now: 1013.4) == .dropStalePreSeek)
-        #expect(tracker.evaluateRenderFramePTS(132.8, forGeneration: 1, now: 1013.6) == .renderNormal)
-        #expect(!tracker.isSeekGuardActive)
-
-        _ = tracker.beginSkip(
-            withGeneration: 1, deltaSeconds: -10.0, fallbackPositionSec: 132.8,
-            durationSeconds: 600.0, paused: true, playbackRate: 0.0,
-            timebaseSeconds: 132.8, now: 1020.0, outTargetTimebaseSeconds: nil
-        )
-        tracker.noteGeneration(2)
-        #expect(!tracker.hasPendingSeek)
-        #expect(!tracker.isSeekGuardActive)
-        #expect(!tracker.isRenderSeekGuardActive)
+        store.browserHost(host, didCreateDownload: inlinePDF)
+        #expect(store.activeTab?.pdfSession != nil)
+        store.activeTab?.dismissPDFSession()
     }
 
-    @Test("Buffering paused == NO with rate 0.0 keeps render seek guard alive and does not stall estimation")
-    func bufferingZeroRatePreservesRenderGuardAndPlaybackRate() {
-        let tracker = CuriumPiPSkipTracker()
-        tracker.noteGeneration(1)
+    @Test("CuriumMediaRadar classifies HLS/DASH/video/audio, deduplicates, captures UA, and clears on navigation")
+    @MainActor
+    func mediaRadarIngestAndLifecycle() throws {
+        let host = MockBrowserHost()
+        let tab = MockTabHost(tabID: "t1", url: URL(string: "https://video.example/watch"))
+        host.tabs = [tab]
+        host.activeTab = tab
+        let store = CuriumBrowserStore(host: host)
 
-        // Resume from pause without a fresh MediaPosition (cached rate == 0.0).
-        tracker.recordPlaybackUpdate(
-            withGeneration: 1, paused: true, rate: 0.0, hasPosition: true,
-            positionSeconds: 50.0, durationSeconds: 300.0, now: 2000.0
+        let hlsURL = try #require(URL(string: "https://cdn.example/master.m3u8"))
+        let mp4URL = try #require(URL(string: "https://cdn.example/clip.mp4"))
+        let errURL = try #require(URL(string: "https://cdn.example/missing.mp4"))
+        let jsonURL = try #require(URL(string: "https://api.example/data.json"))
+
+        // Non-media JSON and 404 video are ignored.
+        #expect(store.mediaRadar.ingest(rawEvent: ["url": jsonURL, "mimeType": "application/json", "httpStatusCode": 200], tabID: "t1", effectiveUserAgent: "CuriumTest/1") == nil)
+        #expect(store.mediaRadar.ingest(rawEvent: ["url": errURL, "mimeType": "video/mp4", "httpStatusCode": 404], tabID: "t1", effectiveUserAgent: "CuriumTest/1") == nil)
+
+        // HLS & MP4 are captured with UA and deduplicated.
+        let e1 = try #require(store.mediaRadar.ingest(
+            rawEvent: ["url": hlsURL, "mimeType": "application/vnd.apple.mpegurl", "httpStatusCode": 200, "contentLength": 4096, "requestDestination": "empty"],
+            tabID: "t1",
+            effectiveUserAgent: "CuriumTest/160"
+        ))
+        #expect(e1.kind == .hls)
+        #expect(e1.effectiveUserAgent == "CuriumTest/160")
+
+        store.browserHost(host, tab: tab, didLoadResourceEvent: [
+            "url": mp4URL,
+            "mimeType": "video/mp4",
+            "httpStatusCode": 206,
+            "contentLength": 1_048_576,
+            "requestDestination": "video",
+        ])
+        // Re-ingesting same HLS URL updates in place without duplicating.
+        _ = store.mediaRadar.ingest(
+            rawEvent: ["url": hlsURL, "mimeType": "application/vnd.apple.mpegurl", "httpStatusCode": 200, "contentLength": 8192, "requestDestination": "empty"],
+            tabID: "t1",
+            effectiveUserAgent: "CuriumTest/160"
         )
-        tracker.recordPlaybackUpdate(
-            withGeneration: 1, paused: false, rate: 0.0, hasPosition: false,
-            positionSeconds: 0.0, durationSeconds: 300.0, now: 2020.0
-        )
-        let resumedPos = tracker.estimatedPosition(
-            withGeneration: 1, fallbackPositionSec: 50.0, durationSeconds: 300.0,
-            paused: false, playbackRate: 0.0, now: 2022.0
-        )
-        #expect(abs(resumedPos - 52.0) < 0.01)
+        #expect(store.mediaRadar.events(for: "t1").count == 2)
 
-        // Seed rendered frame and skip +15 s.
-        #expect(tracker.evaluateRenderFramePTS(52.0, forGeneration: 1, now: 2022.0) == .renderNormal)
-        var skipTb = 0.0
-        let target = tracker.beginSkip(
-            withGeneration: 1, deltaSeconds: 15.0, fallbackPositionSec: 52.0,
-            durationSeconds: 300.0, paused: false, playbackRate: 0.0,
-            timebaseSeconds: 52.0, now: 2022.0, outTargetTimebaseSeconds: &skipTb
-        )
-        #expect(abs(target - 67.0) < 0.01)
-        #expect(tracker.isRenderSeekGuardActive)
+        // Same-document navigation preserves captured media; cross-document navigation clears it.
+        store.browserHost(host, tab: tab, didCommitNavigationTo: URL(string: "https://video.example/watch#t=10")!, navigationID: 1, isSameDocument: true, isReload: false)
+        #expect(store.mediaRadar.events(for: "t1").count == 2)
 
-        // Blink emits buffering MediaPosition(position = 67.0, playback_rate = 0.0, paused = NO).
-        // Must accept target position into MediaPosition state WITHOUT disarming render seek guard
-        // or freezing estimatedPosition at 0.0x.
-        tracker.recordPlaybackUpdate(
-            withGeneration: 1, paused: false, rate: 0.0, hasPosition: true,
-            positionSeconds: 67.0, durationSeconds: 300.0, now: 2022.4
-        )
-        #expect(!tracker.hasPendingSeek)
-        #expect(tracker.isRenderSeekGuardActive)
-        #expect(tracker.isSeekGuardActive)
-
-        let estWhileBuffering = tracker.estimatedPosition(
-            withGeneration: 1, fallbackPositionSec: 67.0, durationSeconds: 300.0,
-            paused: false, playbackRate: 0.0, now: 2023.4
-        )
-        #expect(abs(estWhileBuffering - 68.0) < 0.02)
-
-        // Stale pre-seek frame arriving during buffering (at +1.5 s) MUST still be dropped!
-        #expect(tracker.evaluateRenderFramePTS(52.4, forGeneration: 1, now: 2023.5) == .dropStalePreSeek)
-        #expect(tracker.isRenderSeekGuardActive)
-
-        // Post-seek frame landing disarms render seek guard.
-        #expect(tracker.evaluateRenderFramePTS(68.6, forGeneration: 1, now: 2023.8) == .flushAndRenderPostSeek)
-        #expect(!tracker.isRenderSeekGuardActive)
-    }
-
-    @Test("0-based and high-PTS HLS (46791 s) stale pre-seek drops, coarse landings, and multi-tap preservation")
-    func zeroBasedAndHighPTSHLSFrameFiltering() {
-        let tracker = CuriumPiPSkipTracker()
-        tracker.noteGeneration(7)
-
-        // Seed CNN-style high-PTS HLS playback: dur = 120 s, pos = 10 s, pts = 46791 s.
-        #expect(tracker.evaluateRenderFramePTS(46791.0, forGeneration: 7, now: 3000.0) == .renderNormal)
-        tracker.recordPlaybackUpdate(
-            withGeneration: 7, paused: false, rate: 1.0, hasPosition: true,
-            positionSeconds: 10.0, durationSeconds: 120.0, now: 3000.0
-        )
-
-        // Rapid 2x +15 s skip -> pos 10 -> 25 -> ~40.2 (tb ~46806 -> ~46821.2),
-        // preserving preSeekPts == 46791.0 across both taps.
-        var tb1 = 0.0
-        _ = tracker.beginSkip(
-            withGeneration: 7, deltaSeconds: 15.0, fallbackPositionSec: 10.0,
-            durationSeconds: 120.0, paused: false, playbackRate: 1.0,
-            timebaseSeconds: 46791.0, now: 3000.0, outTargetTimebaseSeconds: &tb1
-        )
-        #expect(abs(tb1 - 46806.0) < 0.01)
-        #expect(abs(tracker.preSeekPts - 46791.0) < 0.01)
-
-        var tb2 = 0.0
-        let target2 = tracker.beginSkip(
-            withGeneration: 7, deltaSeconds: 15.0, fallbackPositionSec: 10.0,
-            durationSeconds: 120.0, paused: false, playbackRate: 1.0,
-            timebaseSeconds: 46806.2, now: 3000.2, outTargetTimebaseSeconds: &tb2
-        )
-        #expect(abs(target2 - 40.2) < 0.01)
-        #expect(abs(tb2 - 46821.2) < 0.01)
-        #expect(abs(tracker.preSeekPts - 46791.0) < 0.01)
-        #expect(abs(tracker.expectedTargetPts - 46821.2) < 0.01)
-
-        // Buffering update at target (rate = 0.0) does not disarm render guard.
-        tracker.recordPlaybackUpdate(
-            withGeneration: 7, paused: false, rate: 0.0, hasPosition: true,
-            positionSeconds: 40.2, durationSeconds: 120.0, now: 3000.8
-        )
-        #expect(tracker.isRenderSeekGuardActive)
-
-        // Pre-seek HLS frames near 46791 s are dropped cleanly.
-        #expect(tracker.evaluateRenderFramePTS(46791.6, forGeneration: 7, now: 3001.2) == .dropStalePreSeek)
-        #expect(tracker.evaluateRenderFramePTS(46792.1, forGeneration: 7, now: 3001.6) == .dropStalePreSeek)
-
-        // Coarse HLS keyframe landing (e.g. 46818.0 s vs expected 46822.8 s) is accepted and flushes!
-        #expect(tracker.evaluateRenderFramePTS(46818.0, forGeneration: 7, now: 3001.8) == .flushAndRenderPostSeek)
-        #expect(!tracker.isRenderSeekGuardActive)
-        #expect(abs(tracker.lastRenderedPts - 46818.0) < 0.01)
-
-        let hlsRange = CuriumPiPComputePlayableTimeRange(120.0, 40.2, 46818.0)
-        #expect(46818.0 >= CMTimeGetSeconds(hlsRange.start))
-        #expect(46818.0 <= CMTimeGetSeconds(CMTimeRangeGetEnd(hlsRange)))
-
-        // Backward HLS skip (46818 -> 46803) drops pre-seek 46818.2 and accepts 46800.5 coarse keyframe.
-        tracker.recordPlaybackUpdate(
-            withGeneration: 7, paused: false, rate: 1.0, hasPosition: true,
-            positionSeconds: 37.0, durationSeconds: 120.0, now: 3002.0
-        )
-        var backTb = 0.0
-        _ = tracker.beginSkip(
-            withGeneration: 7, deltaSeconds: -15.0, fallbackPositionSec: 37.0,
-            durationSeconds: 120.0, paused: false, playbackRate: 1.0,
-            timebaseSeconds: 46818.0, now: 3002.0, outTargetTimebaseSeconds: &backTb
-        )
-        #expect(tracker.evaluateRenderFramePTS(46818.3, forGeneration: 7, now: 3002.5) == .dropStalePreSeek)
-        #expect(tracker.evaluateRenderFramePTS(46800.5, forGeneration: 7, now: 3003.1) == .flushAndRenderPostSeek)
-    }
-
-    @Test("Backward (< last - 0.05 s) and forward (> 1.5 s) PTS discontinuities trigger flush detection, plus notReady counter")
-    func discontinuityFlushAndNotReadyCounter() {
-        let tracker = CuriumPiPSkipTracker()
-        tracker.noteGeneration(3)
-
-        // Normal monotonic progression + tiny jitter under 0.05 s.
-        #expect(tracker.evaluateRenderFramePTS(100.00, forGeneration: 3, now: 4000.00) == .renderNormal)
-        #expect(tracker.evaluateRenderFramePTS(100.03, forGeneration: 3, now: 4000.03) == .renderNormal)
-        #expect(tracker.evaluateRenderFramePTS(100.00, forGeneration: 3, now: 4000.06) == .renderNormal)
-
-        // Backward PTS jump > 0.05 s (e.g. webpage scrub or <video loop> restart) triggers flush.
-        #expect(tracker.evaluateRenderFramePTS(99.90, forGeneration: 3, now: 4000.10) == .flushDiscontinuity)
-        #expect(abs(tracker.lastRenderedPts - 99.90) < 0.001)
-
-        // Forward PTS jump > 1.5 s triggers flush.
-        #expect(tracker.evaluateRenderFramePTS(101.60, forGeneration: 3, now: 4000.20) == .flushDiscontinuity)
-        #expect(abs(tracker.lastRenderedPts - 101.60) < 0.001)
-
-        // Not-ready counter increments deterministically and resets on clear or generation change.
-        #expect(tracker.recordNotReadyFrame(forGeneration: 3) == 1)
-        #expect(tracker.recordNotReadyFrame(forGeneration: 3) == 2)
-        tracker.resetNotReadyCount(forGeneration: 3)
-        #expect(tracker.recordNotReadyFrame(forGeneration: 3) == 1)
-        tracker.noteGeneration(4)
-        #expect(tracker.recordNotReadyFrame(forGeneration: 4) == 1)
-    }
-
-    @Test("Coalesced setPlaying cancels AVKit's transient pause-before-skip without blocking genuine pause/play")
-    func coalescedSetPlayingSkipRoundTripAndGenuinePause() {
-        let tracker = CuriumPiPSkipTracker()
-        tracker.noteGeneration(1)
-
-        // 1. AVKit seekByTimeInterval: while playing (paused == false):
-        //    setPlaying(NO) -> skipByInterval -> completionHandler -> setPlaying(YES).
-        var shouldSchedule1 = ObjCBool(false)
-        let token1 = tracker.recordSetPlaying(false, currentPaused: false, forGeneration: 1, shouldScheduleFlush: &shouldSchedule1)
-        #expect(shouldSchedule1.boolValue)
-        // Skip sees true pre-seek playing state (paused == false) despite _mainPlaybackPaused flipped synchronously.
-        #expect(tracker.effectivePausedForSkip(withCurrentPaused: true, generation: 1) == false)
-
-        // completionHandler toggles back to playing == true in the same runloop turn -> cancels cleanly.
-        var shouldSchedule2 = ObjCBool(true)
-        _ = tracker.recordSetPlaying(true, currentPaused: true, forGeneration: 1, shouldScheduleFlush: &shouldSchedule2)
-        #expect(!shouldSchedule2.boolValue)
-
-        // Deferred flush for token1 becomes a no-op (never sends Pause() to Chromium!).
-        var flushedPlaying = ObjCBool(true)
-        #expect(!tracker.consumePendingSetPlaying(forToken: token1, generation: 1, outPlaying: &flushedPlaying))
-
-        // 2. Genuine user Pause button tap while playing (no skip follows):
-        var shouldSchedulePause = ObjCBool(false)
-        let pauseToken = tracker.recordSetPlaying(false, currentPaused: false, forGeneration: 1, shouldScheduleFlush: &shouldSchedulePause)
-        #expect(shouldSchedulePause.boolValue)
-        var dispatchedPause = ObjCBool(true)
-        #expect(tracker.consumePendingSetPlaying(forToken: pauseToken, generation: 1, outPlaying: &dispatchedPause))
-        #expect(dispatchedPause.boolValue == false)
-        // Re-consuming the same token is idempotent false.
-        #expect(!tracker.consumePendingSetPlaying(forToken: pauseToken, generation: 1, outPlaying: &dispatchedPause))
-
-        // 3. Genuine user Play button tap while paused:
-        var shouldSchedulePlay = ObjCBool(false)
-        let playToken = tracker.recordSetPlaying(true, currentPaused: true, forGeneration: 1, shouldScheduleFlush: &shouldSchedulePlay)
-        #expect(shouldSchedulePlay.boolValue)
-        var dispatchedPlay = ObjCBool(false)
-        #expect(tracker.consumePendingSetPlaying(forToken: playToken, generation: 1, outPlaying: &dispatchedPlay))
-        #expect(dispatchedPlay.boolValue == true)
-
-        // 4. Skip while genuinely paused preserves paused == true.
-        #expect(tracker.effectivePausedForSkip(withCurrentPaused: true, generation: 1) == true)
-
-        // 5. Generation change invalidates any in-flight deferred setPlaying flush.
-        var shouldScheduleStale = ObjCBool(false)
-        let staleToken = tracker.recordSetPlaying(false, currentPaused: false, forGeneration: 1, shouldScheduleFlush: &shouldScheduleStale)
-        #expect(shouldScheduleStale.boolValue)
-        tracker.noteGeneration(2)
-        #expect(!tracker.consumePendingSetPlaying(forToken: staleToken, generation: 1, outPlaying: nil))
-    }
-
-    @Test("CuriumInstallPiPSkipHooks fails closed cleanly when CuriumPiPBridge is absent")
-    func installHookFailsClosedWithoutEngine() {
-        CuriumInstallPiPSkipHooks()
-        let statuses = CuriumDiagnostics.shared.hookStatuses()
-        let pipHook = statuses.first { $0.name == "PiP Skip Controls" }
-        #expect(pipHook != nil)
-        #expect(pipHook?.status == "skipped")
+        store.browserHost(host, tab: tab, didCommitNavigationTo: URL(string: "https://video.example/other")!, navigationID: 2, isSameDocument: false, isReload: false)
+        #expect(store.mediaRadar.events(for: "t1").isEmpty)
     }
 }

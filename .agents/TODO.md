@@ -8,20 +8,21 @@ the pinned engine first, translate to `patches/` once proven.
 ## Pinned
 
 - **Repository:** `benjipeng/curium` (renamed from `benjipeng/chromium-blink-ios`).
-- **Engine:** Build 40, `Kernel.lock` → `8b550ce` (run `44939797575`, artifact
-  `14723972534`, Chromium `160.0.8171.0`), patches `0001`–`0106`, with separate
+- **Engine:** Build 41, `Kernel.lock` → `b95f677` (run `45092671606`, artifact
+  `14784534096`, Chromium `160.0.8171.0`), patches `0001`–`0110`, with separate
   unstripped symbols artifact (`Chromium-Blink-160.0.8171.0-arm64-symbols`, ID
-  `14724061921`).
+  `14784852087`). GHCR cache packages migrated to `ghcr.io/benjipeng/curium/*`.
 - **App / On `ac_duo`:** `Curium-0.1.11-b15-arm64.ipa` (Build 40 + native Swift
   Fingerprint Profile Studio, `eb127cb`, verified on `iphone_duo_27_2` Simulator
-  and tested on `ac_duo` via LiveContainer).
-- **Local candidate:** `Curium-0.1.13-b22` (universal per-video floating PiP
-  button + universal anti-PiP & background-pause MV3 guard + Build 40 4-bug
-  HLS/VOD skip-stall fix + iOS 27.2 AVKit `setPlaying:` coalescing so forward/rewind
-  skip never pauses playback + `MappableBufferIOSurface` zero-copy fallback for
-  software-decoded AV1/VP9/Simulator frames + `AVAudioSessionCategoryPlayback`
-  activation for muted PiP; removed address-bar PiP button & refusal banner).
-  Previous `0.1.11-b17` (`57a095c`) verified on `ac_duo`.
+  and tested on `ac_duo` via LiveContainer). Previous `0.1.11-b17` (`57a095c`)
+  also verified on `ac_duo`.
+- **Local candidate:** `Curium-0.1.13-b23` on `feat/build-41-engine-wave`
+  (Build 41 downstream integration: retired `CuriumPiPHooks.{h,m}`, retired
+  `--disable-blink-features` permission-element workaround, retired `MAIN`-world
+  `pip_guard.js`, wired `schemaVersion: 2` native Blink anti-fingerprinting UI /
+  presets / validator, wired Build 41 PDFKit handoff flags & `CuriumMediaRadar`;
+  verified live with real Blink on `iphone_duo_27_2` Simulator, `sdk 27.2`,
+  `38/38` `CuriumTests` passing).
 
 ## App (on the pinned engine)
 
@@ -95,34 +96,56 @@ the pinned engine first, translate to `patches/` once proven.
   `AVAudioSessionCategoryPlayback` activation for muted videos. Verified live
   with real native iOS 27.2 SpringBoard Pegasus PiP on `iphone_duo_27_2`
   Simulator (`42/42` `CuriumTests` passing).
-- [ ] **Dysprosium-inspired media stream sniffer & multi-lane downloader (on Build 40).**
-  Next milestone after `0.1.12` PiP checkpoint.
+- [x] **Build 41 downstream integration & Build 40 workaround retirement (`0.1.13-b23`).**
+  Repinned `Kernel.lock` to Build 41 (`45092671606`), deleted temporary
+  `CuriumPiPHooks.{h,m}`, dropped the `--disable-blink-features` permission
+  element workaround from `CuriumRuntime.m`, retired `MAIN`-world `pip_guard.js`
+  from `CuriumVideoPiPExtension` (`manifestVersion = "1.1.0"`, `ISOLATED`-world
+  floating pill only with clean legacy upgrade), wired `schemaVersion: 2`
+  anti-fingerprinting presets/validator/Studio UI (`CuriumFingerprint*`), gated
+  inline `PDFKit` preview on `!isExplicitDownload && isMainFrame && httpMethod == "GET"`,
+  and added `CuriumMediaRadar.swift` consuming `didLoadResourceEvent:` +
+  `effectiveUserAgent`. Verified live with real Blink on `iphone_duo_27_2`
+  Simulator (`sdk 27.2`, `38/38` `CuriumTests` passing).
+- [ ] **Dysprosium-inspired media stream sniffer & multi-lane downloader (on Build 41).**
+  Backed by `0108` `CuriumMediaRadar` (`didLoadResourceEvent:` +
+  `effectiveUserAgent`); next UI/downloader milestone after Build 41 checkpoint.
 
 ## Live hooks
 
-Permanent shell-side runtime guards in `Curium/Engine/CuriumRuntime.m` plus
-scoped Build 40 bridge hooks in `Curium/Engine/CuriumPiPHooks.m`. All five
-temporary Build 35 engine hooks were retired in Build 37 (`0099`–`0104`).
+Permanent shell-side runtime guards in `Curium/Engine/CuriumRuntime.m`. All
+temporary Build 35 (`0099`–`0104`) and Build 40 (`CuriumPiPHooks.m` → `0109`,
+permission element disable flag → `0107`) workarounds are retired.
 
 | Hook | Effect | Exit |
 | --- | --- | --- |
-| `CuriumPiPBridge` skip controls (`CuriumPiPHooks.m`) | Enables VOD `requiresLinearPlayback = NO`, native `SeekTo` on `skipByInterval:completionHandler:`, render-queue seek guard against stale pre-seek frames/positions, and offset-contained `timeRangeForPlayback:`. Fails closed on any Build 40 layout drift. | Retire once `0089` wires `OnAVKitSkipByInterval` + seek-epoch timebase handling directly in `ios_video_overlay_window.mm` in the next engine wave. |
-| `CrIOSEngineBootstrap` launch fingerprint bridge (`CuriumRuntime.m`) | Probes Build 40 capabilities, sends bounded `schemaVersion: 1` JSON before `ChromeMain`, fails closed on rejection, and queries live `activeFingerprintStatus`. | Permanent: shell ↔ engine launch contract. |
-| `-[NSProcessInfo arguments]` (`CuriumRuntime.m`) | Adds launch switches: Google features off, `--disable-sync`, JIT mode, Skia Graphite off on Simulator, `--enable-features=GlobalPrivacyControlApi` strictly when the active profile opts into GPC, and legacy `0105` switches only in unconfigured Build 39 default mode. Also disables the affected Blink permission elements on the pinned engine. | Permanent channel; remove each permission element workaround after validating its label and prompt on a new pinned engine. |
+| `CrIOSEngineBootstrap` launch fingerprint bridge (`CuriumRuntime.m`) | Probes engine capabilities (`v1` / `v2`, 17 features on Build 41), sends bounded `schemaVersion: 1|2` JSON before `ChromeMain`, fails closed on rejection, and queries live `activeFingerprintStatus`. | Permanent: shell ↔ engine launch contract. |
+| `-[NSProcessInfo arguments]` (`CuriumRuntime.m`) | Adds launch switches: Google features off, `--disable-sync`, JIT mode, Skia Graphite off on Simulator, `--enable-features=GlobalPrivacyControlApi` strictly when the active profile opts into GPC, and legacy `0105` switches only in unconfigured Build 39 default mode. | Permanent channel. |
 | `V8IOSJitPrepareForProcess` pre-`ChromeMain` probe (`CuriumRuntime.m`) | Prepares V8's iOS TXM / Simulator JIT pool before Crashpad installs exception handlers. | Permanent: shell-controlled JIT preference. |
 | `+[MetricsMediator logLaunchMetricsWithStartupInformation:connectedScenes:]` (`CuriumRuntime.m`) | No-op. Launch metrics walk Chrome's tab model for uploads Curium never makes. | None planned. |
 
-## Engine wave (Build 40 landed & pinned in `Kernel.lock`)
+## Engine wave (Build 41 landed & pinned in `Kernel.lock`)
 
-Built in run `44939797575` (`8b550ce`) after green `graph-diagnose.yml` (`44938172892` graph + `44938715790` `compile_extensions=true`).
+Built in run `45092671606` (`b95f677`) after green `graph-diagnose.yml` (`45090912166`, `47406 targets`, `169 device objects`).
 
-- [ ] **Verify smaller initial Wasm reservations on TXM (next engine, `0001`).**
-  Target at most 8 MiB for a module's first reservation; jump tables can require
-  more. Build 40 on Simulator reported the explicit flag with both JITs enabled
-  and passed JS ↔ Wasm calls on a page and three workers. On device, compare a
-  large module and repeated tab/worker loads against Build 40 before resizing
-  the 64 MiB pool. This V8 pin requires global jitless for DrumBrake; crossing
-  its committed-code cap is fatal.
+- [ ] **Verify smaller initial Wasm reservations on TXM (`ac_duo`, `0001`).**
+  Landed in Build 41 (`0001` targets at most 8 MiB for a module's first
+  reservation; jump tables can require more). Simulator verified `256` JS ↔ Wasm
+  calls under `Native MAP_JIT`. On physical `ac_duo`, compare a large module and
+  repeated tab/worker loads against Build 40 before resizing the 64 MiB pool.
+  This V8 pin requires global jitless for DrumBrake; crossing its committed-code
+  cap is fatal.
+- [ ] **Build 42 `0110` real-Blink micro-fixes (3 findings from `iphone_duo_27_2` live audit).**
+  1. `canvas_async_blob_creator.cc`: allow `kBGRA_8888_SkColorType` alongside
+     `kRGBA_8888_SkColorType` (passing `is_bgra`) so Metal-backed
+     `HTMLCanvasElement.toBlob()` farbles identically to `toDataURL()` and
+     `OffscreenCanvas.convertToBlob()`.
+  2. `screen.cc`: avoid letting Blink's unscaled desktop virtual viewport height
+     on portrait outer displays without `<meta name="viewport">` stretch
+     `ResolveWebScreenMetrics` `screen.height` above the profile target (`1080`).
+  3. `base_rendering_context_2d.cc`: hash `site_key` (or resolved `PrimaryFont()`
+     family) instead of the pre-fallback CSS family string in
+     `ResolveTextMetricsScale` so blocked fonts match their fallback to `0.0000 px`.
 - [x] **Unstripped framework symbols artifact (`0098`).** Landed Build 37.
 - [x] **Single-process extension coexistence (`0099`).** Landed Build 37.
 - [x] **Extension APIs & native permissions prompt (`0100`).** Landed Build 37.
@@ -132,51 +155,28 @@ Built in run `44939797575` (`8b550ce`) after green `graph-diagnose.yml` (`449381
 - [x] **PiP close crash & start-when-ready (`0104`).** Landed Build 37.
 - [x] **Authentic Chrome dual identity, Client Hints delegate & `Accept-Language` (`0105`).** Landed Build 38/39.
 - [x] **Modular launch-scoped fingerprint contract, isolated profile roots, Zstd baseline, OOPIF Desktop inheritance & optional native-first hardware/GPU overrides (`0106`).**
-  Landed Build 40 (`8b550ce`, run `44939797575`) and verified end-to-end on `iphone_duo_27_2` Simulator (Zstd HTTPS decode + Range `identity` control, cross-origin OOPIF + nested `about:blank`/`srcdoc`/Worker + sync `window.open('')`/`window.open('about:blank')`, cold `A → B → A → Default` 4-store isolation, Win11 x64 partial `majorVersion=158` coherence + Window/Worker HW/GPU/TZ parity, DNT/GPC, fail-closed recovery, and fixed-proxy `<-loopback>` zero-direct-leak).
-- [ ] **Package Blink's localized permission element strings (Build 41 wave, `0107`).**
-  On `iphone_duo_27_2`, navigating to `google.com` in `0.1.11-b15` with Build 40
-  triggered a renderer `SIGTRAP` in `ui::ResourceBundle::GetLocalizedStringImpl`
-  for resource `47053` (absent from `resources.pak`). Mitigated downstream on
-  Build 40 via `--disable-blink-features=CameraAndMicrophoneElements,UserMediaElement,GeolocationElement`
-  in `CuriumRuntime.m`; standard media capture and geolocation APIs stay active.
-  Drafted in `0107` on `feat/build-41-engine-wave`: repacks
-  `permission_element_generated_strings.pak` and localized
-  `permission_element_strings_<locale>.pak`, with a DataPack v5 assertion for
-  resource `47053` in `scripts/stages/link.sh`.
-- [ ] **Flip geolocation prompt order & harden cross-origin iframe media checks (Build 41 wave, `0107`).**
-  Drafted in `0107` on `feat/build-41-engine-wave`: handles
-  `GEOLOCATION_APPROXIMATE`, requests iOS geolocation authorization after site
-  approval, and adds `IsCurrentMediaOrigin` in `content_web_state.mm`. Note:
-  before running Pipeline 1 under `benjipeng/curium`, copy the existing GHCR
-  source/stub/ccache images from `ghcr.io/benjipeng/chromium-blink-ios/*` to
+  Landed Build 40 (`8b550ce`, run `44939797575`).
+- [x] **Package Blink's localized permission element strings (`0107`).**
+  Landed Build 41 (`45092671606`): verified resource `47053` across 10,167 packed
+  resources at link time; `<geolocation>` and `<usermedia type="camera">` render
+  natively on `iphone_duo_27_2` with zero `SIGTRAP`.
+- [x] **Flip geolocation prompt order & harden cross-origin iframe media checks (`0107`).**
+  Landed Build 41 (`45092671606`) after migrating all 21 GHCR cache tags to
   `ghcr.io/benjipeng/curium/*`.
-- [ ] **Drop `helpers/extensions_ui` from packaging (Build 41 wave).**
-  Removed `helpers/extensions_ui/`, its `package_ipa.sh` build/inject step, and
-  `plan_pipeline.py` entry on `feat/build-41-engine-wave`.
-- [ ] **Downloads/PDFKit handoff & Media Radar engine contract (Build 41 wave, `0108`).**
-  Drafted in `0108` + `EngineContract/CrIOSBrowserHostV1.h`: keeps
-  `enable_pdf = false`, adds `@optional` `isExplicitDownload`/`isMainFrame`/
-  `httpMethod` on `CrIOSDownloadTaskV1`, fixes `CuriumBrowserHost._downloads`
-  retention leak with terminal snapshots, adds `@optional` `effectiveUserAgent`
-  on `CrIOSTabHostingV1`, and adds pre-filtered `browserHost:tab:didLoadResourceEvent:`.
-- [ ] **Universal PiP upstreaming & native Blink C++ PiP guard (Build 41 wave, `0109`).**
-  Drafted in `0109`: folds `CuriumPiPHooks.m` HLS/VOD skip fixes, iOS 27.2
-  `setPlaying:` coalescing, `ClientSharedImage::CloneGpuMemoryBufferHandle()`
-  IOSurface fallback, and muted `MixWithOthers` audio session into
-  `ios_video_overlay_window.mm`/`ios_pip_frame_hub.mm`; prioritizes iOS PiP in
-  `ShouldPausePlaybackWhenHidden`; adds native Blink C++ PiP guard
-  (`disablePictureInPicture`, `AttributeChanged`, `exitPictureInPicture`,
-  `pauseForBindings` with `MediaSession` pause-action timestamp preservation) so
-  `MAIN`-world `pip_guard.js` can be retired after Build 41 pins.
-- [ ] **Native Blink C++ anti-fingerprinting (`schemaVersion: 2`, Build 41 wave, `0110`).**
-  Drafted in `0110`: backward-compatible `schemaVersion: 1|2` launch config,
-  per-`ExecutionContext` `HMAC-SHA256(seed, top_level_site)` farbling across
-  Canvas 2D & `OffscreenCanvas`, `measureText`, `OfflineAudioContext` &
-  `AnalyserNode`, subtractive/clamped WebGL + client-memory `readPixels`,
-  OS-profile `FontCache` filtering & `0005` Apple alias gating, Duo-coherent
-  Web-only `Screen`/`MediaValues`/`outer*`/`ScreenOrientation`, desktop
-  `DOMPluginArray::IsPdfViewerAvailable()`, and non-Apple `speechSynthesis`
-  voice hiding.
+- [x] **Drop `helpers/extensions_ui` from packaging.**
+  Landed Build 41 (`45092671606`).
+- [x] **Downloads/PDFKit handoff & Media Radar engine contract (`0108`).**
+  Landed Build 41 (`45092671606`) and verified live on `iphone_duo_27_2`:
+  `Content-Disposition: attachment` PDFs stay in Download Banner, inline PDFs
+  open in `PDFKit`, and `.m3u8`/`.mp4` fetches fire `didLoadResourceEvent:`.
+- [x] **Universal PiP upstreaming & native Blink C++ PiP guard (`0109`).**
+  Landed Build 41 (`45092671606`) and verified live on `iphone_duo_27_2`:
+  `disablePictureInPicture`, `pause()`, and `exitPictureInPicture()` stay
+  100% `[native code]` with zero `MAIN`-world JS footprint.
+- [x] **Native Blink C++ anti-fingerprinting (`schemaVersion: 2`, `0110`).**
+  Landed Build 41 (`45092671606`) and verified live on `iphone_duo_27_2` across
+  `127.0.0.1` vs `localhost` (`win11-lab`, 17 engine capabilities, `v2` contract;
+  3 micro-fixes tracked above for Build 42).
 
 ## Environment
 

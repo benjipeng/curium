@@ -95,10 +95,14 @@ private final class MockTrustedUnpackedExtensionManager: NSObject, CrIOSExtensio
         let entry: [String: Any] = [
             "id": CuriumVideoPiPExtension.extensionID,
             "name": "Curium Video PiP",
-            "version": "1.0.0",
+            "version": CuriumVideoPiPExtension.manifestVersion,
             "enabled": enabled,
         ]
-        entries.append(entry)
+        if let idx = entries.firstIndex(where: { ($0["id"] as? String) == CuriumVideoPiPExtension.extensionID }) {
+            entries[idx] = entry
+        } else {
+            entries.append(entry)
+        }
         completion(entry, nil)
     }
 
@@ -134,7 +138,7 @@ struct CuriumVideoPiPTests {
         #expect(CuriumVideoPiPExtension.deriveExtensionID(publicKeyBase64: "not valid base64!!!") == nil)
     }
 
-    @Test("Generated manifest.json is valid MV3 with MAIN guard and ISOLATED overlay content scripts")
+    @Test("Generated manifest.json is valid MV3 with ISOLATED-only overlay script (zero MAIN-world JS footprint)")
     func manifestStructure() throws {
         let data = Data(CuriumVideoPiPExtension.manifestJSON.utf8)
         let raw = try JSONSerialization.jsonObject(with: data)
@@ -142,24 +146,16 @@ struct CuriumVideoPiPTests {
 
         #expect((obj["manifest_version"] as? Int) == 3)
         #expect((obj["name"] as? String) == "Curium Video PiP")
-        #expect((obj["version"] as? String) == "1.0.0")
+        #expect((obj["version"] as? String) == CuriumVideoPiPExtension.manifestVersion)
         #expect((obj["key"] as? String) == CuriumVideoPiPExtension.publicKeyBase64)
         #expect(obj["background"] == nil)
         #expect(obj["permissions"] == nil)
         #expect(obj["action"] == nil)
 
         let scripts = try #require(obj["content_scripts"] as? [[String: Any]])
-        #expect(scripts.count == 2)
+        #expect(scripts.count == 1)
 
-        let guardEntry = scripts[0]
-        #expect((guardEntry["js"] as? [String]) == ["pip_guard.js"])
-        #expect((guardEntry["matches"] as? [String]) == ["http://*/*", "https://*/*"])
-        #expect((guardEntry["run_at"] as? String) == "document_start")
-        #expect((guardEntry["world"] as? String) == "MAIN")
-        #expect((guardEntry["all_frames"] as? Bool) == true)
-        #expect((guardEntry["match_about_blank"] as? Bool) == true)
-
-        let overlayEntry = scripts[1]
+        let overlayEntry = scripts[0]
         #expect((overlayEntry["js"] as? [String]) == ["pip_overlay.js"])
         #expect((overlayEntry["matches"] as? [String]) == ["http://*/*", "https://*/*"])
         #expect((overlayEntry["run_at"] as? String) == "document_idle")
@@ -168,7 +164,7 @@ struct CuriumVideoPiPTests {
         #expect((overlayEntry["match_about_blank"] as? Bool) == true)
     }
 
-    @Test("materialize(into:) writes extension files atomically and is idempotent across repeated calls")
+    @Test("materialize(into:) writes overlay-only files atomically, cleans legacy pip_guard.js, and is idempotent")
     func materializeIdempotent() throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "curium-pip-ext-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -179,22 +175,28 @@ struct CuriumVideoPiPTests {
         #expect(firstDir.lastPathComponent == CuriumVideoPiPExtension.directoryName)
 
         let manifestURL = firstDir.appending(path: "manifest.json", directoryHint: .notDirectory)
-        let guardURL = firstDir.appending(path: "pip_guard.js", directoryHint: .notDirectory)
+        let legacyGuardURL = firstDir.appending(path: "pip_guard.js", directoryHint: .notDirectory)
         let overlayURL = firstDir.appending(path: "pip_overlay.js", directoryHint: .notDirectory)
 
         #expect(try String(contentsOf: manifestURL, encoding: .utf8) == CuriumVideoPiPExtension.manifestJSON)
-        #expect(try String(contentsOf: guardURL, encoding: .utf8) == CuriumVideoPiPExtension.guardScript)
+        #expect(!FileManager.default.fileExists(atPath: legacyGuardURL.path))
         #expect(try String(contentsOf: overlayURL, encoding: .utf8) == CuriumVideoPiPExtension.overlayScript)
 
-        let attrs1 = try FileManager.default.attributesOfItem(atPath: guardURL.path)
+        let attrs1 = try FileManager.default.attributesOfItem(atPath: overlayURL.path)
         let mtime1 = attrs1[.modificationDate] as? Date
 
         // Second call with unchanged payload skips rewriting disk files.
         let secondDir = try CuriumVideoPiPExtension.materialize(into: trustedRoot)
         #expect(secondDir.standardizedFileURL == firstDir.standardizedFileURL)
-        let attrs2 = try FileManager.default.attributesOfItem(atPath: guardURL.path)
+        let attrs2 = try FileManager.default.attributesOfItem(atPath: overlayURL.path)
         let mtime2 = attrs2[.modificationDate] as? Date
         #expect(mtime1 == mtime2)
+
+        // Legacy pip_guard.js left over from Build 40 triggers clean atomic replacement.
+        try Data("stale".utf8).write(to: legacyGuardURL)
+        #expect(FileManager.default.fileExists(atPath: legacyGuardURL.path))
+        _ = try CuriumVideoPiPExtension.materialize(into: trustedRoot)
+        #expect(!FileManager.default.fileExists(atPath: legacyGuardURL.path))
 
         // Removing one payload file triggers self-healing re-materialization.
         try FileManager.default.removeItem(at: overlayURL)
@@ -292,12 +294,21 @@ struct CuriumVideoPiPTests {
         let installedPath = try #require(manager.lastInstalledDirectoryPath)
         #expect(installedPath.hasSuffix("/TrustedUnpackedExtensions/\(CuriumVideoPiPExtension.directoryName)"))
         #expect(FileManager.default.fileExists(atPath: "\(installedPath)/manifest.json"))
-        #expect(FileManager.default.fileExists(atPath: "\(installedPath)/pip_guard.js"))
+        #expect(!FileManager.default.fileExists(atPath: "\(installedPath)/pip_guard.js"))
         #expect(FileManager.default.fileExists(atPath: "\(installedPath)/pip_overlay.js"))
         #expect(manager.setEnabledCalls.contains { $0.0 == CuriumVideoPiPExtension.extensionID && $0.1 == true })
 
         // Subsequent bootstrap calls for the same manager are skipped immediately.
         await CuriumVideoPiPExtension.ensureInstalled(using: manager)
         #expect(manager.installAttempts == 2)
+
+        // Upgrading a legacy 1.0.0 install reloads the 1.1.0 overlay-only package cleanly.
+        let upgradeManager = MockTrustedUnpackedExtensionManager(trustedRootPath: trustedRoot.path)
+        upgradeManager.entries = [
+            ["id": CuriumVideoPiPExtension.extensionID, "name": "Curium Video PiP", "version": "1.0.0", "enabled": true]
+        ]
+        await CuriumVideoPiPExtension.ensureInstalled(using: upgradeManager)
+        #expect(upgradeManager.installAttempts == 1)
+        #expect((upgradeManager.entries.first?["version"] as? String) == CuriumVideoPiPExtension.manifestVersion)
     }
 }

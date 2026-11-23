@@ -213,9 +213,9 @@ final class CuriumFingerprintStore {
             return upsert(profile)
         }
         let wire = try decoder.decode(EngineWireImportPayload.self, from: data)
-        guard wire.schemaVersion == CuriumFingerprintSchema.version else {
+        guard (CuriumFingerprintSchema.minSupportedVersion...CuriumFingerprintSchema.version).contains(wire.schemaVersion) else {
             return CuriumFingerprintValidationReport(
-                errors: ["Unsupported fingerprint schemaVersion: \(wire.schemaVersion) (expected \(CuriumFingerprintSchema.version))."]
+                errors: ["Unsupported fingerprint schemaVersion: \(wire.schemaVersion) (expected \(CuriumFingerprintSchema.minSupportedVersion)–\(CuriumFingerprintSchema.version))."]
             )
         }
         let imported = CuriumFingerprintProfile(
@@ -232,7 +232,11 @@ final class CuriumFingerprintStore {
             webrtcIpHandlingPolicy: wire.webrtcIpHandlingPolicy ?? .default,
             enableDoNotTrack: wire.enableDoNotTrack ?? false,
             enableGlobalPrivacyControl: wire.enableGlobalPrivacyControl ?? false,
-            hardware: wire.hardware ?? .native
+            hardware: wire.hardware ?? .native,
+            fingerprintSeed: wire.fingerprintSeed,
+            farbling: wire.farbling,
+            fontProfile: wire.fontProfile,
+            hideSpeechVoices: wire.hideSpeechVoices
         )
         return upsert(imported)
     }
@@ -291,6 +295,10 @@ final class CuriumFingerprintStore {
         let enableDoNotTrack: Bool?
         let enableGlobalPrivacyControl: Bool?
         let hardware: CuriumHardwareOverrides?
+        let fingerprintSeed: String?
+        let farbling: CuriumFarblingSettings?
+        let fontProfile: CuriumFontProfile?
+        let hideSpeechVoices: Bool?
     }
 
     private static let log = Logger(subsystem: "com.appautomaton.curium", category: "fingerprint")
@@ -359,9 +367,13 @@ enum CuriumFingerprintBootstrap {
             return outcome
         }
 
+        let negotiatedVersion = min(
+            CuriumFingerprintSchema.version,
+            max(CuriumFingerprintSchema.minSupportedVersion, caps.contractVersion)
+        )
         let jsonData: Data
         do {
-            jsonData = try profile.makeEngineLaunchJSON()
+            jsonData = try profile.makeEngineLaunchJSON(schemaVersion: negotiatedVersion)
         } catch {
             let outcome = LaunchOutcome.rejected(
                 profileID: selectedID,

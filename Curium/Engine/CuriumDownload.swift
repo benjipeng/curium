@@ -10,6 +10,9 @@ final class CuriumDownload: Identifiable {
     let originalURL: URL?
     let filename: String
     let mimeType: String?
+    let isExplicitDownload: Bool
+    let isMainFrame: Bool
+    let httpMethod: String
     private let task: any CrIOSDownloadTaskV1
     private(set) var state: CrIOSDownloadState
     private(set) var savedURL: URL?
@@ -28,6 +31,10 @@ final class CuriumDownload: Identifiable {
         originalURL = task.originalURL
         filename = CuriumDownloadStorage.sanitizedFilename(task.suggestedFilename)
         mimeType = task.mimeType
+        isExplicitDownload = task.isExplicitDownload ?? false
+        isMainFrame = task.isMainFrame ?? true
+        let method = (task.httpMethod ?? "GET").trimmingCharacters(in: .whitespacesAndNewlines)
+        httpMethod = method.isEmpty ? "GET" : method.uppercased()
         state = task.state
         refresh()
     }
