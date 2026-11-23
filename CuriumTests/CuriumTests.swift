@@ -535,11 +535,12 @@ struct CuriumDiagnosticsAndLayoutTests {
 
 @Suite("Modular Fingerprint Profiles & Validation")
 struct CuriumFingerprintTests {
-    @Test("All built-in presets pass structural validation and preserve native hardware unless opted in")
+    @Test("All built-in presets pass zero-warning validation, mask non-Apple hardware, and preserve native Apple on Apple platforms")
     func builtInPresetsValidate() throws {
         for preset in CuriumFingerprintPresets.allBuiltIns {
             let report = CuriumFingerprintValidator.validate(preset)
             #expect(report.isValid, "Preset \(preset.id) errors: \(report.errors)")
+            #expect(report.warnings.isEmpty, "Preset \(preset.id) warnings: \(report.warnings)")
             let wireData = try preset.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US", "zh-Hans-CN"])
             #expect(wireData.count <= CuriumFingerprintSchema.maxPayloadBytes)
             let obj = try #require(JSONSerialization.jsonObject(with: wireData) as? [String: Any])
@@ -551,15 +552,37 @@ struct CuriumFingerprintTests {
             #expect(obj["isBuiltIn"] == nil)
         }
         #expect(CuriumFingerprintPresets.allBuiltIns.count == 7)
-        #expect(CuriumFingerprintPresets.defaultAuthenticChrome.usesNativeHardwareAndGPU)
+        // Apple-platform presets preserve native Apple Silicon & Metal GPU.
         #expect(CuriumFingerprintPresets.iosBlinkAuthentic.usesNativeHardwareAndGPU)
         #expect(CuriumFingerprintPresets.macosDesktopFirst.usesNativeHardwareAndGPU)
-        #expect(CuriumFingerprintPresets.pixelAndroid.usesNativeHardwareAndGPU)
+        // Non-Apple presets mask non-Apple GPU, fonts, speech voices, and hardware by default.
+        for nonApple in [
+            CuriumFingerprintPresets.defaultAuthenticChrome,
+            CuriumFingerprintPresets.privacyHardened,
+            CuriumFingerprintPresets.pixelAndroid,
+            CuriumFingerprintPresets.windowsWorkstation,
+            CuriumFingerprintPresets.linuxDesktop,
+        ] {
+            #expect(!nonApple.usesNativeHardwareAndGPU, "Non-Apple preset \(nonApple.id) leaked native Apple HW")
+            #expect(nonApple.hideSpeechVoices == true, "Non-Apple preset \(nonApple.id) must hide Apple speech voices")
+            #expect(nonApple.fontProfile != nil && nonApple.fontProfile != .native && nonApple.fontProfile != .apple)
+        }
+        // Dual-slot Android presets mask mobile Android GPU/screen while keeping macOS Desktop slot native Apple.
+        for androidDual in [
+            CuriumFingerprintPresets.defaultAuthenticChrome,
+            CuriumFingerprintPresets.privacyHardened,
+            CuriumFingerprintPresets.pixelAndroid,
+        ] {
+            #expect(androidDual.mobile.hasWebGLOverride)
+            #expect(androidDual.mobile.webglProfile == .mobileAndroid)
+            #expect(androidDual.mobile.screen != nil)
+            #expect(!androidDual.desktop.hasWebGLOverride)
+            #expect(androidDual.fontProfile == .android)
+            #expect(androidDual.hardware.hardwareConcurrency == 8)
+            #expect(androidDual.hardware.deviceMemoryGB == 8)
+        }
         #expect(CuriumFingerprintPresets.pixelAndroid.mobile.model == "Pixel 9")
         #expect(CuriumFingerprintPresets.pixelAndroid.mobile.architecture == "")
-        #expect(CuriumFingerprintPresets.privacyHardened.usesNativeHardwareAndGPU)
-        #expect(!CuriumFingerprintPresets.windowsWorkstation.usesNativeHardwareAndGPU)
-        #expect(!CuriumFingerprintPresets.linuxDesktop.usesNativeHardwareAndGPU)
         #expect(CuriumFingerprintPresets.linuxDesktop.desktop.platform == "Linux")
         #expect(CuriumFingerprintPresets.linuxDesktop.desktop.platformVersion == "")
         #expect(CuriumFingerprintPresets.linuxDesktop.desktop.navigatorPlatform == "Linux x86_64")
@@ -607,9 +630,12 @@ struct CuriumFingerprintTests {
 
         var android16 = CuriumFingerprintPresets.defaultAuthenticChrome
         android16.hardware.deviceMemoryGB = 16
+        android16.mobile.webglVendor = nil
+        android16.mobile.webglRenderer = nil
         let androidReport = CuriumFingerprintValidator.validate(android16)
         #expect(androidReport.isValid)
         #expect(androidReport.warnings.contains { $0.contains("caps navigator.deviceMemory at 8 GB") })
+        #expect(androidReport.warnings.contains { $0.contains("Android identity with native Apple Metal GPU") })
 
         var linuxNativeGPU = CuriumFingerprintPresets.linuxDesktop
         linuxNativeGPU.desktop.webglVendor = nil
@@ -3031,6 +3057,8 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
     @MainActor
     func allHardwareVariantPoolsValidateAndSerializeSchemaV2() throws {
         let expectedMultiVariantMinimums: [String: Int] = [
+            "default": 5,
+            "privacy-hardened": 5,
             "win11-workstation": 6,
             "linux-desktop": 4,
             "macos-desktop": 5,
@@ -3038,7 +3066,7 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
         ]
         #expect(Set(CuriumFingerprintDevicePools.allPools.keys) == Set(expectedMultiVariantMinimums.keys))
 
-        for nativeOnlyID in ["default", "ios-blink", "privacy-hardened"] {
+        for nativeOnlyID in ["ios-blink"] {
             let nativeTemplate = try #require(CuriumProfileTemplate.template(for: nativeOnlyID))
             #expect(!nativeTemplate.hasHardwareVariantPool)
             #expect(nativeTemplate.hardwareVariantCount == 0)
@@ -3135,7 +3163,8 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
 
                 let hwDict = try #require(root["hardware"] as? [String: Any])
                 #expect(Set(hwDict.keys).isSubset(of: allowedHardwareKeys))
-                if templateID == "pixel-android", let mem = (hwDict["deviceMemoryGB"] as? NSNumber)?.doubleValue {
+                if ["default", "privacy-hardened", "pixel-android"].contains(templateID),
+                   let mem = (hwDict["deviceMemoryGB"] as? NSNumber)?.doubleValue {
                     #expect(mem <= 8.0)
                 }
 
@@ -3223,6 +3252,8 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
     @Test("Consecutive createProfile calls from multi-variant templates yield distinct GPU, screen, and hardware signatures")
     func consecutiveCreateProfileCollisionFreeDifferentiation() throws {
         let multiVariantIDs = [
+            "default",
+            "privacy-hardened",
             "win11-workstation",
             "macos-desktop",
             "linux-desktop",
@@ -3269,19 +3300,36 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
             #expect(wrappedReport.warnings.isEmpty)
         }
 
-        // Explicit randomizeHardwareVariant: false preserves native Apple hardware on macos-desktop & pixel-android.
+        // Explicit randomizeHardwareVariant: false preserves native Apple hardware on macos-desktop,
+        // while non-Apple templates still mask non-Apple GPU/fonts/hardware cleanly.
         let optOutDir = try makeTempDir("curium-pa-hw-optout")
         defer { try? FileManager.default.removeItem(at: optOutDir) }
         let optOutStore = CuriumFingerprintStore(fileURL: optOutDir.appending(path: CuriumFingerprintStore.fileName))
-        for nativeBaseID in ["macos-desktop", "pixel-android"] {
-            let plainHW = try #require(
+        let plainMac = try #require(
+            optOutStore.createProfile(
+                fromTemplate: "macos-desktop",
+                displayName: "Native macOS",
+                randomizeHardwareVariant: false
+            )
+        )
+        #expect(plainMac.usesNativeHardwareAndGPU)
+
+        for nonAppleID in ["default", "privacy-hardened", "pixel-android"] {
+            let maskedBase = try #require(
                 optOutStore.createProfile(
-                    fromTemplate: nativeBaseID,
-                    displayName: "Native \(nativeBaseID)",
+                    fromTemplate: nonAppleID,
+                    displayName: "Base \(nonAppleID)",
                     randomizeHardwareVariant: false
                 )
             )
-            #expect(plainHW.usesNativeHardwareAndGPU)
+            #expect(!maskedBase.usesNativeHardwareAndGPU)
+            #expect(maskedBase.mobile.hasWebGLOverride)
+            #expect(!maskedBase.desktop.hasWebGLOverride)
+            #expect(maskedBase.fontProfile == .android)
+            #expect(maskedBase.hideSpeechVoices == true)
+            let report = CuriumFingerprintValidator.validate(maskedBase)
+            #expect(report.errors.isEmpty)
+            #expect(report.warnings.isEmpty)
         }
     }
 
@@ -3388,18 +3436,27 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
         defer { try? FileManager.default.removeItem(at: rootDir) }
         let store = CuriumFingerprintStore(fileURL: rootDir.appending(path: CuriumFingerprintStore.fileName))
 
-        // Native-only archetypes without a pool return nil cleanly.
+        // Apple-native mobile archetype (`ios-blink`) has no non-Apple variant pool and returns nil cleanly.
+        let iosProfile = try #require(
+            store.createProfile(fromTemplate: "ios-blink", displayName: "Native ios-blink")
+        )
+        #expect(CuriumFingerprintPresets.rollCoherentHardwareVariant(for: iosProfile) == nil)
+
+        // Rolling the unconfigured Build 39 Personal (`default`) profile upgrades it onto a zero-warning
+        // non-Apple Android mobile hardware variant while keeping its macOS desktop slot intact.
         let personal = try #require(store.profile(id: "default"))
-        #expect(CuriumFingerprintPresets.rollCoherentHardwareVariant(for: personal) == nil)
-        for nativeID in ["ios-blink", "privacy-hardened"] {
-            let nativeProfile = try #require(
-                store.createProfile(fromTemplate: nativeID, displayName: "Native \(nativeID)")
-            )
-            #expect(CuriumFingerprintPresets.rollCoherentHardwareVariant(for: nativeProfile) == nil)
-        }
+        let rolledPersonal = try #require(CuriumFingerprintPresets.rollCoherentHardwareVariant(for: personal))
+        #expect(rolledPersonal.id == "default")
+        #expect(!rolledPersonal.usesNativeHardwareAndGPU)
+        #expect(rolledPersonal.mobile.hasWebGLOverride)
+        #expect(!rolledPersonal.desktop.hasWebGLOverride)
+        #expect(rolledPersonal.fontProfile == .android)
+        #expect(rolledPersonal.hideSpeechVoices == true)
+        #expect(CuriumFingerprintValidator.validate(rolledPersonal).errors.isEmpty)
+        #expect(CuriumFingerprintValidator.validate(rolledPersonal).warnings.isEmpty)
 
         let fixedProxy = CuriumProxyConfig.fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "localhost")
-        for templateID in ["win11-workstation", "linux-desktop", "macos-desktop", "pixel-android"] {
+        for templateID in ["default", "privacy-hardened", "win11-workstation", "linux-desktop", "macos-desktop", "pixel-android"] {
             let original = try #require(
                 store.createProfile(
                     fromTemplate: templateID,

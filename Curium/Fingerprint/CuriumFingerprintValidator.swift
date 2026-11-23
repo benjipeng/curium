@@ -222,6 +222,9 @@ enum CuriumFingerprintValidator {
         if slot.platform == "Linux" && !slot.hasWebGLOverride {
             report.warnings.append("\(name): Linux identity with native Apple Metal GPU strings may look inconsistent to GPU-aware detectors.")
         }
+        if slot.platform == "Android" && !slot.hasWebGLOverride {
+            report.warnings.append("\(name): Android identity with native Apple Metal GPU strings may look inconsistent to GPU-aware detectors.")
+        }
         if slot.mobile == true && (slot.navigatorPlatform == "MacIntel" || slot.navigatorPlatform == "Win32" || slot.navigatorPlatform == "Linux x86_64") {
             report.warnings.append("\(name): mobile=true paired with desktop navigator.platform (\(slot.navigatorPlatform ?? "")).")
         }

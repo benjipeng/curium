@@ -221,9 +221,9 @@ final class CuriumFingerprintStore {
         preserveLegacyDefaults: Bool = false,
         now: Date = .now
     ) -> CuriumFingerprintProfile {
-        var profile = CuriumFingerprintPresets.defaultAuthenticChrome
+        var profile = CuriumFingerprintPresets.build39NativeBaseline
         profile.displayName = "Personal"
-        profile.notes = "Primary profile using Chromium's default storage and native Apple hardware."
+        profile.notes = "Primary profile using Chromium's default storage and Build 39 native baseline."
         profile.isBuiltIn = false
         profile.revision = 1
         profile.symbolName = "person.crop.circle"

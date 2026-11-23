@@ -454,7 +454,7 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
     /// Build 39's authentic Chrome baseline with no farbling, font, or speech overrides.
     var matchesBuild39EngineDefaults: Bool {
         guard id == "default" else { return false }
-        let baseline = CuriumFingerprintPresets.defaultAuthenticChrome
+        let baseline = CuriumFingerprintPresets.build39NativeBaseline
         return defaultSlot == baseline.defaultSlot
             && mobile == baseline.mobile
             && desktop == baseline.desktop

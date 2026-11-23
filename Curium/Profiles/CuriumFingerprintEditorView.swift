@@ -809,6 +809,18 @@ struct CuriumFingerprintEditorView: View {
                     Button("Clear WebGL (Native Apple Metal)") {
                         applyWebGLPreset(vendor: nil, renderer: nil)
                     }
+                    Button("Qualcomm Adreno 750 (Android Mobile)") {
+                        applyMobileWebGLPreset(
+                            vendor: "Google Inc. (Qualcomm)",
+                            renderer: "ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2)"
+                        )
+                    }
+                    Button("ARM Mali-G715 (Android Mobile)") {
+                        applyMobileWebGLPreset(
+                            vendor: "Google Inc. (ARM)",
+                            renderer: "ANGLE (ARM, Mali-G715, OpenGL ES 3.2)"
+                        )
+                    }
                     Button("Intel Iris Xe (Windows D3D11)") {
                         applyWebGLPreset(
                             vendor: "Google Inc. (Intel)",
@@ -828,7 +840,7 @@ struct CuriumFingerprintEditorView: View {
                         )
                     }
                 } label: {
-                    Label("Apply WebGL GPU Preset to Both Slots…", systemImage: "cpu")
+                    Label("Apply WebGL GPU Preset…", systemImage: "cpu")
                 }
 
                 CuriumStackedTextFieldRow(
@@ -872,7 +884,7 @@ struct CuriumFingerprintEditorView: View {
             Text("Hardware, Timezone & GPU")
         } footer: {
             Text(
-                "Leave off for authentic Apple hardware. Turn on only when spoofing a non-Apple platform (such as Windows or Linux) where WebGL and CPU/RAM parity matter."
+                "Leave off for authentic Apple hardware. Turn on whenever presenting a non-Apple platform (such as Android, Windows, or Linux) so reported WebGL, fonts, and CPU/RAM stay coherent without affecting native Metal rendering speed."
             )
         }
     }
@@ -1091,6 +1103,14 @@ struct CuriumFingerprintEditorView: View {
         draft.mobile.webglRenderer = renderer
         draft.desktop.webglVendor = vendor
         draft.desktop.webglRenderer = renderer
+    }
+
+    private func applyMobileWebGLPreset(vendor: String, renderer: String) {
+        draft.mobile.webglVendor = vendor
+        draft.mobile.webglRenderer = renderer
+        if draft.mobile.webglProfile == nil || draft.mobile.webglProfile == .native {
+            draft.mobile.webglProfile = .mobileAndroid
+        }
     }
 
     private func selectCurrentProfile() {
