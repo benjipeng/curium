@@ -1,16 +1,33 @@
 import Darwin
 import Foundation
-import UIKit
 
-/// Coordinates cold relaunch handoff after flushing profile selection, tabs, SQLite WAL,
-/// and diagnostics — supporting LiveContainer 1/2/3+ URL-scheme relaunch and standalone exit.
+/// Coordinates clean cold-switch handoff after flushing profile selection, tabs, SQLite WAL,
+/// and diagnostics so reopening Curium launches into the target isolated Blink profile.
 enum CuriumProfileRelauncher {
     static var isRunningInLiveContainer: Bool {
         ProcessInfo.processInfo.environment["LC_HOME_PATH"]?.isEmpty == false
     }
 
     static var primaryRelaunchButtonTitle: String {
-        isRunningInLiveContainer ? "Save & Relaunch" : "Save & Close to Switch"
+        "Save & Close to Switch"
+    }
+
+    static var shortActionButtonTitle: String {
+        "Close & Switch"
+    }
+
+    static var recoveryCloseButtonTitle: String {
+        "Close Curium"
+    }
+
+    static func switchHandoffDescription(
+        activeProfileName: String,
+        targetProfileName: String
+    ) -> String {
+        if isRunningInLiveContainer {
+            return "Curium will save open tabs and library data for \(activeProfileName), then close cleanly. Reopen Curium from LiveContainer to launch straight into \(targetProfileName) in a fresh isolated Blink process."
+        }
+        return "Curium will save open tabs and library data for \(activeProfileName), then close cleanly. Reopen Curium to launch straight into \(targetProfileName) in a fresh isolated Blink process."
     }
 
     /// Reads LiveContainer's dynamic URL scheme (`livecontainer`, `livecontainer2`, etc.)
@@ -53,24 +70,28 @@ enum CuriumProfileRelauncher {
         return components.url
     }
 
+    static func liveContainerMenuURL(scheme: String? = nil) -> URL? {
+        let resolvedScheme = (scheme ?? liveContainerAppURLScheme())
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !resolvedScheme.isEmpty else { return nil }
+        var components = URLComponents()
+        components.scheme = resolvedScheme
+        components.host = "livecontainer-launch"
+        components.queryItems = [
+            URLQueryItem(name: "bundle-name", value: "ui"),
+        ]
+        return components.url
+    }
+
     @MainActor
     static func relaunchAfterFlush(customHandler: (@MainActor () -> Void)? = nil) {
         if let customHandler {
             customHandler()
             return
         }
-        if isRunningInLiveContainer, let url = liveContainerRelaunchURL() {
-            UIApplication.shared.open(url, options: [:]) { success in
-                if !success {
-                    exit(0)
-                }
-            }
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(1200))
-                exit(0)
-            }
-            return
-        }
+        // Always close cleanly after flushing rather than self-opening
+        // `livecontainer://livecontainer-launch?bundle-name=<self>`, which races
+        // against LiveContainer's running-guest focus/confirmation prompt and exit(0).
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(150))
             exit(0)

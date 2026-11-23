@@ -318,7 +318,12 @@ final class CuriumFingerprintStore {
         symbolName: String? = nil,
         palette: CuriumPalette? = nil,
         siteMode: CuriumSiteMode? = nil,
-        searchEngine: CuriumSearchEngine? = nil
+        searchEngine: CuriumSearchEngine? = nil,
+        enableFarbling: Bool = true,
+        randomizeHardwareVariant: Bool = true,
+        proxy: CuriumProxyConfig? = nil,
+        timezone: String? = nil,
+        languages: [String]? = nil
     ) -> CuriumFingerprintProfile? {
         guard loadError == nil else {
             lastPersistError = "Cannot create profile while \(Self.fileName) is unreadable. Back up and reset the corrupt store first."
@@ -335,8 +340,19 @@ final class CuriumFingerprintStore {
             symbolName: symbolName,
             palette: palette,
             siteMode: siteMode,
-            searchEngine: searchEngine
+            searchEngine: searchEngine,
+            enableFarbling: enableFarbling,
+            randomizeHardwareVariant: randomizeHardwareVariant,
+            avoidingExisting: profiles,
+            proxy: proxy,
+            timezone: timezone,
+            languages: languages
         )
+        let validation = validateForUpsert(created)
+        guard validation.isValid else {
+            lastPersistError = validation.errors.joined(separator: " ")
+            return nil
+        }
         let previousProfiles = profiles
         profiles.append(created)
         guard persist() else {

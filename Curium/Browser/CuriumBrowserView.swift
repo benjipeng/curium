@@ -821,7 +821,7 @@ private struct CuriumPendingProfileSwitchPill: View {
     @State private var isRelaunching = false
 
     private var shortActionTitle: String {
-        CuriumProfileRelauncher.isRunningInLiveContainer ? "Relaunch" : "Switch"
+        CuriumProfileRelauncher.shortActionButtonTitle
     }
 
     var body: some View {
@@ -857,6 +857,8 @@ private struct CuriumPendingProfileSwitchPill: View {
                 } else {
                     Text(shortActionTitle)
                         .font(.footnote.weight(.semibold))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
             }
             .buttonStyle(.borderedProminent)

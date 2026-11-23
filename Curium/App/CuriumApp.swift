@@ -323,8 +323,8 @@ private struct CuriumProfileLaunchRecoveryView: View {
                         CuriumProfileRelauncher.relaunchAfterFlush()
                     } label: {
                         Label(
-                            CuriumProfileRelauncher.isRunningInLiveContainer ? "Relaunch Curium" : "Close Curium",
-                            systemImage: "arrow.clockwise.circle"
+                            CuriumProfileRelauncher.recoveryCloseButtonTitle,
+                            systemImage: "xmark.circle"
                         )
                     }
                     .buttonStyle(.bordered)

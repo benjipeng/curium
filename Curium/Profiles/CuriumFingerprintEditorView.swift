@@ -713,7 +713,7 @@ struct CuriumFingerprintEditorView: View {
             Text("Native Anti-Fingerprinting")
         } footer: {
             Text(
-                "Perturbations are deterministic per top-level site in Blink C++ with zero JS prototype footprint. Non-Apple font profiles hide Apple-exclusive fonts while preserving CJK & Emoji glyph fallback."
+                "Perturbations are deterministic per top-level site in Blink C++ with zero JS prototype footprint. Non-Apple font profiles hide Apple-exclusive fonts while preserving CJK & Emoji glyph fallback. Pair per-site farbling with a distinct GPU/screen variant and Fixed Proxy IP to prevent server-side services like Fingerprint Pro from linking profiles."
             )
         }
     }
@@ -735,6 +735,33 @@ struct CuriumFingerprintEditorView: View {
                 }
             ))
             .accessibilityIdentifier("curium.editor.hwOverride")
+
+            if CuriumFingerprintPresets.rollCoherentHardwareVariant(
+                for: draft,
+                avoiding: store.profiles.filter { $0.id != draft.id }
+            ) != nil {
+                Button {
+                    if let rolled = CuriumFingerprintPresets.rollCoherentHardwareVariant(
+                        for: draft,
+                        avoiding: store.profiles.filter { $0.id != draft.id }
+                    ) {
+                        draft = rolled
+                        hardwareOverrideEnabled = !rolled.usesNativeHardwareAndGPU
+                    }
+                } label: {
+                    Label("Roll Coherent Hardware Variant", systemImage: "dice")
+                }
+                .accessibilityIdentifier("curium.editor.rollHardware")
+            }
+
+            if let activeScreen = (draft.defaultSlot == .desktop ? draft.desktop.screen : draft.mobile.screen) {
+                LabeledContent("Active Screen") {
+                    Text(activeScreen.summary)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                }
+            }
 
             if !hardwareOverrideEnabled {
                 Label(

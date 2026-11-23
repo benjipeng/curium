@@ -1,8 +1,81 @@
 import SwiftUI
 
 /// Guided local profile creation sheet with live persona preview, curated 16-symbol
-/// icon grid, 6 actinide accent swatches, 7 fingerprint archetypes, and per-profile defaults.
+/// icon grid, 6 actinide accent swatches, 7 fingerprint archetypes, per-profile
+/// farbling & hardware variant controls, optional proxy/locale, and defaults.
 struct CuriumCreateProfileSheet: View {
+    private enum ProxyModeChoice: String, CaseIterable, Identifiable {
+        case system
+        case direct
+        case fixed
+
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .system: return "System"
+            case .direct: return "Direct"
+            case .fixed: return "Fixed"
+            }
+        }
+    }
+
+    private enum LanguagePreset: String, CaseIterable, Identifiable {
+        case system
+        case enUS
+        case enGB
+        case zhCN
+        case jaJP
+        case deDE
+
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .system: return "System Default"
+            case .enUS: return "English (US)"
+            case .enGB: return "English (UK)"
+            case .zhCN: return "Chinese (Simplified)"
+            case .jaJP: return "Japanese"
+            case .deDE: return "German"
+            }
+        }
+
+        var shortSummary: String? {
+            switch self {
+            case .system: return nil
+            case .enUS: return "en-US"
+            case .enGB: return "en-GB"
+            case .zhCN: return "zh-CN"
+            case .jaJP: return "ja-JP"
+            case .deDE: return "de-DE"
+            }
+        }
+
+        var tags: [String]? {
+            switch self {
+            case .system: return nil
+            case .enUS: return ["en-US", "en"]
+            case .enGB: return ["en-GB", "en"]
+            case .zhCN: return ["zh-CN", "zh", "en"]
+            case .jaJP: return ["ja-JP", "ja", "en"]
+            case .deDE: return ["de-DE", "de", "en"]
+            }
+        }
+    }
+
+    private static let commonTimezones: [String] = [
+        "UTC",
+        "America/New_York",
+        "America/Chicago",
+        "America/Los_Angeles",
+        "Europe/London",
+        "Europe/Berlin",
+        "Europe/Paris",
+        "Asia/Tokyo",
+        "Asia/Shanghai",
+        "Asia/Singapore",
+        "Australia/Sydney",
+    ]
+
     var fingerprintStore: CuriumFingerprintStore
     var onCreated: (CuriumFingerprintProfile) -> Void
 
@@ -21,6 +94,14 @@ struct CuriumCreateProfileSheet: View {
     @State private var selectedPalette: CuriumPalette = CuriumProfileTemplate.allTemplates.first?.defaultPalette ?? .violet
     @State private var userPickedSymbol = false
     @State private var userPickedPalette = false
+    @State private var enableFarbling = true
+    @State private var randomizeHardwareVariant = true
+    @State private var isNetworkLocaleExpanded = false
+    @State private var proxyModeSelection: ProxyModeChoice = .system
+    @State private var fixedProxyRules = ""
+    @State private var fixedProxyBypass = ""
+    @State private var selectedTimezone = ""
+    @State private var selectedLanguagePreset: LanguagePreset = .system
     @State private var selectedSiteMode: CuriumSiteMode = .adaptive
     @State private var selectedSearchEngine: CuriumSearchEngine = .google
     @State private var alertMessage: String?
@@ -30,6 +111,68 @@ struct CuriumCreateProfileSheet: View {
 
     private var trimmedDisplayName: String {
         displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var trimmedProxyRules: String {
+        fixedProxyRules.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var trimmedProxyBypass: String {
+        fixedProxyBypass.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var isFixedProxyRulesValid: Bool {
+        guard proxyModeSelection == .fixed else { return true }
+        let rules = trimmedProxyRules
+        guard !rules.isEmpty,
+              rules.utf8.count <= 1024,
+              !rules.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F })
+        else { return false }
+        return CuriumFingerprintValidator.isValidFixedProxyRules(rules)
+    }
+
+    private var isFixedProxyBypassValid: Bool {
+        guard proxyModeSelection == .fixed else { return true }
+        let bypass = trimmedProxyBypass
+        guard bypass.utf8.count <= 2048,
+              !bypass.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F })
+        else { return false }
+        return true
+    }
+
+    private var canCreateProfile: Bool {
+        !trimmedDisplayName.isEmpty
+            && fingerprintStore.loadError == nil
+            && isFixedProxyRulesValid
+            && isFixedProxyBypassValid
+    }
+
+    private var networkLocaleSummary: String {
+        var parts: [String] = []
+        switch proxyModeSelection {
+        case .system:
+            parts.append("System")
+        case .direct:
+            parts.append("Direct")
+        case .fixed:
+            parts.append("Fixed Proxy")
+        }
+        if selectedTimezone.isEmpty {
+            if proxyModeSelection == .system && selectedLanguagePreset == .system {
+                parts.append("Native TZ")
+            }
+        } else {
+            let shortTZ = selectedTimezone
+                .split(separator: "/")
+                .last
+                .map { $0.replacingOccurrences(of: "_", with: " ") }
+                ?? selectedTimezone
+            parts.append(shortTZ)
+        }
+        if let langSummary = selectedLanguagePreset.shortSummary {
+            parts.append(langSummary)
+        }
+        return parts.joined(separator: " · ")
     }
 
     private var selectedTemplate: CuriumProfileTemplate {
@@ -43,6 +186,8 @@ struct CuriumCreateProfileSheet: View {
                 previewHeaderSection
                 identitySection
                 templatesSection
+                fingerprintProtectionSection
+                networkAndLocaleSection
                 defaultsSection
             }
             .scrollDismissesKeyboard(.interactively)
@@ -64,7 +209,7 @@ struct CuriumCreateProfileSheet: View {
                     } label: {
                         Label("Create", systemImage: "checkmark")
                     }
-                    .disabled(trimmedDisplayName.isEmpty || fingerprintStore.loadError != nil)
+                    .disabled(!canCreateProfile)
                     .accessibilityIdentifier("curium.createProfile.create")
                 }
             }
@@ -245,6 +390,12 @@ struct CuriumCreateProfileSheet: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
+
+                            if template.hasHardwareVariantPool {
+                                Text("\(template.hardwareVariantCount) hardware variants")
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -267,7 +418,129 @@ struct CuriumCreateProfileSheet: View {
             Text("Fingerprint Archetype")
         } footer: {
             Text(
-                "Templates seed an independent local profile with its own random farbling seed. Every setting can be customized after creation."
+                "Choose a platform archetype for UA, Client Hints, and font filtering. Every setting can be customized after creation."
+            )
+        }
+    }
+
+    private var fingerprintProtectionSection: some View {
+        Section {
+            Toggle("Unique Per-Site Farbling Seed", isOn: $enableFarbling)
+                .accessibilityIdentifier("curium.createProfile.farbling")
+
+            if selectedTemplate.hasHardwareVariantPool {
+                Toggle("Distinct Hardware & GPU Variant", isOn: $randomizeHardwareVariant)
+                    .accessibilityIdentifier("curium.createProfile.randomizeHW")
+            }
+        } header: {
+            Text("Fingerprint Protection")
+        } footer: {
+            if selectedTemplate.hasHardwareVariantPool {
+                Text(
+                    "Every new profile gets its own 256-bit deterministic farbling seed and a distinct realistic GPU, screen, and CPU variant so profiles stay separated across fingerprinting checks."
+                )
+            } else {
+                Text(
+                    "Every new profile gets its own 256-bit deterministic farbling seed in Blink C++ so Canvas, Audio, WebGL, and TextMetrics hashes stay separated across profiles."
+                )
+            }
+        }
+    }
+
+    private var networkAndLocaleSection: some View {
+        Section {
+            DisclosureGroup(isExpanded: $isNetworkLocaleExpanded) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Proxy")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+
+                    Picker("Proxy", selection: $proxyModeSelection) {
+                        ForEach(ProxyModeChoice.allCases) { choice in
+                            Text(choice.title).tag(choice)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("curium.createProfile.proxyMode")
+                }
+                .padding(.vertical, 2)
+
+                if proxyModeSelection == .fixed {
+                    CuriumStackedTextFieldRow(
+                        title: "Proxy Rules",
+                        placeholder: "socks5://127.0.0.1:1080",
+                        text: $fixedProxyRules,
+                        isReadOnly: false,
+                        monospaced: true,
+                        font: .callout,
+                        keyboardType: .URL,
+                        autocapitalization: .never,
+                        textFieldAccessibilityID: "curium.createProfile.proxyRules"
+                    )
+
+                    if !isFixedProxyRulesValid {
+                        Label(
+                            "Enter valid proxy rules (e.g. socks5://127.0.0.1:1080 or http=127.0.0.1:8080).",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("curium.createProfile.proxyError")
+                    }
+
+                    CuriumStackedTextFieldRow(
+                        title: "Bypass Rules (Optional)",
+                        placeholder: "localhost,127.0.0.1",
+                        text: $fixedProxyBypass,
+                        isReadOnly: false,
+                        monospaced: true,
+                        font: .callout,
+                        keyboardType: .URL,
+                        autocapitalization: .never,
+                        textFieldAccessibilityID: "curium.createProfile.proxyBypass"
+                    )
+
+                    if !isFixedProxyBypassValid {
+                        Label(
+                            "Bypass rules contain invalid control characters or exceed 2048 bytes.",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    }
+                }
+
+                Picker("Timezone", selection: $selectedTimezone) {
+                    Text("System Default").tag("")
+                    ForEach(Self.commonTimezones, id: \.self) { tz in
+                        Text(tz).tag(tz)
+                    }
+                }
+                .accessibilityIdentifier("curium.createProfile.timezone")
+
+                Picker("Language", selection: $selectedLanguagePreset) {
+                    ForEach(LanguagePreset.allCases) { preset in
+                        Text(preset.title).tag(preset)
+                    }
+                }
+                .accessibilityIdentifier("curium.createProfile.language")
+            } label: {
+                LabeledContent("Proxy & Locale") {
+                    Text(networkLocaleSummary)
+                        .font(.caption)
+                        .foregroundStyle(
+                            (!isFixedProxyRulesValid || !isFixedProxyBypassValid) ? .red : .secondary
+                        )
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .accessibilityIdentifier("curium.createProfile.networkLocale")
+        } header: {
+            Text("Network & Locale")
+        } footer: {
+            Text(
+                "Pairing a per-profile Fixed Proxy IP with a distinct hardware variant prevents server-side services like Fingerprint Pro from linking profiles on the same network."
             )
         }
     }
@@ -297,14 +570,33 @@ struct CuriumCreateProfileSheet: View {
     // MARK: - Actions
 
     private func createProfile() {
-        guard !trimmedDisplayName.isEmpty else { return }
+        guard canCreateProfile else { return }
+        let proxyConfig: CuriumProxyConfig? = switch proxyModeSelection {
+        case .system:
+            .system
+        case .direct:
+            .direct
+        case .fixed:
+            .fixed(
+                rules: trimmedProxyRules,
+                bypassRules: trimmedProxyBypass.isEmpty ? nil : trimmedProxyBypass
+            )
+        }
+        let timezone = selectedTimezone.isEmpty ? nil : selectedTimezone
+        let languages = selectedLanguagePreset.tags
+
         guard let created = fingerprintStore.createProfile(
             fromTemplate: selectedTemplateID,
             displayName: trimmedDisplayName,
             symbolName: selectedSymbol,
             palette: selectedPalette,
             siteMode: selectedSiteMode,
-            searchEngine: selectedSearchEngine
+            searchEngine: selectedSearchEngine,
+            enableFarbling: enableFarbling,
+            randomizeHardwareVariant: selectedTemplate.hasHardwareVariantPool ? randomizeHardwareVariant : false,
+            proxy: proxyConfig,
+            timezone: timezone,
+            languages: languages
         ) else {
             alertMessage = fingerprintStore.lastPersistError ?? "Unable to create profile."
             return

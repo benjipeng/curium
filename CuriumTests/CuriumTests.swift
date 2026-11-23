@@ -661,10 +661,14 @@ struct CuriumFingerprintTests {
         let templateInstance = try #require(
             store.createProfile(fromTemplate: "win11-workstation", displayName: "Windows Base")
         )
+        #expect(templateInstance.isFarblingActive)
+        #expect(!templateInstance.usesNativeHardwareAndGPU)
         let custom = try #require(
             store.duplicateProfile(from: templateInstance.id, newID: "office-win", displayName: "Office Win")
         )
         #expect(custom.id == "office-win")
+        #expect(custom.isFarblingActive)
+        #expect(custom.fingerprintSeed != templateInstance.fingerprintSeed)
         #expect(store.selectProfile(id: "office-win"))
 
         var edited = custom
@@ -2981,5 +2985,492 @@ struct CuriumWave2MultiProfileAndDownloadsTests {
         #expect(!FileManager.default.fileExists(atPath: oldDownload.path))
         #expect(FileManager.default.fileExists(atPath: outsideFile.path))
         #expect(!FileManager.default.fileExists(atPath: hostRoot.appending(path: "Documents/Curium/Downloads/escape-link.txt").path))
+    }
+}
+
+@Suite("Phase A Fingerprint Differentiation & Reliable Switch")
+struct CuriumPhaseAFingerprintAndSwitchTests {
+    private func makeTempDir(_ prefix: String = "curium-pa") throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "\(prefix)-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private struct HardwareSignature: Hashable {
+        let webglVendor: String?
+        let webglRenderer: String?
+        let width: Int?
+        let height: Int?
+        let availWidth: Int?
+        let availHeight: Int?
+        let colorDepth: Int?
+        let model: String?
+        let platformVersion: String?
+        let cores: Int?
+        let memoryGB: Double?
+
+        init(profile: CuriumFingerprintProfile) {
+            let slot = profile.defaultSlot == .desktop ? profile.desktop : profile.mobile
+            self.webglVendor = slot.webglVendor
+            self.webglRenderer = slot.webglRenderer
+            self.width = slot.screen?.width
+            self.height = slot.screen?.height
+            self.availWidth = slot.screen?.availWidth
+            self.availHeight = slot.screen?.availHeight
+            self.colorDepth = slot.screen?.colorDepth
+            self.model = slot.model
+            self.platformVersion = slot.platformVersion
+            self.cores = profile.hardware.hardwareConcurrency
+            self.memoryGB = profile.hardware.deviceMemoryGB
+        }
+    }
+
+    @Test("All hardware variant pools pass zero-error zero-warning validation and emit strict schema v2 wire JSON")
+    @MainActor
+    func allHardwareVariantPoolsValidateAndSerializeSchemaV2() throws {
+        let expectedMultiVariantMinimums: [String: Int] = [
+            "win11-workstation": 6,
+            "linux-desktop": 4,
+            "macos-desktop": 5,
+            "pixel-android": 4,
+        ]
+        #expect(Set(CuriumFingerprintDevicePools.allPools.keys) == Set(expectedMultiVariantMinimums.keys))
+
+        for nativeOnlyID in ["default", "ios-blink", "privacy-hardened"] {
+            let nativeTemplate = try #require(CuriumProfileTemplate.template(for: nativeOnlyID))
+            #expect(!nativeTemplate.hasHardwareVariantPool)
+            #expect(nativeTemplate.hardwareVariantCount == 0)
+            #expect(CuriumFingerprintDevicePools.variants(forTemplateID: nativeOnlyID).isEmpty)
+        }
+
+        // Exact Build 42 C++ schema v2 key allowlists from patches/0106 & patches/0110.
+        let allowedTopKeys: Set<String> = [
+            "schemaVersion", "revision", "profileId", "defaultSlot", "mobile", "desktop",
+            "languages", "proxy", "webrtcIpHandlingPolicy", "enableDoNotTrack",
+            "enableGlobalPrivacyControl", "hardware", "fingerprintSeed", "farbling",
+            "fontProfile", "hideSpeechVoices",
+        ]
+        let allowedSlotKeys: Set<String> = [
+            "uaString", "osCpu", "productVersion", "appendMobileToken", "primaryBrand",
+            "majorVersion", "fullVersion", "brands", "fullVersionBrands", "platform",
+            "platformVersion", "architecture", "bitness", "model", "mobile", "wow64",
+            "formFactors", "navigatorPlatform", "maxTouchPoints", "pointerType",
+            "hoverType", "webglVendor", "webglRenderer", "screen", "webglProfile",
+            "webglMaxTextureSize", "webglMaxRenderbufferSize", "webglMaxCubeMapTextureSize",
+            "pdfViewerEnabled",
+        ]
+        let allowedScreenKeys: Set<String> = [
+            "width", "height", "availWidth", "availHeight", "colorDepth",
+        ]
+        let allowedHardwareKeys: Set<String> = [
+            "hardwareConcurrency", "deviceMemoryGB", "timezone",
+        ]
+        let allowedFarblingKeys: Set<String> = [
+            "canvas", "audio", "webgl", "textMetrics",
+        ]
+        let allowedProxyKeys: Set<String> = [
+            "mode", "rules", "bypassRules",
+        ]
+
+        for (templateID, minCount) in expectedMultiVariantMinimums {
+            let template = try #require(CuriumProfileTemplate.template(for: templateID))
+            let variants = CuriumFingerprintDevicePools.variants(forTemplateID: templateID)
+            #expect(template.hasHardwareVariantPool)
+            #expect(template.hardwareVariantCount == variants.count)
+            #expect(variants.count >= minCount, "Pool \(templateID) has \(variants.count) < \(minCount)")
+            #expect(Set(variants.map(\.id)).count == variants.count)
+
+            let baseInstantiated = template.instantiate(
+                id: "p-a1b2c3d4",
+                displayName: "Audit \(templateID)",
+                enableFarbling: true,
+                randomizeHardwareVariant: false
+            )
+
+            for variant in variants {
+                let candidate = variant.apply(to: baseInstantiated).normalizedForPersistence()
+                let report = CuriumFingerprintValidator.validate(candidate)
+                #expect(report.errors.isEmpty, "Variant \(variant.id) errors: \(report.errors)")
+                #expect(report.warnings.isEmpty, "Variant \(variant.id) warnings: \(report.warnings)")
+
+                let wireData = try candidate.makeEngineLaunchJSON(
+                    preferredSystemLanguages: ["en-US"],
+                    schemaVersion: 2
+                )
+                #expect(wireData.count <= CuriumFingerprintSchema.maxPayloadBytes)
+
+                let root = try #require(JSONSerialization.jsonObject(with: wireData) as? [String: Any])
+                #expect(Set(root.keys).isSubset(of: allowedTopKeys), "Unknown top keys in \(variant.id): \(root.keys)")
+                #expect((root["schemaVersion"] as? Int) == 2)
+                #expect((root["profileId"] as? String) == "p-a1b2c3d4")
+
+                for slotKey in ["mobile", "desktop"] {
+                    let slotDict = try #require(root[slotKey] as? [String: Any])
+                    #expect(
+                        Set(slotDict.keys).isSubset(of: allowedSlotKeys),
+                        "Unknown \(slotKey) keys in \(variant.id): \(slotDict.keys)"
+                    )
+                    if let screenDict = slotDict["screen"] as? [String: Any] {
+                        #expect(Set(screenDict.keys).isSubset(of: allowedScreenKeys))
+                        let w = try #require(screenDict["width"] as? Int)
+                        let h = try #require(screenDict["height"] as? Int)
+                        let aw = (screenDict["availWidth"] as? Int) ?? w
+                        let ah = (screenDict["availHeight"] as? Int) ?? h
+                        let depth = (screenDict["colorDepth"] as? Int) ?? 24
+                        #expect((240...16384).contains(w))
+                        #expect((240...16384).contains(h))
+                        #expect((240...w).contains(aw))
+                        #expect((240...h).contains(ah))
+                        #expect(CuriumFingerprintSchema.validColorDepths.contains(depth))
+                    }
+                    for glKey in ["webglVendor", "webglRenderer"] {
+                        if let glStr = slotDict[glKey] as? String {
+                            #expect(!glStr.isEmpty && glStr.utf8.count <= 256)
+                            #expect(glStr.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value <= 0x7E })
+                        }
+                    }
+                }
+
+                let hwDict = try #require(root["hardware"] as? [String: Any])
+                #expect(Set(hwDict.keys).isSubset(of: allowedHardwareKeys))
+                if templateID == "pixel-android", let mem = (hwDict["deviceMemoryGB"] as? NSNumber)?.doubleValue {
+                    #expect(mem <= 8.0)
+                }
+
+                let proxyDict = try #require(root["proxy"] as? [String: Any])
+                #expect(Set(proxyDict.keys).isSubset(of: allowedProxyKeys))
+
+                let farblingDict = try #require(root["farbling"] as? [String: Any])
+                #expect(Set(farblingDict.keys).isSubset(of: allowedFarblingKeys))
+            }
+        }
+
+        // Default Personal baseline remains 100% untouched Build 39 native behavior.
+        let rootDir = try makeTempDir("curium-pa-default")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        let store = CuriumFingerprintStore(fileURL: rootDir.appending(path: CuriumFingerprintStore.fileName))
+        let personal = try #require(store.profile(id: "default"))
+        #expect(personal.matchesBuild39EngineDefaults)
+        #expect(personal.fingerprintSeed == nil)
+        #expect(!personal.isFarblingActive)
+        #expect(CuriumFingerprintBootstrap.prepareEngineLaunch(store: store) == .defaultBuild39)
+    }
+
+    @Test("Default createProfile across all 7 templates enables farbling with unique 256-bit seeds and honors enableFarbling: false")
+    func createProfileDefaultFarblingAndExplicitOptOut() throws {
+        let rootDir = try makeTempDir("curium-pa-seeds")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        let store = CuriumFingerprintStore(fileURL: rootDir.appending(path: CuriumFingerprintStore.fileName))
+        #expect(CuriumProfileTemplate.allTemplates.count == 7)
+
+        var mintedSeeds: Set<String> = []
+        for template in CuriumProfileTemplate.allTemplates {
+            let created = try #require(
+                store.createProfile(fromTemplate: template.id, displayName: "Farbled \(template.title)")
+            )
+            #expect(created.isFarblingActive)
+            #expect(created.hasFarblingEnabled)
+            #expect(created.farbling == .allEnabled)
+            let seed = try #require(created.fingerprintSeed)
+            #expect(CuriumFingerprintSchema.isValidSeedHex(seed))
+            #expect(!CuriumFingerprintSchema.isRetiredStaticSeed(seed))
+            mintedSeeds.insert(seed)
+
+            let report = CuriumFingerprintValidator.validate(created)
+            #expect(report.errors.isEmpty)
+            #expect(report.warnings.isEmpty)
+
+            let wireObj = try #require(
+                JSONSerialization.jsonObject(
+                    with: try created.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US"], schemaVersion: 2)
+                ) as? [String: Any]
+            )
+            #expect((wireObj["fingerprintSeed"] as? String) == seed)
+            let farblingObj = try #require(wireObj["farbling"] as? [String: Bool])
+            #expect(farblingObj == ["canvas": true, "audio": true, "webgl": true, "textMetrics": true])
+        }
+        #expect(mintedSeeds.count == CuriumProfileTemplate.allTemplates.count)
+
+        for template in CuriumProfileTemplate.allTemplates {
+            let unfarbled = try #require(
+                store.createProfile(
+                    fromTemplate: template.id,
+                    displayName: "Plain \(template.title)",
+                    enableFarbling: false
+                )
+            )
+            #expect(unfarbled.fingerprintSeed == nil)
+            #expect(unfarbled.farbling == nil)
+            #expect(!unfarbled.isFarblingActive)
+            #expect(!unfarbled.hasFarblingEnabled)
+
+            let report = CuriumFingerprintValidator.validate(unfarbled)
+            #expect(report.errors.isEmpty)
+            #expect(report.warnings.isEmpty)
+
+            let wireObj = try #require(
+                JSONSerialization.jsonObject(
+                    with: try unfarbled.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US"], schemaVersion: 2)
+                ) as? [String: Any]
+            )
+            #expect(wireObj["fingerprintSeed"] == nil)
+            #expect(wireObj["farbling"] == nil)
+        }
+    }
+
+    @Test("Consecutive createProfile calls from multi-variant templates yield distinct GPU, screen, and hardware signatures")
+    func consecutiveCreateProfileCollisionFreeDifferentiation() throws {
+        let multiVariantIDs = [
+            "win11-workstation",
+            "macos-desktop",
+            "linux-desktop",
+            "pixel-android",
+        ]
+
+        for templateID in multiVariantIDs {
+            let rootDir = try makeTempDir("curium-pa-diff-\(templateID)")
+            defer { try? FileManager.default.removeItem(at: rootDir) }
+            let store = CuriumFingerprintStore(fileURL: rootDir.appending(path: CuriumFingerprintStore.fileName))
+
+            let template = try #require(CuriumProfileTemplate.template(for: templateID))
+            let poolSize = template.hardwareVariantCount
+            #expect(poolSize >= 4)
+
+            var createdProfiles: [CuriumFingerprintProfile] = []
+            for idx in 0..<poolSize {
+                let profile = try #require(
+                    store.createProfile(fromTemplate: templateID, displayName: "\(templateID)-\(idx)")
+                )
+                let report = CuriumFingerprintValidator.validate(profile)
+                #expect(report.errors.isEmpty)
+                #expect(report.warnings.isEmpty)
+                createdProfiles.append(profile)
+            }
+
+            let signatures = createdProfiles.map(HardwareSignature.init(profile:))
+            let seeds = try createdProfiles.map { try #require($0.fingerprintSeed) }
+            #expect(
+                Set(signatures).count == poolSize,
+                "Expected \(poolSize) unique hardware variants before wrap for \(templateID), got \(Set(signatures).count)"
+            )
+            #expect(Set(seeds).count == poolSize)
+
+            // Wrapping past poolSize still mints a unique seed and avoids repeating the immediately preceding variant.
+            let wrapped = try #require(
+                store.createProfile(fromTemplate: templateID, displayName: "\(templateID)-wrap")
+            )
+            let wrappedSeed = try #require(wrapped.fingerprintSeed)
+            #expect(!Set(seeds).contains(wrappedSeed))
+            #expect(HardwareSignature(profile: wrapped) != signatures.last)
+            let wrappedReport = CuriumFingerprintValidator.validate(wrapped)
+            #expect(wrappedReport.errors.isEmpty)
+            #expect(wrappedReport.warnings.isEmpty)
+        }
+
+        // Explicit randomizeHardwareVariant: false preserves native Apple hardware on macos-desktop & pixel-android.
+        let optOutDir = try makeTempDir("curium-pa-hw-optout")
+        defer { try? FileManager.default.removeItem(at: optOutDir) }
+        let optOutStore = CuriumFingerprintStore(fileURL: optOutDir.appending(path: CuriumFingerprintStore.fileName))
+        for nativeBaseID in ["macos-desktop", "pixel-android"] {
+            let plainHW = try #require(
+                optOutStore.createProfile(
+                    fromTemplate: nativeBaseID,
+                    displayName: "Native \(nativeBaseID)",
+                    randomizeHardwareVariant: false
+                )
+            )
+            #expect(plainHW.usesNativeHardwareAndGPU)
+        }
+    }
+
+    @Test("createProfile persists custom Fixed Proxy, timezone, and languages and fails closed on invalid inputs")
+    func createProfileNetworkLocalePersistenceAndFailClosedValidation() throws {
+        let rootDir = try makeTempDir("curium-pa-net")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        let fileURL = rootDir.appending(path: CuriumFingerprintStore.fileName)
+        let store = CuriumFingerprintStore(fileURL: fileURL)
+
+        let validProxy = CuriumProxyConfig.fixed(
+            rules: "socks5://127.0.0.1:1080",
+            bypassRules: "localhost,127.0.0.1"
+        )
+        let created = try #require(
+            store.createProfile(
+                fromTemplate: "win11-workstation",
+                displayName: "Berlin Workstation",
+                symbolName: "network",
+                palette: .americium,
+                proxy: validProxy,
+                timezone: "Europe/Berlin",
+                languages: ["de-DE", "de", "en"]
+            )
+        )
+        #expect(created.proxy == validProxy)
+        #expect(created.hardware.timezone == "Europe/Berlin")
+        #expect(created.languages == ["de-DE", "de", "en"])
+
+        let reloaded = CuriumFingerprintStore(fileURL: fileURL)
+        let persisted = try #require(reloaded.profile(id: created.id))
+        #expect(persisted.proxy == validProxy)
+        #expect(persisted.hardware.timezone == "Europe/Berlin")
+        #expect(persisted.languages == ["de-DE", "de", "en"])
+
+        let wireObj = try #require(
+            JSONSerialization.jsonObject(with: try persisted.makeEngineLaunchJSON()) as? [String: Any]
+        )
+        let wireProxy = try #require(wireObj["proxy"] as? [String: Any])
+        #expect((wireProxy["mode"] as? String) == "fixed")
+        #expect((wireProxy["rules"] as? String) == "socks5://127.0.0.1:1080")
+        #expect((wireProxy["bypassRules"] as? String) == "localhost,127.0.0.1")
+        let wireHW = try #require(wireObj["hardware"] as? [String: Any])
+        #expect((wireHW["timezone"] as? String) == "Europe/Berlin")
+        #expect((wireObj["languages"] as? [String]) == ["de-DE", "de", "en"])
+
+        let countBefore = store.profiles.count
+        let diskBytesBefore = try Data(contentsOf: fileURL)
+
+        // Malformed fixed proxy rules fail closed without mutating profiles or disk.
+        for badProxy in [
+            CuriumProxyConfig.fixed(rules: "   ", bypassRules: nil),
+            CuriumProxyConfig.fixed(rules: "direct://", bypassRules: nil),
+            CuriumProxyConfig.fixed(rules: "bad_scheme://127.0.0.1:1080", bypassRules: nil),
+            CuriumProxyConfig.fixed(rules: "socks5://127.0.0.1:99999", bypassRules: nil),
+            CuriumProxyConfig.fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "localhost\n127.0.0.1"),
+        ] {
+            let rejected = store.createProfile(
+                fromTemplate: "win11-workstation",
+                displayName: "Bad Proxy",
+                proxy: badProxy
+            )
+            #expect(rejected == nil)
+            #expect(store.lastPersistError?.isEmpty == false)
+        }
+
+        // Invalid IANA timezones fail closed.
+        for badTimezone in ["Mars/Olympus", "../UTC", "/America/New_York"] {
+            let rejected = store.createProfile(
+                fromTemplate: "macos-desktop",
+                displayName: "Bad TZ",
+                timezone: badTimezone
+            )
+            #expect(rejected == nil)
+            #expect(store.lastPersistError?.isEmpty == false)
+        }
+
+        // Invalid BCP-47 language tags or >8 tags fail closed.
+        for badLanguages in [
+            ["bad;header"],
+            ["en-US,fr-FR"],
+            ["en-US", "en-GB", "fr-FR", "de-DE", "ja-JP", "zh-CN", "es-ES", "it-IT", "pt-BR"],
+        ] {
+            let rejected = store.createProfile(
+                fromTemplate: "linux-desktop",
+                displayName: "Bad Lang",
+                languages: badLanguages
+            )
+            #expect(rejected == nil)
+            #expect(store.lastPersistError?.isEmpty == false)
+        }
+
+        // Unknown template ID fails closed.
+        #expect(store.createProfile(fromTemplate: "unknown-archetype", displayName: "Unknown") == nil)
+        #expect(store.lastPersistError?.isEmpty == false)
+
+        #expect(store.profiles.count == countBefore)
+        #expect(try Data(contentsOf: fileURL) == diskBytesBefore)
+    }
+
+    @Test("rollCoherentHardwareVariant rotates to a distinct variant while preserving identity, proxy, timezone, languages, and seed")
+    func rollCoherentHardwareVariantRotatesAndPreservesMetadata() throws {
+        let rootDir = try makeTempDir("curium-pa-roll")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        let store = CuriumFingerprintStore(fileURL: rootDir.appending(path: CuriumFingerprintStore.fileName))
+
+        // Native-only archetypes without a pool return nil cleanly.
+        let personal = try #require(store.profile(id: "default"))
+        #expect(CuriumFingerprintPresets.rollCoherentHardwareVariant(for: personal) == nil)
+        for nativeID in ["ios-blink", "privacy-hardened"] {
+            let nativeProfile = try #require(
+                store.createProfile(fromTemplate: nativeID, displayName: "Native \(nativeID)")
+            )
+            #expect(CuriumFingerprintPresets.rollCoherentHardwareVariant(for: nativeProfile) == nil)
+        }
+
+        let fixedProxy = CuriumProxyConfig.fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "localhost")
+        for templateID in ["win11-workstation", "linux-desktop", "macos-desktop", "pixel-android"] {
+            let original = try #require(
+                store.createProfile(
+                    fromTemplate: templateID,
+                    displayName: "Roll \(templateID)",
+                    symbolName: "globe",
+                    palette: .berkelium,
+                    proxy: fixedProxy,
+                    timezone: "Asia/Tokyo",
+                    languages: ["ja-JP", "ja", "en"]
+                )
+            )
+            var current = original
+            for _ in 0..<3 {
+                let others = store.profiles.filter { $0.id != current.id }
+                let rolled = try #require(
+                    CuriumFingerprintPresets.rollCoherentHardwareVariant(for: current, avoiding: others)
+                )
+                #expect(HardwareSignature(profile: rolled) != HardwareSignature(profile: current))
+                #expect(rolled.id == original.id)
+                #expect(rolled.displayName == original.displayName)
+                #expect(rolled.proxy == fixedProxy)
+                #expect(rolled.hardware.timezone == "Asia/Tokyo")
+                #expect(rolled.languages == ["ja-JP", "ja", "en"])
+                #expect(rolled.fingerprintSeed == original.fingerprintSeed)
+                #expect(rolled.farbling == original.farbling)
+                #expect(rolled.symbolName == "globe")
+                #expect(rolled.palette == .berkelium)
+
+                let report = CuriumFingerprintValidator.validate(rolled)
+                #expect(report.errors.isEmpty)
+                #expect(report.warnings.isEmpty)
+                current = rolled
+            }
+        }
+    }
+
+    @Test("CuriumProfileRelauncher exposes honest close-to-switch copy and LiveContainer launch/menu URLs")
+    @MainActor
+    func relauncherCopyAndLiveContainerURLs() throws {
+        #expect(CuriumProfileRelauncher.primaryRelaunchButtonTitle == "Save & Close to Switch")
+        #expect(CuriumProfileRelauncher.shortActionButtonTitle == "Close & Switch")
+        #expect(CuriumProfileRelauncher.recoveryCloseButtonTitle == "Close Curium")
+
+        let handoffCopy = CuriumProfileRelauncher.switchHandoffDescription(
+            activeProfileName: "Personal",
+            targetProfileName: "Work Mac"
+        )
+        #expect(handoffCopy.contains("Personal"))
+        #expect(handoffCopy.contains("Work Mac"))
+        #expect(handoffCopy.contains("save open tabs and library data"))
+        #expect(handoffCopy.contains("close cleanly"))
+        #expect(handoffCopy.contains("isolated Blink process"))
+
+        let relaunchLC1 = try #require(
+            CuriumProfileRelauncher.liveContainerRelaunchURL(
+                bundlePath: "/var/containers/Bundle/Application/1234/com.appautomaton.curium.app",
+                scheme: "livecontainer"
+            )
+        )
+        #expect(relaunchLC1.absoluteString == "livecontainer://livecontainer-launch?bundle-name=com.appautomaton.curium.app")
+
+        let menuLC1 = try #require(CuriumProfileRelauncher.liveContainerMenuURL(scheme: "livecontainer"))
+        #expect(menuLC1.absoluteString == "livecontainer://livecontainer-launch?bundle-name=ui")
+
+        let menuLC2 = try #require(CuriumProfileRelauncher.liveContainerMenuURL(scheme: "livecontainer2"))
+        #expect(menuLC2.absoluteString == "livecontainer2://livecontainer-launch?bundle-name=ui")
+        #expect(CuriumProfileRelauncher.liveContainerMenuURL(scheme: "   ") == nil)
+
+        var customHandlerCalled = false
+        CuriumProfileRelauncher.relaunchAfterFlush {
+            customHandlerCalled = true
+        }
+        #expect(customHandlerCalled)
     }
 }

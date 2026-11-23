@@ -272,7 +272,10 @@ struct CuriumProfileSwitcherSheet: View {
             switch dialog {
             case .switchHandoff(let profile):
                 Text(
-                    "Curium will save your open tabs and library for \(activeProfile.displayName) before starting \(profile.displayName) in a fresh isolated Blink process."
+                    CuriumProfileRelauncher.switchHandoffDescription(
+                        activeProfileName: activeProfile.displayName,
+                        targetProfileName: profile.displayName
+                    )
                 )
 
             case .wipeProfile(let profile):
@@ -391,7 +394,7 @@ struct CuriumProfileSwitcherSheet: View {
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.primary)
                         Text(
-                            "Tabs and library for \(activeProfile.displayName) will be saved before relaunching."
+                            "Tabs and library for \(activeProfile.displayName) will be saved before closing so Curium opens cleanly into \(nextLaunchProfile.displayName)."
                         )
                         .font(.caption)
                         .foregroundStyle(.secondary)
