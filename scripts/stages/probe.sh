@@ -221,6 +221,47 @@ for out in sorted(graph.producer.keys()):
 missing_v8 = v8_basenames - found_v8
 if missing_v8:
     sys.exit(f"Missing patched V8 device object targets: {sorted(missing_v8)}")
+# Also resolve Build 41 patched objects across content/ios/blink targets so
+# graph-diagnose verifies every newly patched TU before the 18-shard build.
+build41_specs = [
+    ("obj/content/browser/", "geolocation_service_impl.o"),
+    ("obj/ios/web/content/", "content_permission_manager.o"),
+    ("obj/ios/web/content/", "content_download_task.o"),
+    ("obj/third_party/blink/renderer/core/", "html_media_element.o"),
+    ("obj/third_party/blink/renderer/core/", "html_video_element.o"),
+    ("obj/third_party/blink/renderer/modules/", "picture_in_picture_controller_impl.o"),
+    ("obj/third_party/blink/renderer/modules/", "document_video_picture_in_picture.o"),
+    ("obj/third_party/blink/renderer/modules/", "media_session.o"),
+    ("obj/third_party/blink/renderer/core/", "media_values.o"),
+    ("obj/third_party/blink/renderer/core/", "style_builder_converter.o"),
+    ("obj/third_party/blink/renderer/core/", "execution_context.o"),
+    ("obj/third_party/blink/renderer/core/", "local_dom_window.o"),
+    ("obj/third_party/blink/renderer/core/", "screen.o"),
+    ("obj/third_party/blink/renderer/core/", "canvas_async_blob_creator.o"),
+    ("obj/third_party/blink/renderer/core/", "html_canvas_element.o"),
+    ("obj/third_party/blink/renderer/modules/", "base_rendering_context_2d.o"),
+    ("obj/third_party/blink/renderer/modules/", "dom_plugin_array.o"),
+    ("obj/third_party/blink/renderer/modules/", "screen_orientation_controller.o"),
+    ("obj/third_party/blink/renderer/modules/", "speech_synthesis.o"),
+    ("obj/third_party/blink/renderer/modules/", "analyser_node.o"),
+    ("obj/third_party/blink/renderer/modules/", "offline_audio_context.o"),
+    ("obj/third_party/blink/renderer/platform/", "font_cache.o"),
+    ("obj/third_party/blink/renderer/platform/", "image_data_buffer.o"),
+]
+missing_b41 = []
+for prefix, base in build41_specs:
+    matches = [
+        out for out in sorted(graph.producer.keys())
+        if out.startswith(prefix) and out.rsplit("/", 1)[-1] == base
+    ]
+    if not matches:
+        missing_b41.append(f"{prefix}.../{base}")
+    else:
+        for out in matches:
+            if out not in targets:
+                targets.append(out)
+if missing_b41:
+    sys.exit(f"Missing Build 41 device object targets: {missing_b41}")
 targets_path.write_text("\n".join(targets) + "\n")
 missing = set(targets) - graph.producer.keys()
 if missing:

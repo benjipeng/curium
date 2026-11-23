@@ -1,0 +1,267 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Date: Sun, 22 Nov 2026 19:04:12 -0500
+Subject: [PATCH] iOS Curium: repack permission element strings, geolocation
+ order, and media origin hardening
+
+---
+ .../geolocation/geolocation_service_impl.cc   | 18 +++++----
+ ios/chrome/app/resources/BUILD.gn             |  4 ++
+ .../app/resources/ios_chrome_repack.gni       |  8 ++++
+ ios/web/content/content_permission_manager.mm | 23 ++++++++---
+ ios/web/content/web_state/content_web_state.h |  2 +
+ .../content/web_state/content_web_state.mm    | 40 +++++++++++++++++--
+ 6 files changed, 77 insertions(+), 18 deletions(-)
+
+diff --git a/content/browser/geolocation/geolocation_service_impl.cc b/content/browser/geolocation/geolocation_service_impl.cc
+index efe415e..807aa2c 100644
+--- a/content/browser/geolocation/geolocation_service_impl.cc
++++ b/content/browser/geolocation/geolocation_service_impl.cc
+@@ -164,14 +164,6 @@ void GeolocationServiceImpl::Bind(
+                     std::make_unique<GeolocationServiceImplContext>());
+   receiver_set_.set_disconnect_handler(base::BindRepeating(
+       &GeolocationServiceImpl::OnDisconnected, base::Unretained(this)));
+-#if BUILDFLAG(IS_IOS)
+-  device::GeolocationSystemPermissionManager*
+-      geolocation_system_permission_manager =
+-          device::GeolocationSystemPermissionManager::GetInstance();
+-  if (geolocation_system_permission_manager) {
+-    geolocation_system_permission_manager->RequestSystemPermission();
+-  }
+-#endif
+ }
+ 
+ void GeolocationServiceImpl::CreateGeolocation(
+@@ -216,6 +208,16 @@ void GeolocationServiceImpl::CreateGeolocationWithPermissionResult(
+     return;
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  // Ask the user for site permission before triggering the iOS system prompt.
++  device::GeolocationSystemPermissionManager*
++      geolocation_system_permission_manager =
++          device::GeolocationSystemPermissionManager::GetInstance();
++  if (geolocation_system_permission_manager) {
++    geolocation_system_permission_manager->RequestSystemPermission();
++  }
++#endif
++
+   requesting_origin_ =
+       render_frame_host_->GetMainFrame()->GetLastCommittedOrigin();
+   auto requesting_url =
+diff --git a/ios/chrome/app/resources/BUILD.gn b/ios/chrome/app/resources/BUILD.gn
+index e7eb2a3..8ae18f1 100644
+--- a/ios/chrome/app/resources/BUILD.gn
++++ b/ios/chrome/app/resources/BUILD.gn
+@@ -168,6 +168,8 @@ repack("repack_unscaled_resources") {
+       "$root_gen_dir/third_party/blink/public/resources/blink_scaled_resources_100_percent.pak",
+       "$root_gen_dir/third_party/blink/public/resources/inspector_overlay_resources.pak",
+       "$root_gen_dir/third_party/blink/public/strings/blink_strings_en-US.pak",
++      "$root_gen_dir/third_party/blink/public/strings/permission_element_generated_strings.pak",
++      "$root_gen_dir/third_party/blink/public/strings/permission_element_strings_en-US.pak",
+       "$root_gen_dir/ui/strings/auto_image_annotation_strings_en-US.pak",
+     ]
+     deps += [
+@@ -180,6 +182,8 @@ repack("repack_unscaled_resources") {
+       "//third_party/blink/public:resources",
+       "//third_party/blink/public:scaled_resources_100_percent",
+       "//third_party/blink/public/strings",
++      "//third_party/blink/public/strings:permission_element_generated_strings",
++      "//third_party/blink/public/strings:permission_element_strings",
+       "//ui/resources:ui_resources_grd_grit",
+       "//ui/strings:auto_image_annotation_strings",
+     ]
+diff --git a/ios/chrome/app/resources/ios_chrome_repack.gni b/ios/chrome/app/resources/ios_chrome_repack.gni
+index 093bc43..ef72b9b 100644
+--- a/ios/chrome/app/resources/ios_chrome_repack.gni
++++ b/ios/chrome/app/resources/ios_chrome_repack.gni
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//build/config/chrome_build.gni")
++import("//build/config/features.gni")
+ import("//extensions/buildflags/buildflags.gni")
+ import("//tools/grit/repack.gni")
+ 
+@@ -72,6 +73,13 @@ template("ios_chrome_repack_locales") {
+       deps += [ "//extensions/strings" ]
+     }
+ 
++    if (use_blink) {
++      source_patterns += [
++        "${root_gen_dir}/third_party/blink/public/strings/permission_element_strings_",
++      ]
++      deps += [ "//third_party/blink/public/strings:permission_element_strings" ]
++    }
++
+     copy_data_to_bundle = true
+ 
+     if (enable_builtin_search_provider_assets) {
+diff --git a/ios/web/content/content_permission_manager.mm b/ios/web/content/content_permission_manager.mm
+index 264d4e7..0c3234f 100644
+--- a/ios/web/content/content_permission_manager.mm
++++ b/ios/web/content/content_permission_manager.mm
+@@ -27,9 +27,17 @@
+ 
+ using blink::mojom::PermissionStatus;
+ 
++// Share a single site decision across precise and approximate geolocation.
++blink::PermissionType CanonicalPermissionType(blink::PermissionType type) {
++  if (type == blink::PermissionType::GEOLOCATION_APPROXIMATE) {
++    return blink::PermissionType::GEOLOCATION;
++  }
++  return type;
++}
++
+ // The alert asking for `type`, for the types this manager asks for itself.
+ std::optional<int> PromptMessageId(blink::PermissionType type) {
+-  switch (type) {
++  switch (CanonicalPermissionType(type)) {
+     case blink::PermissionType::GEOLOCATION:
+       return IDS_GEOLOCATION_INFOBAR_TEXT;
+     case blink::PermissionType::CLIPBOARD_READ_WRITE:
+@@ -72,12 +80,13 @@
+ PermissionStatus ContentPermissionManager::GetStatus(
+     blink::PermissionType type,
+     const url::Origin& origin) const {
+-  switch (type) {
++  const blink::PermissionType canonical = CanonicalPermissionType(type);
++  switch (canonical) {
+     case blink::PermissionType::CLIPBOARD_SANITIZED_WRITE:
+       return PermissionStatus::GRANTED;
+     case blink::PermissionType::GEOLOCATION:
+     case blink::PermissionType::CLIPBOARD_READ_WRITE: {
+-      auto it = decisions_.find({type, origin});
++      auto it = decisions_.find({canonical, origin});
+       if (it == decisions_.end()) {
+         return PermissionStatus::ASK;
+       }
+@@ -190,9 +199,10 @@
+     return;
+   }
+   Request& request = *it->second;
+-  decisions_[{type, request.origin}] = granted;
++  const blink::PermissionType canonical = CanonicalPermissionType(type);
++  decisions_[{canonical, request.origin}] = granted;
+   for (size_t i = 0; i < request.types.size(); ++i) {
+-    if (request.types[i] == type &&
++    if (CanonicalPermissionType(request.types[i]) == canonical &&
+         request.statuses[i] == PermissionStatus::ASK) {
+       request.statuses[i] =
+           granted ? PermissionStatus::GRANTED : PermissionStatus::DENIED;
+@@ -247,7 +257,8 @@
+     blink::PermissionType permission,
+     const GURL& requesting_origin,
+     const GURL& embedding_origin) {
+-  decisions_.erase({permission, url::Origin::Create(embedding_origin)});
++  decisions_.erase(
++      {CanonicalPermissionType(permission), url::Origin::Create(embedding_origin)});
+ }
+ 
+ }  // namespace web
+diff --git a/ios/web/content/web_state/content_web_state.h b/ios/web/content/web_state/content_web_state.h
+index 6a32f4c..09d15c3 100644
+--- a/ios/web/content/web_state/content_web_state.h
++++ b/ios/web/content/web_state/content_web_state.h
+@@ -308,6 +308,7 @@ class ContentWebState : public WebState,
+   void OnKeyboardHide(NSNotification* notification);
+   void UpdateTopControlsConstraints();
+   void SynchronizeTopControlsVisualProperties();
++  bool IsCurrentMediaOrigin(const url::Origin& origin) const;
+ 
+   raw_ptr<WebStateDelegate> delegate_ = nullptr;
+   CRCWebViewportContainerView* web_view_;
+@@ -332,6 +333,7 @@ class ContentWebState : public WebState,
+   // microphone, once asked. Kept until another page shows, as WebKit does.
+   std::optional<bool> camera_allowed_;
+   std::optional<bool> microphone_allowed_;
++  std::optional<url::Origin> media_origin_;
+   // [ios-blink-sideload] See GetInterfaceBinderForMainFrame().
+   InterfaceBinder interface_binder_{this};
+   // [ios-blink-sideload] The WebUI of the chrome:// page being shown or loaded:
+diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
+index 2879916..a54466c 100644
+--- a/ios/web/content/web_state/content_web_state.mm
++++ b/ios/web/content/web_state/content_web_state.mm
+@@ -927,6 +927,7 @@ void SerializeMetadata(web::proto::WebStateMetadataStorage& metadata) {
+ void ContentWebState::PrimaryPageChanged(content::Page& page) {
+   camera_allowed_.reset();
+   microphone_allowed_.reset();
++  media_origin_.reset();
+ }
+ 
+ void ContentWebState::RenderViewReady() {
+@@ -1357,6 +1358,18 @@ void RespondToMediaAccessRequest(const content::MediaStreamRequest& request,
+ 
+ }  // namespace
+ 
++bool ContentWebState::IsCurrentMediaOrigin(const url::Origin& origin) const {
++  if (origin.opaque() || !web_contents_) {
++    return false;
++  }
++  content::RenderFrameHost* main_frame = web_contents_->GetPrimaryMainFrame();
++  if (!main_frame) {
++    return false;
++  }
++  const url::Origin main_origin = main_frame->GetLastCommittedOrigin();
++  return !main_origin.opaque() && main_origin.IsSameOriginWith(origin);
++}
++
+ void ContentWebState::RequestMediaAccessPermission(
+     content::WebContents* web_contents,
+     const content::MediaStreamRequest& request,
+@@ -1375,6 +1388,18 @@ void RespondToMediaAccessRequest(const content::MediaStreamRequest& request,
+         blink::mojom::MediaStreamRequestResult::NOT_SUPPORTED, nullptr);
+     return;
+   }
++  if (!IsCurrentMediaOrigin(request.url_origin)) {
++    std::move(callback).Run(
++        blink::mojom::StreamDevicesSet(),
++        blink::mojom::MediaStreamRequestResult::PERMISSION_DENIED, nullptr);
++    return;
++  }
++  if (media_origin_.has_value() &&
++      !media_origin_->IsSameOriginWith(request.url_origin)) {
++    camera_allowed_.reset();
++    microphone_allowed_.reset();
++    media_origin_.reset();
++  }
+   // What is not requested counts as answered: not allowed.
+   const std::optional<bool> audio_decision =
+       audio ? microphone_allowed_ : std::optional<bool>(false);
+@@ -1400,8 +1425,11 @@ void RespondToMediaAccessRequest(const content::MediaStreamRequest& request,
+   const content::MediaStreamRequest request_copy = request;
+   delegate_->HandlePermissionsDecisionRequest(
+       this, asked, ^(PermissionDecision decision) {
+-        const bool granted = decision == PermissionDecisionGrant;
+-        if (weak_this) {
++        const bool same_origin =
++            weak_this && weak_this->IsCurrentMediaOrigin(request_copy.url_origin);
++        const bool granted = same_origin && decision == PermissionDecisionGrant;
++        if (same_origin) {
++          weak_this->media_origin_ = request_copy.url_origin;
+           if (!video_decision) {
+             weak_this->camera_allowed_ = granted;
+           }
+@@ -1410,8 +1438,8 @@ void RespondToMediaAccessRequest(const content::MediaStreamRequest& request,
+           }
+         }
+         RespondToMediaAccessRequest(request_copy, std::move(*shared_callback),
+-                                    audio_decision.value_or(granted),
+-                                    video_decision.value_or(granted));
++                                    same_origin && audio_decision.value_or(granted),
++                                    same_origin && video_decision.value_or(granted));
+       });
+ }
+ 
+@@ -1420,6 +1448,10 @@ void RespondToMediaAccessRequest(const content::MediaStreamRequest& request,
+     const url::Origin& security_origin,
+     blink::mojom::MediaStreamType type) {
+   // [ios-blink-sideload] See RequestMediaAccessPermission().
++  if (!IsCurrentMediaOrigin(security_origin) || !media_origin_.has_value() ||
++      !media_origin_->IsSameOriginWith(security_origin)) {
++    return false;
++  }
+   return (type == blink::mojom::MediaStreamType::DEVICE_AUDIO_CAPTURE
+               ? microphone_allowed_
+               : camera_allowed_)

@@ -71,6 +71,8 @@ NS_SWIFT_UI_ACTOR
 @property (nonatomic, readonly) BOOL isPictureInPictureActive;
 - (void)enterPictureInPicture;
 - (void)exitPictureInPicture;
+/// The effective HTTP User-Agent string for this tab (respecting Desktop mode and active profile).
+@property (nonatomic, copy, readonly, nullable) NSString *effectiveUserAgent;
 
 @end
 
@@ -101,6 +103,14 @@ NS_SWIFT_UI_ACTOR
                      completion:(void (^NS_SWIFT_UI_ACTOR)(NSURL *_Nullable savedFileURL,
                                                             NSError *_Nullable error))completion;
 - (void)cancel;
+
+@optional
+/// YES for Content-Disposition: attachment, <a download>, or context-menu downloads.
+@property (nonatomic, readonly) BOOL isExplicitDownload;
+/// YES when the download originated from the primary main frame rather than an embedded subframe.
+@property (nonatomic, readonly) BOOL isMainFrame;
+/// HTTP method ("GET" or "POST") that initiated the download.
+@property (nonatomic, copy, readonly) NSString *httpMethod;
 
 @end
 
@@ -154,6 +164,13 @@ NS_SWIFT_UI_ACTOR
               mimeType:(nullable NSString *)mimeType
         httpStatusCode:(NSInteger)httpStatusCode
          contentLength:(int64_t)contentLength;
+
+/// Additive subresource load event for Media Radar (pre-filtered in C++ to skip
+/// static page assets). Keys: url, originalURL, referrer, frameURL, frameOrigin,
+/// mimeType, httpStatusCode, contentLength, requestDestination.
+- (void)browserHost:(id<CrIOSBrowserHostV1>)host
+                     tab:(id<CrIOSTabHostingV1>)tab
+    didLoadResourceEvent:(NSDictionary<NSString *, id> *)event;
 
 /// Called on the main thread after a document commits in the tab's main frame.
 /// Error pages are excluded. The navigation ID is unique while the engine runs.

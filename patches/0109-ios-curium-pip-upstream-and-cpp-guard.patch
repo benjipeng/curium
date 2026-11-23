@@ -1,0 +1,1386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Date: Sun, 22 Nov 2026 19:12:04 -0500
+Subject: [PATCH] iOS Curium: upstream PiP skip/AVKit/SharedImage fixes and
+ Blink C++ PiP guard
+
+---
+ ...cture_in_picture_window_controller_impl.cc |  29 +-
+ .../ios_video_overlay_window.h                |   2 +
+ .../ios_video_overlay_window.mm               | 748 +++++++++++++++++-
+ media/base/mac/BUILD.gn                       |   7 +-
+ media/base/mac/ios_pip_frame_hub.mm           |  37 +-
+ .../frame/picture_in_picture_controller.h     |  12 +
+ .../core/html/media/html_media_element.cc     |  32 +
+ .../core/html/media/html_media_element.h      |   1 +
+ .../core/html/media/html_media_element.idl    |   2 +-
+ .../core/html/media/html_video_element.cc     |   3 +
+ .../picture_in_picture_controller_impl.cc     |  24 +
+ .../picture_in_picture_controller_impl.h      |   9 +
+ .../modules/mediasession/media_session.cc     |  11 +
+ .../document_video_picture_in_picture.cc      |  16 +
+ .../platform/media/web_media_player_impl.cc   |  21 +-
+ 15 files changed, 899 insertions(+), 55 deletions(-)
+
+diff --git a/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.cc b/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.cc
+index 867603b..7b31007 100644
+--- a/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.cc
++++ b/content/browser/picture_in_picture/video_picture_in_picture_window_controller_impl.cc
+@@ -299,23 +299,17 @@ bool VideoPictureInPictureWindowControllerImpl::TogglePlayPause() {
+ }
+ 
+ void VideoPictureInPictureWindowControllerImpl::Play() {
+-  // This comes from the window, rather than the renderer, so we must actually
+-  // have a window at this point.
+-  CHECK(window_, base::NotFatalUntil::M159);
+-  // TODO(crbug.com/572378290): CHECK-exclusion: Convert to a CHECK once we are
+-  // confident it won't be triggered.
+-  DCHECK(active_session_);
++  if (!window_ || !active_session_) {
++    return;
++  }
+ 
+   PlayInternal();
+ }
+ 
+ void VideoPictureInPictureWindowControllerImpl::Pause() {
+-  // This comes from the window, rather than the renderer, so we must actually
+-  // have a window at this point.
+-  CHECK(window_, base::NotFatalUntil::M159);
+-  // TODO(crbug.com/561460780): CHECK-exclusion: Convert to a CHECK once we are
+-  // confident it won't be triggered.
+-  DCHECK(active_session_);
++  if (!window_ || !active_session_) {
++    return;
++  }
+ 
+   PauseInternal();
+ }
+@@ -753,13 +747,20 @@ bool VideoPictureInPictureWindowControllerImpl::GetMuteStatus() {
+ }
+ 
+ void VideoPictureInPictureWindowControllerImpl::SeekTo(base::TimeDelta time) {
++  if (!active_session_) {
++    return;
++  }
+   // Default to the Media Session handler if it's available.
+   if (media_session_action_seek_to_handled_) {
+-    MediaSession::Get(web_contents())->SeekTo(time);
++    if (web_contents()) {
++      MediaSession::Get(web_contents())->SeekTo(time);
++    }
+     return;
+   }
+   // Otherwise, directly seek the video player.
+-  active_session_->GetMediaPlayerRemote()->RequestSeekTo(time);
++  if (active_session_->GetMediaPlayerRemote().is_bound()) {
++    active_session_->GetMediaPlayerRemote()->RequestSeekTo(time);
++  }
+ }
+ 
+ void VideoPictureInPictureWindowControllerImpl::MediaSessionInfoChanged(
+diff --git a/ios/web/content/picture_in_picture/ios_video_overlay_window.h b/ios/web/content/picture_in_picture/ios_video_overlay_window.h
+index 5df249f..d7354c2 100644
+--- a/ios/web/content/picture_in_picture/ios_video_overlay_window.h
++++ b/ios/web/content/picture_in_picture/ios_video_overlay_window.h
+@@ -82,6 +82,7 @@ class IOSVideoOverlayWindow final : public content::VideoOverlayWindow {
+   void OnAVKitFailedToStart(uint64_t generation);
+   void OnAVKitDidStop(uint64_t generation, bool should_pause_video);
+   void OnAVKitSetPlaying(bool playing);
++  void OnAVKitSeekTo(double target_seconds);
+   void OnAVKitRenderSizeChanged(const gfx::Size& render_size);
+   void OnAVKitRestoreUI(base::OnceCallback<void(bool)> completion);
+   void OnSceneBackgroundChanged(bool backgrounded);
+@@ -101,6 +102,7 @@ class IOSVideoOverlayWindow final : public content::VideoOverlayWindow {
+   gfx::Size natural_size_{320, 180};
+   gfx::Size render_size_;
+   PlaybackState playback_state_ = PlaybackState::kPlaying;
++  bool media_muted_ = false;
+   std::optional<media_session::MediaPosition> media_position_;
+   base::OnceCallback<void(bool, const gfx::Size&)> pending_start_callback_;
+   base::RepeatingCallback<void(bool)> background_callback_;
+diff --git a/ios/web/content/picture_in_picture/ios_video_overlay_window.mm b/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
+index db70043..5d64de7 100644
+--- a/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
++++ b/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
+@@ -45,6 +45,551 @@
+ constexpr CFTimeInterval kStartRetryDelaySeconds = 0.25;
+ constexpr NSUInteger kMaxStartRetries = 1;
+ 
++constexpr CFTimeInterval kSeekGuardWindowSeconds = 3.5;
++constexpr double kSeekLandingToleranceSeconds = 2.5;
++constexpr double kMinDropSeparationSeconds = 1.5;
++constexpr double kRenderPreSeekSlackSeconds = 1.5;
++constexpr double kRenderPreSeekMaxAdvanceSeconds = 2.5;
++constexpr double kDiscontinuityBackwardToleranceSeconds = 0.05;
++constexpr double kDiscontinuityForwardToleranceSeconds = 1.5;
++constexpr double kTimebaseOffsetThresholdSeconds = 2.0;
++constexpr NSUInteger kNotReadyFlushThreshold = 8;
++
++char kRenderQueueSpecificKey = 0;
++
++void FlushVideoRenderer(AVSampleBufferVideoRenderer* renderer) {
++  if (!renderer) {
++    return;
++  }
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++  [renderer flush];
++#pragma clang diagnostic pop
++}
++
++inline bool IsSeekableDuration(double duration_seconds) {
++  return std::isfinite(duration_seconds) && duration_seconds > 0.0;
++}
++
++inline double SanitizedRate(bool paused, double rate) {
++  if (paused) {
++    return 0.0;
++  }
++  if (!std::isfinite(rate) || rate <= 0.0) {
++    return 1.0;
++  }
++  return rate;
++}
++
++inline double ClampPosition(double value, double duration_seconds) {
++  if (!std::isfinite(value) || value < 0.0) {
++    value = 0.0;
++  }
++  if (IsSeekableDuration(duration_seconds) && value > duration_seconds) {
++    value = duration_seconds;
++  }
++  return value;
++}
++
++double EstimateMediaPosition(double base_pos,
++                             double duration_seconds,
++                             bool paused,
++                             double playback_rate,
++                             CFTimeInterval base_wall_time,
++                             CFTimeInterval now) {
++  double pos = std::isfinite(base_pos) ? base_pos : 0.0;
++  const double rate = SanitizedRate(paused, playback_rate);
++  if (!paused && rate > 0.0 && base_wall_time > 0.0 && std::isfinite(now) &&
++      now > base_wall_time) {
++    pos += (now - base_wall_time) * rate;
++  }
++  return ClampPosition(pos, duration_seconds);
++}
++
++double ComputeSkipTarget(double current_pos,
++                         double duration_seconds,
++                         double delta_seconds) {
++  if (!IsSeekableDuration(duration_seconds)) {
++    return ClampPosition(current_pos, duration_seconds);
++  }
++  const double base = ClampPosition(current_pos, duration_seconds);
++  const double delta = std::isfinite(delta_seconds) ? delta_seconds : 0.0;
++  return ClampPosition(base + delta, duration_seconds);
++}
++
++double InferTimebaseOffset(double timebase_seconds, double current_pos) {
++  if (!std::isfinite(timebase_seconds) || !std::isfinite(current_pos)) {
++    return 0.0;
++  }
++  const double tb_non_neg = std::max(0.0, timebase_seconds);
++  if (tb_non_neg > current_pos + kTimebaseOffsetThresholdSeconds) {
++    return std::max(0.0, tb_non_neg - current_pos);
++  }
++  return 0.0;
++}
++
++CMTimeRange ComputePlayableTimeRange(double duration_seconds,
++                                     double estimated_pos,
++                                     double timebase_seconds) {
++  if (!IsSeekableDuration(duration_seconds)) {
++    return CMTimeRangeMake(kCMTimeZero, kCMTimePositiveInfinity);
++  }
++  const double clamped_pos = ClampPosition(estimated_pos, duration_seconds);
++  double start_sec = 0.0;
++  double span = duration_seconds;
++  if (std::isfinite(timebase_seconds)) {
++    const double tb_non_neg = std::max(0.0, timebase_seconds);
++    // Handle small, medium, and high-PTS HLS/DVR epochs cleanly while keeping
++    // start == 0 when controlTimebase is unprimed at 0 s mid-stream.
++    if (tb_non_neg > clamped_pos + kTimebaseOffsetThresholdSeconds) {
++      start_sec = std::max(0.0, tb_non_neg - clamped_pos);
++    }
++    // Guarantee [start_sec, start_sec + span] always contains tb_non_neg so
++    // AVKit never concludes playback ended from a slightly ahead timebase.
++    if (tb_non_neg < start_sec) {
++      start_sec = tb_non_neg;
++    }
++    if (tb_non_neg > start_sec + span) {
++      span = tb_non_neg - start_sec;
++    }
++  }
++  return CMTimeRangeMake(CMTimeMakeWithSeconds(start_sec, 1000000),
++                         CMTimeMakeWithSeconds(std::max(span, 0.001), 1000000));
++}
++
++void EnsurePlaybackAudioSession(bool muted) {
++  AVAudioSession* session = [AVAudioSession sharedInstance];
++  AVAudioSessionCategory cat = session.category;
++  if ([cat isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
++    return;
++  }
++  const AVAudioSessionCategoryOptions desired_options =
++      muted ? AVAudioSessionCategoryOptionMixWithOthers : 0;
++  if (![cat isEqualToString:AVAudioSessionCategoryPlayback] ||
++      session.categoryOptions != desired_options) {
++    NSError* err = nil;
++    [session setCategory:AVAudioSessionCategoryPlayback
++                    mode:AVAudioSessionModeDefault
++                 options:desired_options
++                   error:&err];
++  }
++  NSError* active_err = nil;
++  [session setActive:YES error:&active_err];
++}
++
++enum class RenderFrameAction {
++  kRenderNormal = 0,
++  kDropStalePreSeek = 1,
++  kFlushAndRenderPostSeek = 2,
++  kFlushDiscontinuity = 3,
++};
++
++// Synchronizes AVKit playback/skip/coalescing state between main & render queues.
++class PiPSkipState {
++ public:
++  void NoteGeneration(uint64_t generation) {
++    base::AutoLock lock(lock_);
++    EnsureGenerationLocked(generation);
++  }
++
++  void RecordPlaybackUpdate(uint64_t generation,
++                            bool paused,
++                            double rate,
++                            bool has_position,
++                            double position_seconds,
++                            double duration_seconds,
++                            CFTimeInterval now) {
++    base::AutoLock lock(lock_);
++    EnsureGenerationLocked(generation);
++    ExpireGuardsLocked(generation, now);
++
++    const double eff_rate = SanitizedRate(paused, rate);
++    const bool was_paused = last_known_paused_;
++    const double prev_rate = last_known_rate_;
++    const bool valid_pos = has_position && std::isfinite(position_seconds);
++    const double clamped_pos =
++        valid_pos ? ClampPosition(position_seconds, duration_seconds) : 0.0;
++
++    if (render_seek_guard_active_) {
++      expected_target_pts_ = CurrentExpectedTargetPtsLocked(now);
++      expected_target_anchor_wall_time_ = now;
++      expected_target_paused_ = paused;
++      expected_target_rate_ = eff_rate;
++    }
++
++    if (pending_seek_active_) {
++      const double expected_pos = CurrentPendingTargetLocked(
++          duration_seconds, was_paused, prev_rate, now);
++      if (valid_pos &&
++          std::fabs(clamped_pos - expected_pos) <= kSeekLandingToleranceSeconds) {
++        last_known_position_seconds_ = clamped_pos;
++        position_wall_time_ = now;
++        has_position_wall_time_ = true;
++        pending_seek_active_ = false;
++      } else {
++        pending_target_seconds_ = expected_pos;
++        pending_seek_set_at_ = now;
++        pending_seek_active_ = true;
++      }
++    } else {
++      if (!valid_pos && has_position_wall_time_) {
++        if (!was_paused && paused) {
++          last_known_position_seconds_ = EstimateMediaPosition(
++              last_known_position_seconds_, duration_seconds, false, prev_rate,
++              position_wall_time_, now);
++          position_wall_time_ = now;
++        } else if (was_paused && !paused) {
++          position_wall_time_ = now;
++        }
++      } else if (valid_pos) {
++        last_known_position_seconds_ = clamped_pos;
++        position_wall_time_ = now;
++        has_position_wall_time_ = true;
++      }
++    }
++
++    last_known_paused_ = paused;
++    last_known_rate_ = eff_rate;
++  }
++
++  double EstimatedPosition(uint64_t generation,
++                           double fallback_pos,
++                           double duration_seconds,
++                           bool paused,
++                           double playback_rate,
++                           CFTimeInterval now) {
++    base::AutoLock lock(lock_);
++    EnsureGenerationLocked(generation);
++    ExpireGuardsLocked(generation, now);
++
++    if (pending_seek_active_ && std::isfinite(now) &&
++        now < media_seek_guard_until_) {
++      return CurrentPendingTargetLocked(duration_seconds, paused, playback_rate,
++                                        now);
++    }
++    pending_seek_active_ = false;
++    const double base_pos =
++        has_position_wall_time_ ? last_known_position_seconds_ : fallback_pos;
++    const CFTimeInterval wall_time =
++        has_position_wall_time_ ? position_wall_time_ : 0.0;
++    return EstimateMediaPosition(base_pos, duration_seconds, paused,
++                                 playback_rate, wall_time, now);
++  }
++
++  double BeginSkip(uint64_t generation,
++                   double delta_seconds,
++                   double fallback_pos,
++                   double duration_seconds,
++                   bool paused,
++                   double playback_rate,
++                   double timebase_seconds,
++                   CFTimeInterval now,
++                   double* out_target_timebase_seconds) {
++    base::AutoLock lock(lock_);
++    EnsureGenerationLocked(generation);
++    ExpireGuardsLocked(generation, now);
++
++    const double eff_rate = SanitizedRate(paused, playback_rate);
++    double cur_pos = 0.0;
++    if (pending_seek_active_ && std::isfinite(now) &&
++        now < media_seek_guard_until_) {
++      cur_pos = CurrentPendingTargetLocked(duration_seconds, paused, eff_rate,
++                                           now);
++    } else {
++      const double base_pos =
++          has_position_wall_time_ ? last_known_position_seconds_ : fallback_pos;
++      const CFTimeInterval wall_time =
++          has_position_wall_time_ ? position_wall_time_ : 0.0;
++      cur_pos = EstimateMediaPosition(base_pos, duration_seconds, paused,
++                                      eff_rate, wall_time, now);
++    }
++
++    const double target_sec =
++        ComputeSkipTarget(cur_pos, duration_seconds, delta_seconds);
++    const double tb_offset = InferTimebaseOffset(timebase_seconds, cur_pos);
++    const double target_tb = target_sec + tb_offset;
++
++    pending_seek_active_ = true;
++    pending_target_seconds_ = target_sec;
++    pending_seek_set_at_ = now;
++    media_seek_guard_until_ = now + kSeekGuardWindowSeconds;
++
++    if (!render_seek_guard_active_) {
++      if (has_last_rendered_pts_) {
++        pre_seek_pts_ = last_rendered_pts_;
++        has_pre_seek_pts_ = true;
++      } else if (std::isfinite(timebase_seconds)) {
++        pre_seek_pts_ = timebase_seconds;
++        has_pre_seek_pts_ = true;
++      } else {
++        pre_seek_pts_ = 0.0;
++        has_pre_seek_pts_ = false;
++      }
++      render_seek_guard_started_at_ = now;
++    }
++
++    render_seek_guard_active_ = true;
++    render_seek_guard_generation_ = generation;
++    render_seek_guard_until_ = now + kSeekGuardWindowSeconds;
++    expected_target_pts_ = target_tb;
++    expected_target_anchor_wall_time_ = now;
++    expected_target_rate_ = eff_rate;
++    expected_target_paused_ = paused;
++    consecutive_not_ready_count_ = 0;
++
++    if (out_target_timebase_seconds) {
++      *out_target_timebase_seconds = target_tb;
++    }
++    return target_sec;
++  }
++
++  RenderFrameAction EvaluateRenderFramePTS(double frame_pts_seconds,
++                                           uint64_t generation,
++                                           CFTimeInterval now) {
++    if (!std::isfinite(frame_pts_seconds)) {
++      return RenderFrameAction::kRenderNormal;
++    }
++    base::AutoLock lock(lock_);
++    EnsureGenerationLocked(generation);
++    ExpireGuardsLocked(generation, now);
++
++    if (render_seek_guard_active_) {
++      const double expected_now = CurrentExpectedTargetPtsLocked(now);
++      double pre_now = pre_seek_pts_;
++      if (has_pre_seek_pts_ && !expected_target_paused_ &&
++          expected_target_rate_ > 0.0 && std::isfinite(now) &&
++          now > render_seek_guard_started_at_) {
++        const double adv =
++            (now - render_seek_guard_started_at_) * expected_target_rate_;
++        pre_now += std::min(adv, kRenderPreSeekMaxAdvanceSeconds);
++      }
++
++      const double seek_sep =
++          has_pre_seek_pts_ ? std::fabs(expected_now - pre_seek_pts_) : 0.0;
++      const double dist_to_target =
++          std::fabs(frame_pts_seconds - expected_now);
++      const double dist_to_pre =
++          has_pre_seek_pts_
++              ? std::min(std::fabs(frame_pts_seconds - pre_seek_pts_),
++                         std::fabs(frame_pts_seconds - pre_now))
++              : INFINITY;
++      const bool in_pre_seek_window =
++          has_pre_seek_pts_ && frame_pts_seconds >= (pre_seek_pts_ - 0.5) &&
++          frame_pts_seconds <= (pre_now + kRenderPreSeekSlackSeconds);
++      if (seek_sep >= kMinDropSeparationSeconds && in_pre_seek_window &&
++          dist_to_target > 1.2 && dist_to_pre < dist_to_target) {
++        return RenderFrameAction::kDropStalePreSeek;
++      }
++
++      render_seek_guard_active_ = false;
++      has_pre_seek_pts_ = false;
++      last_rendered_pts_ = frame_pts_seconds;
++      has_last_rendered_pts_ = true;
++      consecutive_not_ready_count_ = 0;
++      return RenderFrameAction::kFlushAndRenderPostSeek;
++    }
++
++    bool discontinuity = false;
++    if (has_last_rendered_pts_) {
++      if (frame_pts_seconds <
++              last_rendered_pts_ - kDiscontinuityBackwardToleranceSeconds ||
++          frame_pts_seconds >
++              last_rendered_pts_ + kDiscontinuityForwardToleranceSeconds) {
++        discontinuity = true;
++      }
++    }
++
++    last_rendered_pts_ = frame_pts_seconds;
++    has_last_rendered_pts_ = true;
++    if (discontinuity) {
++      consecutive_not_ready_count_ = 0;
++      return RenderFrameAction::kFlushDiscontinuity;
++    }
++    return RenderFrameAction::kRenderNormal;
++  }
++
++  NSUInteger RecordNotReadyFrame(uint64_t generation) {
++    base::AutoLock lock(lock_);
++    EnsureGenerationLocked(generation);
++    return ++consecutive_not_ready_count_;
++  }
++
++  void ResetNotReadyCount(uint64_t generation) {
++    base::AutoLock lock(lock_);
++    EnsureGenerationLocked(generation);
++    consecutive_not_ready_count_ = 0;
++  }
++
++  uint64_t RecordSetPlaying(bool playing,
++                            bool current_paused,
++                            uint64_t generation,
++                            bool* out_should_schedule_flush) {
++    base::AutoLock lock(lock_);
++    EnsureGenerationLocked(generation);
++
++    bool should_schedule = false;
++    if (!has_pending_set_playing_) {
++      pre_set_playing_paused_ = current_paused;
++      pending_set_playing_value_ = playing;
++      ++pending_set_playing_token_;
++      if (playing != (!pre_set_playing_paused_)) {
++        has_pending_set_playing_ = true;
++        should_schedule = true;
++      }
++    } else {
++      pending_set_playing_value_ = playing;
++      ++pending_set_playing_token_;
++      if (playing == (!pre_set_playing_paused_)) {
++        has_pending_set_playing_ = false;
++        should_schedule = false;
++      } else {
++        has_pending_set_playing_ = true;
++        should_schedule = true;
++      }
++    }
++    if (out_should_schedule_flush) {
++      *out_should_schedule_flush = should_schedule;
++    }
++    return pending_set_playing_token_;
++  }
++
++  bool ConsumePendingSetPlaying(uint64_t token,
++                                uint64_t generation,
++                                bool* out_playing) {
++    base::AutoLock lock(lock_);
++    if (!has_observed_generation_ || generation_ != generation ||
++        !has_pending_set_playing_ || pending_set_playing_token_ != token) {
++      return false;
++    }
++    has_pending_set_playing_ = false;
++    const bool target_playing = pending_set_playing_value_;
++    if (target_playing == (!pre_set_playing_paused_)) {
++      return false;
++    }
++    if (out_playing) {
++      *out_playing = target_playing;
++    }
++    return true;
++  }
++
++  bool EffectivePausedForSkip(bool current_paused, uint64_t generation) {
++    base::AutoLock lock(lock_);
++    EnsureGenerationLocked(generation);
++    return (has_pending_set_playing_ && !pending_set_playing_value_)
++               ? pre_set_playing_paused_
++               : current_paused;
++  }
++
++ private:
++  void EnsureGenerationLocked(uint64_t generation) EXCLUSIVE_LOCKS_REQUIRED(lock_) {
++    if (!has_observed_generation_ || generation_ != generation) {
++      const bool is_subsequent =
++          has_observed_generation_ && generation_ != 0 && generation != generation_;
++      generation_ = generation;
++      has_observed_generation_ = true;
++      pending_seek_active_ = false;
++      pending_target_seconds_ = 0.0;
++      pending_seek_set_at_ = 0.0;
++      media_seek_guard_until_ = 0.0;
++      render_seek_guard_active_ = false;
++      render_seek_guard_generation_ = generation;
++      render_seek_guard_started_at_ = 0.0;
++      render_seek_guard_until_ = 0.0;
++      has_pre_seek_pts_ = false;
++      pre_seek_pts_ = 0.0;
++      expected_target_pts_ = 0.0;
++      expected_target_anchor_wall_time_ = 0.0;
++      expected_target_rate_ = 1.0;
++      expected_target_paused_ = false;
++      has_last_rendered_pts_ = false;
++      last_rendered_pts_ = 0.0;
++      consecutive_not_ready_count_ = 0;
++      has_pending_set_playing_ = false;
++      pending_set_playing_value_ = false;
++      pre_set_playing_paused_ = false;
++      ++pending_set_playing_token_;
++      if (is_subsequent) {
++        has_position_wall_time_ = false;
++        position_wall_time_ = 0.0;
++        last_known_position_seconds_ = 0.0;
++      }
++    }
++  }
++
++  double CurrentPendingTargetLocked(double duration_seconds,
++                                    bool paused,
++                                    double rate,
++                                    CFTimeInterval now) const
++      EXCLUSIVE_LOCKS_REQUIRED(lock_) {
++    const double eff_rate = SanitizedRate(paused, rate);
++    double pos = pending_target_seconds_;
++    if (!paused && eff_rate > 0.0 && std::isfinite(now) &&
++        now > pending_seek_set_at_) {
++      pos += (now - pending_seek_set_at_) * eff_rate;
++    }
++    return ClampPosition(pos, duration_seconds);
++  }
++
++  double CurrentExpectedTargetPtsLocked(CFTimeInterval now) const
++      EXCLUSIVE_LOCKS_REQUIRED(lock_) {
++    double pts = expected_target_pts_;
++    if (!expected_target_paused_ && expected_target_rate_ > 0.0 &&
++        std::isfinite(now) && now > expected_target_anchor_wall_time_) {
++      pts += (now - expected_target_anchor_wall_time_) * expected_target_rate_;
++    }
++    return pts;
++  }
++
++  void ExpireGuardsLocked(uint64_t generation, CFTimeInterval now)
++      EXCLUSIVE_LOCKS_REQUIRED(lock_) {
++    if (pending_seek_active_ &&
++        (generation_ != generation || !std::isfinite(now) ||
++         now >= media_seek_guard_until_)) {
++      pending_seek_active_ = false;
++    }
++    if (render_seek_guard_active_ &&
++        (render_seek_guard_generation_ != generation || !std::isfinite(now) ||
++         now >= render_seek_guard_until_)) {
++      render_seek_guard_active_ = false;
++      has_pre_seek_pts_ = false;
++    }
++  }
++
++  base::Lock lock_;
++  bool has_observed_generation_ = false;
++  uint64_t generation_ = 0;
++  bool has_position_wall_time_ = false;
++  CFTimeInterval position_wall_time_ = 0.0;
++  double last_known_position_seconds_ = 0.0;
++  bool last_known_paused_ = false;
++  double last_known_rate_ = 1.0;
++
++  bool pending_seek_active_ = false;
++  double pending_target_seconds_ = 0.0;
++  CFTimeInterval pending_seek_set_at_ = 0.0;
++  CFTimeInterval media_seek_guard_until_ = 0.0;
++
++  bool render_seek_guard_active_ = false;
++  uint64_t render_seek_guard_generation_ = 0;
++  CFTimeInterval render_seek_guard_started_at_ = 0.0;
++  CFTimeInterval render_seek_guard_until_ = 0.0;
++  bool has_pre_seek_pts_ = false;
++  double pre_seek_pts_ = 0.0;
++  double expected_target_pts_ = 0.0;
++  CFTimeInterval expected_target_anchor_wall_time_ = 0.0;
++  double expected_target_rate_ = 1.0;
++  bool expected_target_paused_ = false;
++
++  bool has_last_rendered_pts_ = false;
++  double last_rendered_pts_ = 0.0;
++  NSUInteger consecutive_not_ready_count_ = 0;
++
++  bool has_pending_set_playing_ = false;
++  bool pending_set_playing_value_ = false;
++  bool pre_set_playing_paused_ = false;
++  uint64_t pending_set_playing_token_ = 0;
++};
++
+ UIWindow* FindTargetWindow(
+     content::VideoPictureInPictureWindowController* controller) {
+   if (controller && controller->GetWebContents()) {
+@@ -387,6 +932,7 @@ - (void)stopPiPAndDetach:(BOOL)removeImage;
+ - (void)updatePlaybackPaused:(BOOL)paused
+                     position:
+                         (std::optional<media_session::MediaPosition>)position;
++- (void)setMediaMuted:(BOOL)muted;
+ - (void)enqueueLatestFrame:(scoped_refptr<media::VideoFrame>)frame
+                   hwBuffer:
+                       (base::apple::ScopedCFTypeRef<CVPixelBufferRef>)hwBuffer
+@@ -423,8 +969,10 @@ @implementation CuriumPiPBridge {
+   double _mainPlaybackRate;
+   double _mainPositionSeconds;
+   base::TimeTicks _mainPositionTimestamp;
++  BOOL _mediaMuted;
+   uint64_t _activeGeneration;
+   std::atomic<uint64_t> _atomicGeneration;
++  PiPSkipState _skipState;
+ 
+   // Render-queue-only owned rendering state (never mutated from main thread).
+   AVSampleBufferVideoRenderer* _renderRenderer;
+@@ -450,6 +998,8 @@ - (instancetype)initWithOwner:(base::WeakPtr<web::IOSVideoOverlayWindow>)owner
+     _uiRunner = std::move(uiRunner);
+     _renderQueue = dispatch_queue_create("com.curium.ios.pip.renderer",
+                                          DISPATCH_QUEUE_SERIAL);
++    dispatch_queue_set_specific(_renderQueue, &kRenderQueueSpecificKey,
++                                &kRenderQueueSpecificKey, nullptr);
+     _atomicGeneration.store(0, std::memory_order_release);
+     _mainPlaybackRate = 1.0;
+     _mainDurationSeconds = NAN;
+@@ -527,6 +1077,7 @@ - (void)prepareHostInWindow:(UIWindow*)window
+                  generation:(uint64_t)generation {
+   _activeGeneration = generation;
+   _atomicGeneration.store(generation, std::memory_order_release);
++  _skipState.NoteGeneration(generation);
+   _startAttemptActive = NO;
+   _startRetryGeneration = generation;
+   _startRetryCount = 0;
+@@ -595,7 +1146,8 @@ - (void)prepareHostInWindow:(UIWindow*)window
+     _pipControllerCreatedAt = CACurrentMediaTime();
+     _pipController.delegate = self;
+     _pipController.canStartPictureInPictureAutomaticallyFromInline = NO;
+-    _pipController.requiresLinearPlayback = YES;
++    _pipController.requiresLinearPlayback =
++        !IsSeekableDuration(_mainDurationSeconds);
+ 
+     [_pipController addObserver:self
+                      forKeyPath:@"pictureInPicturePossible"
+@@ -719,6 +1271,7 @@ - (void)startPiPForGeneration:(uint64_t)generation {
+   _startRetryGeneration = generation;
+   _startRetryCount = 0;
+   _startRetryPending = NO;
++  EnsurePlaybackAudioSession(_mediaMuted);
+ 
+   __weak CuriumPiPBridge* weakSelf = self;
+   dispatch_after(
+@@ -803,34 +1356,44 @@ - (void)stopPiPAndDetach:(BOOL)removeImage {
+   });
+ }
+ 
++- (void)setMediaMuted:(BOOL)muted {
++  _mediaMuted = muted;
++  if (_pipActive || _startAttemptActive) {
++    EnsurePlaybackAudioSession(muted);
++  }
++}
++
+ - (void)updatePlaybackPaused:(BOOL)paused
+                     position:
+                         (std::optional<media_session::MediaPosition>)position {
+   _mainPlaybackPaused = paused;
+   const bool hasPos = position.has_value();
+   double posSec = _mainPositionSeconds;
+-  double rate = paused ? 0.0 : 1.0;
++  double rawRate = _mainPlaybackRate;
+   if (hasPos) {
+     const base::TimeDelta dur = position->duration();
+     _mainDurationSeconds = dur.is_max() ? INFINITY : dur.InSecondsF();
+-    rate = paused ? 0.0 : position->playback_rate();
+-    _mainPlaybackRate = rate;
++    rawRate = position->playback_rate();
+     posSec = position->GetPosition().InSecondsF();
+     _mainPositionSeconds = posSec;
+     _mainPositionTimestamp = base::TimeTicks::Now();
+   }
++  const double effRate = SanitizedRate(paused, rawRate);
++  _mainPlaybackRate = effRate;
++  _skipState.RecordPlaybackUpdate(_activeGeneration, paused, rawRate, hasPos,
++                                  posSec, _mainDurationSeconds,
++                                  CACurrentMediaTime());
++  if (_pipController) {
++    _pipController.requiresLinearPlayback =
++        !IsSeekableDuration(_mainDurationSeconds);
++  }
+   dispatch_async(_renderQueue, ^{
+     self->_renderPlaybackPaused = paused;
+-    self->_renderPlaybackRate = rate;
++    self->_renderPlaybackRate = effRate;
+     if (self->_renderTimebase && self->_renderTimebasePrimed) {
+-      if (hasPos) {
+-        CMTime anchor = CMTimeMakeWithSeconds(posSec, 1000000);
+-        CMTimebaseSetRateAndAnchorTime(
+-            self->_renderTimebase.get(), rate, anchor,
+-            CMClockGetTime(CMClockGetHostTimeClock()));
+-      } else {
+-        CMTimebaseSetRate(self->_renderTimebase.get(), rate);
+-      }
++      // Only update rate; never clobber a high-PTS HLS timebase anchor with
++      // 0-based MediaPosition.
++      CMTimebaseSetRate(self->_renderTimebase.get(), effRate);
+     }
+   });
+   [_pipController invalidatePlaybackState];
+@@ -896,15 +1459,38 @@ - (void)drainLatestFrameOnRenderQueue {
+     return;
+   }
+   if (!renderer.isReadyForMoreMediaData) {
++    if (_skipState.RecordNotReadyFrame(slot->generation) >=
++        kNotReadyFlushThreshold) {
++      FlushVideoRenderer(renderer);
++      _renderTimebasePrimed = NO;
++      _skipState.ResetNotReadyCount(slot->generation);
++    }
+     return;
+   }
++  _skipState.ResetNotReadyCount(slot->generation);
++
++  const double ptsSec = slot->frame->timestamp().InSecondsF();
++  const RenderFrameAction frameAction = _skipState.EvaluateRenderFramePTS(
++      ptsSec, slot->generation, CACurrentMediaTime());
++  if (frameAction == RenderFrameAction::kDropStalePreSeek) {
++    return;
++  }
++  if (frameAction == RenderFrameAction::kFlushAndRenderPostSeek ||
++      frameAction == RenderFrameAction::kFlushDiscontinuity) {
++    FlushVideoRenderer(renderer);
++    _renderTimebasePrimed = NO;
++  }
+ 
+   base::apple::ScopedCFTypeRef<CVPixelBufferRef> pixelBuffer =
+       std::move(slot->hw_buffer);
+-  if (!pixelBuffer) {
+-    if (slot->frame->HasDirectCpuAccess()) {
+-      pixelBuffer = _swPool.Convert(*slot->frame);
++  if (pixelBuffer) {
++    if (!CVBufferHasAttachment(pixelBuffer.get(),
++                               kCVImageBufferColorPrimariesKey)) {
++      ApplyColorSpaceAttachments(pixelBuffer.get(), *slot->frame);
++      ApplyCleanApertureAndAspect(pixelBuffer.get(), *slot->frame);
+     }
++  } else if (slot->frame->HasDirectCpuAccess()) {
++    pixelBuffer = _swPool.Convert(*slot->frame);
+   }
+   if (!pixelBuffer) {
+     return;
+@@ -937,7 +1523,8 @@ - (void)drainLatestFrameOnRenderQueue {
+   base::apple::ScopedCFTypeRef<CMSampleBufferRef> sample(rawSample);
+ 
+   if (_renderTimebase) {
+-    const double effRate = _renderPlaybackPaused ? 0.0 : _renderPlaybackRate;
++    const double effRate =
++        SanitizedRate(_renderPlaybackPaused, _renderPlaybackRate);
+     if (!_renderTimebasePrimed) {
+       CMTimebaseSetRateAndAnchorTime(_renderTimebase.get(), effRate, pts,
+                                      CMClockGetTime(CMClockGetHostTimeClock()));
+@@ -1156,25 +1743,54 @@ - (void)pictureInPictureController:
+ - (void)pictureInPictureController:
+             (AVPictureInPictureController*)pictureInPictureController
+                         setPlaying:(BOOL)playing {
+-  auto owner = _owner;
+-  _uiRunner->PostTask(
+-      FROM_HERE,
+-      base::BindOnce(&web::IOSVideoOverlayWindow::OnAVKitSetPlaying, owner,
+-                     playing));
++  const uint64_t gen = _activeGeneration;
++  const bool prevPaused = _mainPlaybackPaused;
++  // iOS 27.2 AVSampleBufferDisplayLayerPlayerController calls setPlaying:NO ->
++  // invalidatePlaybackState -> skipByInterval: -> completionHandler ->
++  // setPlaying:YES synchronously within a skip. Update _mainPlaybackPaused
++  // immediately so AVKit observes the toggled state, and coalesce same-turn
++  // NO -> YES round-trips to a zero-pause no-op while genuine Pause/Play
++  // dispatches on the next turn.
++  _mainPlaybackPaused = !playing;
++  bool shouldSchedule = false;
++  const uint64_t token =
++      _skipState.RecordSetPlaying(playing, prevPaused, gen, &shouldSchedule);
++  if (!shouldSchedule) {
++    return;
++  }
++  __weak CuriumPiPBridge* weakSelf = self;
++  dispatch_async(dispatch_get_main_queue(), ^{
++    CuriumPiPBridge* strongSelf = weakSelf;
++    if (!strongSelf || strongSelf->_activeGeneration != gen) {
++      return;
++    }
++    bool targetPlaying = false;
++    if (!strongSelf->_skipState.ConsumePendingSetPlaying(token, gen,
++                                                         &targetPlaying)) {
++      return;
++    }
++    strongSelf->_mainPlaybackPaused = !targetPlaying;
++    auto owner = strongSelf->_owner;
++    strongSelf->_uiRunner->PostTask(
++        FROM_HERE,
++        base::BindOnce(&web::IOSVideoOverlayWindow::OnAVKitSetPlaying, owner,
++                       targetPlaying));
++  });
+ }
+ 
+ - (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:
+     (AVPictureInPictureController*)pictureInPictureController {
+-  if (std::isnan(_mainDurationSeconds) || std::isinf(_mainDurationSeconds)) {
+-    return CMTimeRangeMake(kCMTimeZero, kCMTimePositiveInfinity);
+-  }
+-  double estPos = _mainPositionSeconds;
+-  if (!_mainPlaybackPaused && !_mainPositionTimestamp.is_null()) {
+-    estPos += (base::TimeTicks::Now() - _mainPositionTimestamp).InSecondsF() *
+-              _mainPlaybackRate;
++  const double estPos = _skipState.EstimatedPosition(
++      _activeGeneration, _mainPositionSeconds, _mainDurationSeconds,
++      _mainPlaybackPaused, _mainPlaybackRate, CACurrentMediaTime());
++  double tbSec = NAN;
++  if (_displayLayer && _displayLayer.controlTimebase) {
++    const CMTime tb = CMTimebaseGetTime(_displayLayer.controlTimebase);
++    if (CMTIME_IS_NUMERIC(tb)) {
++      tbSec = CMTimeGetSeconds(tb);
++    }
+   }
+-  const double span = std::max(std::max(0.0, _mainDurationSeconds), estPos);
+-  return CMTimeRangeMake(kCMTimeZero, CMTimeMakeWithSeconds(span, 1000));
++  return ComputePlayableTimeRange(_mainDurationSeconds, estPos, tbSec);
+ }
+ 
+ - (BOOL)pictureInPictureControllerIsPlaybackPaused:
+@@ -1205,9 +1821,67 @@ - (void)pictureInPictureController:
+             (AVPictureInPictureController*)pictureInPictureController
+                     skipByInterval:(CMTime)skipInterval
+                  completionHandler:(void (^)(void))completionHandler {
++  const uint64_t gen = _activeGeneration;
++  const double delta =
++      CMTIME_IS_NUMERIC(skipInterval) ? CMTimeGetSeconds(skipInterval) : 0.0;
++  if (IsSeekableDuration(_mainDurationSeconds) && std::isfinite(delta) &&
++      delta != 0.0) {
++    const bool effPaused =
++        _skipState.EffectivePausedForSkip(_mainPlaybackPaused, gen);
++    double tbSec = NAN;
++    if (_displayLayer && _displayLayer.controlTimebase) {
++      const CMTime tb = CMTimebaseGetTime(_displayLayer.controlTimebase);
++      if (CMTIME_IS_NUMERIC(tb)) {
++        tbSec = CMTimeGetSeconds(tb);
++      }
++    }
++    double targetTbSec = 0.0;
++    const double targetSec = _skipState.BeginSkip(
++        gen, delta, _mainPositionSeconds, _mainDurationSeconds, effPaused,
++        _mainPlaybackRate, tbSec, CACurrentMediaTime(), &targetTbSec);
++    _mainPositionSeconds = targetSec;
++    _mainPositionTimestamp = base::TimeTicks::Now();
++
++    const double effRate = SanitizedRate(effPaused, _mainPlaybackRate);
++    // Synchronously flush stale sample buffers on _renderQueue and anchor
++    // _renderTimebase before completionHandler() and invalidatePlaybackState.
++    // _renderQueue never dispatches synchronously back to main, so lock/queue
++    // ordering (Main -> _renderQueue -> _skipState/_slotLock) is acyclic.
++    void (^flushAndAnchor)(void) = ^{
++      if (self->_atomicGeneration.load(std::memory_order_acquire) != gen) {
++        return;
++      }
++      FlushVideoRenderer(self->_renderRenderer);
++      self->_renderPlaybackPaused = effPaused;
++      self->_renderPlaybackRate = effRate;
++      if (self->_renderTimebase && std::isfinite(targetTbSec)) {
++        CMTimebaseSetRateAndAnchorTime(
++            self->_renderTimebase.get(), effRate,
++            CMTimeMakeWithSeconds(targetTbSec, 1000000),
++            CMClockGetTime(CMClockGetHostTimeClock()));
++        self->_renderTimebasePrimed = YES;
++      }
++    };
++    if (dispatch_get_specific(&kRenderQueueSpecificKey) !=
++        &kRenderQueueSpecificKey) {
++      dispatch_sync(_renderQueue, flushAndAnchor);
++    } else {
++      flushAndAnchor();
++    }
++
++    auto owner = _owner;
++    _uiRunner->PostTask(
++        FROM_HERE,
++        base::BindOnce(&web::IOSVideoOverlayWindow::OnAVKitSeekTo, owner,
++                       targetSec));
++  }
++
++  // Invoke completionHandler BEFORE invalidatePlaybackState so iOS 27.2 AVKit
++  // restores playing=YES cleanly on the same runloop turn.
+   if (completionHandler) {
+     completionHandler();
+   }
++  [pictureInPictureController invalidatePlaybackState];
+ }
+ 
+ @end
+@@ -1284,7 +1958,10 @@ - (void)pictureInPictureController:
+     bool is_visible) {}
+ void IOSVideoOverlayWindow::SetMicrophoneMuted(bool muted) {}
+ void IOSVideoOverlayWindow::SetCameraState(bool turned_on) {}
+-void IOSVideoOverlayWindow::SetMediaMuted(bool muted) {}
++void IOSVideoOverlayWindow::SetMediaMuted(bool muted) {
++  media_muted_ = muted;
++  [impl_->bridge setMediaMuted:muted];
++}
+ void IOSVideoOverlayWindow::SetToggleMicrophoneButtonVisibility(
+     bool is_visible) {}
+ void IOSVideoOverlayWindow::SetToggleCameraButtonVisibility(bool is_visible) {}
+@@ -1422,6 +2099,13 @@ - (void)pictureInPictureController:
+   }
+ }
+ 
++void IOSVideoOverlayWindow::OnAVKitSeekTo(double target_seconds) {
++  if (!controller_ || !std::isfinite(target_seconds)) {
++    return;
++  }
++  controller_->SeekTo(base::Seconds(std::max(0.0, target_seconds)));
++}
++
+ void IOSVideoOverlayWindow::OnAVKitRenderSizeChanged(
+     const gfx::Size& render_size) {
+   if (render_size.IsEmpty()) {
+diff --git a/media/base/mac/BUILD.gn b/media/base/mac/BUILD.gn
+index 839d832..3af4092 100644
+--- a/media/base/mac/BUILD.gn
++++ b/media/base/mac/BUILD.gn
+@@ -54,7 +54,12 @@ source_set("mac") {
+     "//ui/gfx:color_space",
+   ]
+   if (is_ios) {
+-    deps += [ "//gpu/command_buffer/common" ]
++    frameworks += [ "IOSurface.framework" ]
++    deps += [
++      "//gpu/command_buffer/client",
++      "//gpu/command_buffer/common",
++      "//ui/gfx:memory_buffer",
++    ]
+   }
+ }
+ 
+diff --git a/media/base/mac/ios_pip_frame_hub.mm b/media/base/mac/ios_pip_frame_hub.mm
+index eac9428..5f2a6a8 100644
+--- a/media/base/mac/ios_pip_frame_hub.mm
++++ b/media/base/mac/ios_pip_frame_hub.mm
+@@ -12,6 +12,7 @@
+ #include "gpu/command_buffer/client/client_shared_image.h"
+ #include "media/base/mac/ios_pip_buffer_registry.h"
+ #include "media/base/video_frame.h"
++#include "ui/gfx/gpu_memory_buffer_handle.h"
+ 
+ namespace media {
+ 
+@@ -60,12 +61,38 @@ void Deliver(const base::UnguessableToken& session_token,
+ 
+     // Resolve the VideoToolbox CVPixelBuffer while holding a reference to the
+     // renderer |frame| so the producer VideoFrame cannot be recycled mid-lookup.
++    // For STORAGE_OPAQUE software-decoded (AV1/VP9) or Simulator frames backed
++    // by a native IOSurface MappableBuffer, wrap the IOSurface zero-copy.
++    auto wrap_io_surface =
++        [](const gfx::GpuMemoryBufferHandle& handle)
++        -> base::apple::ScopedCFTypeRef<CVPixelBufferRef> {
++      base::apple::ScopedCFTypeRef<CVPixelBufferRef> pb;
++      if (handle.type == gfx::IO_SURFACE_BUFFER && handle.io_surface()) {
++        CVPixelBufferRef raw_pb = nullptr;
++        if (CVPixelBufferCreateWithIOSurface(
++                kCFAllocatorDefault, handle.io_surface().get(), nullptr,
++                &raw_pb) == kCVReturnSuccess &&
++            raw_pb) {
++          pb.reset(raw_pb);
++        }
++      }
++      return pb;
++    };
++
+     base::apple::ScopedCFTypeRef<CVPixelBufferRef> hw_pixel_buffer;
+-    if (frame->metadata().ios_pip_buffer_token.has_value() &&
+-        frame->HasSharedImage() && frame->shared_image()) {
+-      hw_pixel_buffer = CopyIOSPiPPixelBuffer(
+-          *frame->metadata().ios_pip_buffer_token,
+-          frame->shared_image()->mailbox());
++    if (frame->HasSharedImage() && frame->shared_image()) {
++      const scoped_refptr<gpu::ClientSharedImage>& si = frame->shared_image();
++      if (frame->metadata().ios_pip_buffer_token.has_value()) {
++        hw_pixel_buffer = CopyIOSPiPPixelBuffer(
++            *frame->metadata().ios_pip_buffer_token, si->mailbox());
++      }
++      if (!hw_pixel_buffer && !si->is_software() &&
++          si->GetGpuMemoryBufferType() == gfx::IO_SURFACE_BUFFER) {
++        hw_pixel_buffer = wrap_io_surface(si->CloneGpuMemoryBufferHandle());
++      }
++    }
++    if (!hw_pixel_buffer && frame->HasNativeMappableSharedImage()) {
++      hw_pixel_buffer = wrap_io_surface(frame->GetGpuMemoryBufferHandle());
+     }
+ 
+     callback.Run(std::move(frame), std::move(hw_pixel_buffer));
+diff --git a/third_party/blink/renderer/core/frame/picture_in_picture_controller.h b/third_party/blink/renderer/core/frame/picture_in_picture_controller.h
+index cbad4ec..19579c2 100644
+--- a/third_party/blink/renderer/core/frame/picture_in_picture_controller.h
++++ b/third_party/blink/renderer/core/frame/picture_in_picture_controller.h
+@@ -5,6 +5,8 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_FRAME_PICTURE_IN_PICTURE_CONTROLLER_H_
+ #define THIRD_PARTY_BLINK_RENDERER_CORE_FRAME_PICTURE_IN_PICTURE_CONTROLLER_H_
+ 
++#include "base/time/time.h"
++#include "build/build_config.h"
+ #include "services/media_session/public/mojom/media_session.mojom-blink.h"
+ #include "third_party/blink/public/mojom/picture_in_picture/picture_in_picture.mojom-blink.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+@@ -120,6 +122,16 @@ class CORE_EXPORT PictureInPictureController
+   virtual void ActivatePictureInPictureRequestToken() = 0;
+   virtual bool ConsumePictureInPictureRequestToken() = 0;
+ 
++#if BUILDFLAG(IS_IOS)
++  virtual base::TimeTicks LastPictureInPictureEnterTime() const {
++    return base::TimeTicks();
++  }
++  virtual void RecordMediaSessionPauseAction() {}
++  virtual base::TimeTicks LastMediaSessionPauseTime() const {
++    return base::TimeTicks();
++  }
++#endif
++
+   void Trace(Visitor*) const override;
+ 
+  protected:
+diff --git a/third_party/blink/renderer/core/html/media/html_media_element.cc b/third_party/blink/renderer/core/html/media/html_media_element.cc
+index 15ffc73..d2a1f39 100644
+--- a/third_party/blink/renderer/core/html/media/html_media_element.cc
++++ b/third_party/blink/renderer/core/html/media/html_media_element.cc
+@@ -74,6 +74,8 @@
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/local_frame_client.h"
+ #include "third_party/blink/renderer/core/frame/picture_in_picture_controller.h"
++#include "third_party/blink/renderer/core/page/focus_controller.h"
++#include "third_party/blink/renderer/core/page/page.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/fullscreen/fullscreen.h"
+ #include "third_party/blink/renderer/core/html/html_source_element.h"
+@@ -3270,6 +3272,36 @@ void HTMLMediaElement::pause() {
+   PauseInternal(WebMediaPlayer::PauseReason::kPauseCalled);
+ }
+ 
++void HTMLMediaElement::pauseForBindings() {
++#if BUILDFLAG(IS_IOS)
++  if (!ended() &&
++      PictureInPictureController::IsElementInPictureInPicture(this)) {
++    Document& doc = GetDocument();
++    PictureInPictureController& pip = PictureInPictureController::From(doc);
++    const base::TimeTicks now = base::TimeTicks::Now();
++    const base::TimeTicks ms_pause = pip.LastMediaSessionPauseTime();
++    const bool from_media_session =
++        !ms_pause.is_null() && (now - ms_pause) < base::Milliseconds(750);
++    if (!from_media_session) {
++      const base::TimeTicks enter_time = pip.LastPictureInPictureEnterTime();
++      const bool within_enter_guard =
++          !enter_time.is_null() &&
++          (now - enter_time) < base::Milliseconds(500);
++      const bool page_hidden_or_unfocused =
++          doc.hidden() ||
++          (doc.GetPage() && !doc.GetPage()->GetFocusController().IsFocused());
++      const bool has_user_activation =
++          LocalFrame::HasTransientUserActivation(doc.GetFrame());
++      if (within_enter_guard ||
++          (page_hidden_or_unfocused && !has_user_activation)) {
++        return;
++      }
++    }
++  }
++#endif
++  pause();
++}
++
+ void HTMLMediaElement::PauseInternal(WebMediaPlayer::PauseReason pause_reason) {
+   DVLOG(3) << "pauseInternal(" << *this << ")";
+ 
+diff --git a/third_party/blink/renderer/core/html/media/html_media_element.h b/third_party/blink/renderer/core/html/media/html_media_element.h
+index e5be898..f8254c5 100644
+--- a/third_party/blink/renderer/core/html/media/html_media_element.h
++++ b/third_party/blink/renderer/core/html/media/html_media_element.h
+@@ -271,6 +271,7 @@ class CORE_EXPORT HTMLMediaElement
+   std::optional<DOMExceptionCode> Play();
+ 
+   void pause();
++  void pauseForBindings();
+   double latencyHint() const;
+   void setLatencyHint(double);
+   bool preservesPitch() const;
+diff --git a/third_party/blink/renderer/core/html/media/html_media_element.idl b/third_party/blink/renderer/core/html/media/html_media_element.idl
+index 9c5f09f..55020fc 100644
+--- a/third_party/blink/renderer/core/html/media/html_media_element.idl
++++ b/third_party/blink/renderer/core/html/media/html_media_element.idl
+@@ -74,7 +74,7 @@ enum CanPlayTypeResult { "" /* empty string */, "maybe", "probably" };
+     [CEReactions, Reflect] attribute boolean autoplay;
+     [CEReactions, Reflect] attribute boolean loop;
+     [CallWith=ScriptState, ImplementedAs=playForBindings] Promise<undefined> play();
+-    void pause();
++    [ImplementedAs=pauseForBindings] void pause();
+     [RuntimeEnabled=MediaLatencyHint, CEReactions]
+     attribute double latencyHint;
+     attribute boolean preservesPitch;
+diff --git a/third_party/blink/renderer/core/html/media/html_video_element.cc b/third_party/blink/renderer/core/html/media/html_video_element.cc
+index 340c2fa..c1a9b03 100644
+--- a/third_party/blink/renderer/core/html/media/html_video_element.cc
++++ b/third_party/blink/renderer/core/html/media/html_video_element.cc
+@@ -28,6 +28,7 @@
+ #include <memory>
+ 
+ #include "base/feature_list.h"
++#include "build/build_config.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "cc/layers/layer.h"
+@@ -1313,11 +1314,13 @@ void HTMLVideoElement::AttributeChanged(
+     return;
+   }
+ 
++#if !BUILDFLAG(IS_IOS)
+   PictureInPictureController& controller =
+       PictureInPictureController::From(GetDocument());
+   if (controller.PictureInPictureElement(GetTreeScope()) == *this) {
+     controller.ExitPictureInPicture(this, nullptr);
+   }
++#endif
+ }
+ 
+ void HTMLVideoElement::OnRequestVideoFrameCallback() {
+diff --git a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc
+index 9411b46..4908121 100644
+--- a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc
++++ b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.cc
+@@ -127,8 +127,10 @@ PictureInPictureControllerImpl::IsElementAllowedInternal(
+   if (!video_element.HasVideo())
+     return Status::kVideoTrackNotAvailable;
+ 
++#if !BUILDFLAG(IS_IOS)
+   if (video_element.FastHasAttribute(html_names::kDisablepictureinpictureAttr))
+     return Status::kDisabledByAttribute;
++#endif
+ 
+   if (video_element.IsInAutoPIP())
+     return Status::kAutoPipAndroid;
+@@ -269,6 +271,9 @@ void PictureInPictureControllerImpl::OnEnteredPictureInPicture(
+   }
+ 
+   picture_in_picture_element_ = element;
++#if BUILDFLAG(IS_IOS)
++  last_pip_enter_time_ = base::TimeTicks::Now();
++#endif
+   picture_in_picture_element_->OnEnteredPictureInPicture();
+ 
+ #if !BUILDFLAG(IS_IOS)
+@@ -351,6 +356,9 @@ void PictureInPictureControllerImpl::OnExitedPictureInPicture(
+ 
+     HTMLVideoElement* element = picture_in_picture_element_;
+     picture_in_picture_element_ = nullptr;
++#if BUILDFLAG(IS_IOS)
++    last_pip_enter_time_ = base::TimeTicks();
++#endif
+ 
+     element->OnExitedPictureInPicture();
+     element->DispatchEvent(*PictureInPictureEvent::Create(
+@@ -692,4 +700,20 @@ bool PictureInPictureControllerImpl::ConsumePictureInPictureRequestToken() {
+   return picture_in_picture_request_token_.ConsumeIfActive();
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++base::TimeTicks PictureInPictureControllerImpl::LastPictureInPictureEnterTime()
++    const {
++  return last_pip_enter_time_;
++}
++
++void PictureInPictureControllerImpl::RecordMediaSessionPauseAction() {
++  last_media_session_pause_time_ = base::TimeTicks::Now();
++}
++
++base::TimeTicks PictureInPictureControllerImpl::LastMediaSessionPauseTime()
++    const {
++  return last_media_session_pause_time_;
++}
++#endif
++
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.h b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.h
+index 671a9d9..ddc5957 100644
+--- a/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.h
++++ b/third_party/blink/renderer/modules/document_picture_in_picture/picture_in_picture_controller_impl.h
+@@ -119,6 +119,11 @@ class MODULES_EXPORT PictureInPictureControllerImpl
+   bool IsPictureInPictureRequestTokenActive() const override;
+   void ActivatePictureInPictureRequestToken() override;
+   bool ConsumePictureInPictureRequestToken() override;
++#if BUILDFLAG(IS_IOS)
++  base::TimeTicks LastPictureInPictureEnterTime() const override;
++  void RecordMediaSessionPauseAction() override;
++  base::TimeTicks LastMediaSessionPauseTime() const override;
++#endif
+ 
+   void SetDocumentPictureInPictureOwner(LocalDOMWindow* owner);
+ 
+@@ -241,6 +246,10 @@ class MODULES_EXPORT PictureInPictureControllerImpl
+       picture_in_picture_session_;
+ 
+   RequestToken picture_in_picture_request_token_;
++#if BUILDFLAG(IS_IOS)
++  base::TimeTicks last_pip_enter_time_;
++  base::TimeTicks last_media_session_pause_time_;
++#endif
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/modules/mediasession/media_session.cc b/third_party/blink/renderer/modules/mediasession/media_session.cc
+index 709c0ad..750015d 100644
+--- a/third_party/blink/renderer/modules/mediasession/media_session.cc
++++ b/third_party/blink/renderer/modules/mediasession/media_session.cc
+@@ -10,6 +10,7 @@
+ #include "base/notreached.h"
+ #include "base/time/default_tick_clock.h"
+ #include "base/time/time.h"
++#include "build/build_config.h"
+ #include "third_party/blink/public/mojom/frame/user_activation_notification_type.mojom-blink.h"
+ #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_media_position_state.h"
+@@ -497,6 +498,16 @@ void MediaSession::DidReceiveAction(
+                           blink::mojom::blink::MediaSessionActionDetailsPtr>::
+           ConvertWithV8Action(details, v8_action);
+ 
++#if BUILDFLAG(IS_IOS)
++  if (action == MediaSessionAction::kPause ||
++      action == MediaSessionAction::kStop) {
++    if (Document* document = window->document()) {
++      PictureInPictureController::From(*document)
++          .RecordMediaSessionPauseAction();
++    }
++  }
++#endif
++
+   iter->value->InvokeAndReportException(this, blink_details);
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/picture_in_picture/document_video_picture_in_picture.cc b/third_party/blink/renderer/modules/picture_in_picture/document_video_picture_in_picture.cc
+index 0d55ce9..f3801a9 100644
+--- a/third_party/blink/renderer/modules/picture_in_picture/document_video_picture_in_picture.cc
++++ b/third_party/blink/renderer/modules/picture_in_picture/document_video_picture_in_picture.cc
+@@ -4,10 +4,13 @@
+ 
+ #include "third_party/blink/renderer/modules/picture_in_picture/document_video_picture_in_picture.h"
+ 
++#include "base/time/time.h"
++#include "build/build_config.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/dom/element.h"
+ #include "third_party/blink/renderer/core/dom/events/event.h"
++#include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/picture_in_picture_controller.h"
+ #include "third_party/blink/renderer/core/html/media/html_video_element.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_code.h"
+@@ -49,6 +52,19 @@ ScriptPromise<IDLUndefined> DocumentVideoPictureInPicture::exitPictureInPicture(
+       script_state, exception_state.GetContext());
+   auto promise = resolver->Promise();
+ 
++#if BUILDFLAG(IS_IOS)
++  const base::TimeTicks enter_time = controller.LastPictureInPictureEnterTime();
++  const bool within_enter_guard =
++      !enter_time.is_null() &&
++      (base::TimeTicks::Now() - enter_time) < base::Milliseconds(1500);
++  const bool has_user_activation =
++      LocalFrame::HasTransientUserActivation(document.GetFrame());
++  if (within_enter_guard || !has_user_activation) {
++    resolver->Resolve();
++    return promise;
++  }
++#endif
++
+   DCHECK(IsA<HTMLVideoElement>(picture_in_picture_element));
+   controller.ExitPictureInPicture(
+       To<HTMLVideoElement>(picture_in_picture_element), resolver);
+diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.cc b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+index 3ab0247..af0db36 100644
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.cc
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+@@ -3218,9 +3218,13 @@ void WebMediaPlayerImpl::UpdatePlayState() {
+ 
+   bool is_suspended = pipeline_controller_->IsSuspended();
+   bool is_backgrounded = IsBackgroundSuspendEnabled(this) && IsPageHidden();
++  bool in_video_pip = IsInVideoPictureInPicture();
++#if BUILDFLAG(IS_IOS)
++  in_video_pip = in_video_pip || ios_pip_session_token_.has_value();
++#endif
+   PlayState state = UpdatePlayState_ComputePlayState(
+       is_flinging_, can_auto_suspend, is_suspended, is_backgrounded,
+-      IsInVideoPictureInPicture());
++      in_video_pip);
+   SetDelegateState(state.delegate_state, state.is_idle);
+   SetMemoryReportingState(state.is_memory_reporting_enabled);
+   SetSuspendState(state.is_suspended || pending_suspend_resume_cycle_);
+@@ -3770,6 +3774,15 @@ base::WeakPtr<WebMediaPlayer> WebMediaPlayerImpl::AsWeakPtr() {
+ bool WebMediaPlayerImpl::ShouldPausePlaybackWhenHidden() const {
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
+ 
++#if BUILDFLAG(IS_IOS)
++  // Keep active or starting system Picture-in-Picture videos (including muted
++  // and subframe streams) playing when the page or frame becomes hidden.
++  if (HasVideo() &&
++      (IsInVideoPictureInPicture() || ios_pip_session_token_.has_value())) {
++    return false;
++  }
++#endif
++
+   if (should_pause_when_frame_is_hidden_ && IsFrameHidden()) {
+     return true;
+   }
+@@ -3832,7 +3845,11 @@ bool WebMediaPlayerImpl::ShouldDisableVideoWhenHidden() const {
+   }
+ 
+   // In these cases something external needs the frames.
+-  if (IsInVideoPictureInPicture() || IsVideoBeingCaptured() || is_flinging_) {
++  bool in_video_pip = IsInVideoPictureInPicture();
++#if BUILDFLAG(IS_IOS)
++  in_video_pip = in_video_pip || ios_pip_session_token_.has_value();
++#endif
++  if (in_video_pip || IsVideoBeingCaptured() || is_flinging_) {
+     return false;
+   }
+ 

@@ -48,6 +48,35 @@ link_persist() {
   "$SCRIPTS/reclaim_disk_linux.sh" --drop-swap
   mkdir -p "$STATE/app" "$STATE/link_out"
   mv "$LOUT/Chromium.app" "$STATE/app/Chromium.app"
+  # Verify Blink permission element localized strings (e.g. resource ID 47053)
+  # are packed into the app's data packs so <geolocation>/<usermedia> elements
+  # never SIGTRAP in ResourceBundle::GetLocalizedStringImpl.
+  python3 - "$STATE/app/Chromium.app" <<'PY'
+import pathlib, struct, sys
+
+app = pathlib.Path(sys.argv[1])
+def pak_ids(path: pathlib.Path) -> set[int]:
+    data = path.read_bytes()
+    version = struct.unpack_from("<I", data, 0)[0]
+    if version != 5:
+        raise SystemExit(f"Unsupported pak version {version} in {path}")
+    _, res_count, alias_count = struct.unpack_from("<BxxxHH", data, 4)
+    off = 12
+    ids = {struct.unpack_from("<HI", data, off + i * 6)[0] for i in range(res_count)}
+    off += (res_count + 1) * 6
+    ids.update(struct.unpack_from("<HH", data, off + i * 4)[0] for i in range(alias_count))
+    return ids
+
+res_pak = app / "resources.pak"
+en_pak = app / "en.lproj/locale.pak"
+for p in (res_pak, en_pak):
+    if not p.is_file():
+        raise SystemExit(f"Missing expected data pack: {p}")
+found = pak_ids(res_pak) | pak_ids(en_pak)
+if 47053 not in found:
+    raise SystemExit("Permission element resource ID 47053 missing from resources.pak and en.lproj/locale.pak")
+print(f"Verified permission element strings (ID 47053 present across {len(found)} packed resources)")
+PY
   # Keep the unstripped engine beside the checkpoint so crash reports can be
   # symbolicated. It never ships; the IPA carries the stripped binary.
   local unstripped

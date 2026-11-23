@@ -1,0 +1,758 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Date: Sun, 22 Nov 2026 19:07:14 -0500
+Subject: [PATCH] iOS Curium: PDFKit download semantics, terminal task pruning,
+ and Media Radar resource events
+
+---
+ ios/chrome/browser/curium/DEPS                |   1 +
+ .../browser/curium/curium_browser_host.mm     |  38 +++-
+ .../browser/curium/curium_download_task.h     |   2 +
+ .../browser/curium/curium_download_task.mm    | 117 +++++++++---
+ .../curium/curium_engine_contract_internal.h  |   9 +
+ ios/chrome/browser/curium/curium_tab_host.mm  | 166 ++++++++++++++++--
+ ios/web/content/DEPS                          |   4 +
+ .../content/download/content_download_task.h  |   6 +
+ .../content/download/content_download_task.mm |  61 ++++++-
+ ios/web/public/download/download_task.h       |   9 +
+ 10 files changed, 368 insertions(+), 45 deletions(-)
+
+diff --git a/ios/chrome/browser/curium/DEPS b/ios/chrome/browser/curium/DEPS
+index 4008976..d71f9bd 100644
+--- a/ios/chrome/browser/curium/DEPS
++++ b/ios/chrome/browser/curium/DEPS
+@@ -16,4 +16,5 @@ include_rules = [
+   "+third_party/blink/public/common",
+   "+third_party/blink/public/mojom",
+   "+ui/base",
++  "+url",
+ ]
+diff --git a/ios/chrome/browser/curium/curium_browser_host.mm b/ios/chrome/browser/curium/curium_browser_host.mm
+index 9e8502a..2b994ab 100644
+--- a/ios/chrome/browser/curium/curium_browser_host.mm
++++ b/ios/chrome/browser/curium/curium_browser_host.mm
+@@ -131,6 +131,7 @@ @implementation CuriumBrowserHost {
+   BOOL _pendingTabsNotification;
+   BOOL _isShutdown;
+   BOOL _observesResourceLoads;
++  BOOL _observesResourceEvents;
+ }
+ 
+ @synthesize delegate = _delegate;
+@@ -140,12 +141,23 @@ - (void)setDelegate:(nullable id<CrIOSBrowserHostDelegateV1>)delegate {
+   _observesResourceLoads =
+       [delegate respondsToSelector:@selector
+                 (browserHost:tab:didLoadResourceURL:mimeType:httpStatusCode:contentLength:)];
++  _observesResourceEvents =
++      [delegate respondsToSelector:@selector
++                (browserHost:tab:didLoadResourceEvent:)];
+ }
+ 
+ - (BOOL)observesResourceLoads {
++  return (_observesResourceLoads || _observesResourceEvents) && !_isShutdown;
++}
++
++- (BOOL)observesLegacyResourceLoads {
+   return _observesResourceLoads && !_isShutdown;
+ }
+ 
++- (BOOL)observesResourceEvents {
++  return _observesResourceEvents && !_isShutdown;
++}
++
+ - (instancetype)initWithBrowser:(Browser*)browser
+                      sceneState:(SceneState*)sceneState {
+   self = [super init];
+@@ -174,7 +186,7 @@ - (void)shutdown {
+   }
+   _isShutdown = YES;
+ 
+-  for (CuriumDownloadTask* task in _downloads) {
++  for (CuriumDownloadTask* task in [_downloads copy]) {
+     [task invalidate];
+   }
+   [_downloads removeAllObjects];
+@@ -525,6 +537,17 @@ - (void)tabHost:(CuriumTabHost*)tabHost
+   }
+ }
+ 
++- (void)tabHost:(CuriumTabHost*)tabHost
++    didLoadResourceEvent:(NSDictionary<NSString*, id>*)event {
++  if (_isShutdown) {
++    return;
++  }
++  if ([_delegate respondsToSelector:@selector
++                 (browserHost:tab:didLoadResourceEvent:)]) {
++    [_delegate browserHost:self tab:tabHost didLoadResourceEvent:event];
++  }
++}
++
+ - (void)tabHost:(CuriumTabHost*)tabHost
+     didCommitNavigationToURL:(NSURL*)url
+                 navigationID:(int64_t)navigationID
+@@ -603,9 +626,16 @@ - (void)handleDownloadCreated:(std::unique_ptr<web::DownloadTask>)task
+     task->Cancel();
+     return;
+   }
+-  CuriumDownloadTask* wrapper =
+-      [[CuriumDownloadTask alloc] initWithDownloadTask:std::move(task)
+-                                           sourceTabID:sourceTab.tabID];
++  __weak CuriumBrowserHost* weakSelf = self;
++  CuriumDownloadTask* wrapper = [[CuriumDownloadTask alloc]
++      initWithDownloadTask:std::move(task)
++               sourceTabID:sourceTab.tabID
++                onTerminal:^(CuriumDownloadTask* finished) {
++                  CuriumBrowserHost* strongSelf = weakSelf;
++                  if (strongSelf) {
++                    [strongSelf->_downloads removeObjectIdenticalTo:finished];
++                  }
++                }];
+   [_downloads addObject:wrapper];
+   [_delegate browserHost:self didCreateDownload:wrapper];
+ }
+diff --git a/ios/chrome/browser/curium/curium_download_task.h b/ios/chrome/browser/curium/curium_download_task.h
+index 2ea57c1..bbb75b1 100644
+--- a/ios/chrome/browser/curium/curium_download_task.h
++++ b/ios/chrome/browser/curium/curium_download_task.h
+@@ -18,6 +18,8 @@ NS_ASSUME_NONNULL_BEGIN
+ @interface CuriumDownloadTask : NSObject <CrIOSDownloadTaskV1>
+ - (instancetype)initWithDownloadTask:(std::unique_ptr<web::DownloadTask>)task
+                          sourceTabID:(nullable NSString*)sourceTabID
++                          onTerminal:
++                              (nullable void (^)(CuriumDownloadTask*))onTerminal
+     NS_DESIGNATED_INITIALIZER;
+ - (instancetype)init NS_UNAVAILABLE;
+ - (void)invalidate;
+diff --git a/ios/chrome/browser/curium/curium_download_task.mm b/ios/chrome/browser/curium/curium_download_task.mm
+index 6865b18..1068aba 100644
+--- a/ios/chrome/browser/curium/curium_download_task.mm
++++ b/ios/chrome/browser/curium/curium_download_task.mm
+@@ -56,11 +56,20 @@ @implementation CuriumDownloadTask {
+   NSURL* _originalURL;
+   NSString* _suggestedFilename;
+   NSString* _mimeType;
++  BOOL _isExplicitDownload;
++  BOOL _isMainFrame;
++  NSString* _httpMethod;
++  CrIOSDownloadState _terminalState;
++  int64_t _terminalTotalBytes;
++  int64_t _terminalReceivedBytes;
+   void (^_completion)(NSURL* _Nullable, NSError* _Nullable);
++  void (^_onTerminal)(CuriumDownloadTask*);
+ }
+ 
+ - (instancetype)initWithDownloadTask:(std::unique_ptr<web::DownloadTask>)task
+-                         sourceTabID:(nullable NSString*)sourceTabID {
++                         sourceTabID:(nullable NSString*)sourceTabID
++                          onTerminal:
++                              (nullable void (^)(CuriumDownloadTask*))onTerminal {
+   self = [super init];
+   if (self) {
+     _task = std::move(task);
+@@ -72,6 +81,13 @@ - (instancetype)initWithDownloadTask:(std::unique_ptr<web::DownloadTask>)task
+         base::SysUTF8ToNSString(generated.value()) ?: @"Download";
+     const std::string mime = _task->GetMimeType();
+     _mimeType = mime.empty() ? nil : base::SysUTF8ToNSString(mime);
++    _isExplicitDownload = _task->IsExplicitDownload();
++    _isMainFrame = _task->IsMainFrameDownload();
++    _httpMethod = [_task->GetHttpMethod() copy] ?: @"GET";
++    _terminalState = CrIOSDownloadStateCancelled;
++    _terminalTotalBytes = -1;
++    _terminalReceivedBytes = 0;
++    _onTerminal = [onTerminal copy];
+     _observer = std::make_unique<DownloadTaskObserverAdapter>(self);
+     _task->AddObserver(_observer.get());
+   }
+@@ -82,12 +98,37 @@ - (void)dealloc {
+   [self invalidate];
+ }
+ 
+-- (void)invalidate {
+-  if (_task && _observer) {
+-    _task->RemoveObserver(_observer.get());
++- (void)detachAndSnapshotTerminalState:(CrIOSDownloadState)fallbackState {
++  if (_task) {
++    const CrIOSDownloadState mapped = MapDownloadState(_task->GetState());
++    _terminalState = (mapped == CrIOSDownloadStatePending ||
++                      mapped == CrIOSDownloadStateInProgress)
++                         ? fallbackState
++                         : mapped;
++    _terminalTotalBytes = _task->GetTotalBytes();
++    _terminalReceivedBytes = _task->GetReceivedBytes();
++    if (_observer) {
++      _task->RemoveObserver(_observer.get());
++    }
++  } else {
++    _terminalState = fallbackState;
+   }
+   _observer.reset();
+   _task.reset();
++}
++
++- (void)notifyTerminal {
++  if (!_onTerminal) {
++    return;
++  }
++  void (^callback)(CuriumDownloadTask*) = _onTerminal;
++  _onTerminal = nil;
++  callback(self);
++}
++
++- (void)invalidate {
++  _onTerminal = nil;
++  [self detachAndSnapshotTerminalState:CrIOSDownloadStateCancelled];
+   [self finishWithURL:nil
+                 error:[NSError errorWithDomain:kCuriumDownloadErrorDomain
+                                           code:-1
+@@ -117,17 +158,28 @@ - (nullable NSString*)mimeType {
+   return _mimeType;
+ }
+ 
++- (BOOL)isExplicitDownload {
++  return _isExplicitDownload;
++}
++
++- (BOOL)isMainFrame {
++  return _isMainFrame;
++}
++
++- (NSString*)httpMethod {
++  return _httpMethod;
++}
++
+ - (int64_t)totalBytes {
+-  return _task ? _task->GetTotalBytes() : -1;
++  return _task ? _task->GetTotalBytes() : _terminalTotalBytes;
+ }
+ 
+ - (int64_t)receivedBytes {
+-  return _task ? _task->GetReceivedBytes() : 0;
++  return _task ? _task->GetReceivedBytes() : _terminalReceivedBytes;
+ }
+ 
+ - (CrIOSDownloadState)state {
+-  return _task ? MapDownloadState(_task->GetState())
+-               : CrIOSDownloadStateCancelled;
++  return _task ? MapDownloadState(_task->GetState()) : _terminalState;
+ }
+ 
+ - (void)startWithDestinationURL:(NSURL*)destinationURL
+@@ -161,25 +213,23 @@ - (void)handleTaskUpdated {
+   if (!_task || !_task->IsDone()) {
+     return;
+   }
+-  switch (_task->GetState()) {
+-    case web::DownloadTask::State::kComplete: {
+-      NSURL* savedURL = base::apple::FilePathToNSURL(_task->GetResponsePath());
+-      [self finishWithURL:savedURL error:nil];
++  const web::DownloadTask::State taskState = _task->GetState();
++  NSURL* savedURL = nil;
++  NSError* err = nil;
++  switch (taskState) {
++    case web::DownloadTask::State::kComplete:
++      savedURL = base::apple::FilePathToNSURL(_task->GetResponsePath());
+       break;
+-    }
+-    case web::DownloadTask::State::kCancelled: {
+-      NSError* err =
+-          [NSError errorWithDomain:NSCocoaErrorDomain
+-                              code:NSUserCancelledError
+-                          userInfo:@{
+-                            NSLocalizedDescriptionKey : @"Download cancelled."
+-                          }];
+-      [self finishWithURL:nil error:err];
++    case web::DownloadTask::State::kCancelled:
++      err = [NSError errorWithDomain:NSCocoaErrorDomain
++                                code:NSUserCancelledError
++                            userInfo:@{
++                              NSLocalizedDescriptionKey : @"Download cancelled."
++                            }];
+       break;
+-    }
+     case web::DownloadTask::State::kFailed:
+-    case web::DownloadTask::State::kFailedNotResumable: {
+-      NSError* err = [NSError
++    case web::DownloadTask::State::kFailedNotResumable:
++      err = [NSError
+           errorWithDomain:kCuriumDownloadErrorDomain
+                      code:_task->GetErrorCode()
+                  userInfo:@{
+@@ -187,16 +237,26 @@ - (void)handleTaskUpdated {
+                        stringWithFormat:@"Download failed (net error %d).",
+                                         _task->GetErrorCode()]
+                  }];
+-      [self finishWithURL:nil error:err];
+       break;
+-    }
+     case web::DownloadTask::State::kNotStarted:
+     case web::DownloadTask::State::kInProgress:
+-      break;
++      return;
+   }
++  // Keep strong self across completion + host pruning.
++  CuriumDownloadTask* strongSelf = self;
++  [strongSelf detachAndSnapshotTerminalState:MapDownloadState(taskState)];
++  [strongSelf finishWithURL:savedURL error:err];
++  [strongSelf notifyTerminal];
+ }
+ 
+ - (void)handleTaskDestroyed {
++  CuriumDownloadTask* strongSelf = self;
++  if (_task) {
++    _terminalTotalBytes = _task->GetTotalBytes();
++    _terminalReceivedBytes = _task->GetReceivedBytes();
++  }
++  _terminalState = CrIOSDownloadStateCancelled;
++  _observer.reset();
+   _task.release();
+   NSError* err =
+       [NSError errorWithDomain:kCuriumDownloadErrorDomain
+@@ -204,7 +264,8 @@ - (void)handleTaskDestroyed {
+                       userInfo:@{
+                         NSLocalizedDescriptionKey : @"Download destroyed."
+                       }];
+-  [self finishWithURL:nil error:err];
++  [strongSelf finishWithURL:nil error:err];
++  [strongSelf notifyTerminal];
+ }
+ 
+ - (void)finishWithURL:(nullable NSURL*)url error:(nullable NSError*)error {
+diff --git a/ios/chrome/browser/curium/curium_engine_contract_internal.h b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+index a98cd0d..1414ac2 100644
+--- a/ios/chrome/browser/curium/curium_engine_contract_internal.h
++++ b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+@@ -102,6 +102,7 @@ __attribute__((visibility("default")))
+ @optional
+ @property(nonatomic) CGFloat topControlsHeight;
+ @property(nonatomic, readonly) CGFloat topControlsShownRatio;
++@property(nonatomic, copy, readonly, nullable) NSString* effectiveUserAgent;
+ @end
+ 
+ @protocol CrIOSTabBrowserControlsV1 <CrIOSTabHostingV1>
+@@ -123,6 +124,11 @@ __attribute__((visibility("default")))
+                      completion:(void (^)(NSURL* _Nullable savedFileURL,
+                                           NSError* _Nullable error))completion;
+ - (void)cancel;
++
++@optional
++@property(nonatomic, readonly) BOOL isExplicitDownload;
++@property(nonatomic, readonly) BOOL isMainFrame;
++@property(nonatomic, copy, readonly) NSString* httpMethod;
+ @end
+ 
+ @protocol CrIOSBrowserHostDelegateV1 <NSObject>
+@@ -155,6 +161,9 @@ __attribute__((visibility("default")))
+               mimeType:(nullable NSString*)mimeType
+         httpStatusCode:(NSInteger)httpStatusCode
+          contentLength:(int64_t)contentLength;
++- (void)browserHost:(id<CrIOSBrowserHostV1>)host
++                     tab:(id<CrIOSTabHostingV1>)tab
++    didLoadResourceEvent:(NSDictionary<NSString*, id>*)event;
+ - (void)browserHost:(id<CrIOSBrowserHostV1>)host
+                          tab:(id<CrIOSTabHostingV1>)tab
+     didCommitNavigationToURL:(NSURL*)url
+diff --git a/ios/chrome/browser/curium/curium_tab_host.mm b/ios/chrome/browser/curium/curium_tab_host.mm
+index fee56c9..d871db4 100644
+--- a/ios/chrome/browser/curium/curium_tab_host.mm
++++ b/ios/chrome/browser/curium/curium_tab_host.mm
+@@ -32,21 +32,28 @@
+ #import "ios/web/public/navigation/navigation_item.h"
+ #import "ios/web/public/navigation/navigation_manager.h"
+ #import "ios/web/public/navigation/reload_type.h"
++#import "ios/web/public/web_client.h"
+ #import "ios/web/public/web_state.h"
+ #import "ios/web/public/web_state_observer.h"
+ #import "net/base/apple/url_conversions.h"
++#import "services/network/public/mojom/fetch_api.mojom-shared.h"
+ #import "third_party/blink/public/common/page/page_zoom.h"
+ #import "third_party/blink/public/mojom/loader/resource_load_info.mojom.h"
+ #import "ui/base/page_transition_types.h"
++#import "url/origin.h"
+ 
+ @interface CuriumBrowserHost (TabNotifications)
+ - (BOOL)observesResourceLoads;
++- (BOOL)observesLegacyResourceLoads;
++- (BOOL)observesResourceEvents;
+ - (void)tabHostDidUpdate:(CuriumTabHost*)tabHost;
+ - (void)tabHost:(CuriumTabHost*)tabHost
+     didLoadResourceURL:(NSURL*)url
+               mimeType:(nullable NSString*)mimeType
+         httpStatusCode:(NSInteger)httpStatusCode
+          contentLength:(int64_t)contentLength;
++- (void)tabHost:(CuriumTabHost*)tabHost
++    didLoadResourceEvent:(NSDictionary<NSString*, id>*)event;
+ - (void)tabHost:(CuriumTabHost*)tabHost
+     didCommitNavigationToURL:(NSURL*)url
+                 navigationID:(int64_t)navigationID
+@@ -64,7 +71,8 @@ - (void)handleNavigationCommitted;
+ - (void)handleMainFrameCommit:(content::NavigationHandle*)navigation;
+ - (void)updateTopControlsShownRatio:(CGFloat)ratio;
+ - (void)handleWebStateDestroyed;
+-- (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info;
++- (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info
++           renderFrameHost:(nullable content::RenderFrameHost*)renderFrameHost;
+ @end
+ 
+ namespace {
+@@ -104,7 +112,8 @@ void ResourceLoadComplete(
+       const content::GlobalRequestID& request_id,
+       const GURL& original_url,
+       const blink::mojom::ResourceLoadInfo& resource_load_info) override {
+-    [owner_ handleResourceLoad:resource_load_info];
++    [owner_ handleResourceLoad:resource_load_info
++               renderFrameHost:render_frame_host];
+   }
+ 
+  private:
+@@ -155,6 +164,55 @@ void WebStateDestroyed(web::WebState* web_state) override {
+   std::unique_ptr<CuriumWebContentsObserver> web_contents_observer_;
+ };
+ 
++bool ShouldFilterResourceForMediaRadar(
++    const GURL& url,
++    network::mojom::RequestDestination destination) {
++  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS()) {
++    return true;
++  }
++  switch (destination) {
++    case network::mojom::RequestDestination::kImage:
++    case network::mojom::RequestDestination::kStyle:
++    case network::mojom::RequestDestination::kScript:
++    case network::mojom::RequestDestination::kFont:
++    case network::mojom::RequestDestination::kReport:
++    case network::mojom::RequestDestination::kPaintWorklet:
++    case network::mojom::RequestDestination::kAudioWorklet:
++    case network::mojom::RequestDestination::kSpeculationRules:
++    case network::mojom::RequestDestination::kCompressionDictionary:
++      return true;
++    default:
++      return false;
++  }
++}
++
++NSString* RequestDestinationName(network::mojom::RequestDestination dest) {
++  switch (dest) {
++    case network::mojom::RequestDestination::kVideo:
++      return @"video";
++    case network::mojom::RequestDestination::kAudio:
++      return @"audio";
++    case network::mojom::RequestDestination::kTrack:
++      return @"track";
++    case network::mojom::RequestDestination::kEmpty:
++      return @"empty";
++    case network::mojom::RequestDestination::kDocument:
++      return @"document";
++    case network::mojom::RequestDestination::kIframe:
++      return @"iframe";
++    case network::mojom::RequestDestination::kFrame:
++      return @"frame";
++    case network::mojom::RequestDestination::kObject:
++      return @"object";
++    case network::mojom::RequestDestination::kEmbed:
++      return @"embed";
++    case network::mojom::RequestDestination::kManifest:
++      return @"manifest";
++    default:
++      return @"other";
++  }
++}
++
+ }  // namespace
+ 
+ @implementation CuriumTabHost {
+@@ -346,6 +404,28 @@ - (BOOL)isPictureInPictureActive {
+   return wc && wc->HasPictureInPictureVideo();
+ }
+ 
++- (nullable NSString*)effectiveUserAgent {
++  const BOOL desktop = [self usesDesktopUserAgent];
++  if (_webState && desktop) {
++    if (content::WebContents* wc =
++            static_cast<web::ContentWebState*>(_webState)->GetWebContents()) {
++      const std::string& override_ua =
++          wc->GetUserAgentOverride().ua_string_override;
++      if (!override_ua.empty()) {
++        return base::SysUTF8ToNSString(override_ua);
++      }
++    }
++  }
++  if (web::WebClient* client = web::GetWebClient()) {
++    const std::string ua = client->GetUserAgent(
++        desktop ? web::UserAgentType::DESKTOP : web::UserAgentType::MOBILE);
++    if (!ua.empty()) {
++      return base::SysUTF8ToNSString(ua);
++    }
++  }
++  return nil;
++}
++
+ - (void)loadURL:(NSURL*)url {
+   if (!_webState || !url) {
+     return;
+@@ -609,14 +689,23 @@ - (void)handleWebStateDestroyed {
+   [self detach];
+ }
+ 
+-- (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info {
++- (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info
++           renderFrameHost:(nullable content::RenderFrameHost*)renderFrameHost {
+   CuriumBrowserHost* browserHost = _browserHost;
+   if (!browserHost || ![browserHost observesResourceLoads]) {
+     return;
+   }
+-  NSURL* ns_url = net::NSURLWithGURL(info.final_url.is_valid()
+-                                         ? info.final_url
+-                                         : info.original_url);
++  const GURL& effective_url =
++      info.final_url.is_valid() ? info.final_url : info.original_url;
++  const BOOL wantsLegacy = [browserHost observesLegacyResourceLoads];
++  const BOOL wantsEvent =
++      [browserHost observesResourceEvents] &&
++      !ShouldFilterResourceForMediaRadar(effective_url,
++                                         info.request_destination);
++  if (!wantsLegacy && !wantsEvent) {
++    return;
++  }
++  NSURL* ns_url = net::NSURLWithGURL(effective_url);
+   if (!ns_url) {
+     return;
+   }
+@@ -626,17 +715,72 @@ - (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info {
+       info.http_status_code > 0 ? info.http_status_code : 0;
+   const int64_t raw_bytes = static_cast<int64_t>(info.raw_body_bytes.InBytes());
+   const int64_t content_length = raw_bytes > 0 ? raw_bytes : -1;
++
++  NSDictionary<NSString*, id>* event = nil;
++  if (wantsEvent) {
++    NSMutableDictionary<NSString*, id>* dict =
++        [NSMutableDictionary dictionaryWithCapacity:9];
++    dict[@"url"] = ns_url;
++    dict[@"httpStatusCode"] = @(status);
++    dict[@"contentLength"] = @(content_length);
++    dict[@"requestDestination"] =
++        RequestDestinationName(info.request_destination);
++    if (mime_type) {
++      dict[@"mimeType"] = mime_type;
++    }
++    if (info.original_url.is_valid() && info.original_url != effective_url) {
++      if (NSURL* orig = net::NSURLWithGURL(info.original_url)) {
++        dict[@"originalURL"] = orig;
++      }
++    }
++    if (info.referrer.is_valid()) {
++      if (NSURL* ref = net::NSURLWithGURL(info.referrer)) {
++        dict[@"referrer"] = ref;
++      }
++    }
++    // Extract frame URL and origin synchronously on the UI thread; never
++    // capture raw RenderFrameHost* into dispatch_async.
++    content::RenderFrameHost* rfh = renderFrameHost;
++    if (!rfh && _webState) {
++      if (content::WebContents* wc =
++              static_cast<web::ContentWebState*>(_webState)->GetWebContents()) {
++        rfh = wc->GetPrimaryMainFrame();
++      }
++    }
++    if (rfh) {
++      const GURL& frame_gurl = rfh->GetLastCommittedURL();
++      if (frame_gurl.is_valid()) {
++        if (NSURL* frame_ns = net::NSURLWithGURL(frame_gurl)) {
++          dict[@"frameURL"] = frame_ns;
++        }
++      }
++      const url::Origin& frame_origin = rfh->GetLastCommittedOrigin();
++      if (!frame_origin.opaque()) {
++        if (NSString* origin_str =
++                base::SysUTF8ToNSString(frame_origin.Serialize())) {
++          dict[@"frameOrigin"] = origin_str;
++        }
++      }
++    }
++    event = [dict copy];
++  }
++
+   __weak CuriumTabHost* weakSelf = self;
+   dispatch_async(dispatch_get_main_queue(), ^{
+     CuriumTabHost* strongSelf = weakSelf;
+     if (!strongSelf || !strongSelf->_webState) {
+       return;
+     }
+-    [strongSelf->_browserHost tabHost:strongSelf
+-                   didLoadResourceURL:ns_url
+-                             mimeType:mime_type
+-                       httpStatusCode:status
+-                        contentLength:content_length];
++    if (wantsLegacy) {
++      [strongSelf->_browserHost tabHost:strongSelf
++                     didLoadResourceURL:ns_url
++                               mimeType:mime_type
++                         httpStatusCode:status
++                          contentLength:content_length];
++    }
++    if (event) {
++      [strongSelf->_browserHost tabHost:strongSelf didLoadResourceEvent:event];
++    }
+   });
+ }
+ 
+diff --git a/ios/web/content/DEPS b/ios/web/content/DEPS
+index cd3e644..db937fc 100644
+--- a/ios/web/content/DEPS
++++ b/ios/web/content/DEPS
+@@ -38,6 +38,10 @@ specific_include_rules = {
+     "+third_party/blink/public/common/mediastream/media_stream_request.h",
+     "+third_party/blink/public/mojom/mediastream/media_stream.mojom.h",
+   ],
++  "content_download_task\\.mm": [
++    "+net/http/http_content_disposition.h",
++    "+ui/base/page_transition_types.h",
++  ],
+   "content_navigation_manager\\.mm": [
+     "+components/embedder_support/user_agent_utils.h",
+     "+third_party/blink/public/common/user_agent/user_agent_metadata.h",
+diff --git a/ios/web/content/download/content_download_task.h b/ios/web/content/download/content_download_task.h
+index f8362aa..7ccc900 100644
+--- a/ios/web/content/download/content_download_task.h
++++ b/ios/web/content/download/content_download_task.h
+@@ -46,6 +46,10 @@ class ContentDownloadTask final : public DownloadTaskImpl,
+   void OnDownloadUpdated(::download::DownloadItem* item) final;
+   void OnDownloadDestroyed(::download::DownloadItem* item) final;
+ 
++  // web::DownloadTask:
++  bool IsExplicitDownload() const final;
++  bool IsMainFrameDownload() const final;
++
+  private:
+   // DownloadTaskImpl:
+   void StartInternal(const base::FilePath& path) final;
+@@ -59,6 +63,8 @@ class ContentDownloadTask final : public DownloadTaskImpl,
+   raw_ptr<::download::DownloadItem> item_;
+   ::download::DownloadTargetCallback target_callback_;
+   std::string suggested_name_;
++  bool is_explicit_download_ = false;
++  bool is_main_frame_download_ = true;
+ };
+ 
+ }  // namespace web
+diff --git a/ios/web/content/download/content_download_task.mm b/ios/web/content/download/content_download_task.mm
+index e0a513b..8385efe 100644
+--- a/ios/web/content/download/content_download_task.mm
++++ b/ios/web/content/download/content_download_task.mm
+@@ -8,8 +8,16 @@
+ 
+ #import "base/strings/sys_string_conversions.h"
+ #import "base/task/sequenced_task_runner.h"
++#import "components/download/public/common/download_source.h"
++#import "content/public/browser/download_item_utils.h"
++#import "content/public/browser/navigation_controller.h"
++#import "content/public/browser/navigation_entry.h"
++#import "content/public/browser/render_frame_host.h"
++#import "content/public/browser/web_contents.h"
+ #import "ios/web/download/download_result.h"
+ #import "net/base/net_errors.h"
++#import "net/http/http_content_disposition.h"
++#import "ui/base/page_transition_types.h"
+ 
+ namespace web {
+ 
+@@ -22,6 +30,45 @@
+   return base::SysUTF8ToNSString(url.GetHost());
+ }
+ 
++NSString* HttpMethodForItem(::download::DownloadItem* item) {
++  if (ui::PageTransitionCoreTypeIs(item->GetTransitionType(),
++                                   ui::PAGE_TRANSITION_FORM_SUBMIT)) {
++    return @"POST";
++  }
++  if (content::WebContents* wc =
++          content::DownloadItemUtils::GetWebContents(item)) {
++    if (content::NavigationEntry* entry = wc->GetController().GetVisibleEntry();
++        entry && entry->GetHasPostData() &&
++        (entry->GetURL() == item->GetURL() ||
++         entry->GetURL() == item->GetOriginalUrl())) {
++      return @"POST";
++    }
++  }
++  return @"GET";
++}
++
++bool IsExplicitDownloadItem(::download::DownloadItem* item) {
++  const std::string& cd = item->GetContentDisposition();
++  if (!cd.empty() &&
++      net::HttpContentDisposition(cd, std::string()).is_attachment()) {
++    return true;
++  }
++  if (!item->GetSuggestedFilename().empty()) {
++    return true;
++  }
++  const ::download::DownloadSource source = item->GetDownloadSource();
++  return source == ::download::DownloadSource::FROM_RENDERER ||
++         source == ::download::DownloadSource::CONTEXT_MENU;
++}
++
++bool IsMainFrameDownloadItem(::download::DownloadItem* item) {
++  if (content::RenderFrameHost* rfh =
++          content::DownloadItemUtils::GetRenderFrameHost(item)) {
++    return rfh->IsInPrimaryMainFrame();
++  }
++  return ui::PageTransitionIsMainFrame(item->GetTransitionType());
++}
++
+ }  // namespace
+ 
+ ContentDownloadTask::ContentDownloadTask(
+@@ -32,7 +79,7 @@
+     : DownloadTaskImpl(web_state,
+                        item->GetURL(),
+                        OriginatingHostForItem(item),
+-                       @"GET",
++                       HttpMethodForItem(item),
+                        item->GetContentDisposition(),
+                        item->GetTotalBytes() > 0 ? item->GetTotalBytes() : -1,
+                        item->GetMimeType(),
+@@ -40,7 +87,9 @@
+                        task_runner),
+       item_(item),
+       target_callback_(std::move(target_callback)),
+-      suggested_name_(item->GetSuggestedFilename()) {
++      suggested_name_(item->GetSuggestedFilename()),
++      is_explicit_download_(IsExplicitDownloadItem(item)),
++      is_main_frame_download_(IsMainFrameDownloadItem(item)) {
+   item_->AddObserver(this);
+ }
+ 
+@@ -132,6 +181,14 @@
+   return suggested_name_;
+ }
+ 
++bool ContentDownloadTask::IsExplicitDownload() const {
++  return is_explicit_download_;
++}
++
++bool ContentDownloadTask::IsMainFrameDownload() const {
++  return is_main_frame_download_;
++}
++
+ void ContentDownloadTask::RunTargetCallback(const base::FilePath& path) {
+   if (!target_callback_) {
+     return;
+diff --git a/ios/web/public/download/download_task.h b/ios/web/public/download/download_task.h
+index 23ebea1..55821f8 100644
+--- a/ios/web/public/download/download_task.h
++++ b/ios/web/public/download/download_task.h
+@@ -139,6 +139,15 @@ class DownloadTask {
+   // Suggested name for the downloaded file.
+   virtual base::FilePath GenerateFileName() const = 0;
+ 
++  // [ios-blink-sideload] True when the download was explicitly requested
++  // (Content-Disposition: attachment, <a download>, or context menu) rather
++  // than falling through from an inline navigation.
++  virtual bool IsExplicitDownload() const { return false; }
++
++  // [ios-blink-sideload] True when the download originated from the primary
++  // main frame rather than an embedded subframe.
++  virtual bool IsMainFrameDownload() const { return true; }
++
+   // Returns a weak pointer to DownloadTask.
+   virtual base::WeakPtr<DownloadTask> GetWeakPtr() = 0;
+ 

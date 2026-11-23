@@ -1,0 +1,2081 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chromium-blink-ios <noreply@github.com>
+Date: Sun, 22 Nov 2026 19:22:21 -0500
+Subject: [PATCH] ios(curium): native Blink anti-fingerprinting (schema v2,
+ canvas/audio/webgl/fonts/screen/pdf/speech)
+
+---
+ .../browser/curium/cr_ios_engine_bootstrap.mm |  13 +
+ third_party/blink/common/BUILD.gn             |   1 +
+ .../curium/curium_fingerprint_config.cc       | 713 +++++++++++++++++-
+ .../common/curium/curium_fingerprint_config.h | 123 ++-
+ .../blink/renderer/core/css/media_values.cc   |  16 +
+ .../css/resolver/style_builder_converter.cc   |   9 +-
+ .../execution_context/execution_context.cc    |  64 ++
+ .../execution_context/execution_context.h     |  12 +
+ .../renderer/core/frame/local_dom_window.cc   |  38 +
+ .../blink/renderer/core/frame/screen.cc       |  46 ++
+ .../blink/renderer/core/frame/screen.h        |  12 +
+ .../html/canvas/canvas_async_blob_creator.cc  |  38 +
+ .../core/html/canvas/html_canvas_element.cc   |  19 +-
+ .../core/html/canvas/html_canvas_element.h    |   3 +-
+ .../renderer/core/html/canvas/text_metrics.h  |   8 +
+ .../canvas2d/base_rendering_context_2d.cc     |  37 +-
+ .../modules/plugins/dom_plugin_array.cc       |   9 +
+ .../screen_orientation_controller.cc          |  21 +
+ .../modules/speech/speech_synthesis.cc        |  17 +
+ .../modules/webaudio/analyser_node.cc         |  30 +
+ .../modules/webaudio/offline_audio_context.cc |  21 +
+ .../webgl/webgl_rendering_context_base.cc     |  64 ++
+ .../renderer/platform/fonts/font_cache.cc     |  13 +
+ .../platform/graphics/image_data_buffer.cc    |  49 ++
+ .../platform/graphics/image_data_buffer.h     |   8 +
+ 25 files changed, 1363 insertions(+), 21 deletions(-)
+
+diff --git a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+index 70728f2..54f929e 100644
+--- a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
++++ b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+@@ -87,6 +87,7 @@ + (void)registerShellBootstrapDelegate:
+ #if BUILDFLAG(USE_BLINK)
+   return @{
+     @"contractVersion" : @(blink::curium::kLaunchConfigSchemaVersion),
++    @"supportedSchemaVersions" : @[ @1, @2 ],
+     @"maxConfigBytes" : @(blink::curium::kMaxLaunchConfigBytes),
+     @"activationScopes" : @{
+       @"profileIsolation" : @"launch",
+@@ -99,6 +100,9 @@ + (void)registerShellBootstrapDelegate:
+       @"timezone" : @"launch",
+       @"webglStrings" : @"launch_per_slot",
+       @"inputCapabilities" : @"launch_per_slot",
++      @"farbling" : @"launch_per_site_deterministic",
++      @"fontProfile" : @"launch",
++      @"screen" : @"launch_per_slot_web_only",
+     },
+     @"features" : @{
+       @"zstdBaseline" : @YES,
+@@ -109,6 +113,15 @@ + (void)registerShellBootstrapDelegate:
+       @"optionalHardwareOverrides" : @YES,
+       @"nativeHardwareWhenUnset" : @YES,
+       @"androidDeviceMemoryCapFix" : @YES,
++      @"canvasFarbling" : @YES,
++      @"offscreenCanvasFarbling" : @YES,
++      @"textMetricsFarbling" : @YES,
++      @"offlineAudioFarbling" : @YES,
++      @"webglProfileFiltering" : @YES,
++      @"fontProfileFiltering" : @YES,
++      @"webScreenMasking" : @YES,
++      @"desktopPdfViewerMetadata" : @YES,
++      @"speechVoiceHiding" : @YES,
+     },
+   };
+ #else
+diff --git a/third_party/blink/common/BUILD.gn b/third_party/blink/common/BUILD.gn
+index 786dedb..3802c38 100644
+--- a/third_party/blink/common/BUILD.gn
++++ b/third_party/blink/common/BUILD.gn
+@@ -311,6 +311,7 @@ source_set("common") {
+     "//base",
+     "//build:android_buildflags",
+     "//build:chromecast_buildflags",
++    "//crypto",
+     "//media",
+     "//media/capture:capture_base",
+     "//media/capture/mojom:video_capture_mojom_support",
+diff --git a/third_party/blink/common/curium/curium_fingerprint_config.cc b/third_party/blink/common/curium/curium_fingerprint_config.cc
+index e2542ec..120e59e 100644
+--- a/third_party/blink/common/curium/curium_fingerprint_config.cc
++++ b/third_party/blink/common/curium/curium_fingerprint_config.cc
+@@ -17,6 +17,7 @@
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/values.h"
++#include "crypto/hash.h"
+ #include "net/http/http_util.h"
+ #include "net/proxy_resolution/proxy_config.h"
+ 
+@@ -200,19 +201,36 @@ bool ParseIdentitySlot(const base::DictValue& dict,
+                        std::string_view slot_name,
+                        IdentitySlotConfig* out_slot,
+                        ConfigError* out_error) {
+-  static constexpr std::array<std::string_view, 23> kAllowedKeys = {
+-      "uaString",        "osCpu",
+-      "productVersion",  "appendMobileToken",
+-      "primaryBrand",    "majorVersion",
+-      "fullVersion",     "brands",
+-      "fullVersionBrands", "platform",
+-      "platformVersion", "architecture",
+-      "bitness",         "model",
+-      "mobile",          "wow64",
+-      "formFactors",     "navigatorPlatform",
+-      "maxTouchPoints",  "pointerType",
+-      "hoverType",       "webglVendor",
++  static constexpr std::array<std::string_view, 29> kAllowedKeys = {
++      "uaString",
++      "osCpu",
++      "productVersion",
++      "appendMobileToken",
++      "primaryBrand",
++      "majorVersion",
++      "fullVersion",
++      "brands",
++      "fullVersionBrands",
++      "platform",
++      "platformVersion",
++      "architecture",
++      "bitness",
++      "model",
++      "mobile",
++      "wow64",
++      "formFactors",
++      "navigatorPlatform",
++      "maxTouchPoints",
++      "pointerType",
++      "hoverType",
++      "webglVendor",
+       "webglRenderer",
++      "screen",
++      "webglProfile",
++      "webglMaxTextureSize",
++      "webglMaxRenderbufferSize",
++      "webglMaxCubeMapTextureSize",
++      "pdfViewerEnabled",
+   };
+   for (const auto [key, value] : dict) {
+     if (std::find(kAllowedKeys.begin(), kAllowedKeys.end(), key) ==
+@@ -500,6 +518,96 @@ bool ParseIdentitySlot(const base::DictValue& dict,
+     slot.webgl_renderer = *s;
+   }
+ 
++  if (const base::Value* v = dict.Find("screen"); v && !v->is_none()) {
++    const base::DictValue* sdict = v->GetIfDict();
++    if (!sdict) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".screen must be an object");
++    }
++    for (const auto [k, val] : *sdict) {
++      if (k != "width" && k != "height" && k != "availWidth" &&
++          k != "availHeight" && k != "colorDepth") {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "Unknown key in " + std::string(slot_name) + ".screen: " + k);
++      }
++    }
++    std::optional<int> w = sdict->FindInt("width");
++    std::optional<int> h = sdict->FindInt("height");
++    if (!w || !h || *w < 240 || *w > 16384 || *h < 240 || *h > 16384) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) +
++                      ".screen width/height must be integers in [240, 16384]");
++    }
++    ScreenOverrideConfig screen;
++    screen.width = *w;
++    screen.height = *h;
++    screen.avail_width = sdict->FindInt("availWidth").value_or(*w);
++    screen.avail_height = sdict->FindInt("availHeight").value_or(*h);
++    screen.color_depth = sdict->FindInt("colorDepth").value_or(24);
++    if (screen.avail_width < 240 || screen.avail_width > screen.width ||
++        screen.avail_height < 240 || screen.avail_height > screen.height ||
++        (screen.color_depth != 24 && screen.color_depth != 30 &&
++         screen.color_depth != 32)) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".screen values are out of range");
++    }
++    slot.screen = screen;
++  }
++
++  if (const base::Value* v = dict.Find("webglProfile"); v && !v->is_none()) {
++    const std::string* s = v->GetIfString();
++    if (!s) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".webglProfile must be string");
++    }
++    if (*s == "native") {
++      slot.webgl_profile = WebGLProfile::kNative;
++    } else if (*s == "desktop_windows") {
++      slot.webgl_profile = WebGLProfile::kDesktopWindows;
++    } else if (*s == "desktop_macos") {
++      slot.webgl_profile = WebGLProfile::kDesktopMacOS;
++    } else if (*s == "desktop_linux") {
++      slot.webgl_profile = WebGLProfile::kDesktopLinux;
++    } else if (*s == "mobile_android") {
++      slot.webgl_profile = WebGLProfile::kMobileAndroid;
++    } else {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".webglProfile is invalid");
++    }
++  }
++
++  auto parse_gl_limit = [&](const char* key, std::optional<int>* target) -> bool {
++    if (const base::Value* v = dict.Find(key); v && !v->is_none()) {
++      if (!v->is_int()) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    std::string(slot_name) + "." + key + " must be integer");
++      }
++      const int n = v->GetInt();
++      if (n < 512 || n > 65536) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    std::string(slot_name) + "." + key + " must be in [512, 65536]");
++      }
++      *target = n;
++    }
++    return true;
++  };
++  if (!parse_gl_limit("webglMaxTextureSize", &slot.webgl_max_texture_size) ||
++      !parse_gl_limit("webglMaxRenderbufferSize",
++                      &slot.webgl_max_renderbuffer_size) ||
++      !parse_gl_limit("webglMaxCubeMapTextureSize",
++                      &slot.webgl_max_cube_map_texture_size)) {
++    return false;
++  }
++
++  if (const base::Value* v = dict.Find("pdfViewerEnabled");
++      v && !v->is_none()) {
++    if (!v->is_bool()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".pdfViewerEnabled must be bool");
++    }
++    slot.pdf_viewer_enabled = v->GetBool();
++  }
++
+   *out_slot = std::move(slot);
+   return true;
+ }
+@@ -655,7 +763,7 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
+                 "Root fingerprint config must be a JSON object");
+   }
+ 
+-  static constexpr std::array<std::string_view, 12> kTopLevelKeys = {
++  static constexpr std::array<std::string_view, 16> kTopLevelKeys = {
+       "schemaVersion",
+       "revision",
+       "profileId",
+@@ -668,6 +776,10 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
+       "enableDoNotTrack",
+       "enableGlobalPrivacyControl",
+       "hardware",
++      "fingerprintSeed",
++      "farbling",
++      "fontProfile",
++      "hideSpeechVoices",
+   };
+   for (const auto [key, value] : *root) {
+     if (std::find(kTopLevelKeys.begin(), kTopLevelKeys.end(), key) ==
+@@ -682,7 +794,8 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
+     return Fail(out_error, ErrorCode::kInvalidField,
+                 "schemaVersion integer is required");
+   }
+-  if (*schema_version != kLaunchConfigSchemaVersion) {
++  if (*schema_version < kMinSupportedLaunchConfigSchemaVersion ||
++      *schema_version > kLaunchConfigSchemaVersion) {
+     return Fail(out_error, ErrorCode::kUnsupportedSchema,
+                 "Unsupported schemaVersion: " +
+                     base::NumberToString(*schema_version));
+@@ -963,6 +1076,83 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
+     }
+   }
+ 
++  if (const base::Value* seed_val = root->Find("fingerprintSeed");
++      seed_val && !seed_val->is_none()) {
++    const std::string* hex = seed_val->GetIfString();
++    std::vector<uint8_t> bytes;
++    if (!hex || hex->size() != 64 || !base::HexStringToBytes(*hex, &bytes) ||
++        bytes.size() != 32) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "fingerprintSeed must be a 64-character hex string");
++    }
++    std::array<uint8_t, 32> seed{};
++    std::copy(bytes.begin(), bytes.end(), seed.begin());
++    cfg.fingerprint_seed = seed;
++  }
++
++  if (const base::Value* farb_val = root->Find("farbling");
++      farb_val && !farb_val->is_none()) {
++    const base::DictValue* fdict = farb_val->GetIfDict();
++    if (!fdict) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "farbling must be an object");
++    }
++    for (const auto [k, v] : *fdict) {
++      if (k != "canvas" && k != "audio" && k != "webgl" && k != "textMetrics") {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "Unknown key in farbling: " + k);
++      }
++      if (!v.is_bool()) {
++        return Fail(out_error, ErrorCode::kInvalidField,
++                    "farbling." + k + " must be bool");
++      }
++    }
++    if (std::optional<bool> b = fdict->FindBool("canvas")) {
++      cfg.farble_canvas = *b;
++    }
++    if (std::optional<bool> b = fdict->FindBool("audio")) {
++      cfg.farble_audio = *b;
++    }
++    if (std::optional<bool> b = fdict->FindBool("webgl")) {
++      cfg.farble_webgl = *b;
++    }
++    if (std::optional<bool> b = fdict->FindBool("textMetrics")) {
++      cfg.farble_text_metrics = *b;
++    }
++  }
++
++  if (const base::Value* fp_val = root->Find("fontProfile");
++      fp_val && !fp_val->is_none()) {
++    const std::string* s = fp_val->GetIfString();
++    if (!s) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "fontProfile must be a string");
++    }
++    if (*s == "native") {
++      cfg.font_profile = FontProfile::kNative;
++    } else if (*s == "apple") {
++      cfg.font_profile = FontProfile::kApple;
++    } else if (*s == "windows") {
++      cfg.font_profile = FontProfile::kWindows;
++    } else if (*s == "linux") {
++      cfg.font_profile = FontProfile::kLinux;
++    } else if (*s == "android") {
++      cfg.font_profile = FontProfile::kAndroid;
++    } else {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "Invalid fontProfile: " + *s);
++    }
++  }
++
++  if (const base::Value* hsv = root->Find("hideSpeechVoices");
++      hsv && !hsv->is_none()) {
++    if (!hsv->is_bool()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "hideSpeechVoices must be bool");
++    }
++    cfg.hide_speech_voices = hsv->GetBool();
++  }
++
+   if (out_config) {
+     *out_config = std::move(cfg);
+   }
+@@ -1049,4 +1239,499 @@ std::optional<std::string> ResolveWebGLRenderer(
+   return slot.webgl_renderer;
+ }
+ 
++namespace {
++
++uint64_t ReadLE64(base::span<const uint8_t> bytes, size_t offset) {
++  uint64_t v = 0;
++  for (size_t i = 0; i < 8; ++i) {
++    v |= static_cast<uint64_t>(bytes[offset + i]) << (i * 8);
++  }
++  return v;
++}
++
++uint64_t SplitMix64(uint64_t x) {
++  x += 0x9E3779B97F4A7C15ULL;
++  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
++  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
++  return x ^ (x >> 31);
++}
++
++std::array<uint8_t, 32> HmacSha256(base::span<const uint8_t, 32> key,
++                                   std::string_view message) {
++  std::vector<uint8_t> inner;
++  inner.reserve(64 + message.size());
++  for (size_t i = 0; i < 64; ++i) {
++    inner.push_back(static_cast<uint8_t>((i < 32 ? key[i] : 0u) ^ 0x36u));
++  }
++  for (char c : message) {
++    inner.push_back(static_cast<uint8_t>(c));
++  }
++  const std::array<uint8_t, 32> inner_hash = crypto::hash::Sha256(inner);
++
++  std::array<uint8_t, 96> outer{};
++  for (size_t i = 0; i < 64; ++i) {
++    outer[i] = static_cast<uint8_t>((i < 32 ? key[i] : 0u) ^ 0x5cu);
++  }
++  std::copy(inner_hash.begin(), inner_hash.end(), outer.begin() + 64);
++  return crypto::hash::Sha256(outer);
++}
++
++bool StartsWithCaseInsensitive(std::string_view value,
++                               std::string_view prefix) {
++  return value.size() >= prefix.size() &&
++         base::EqualsCaseInsensitiveASCII(value.substr(0, prefix.size()),
++                                          prefix);
++}
++
++bool IsBlockedAppleExclusiveFont(std::string_view name) {
++  static constexpr std::array<std::string_view, 75> kApplePrefixes = {
++      ".sf",
++      "sf pro",
++      "sf mono",
++      "sf compact",
++      "sf arabic",
++      "sf armenian",
++      "sf georgian",
++      "sf hebrew",
++      "san francisco",
++      "new york",
++      "apple ",
++      "applegothic",
++      "applemyungjo",
++      "applesdgothicneo",
++      "pingfang",
++      "hiragino",
++      "helvetica neue",
++      "avenir",
++      "futura",
++      "gill sans",
++      "menlo",
++      "monaco",
++      "optima",
++      "baskerville",
++      "didot",
++      "hoefler",
++      "chalkboard",
++      "chalkduster",
++      "copperplate",
++      "american typewriter",
++      "marker felt",
++      "noteworthy",
++      "papyrus",
++      "snell roundhand",
++      "zapfino",
++      "zapf dingbats",
++      "cochin",
++      "iowan",
++      "marion",
++      "mishafi",
++      "party let",
++      "savoye let",
++      "seravek",
++      "skia",
++      "thonburi",
++      "charter",
++      "superclarendon",
++      "stheiti",
++      "stsong",
++      "stkaiti",
++      "stfangsong",
++      "heiti ",
++      "songti ",
++      "kaiti ",
++      "yuanti ",
++      "wawati ",
++      "xingkai ",
++      "baoli ",
++      "lantinghei ",
++      "weibei ",
++      "kefa",
++      "kohinoor",
++      "galvji",
++      "mukta",
++      "geeza",
++      "damascus",
++      "al nile",
++      "al tarikh",
++      "farah",
++      "baghdad",
++      "beirut",
++      "diwan",
++      "kufistandardgk",
++      "nadeem",
++      "waseem",
++  };
++  for (std::string_view prefix : kApplePrefixes) {
++    if (StartsWithCaseInsensitive(name, prefix)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++FontProfile EffectiveFontProfile(const LaunchConfig& cfg) {
++  if (cfg.font_profile.has_value()) {
++    return *cfg.font_profile;
++  }
++  if (cfg.schema_version < 2) {
++    return FontProfile::kNative;
++  }
++  const IdentitySlotConfig& def = cfg.DefaultIdentity();
++  if (def.platform.has_value()) {
++    if (*def.platform == "Windows") {
++      return FontProfile::kWindows;
++    }
++    if (*def.platform == "Linux" || *def.platform == "Chrome OS" ||
++        *def.platform == "Chromium OS") {
++      return FontProfile::kLinux;
++    }
++    if (*def.platform == "Android") {
++      return FontProfile::kAndroid;
++    }
++    if (*def.platform == "macOS" || *def.platform == "iOS") {
++      return FontProfile::kApple;
++    }
++  }
++  return FontProfile::kNative;
++}
++
++WebGLProfile EffectiveWebGLProfile(const LaunchConfig& cfg,
++                                   const IdentitySlotConfig& slot,
++                                   const blink::UserAgentMetadata& metadata) {
++  if (slot.webgl_profile.has_value()) {
++    return *slot.webgl_profile;
++  }
++  if (cfg.schema_version < 2) {
++    return WebGLProfile::kNative;
++  }
++  if (metadata.platform == "Windows") {
++    return WebGLProfile::kDesktopWindows;
++  }
++  if (metadata.platform == "Linux" || metadata.platform == "Chrome OS" ||
++      metadata.platform == "Chromium OS") {
++    return WebGLProfile::kDesktopLinux;
++  }
++  if (metadata.platform == "Android") {
++    return WebGLProfile::kMobileAndroid;
++  }
++  return WebGLProfile::kNative;
++}
++
++}  // namespace
++
++bool IsFarblingEnabled() {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  return cfg && cfg->fingerprint_seed.has_value();
++}
++
++bool IsCanvasFarblingEnabled() {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  return cfg && cfg->fingerprint_seed.has_value() && cfg->farble_canvas;
++}
++
++bool IsAudioFarblingEnabled() {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  return cfg && cfg->fingerprint_seed.has_value() && cfg->farble_audio;
++}
++
++bool IsWebGLFarblingEnabled() {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  return cfg && cfg->fingerprint_seed.has_value() && cfg->farble_webgl;
++}
++
++bool IsTextMetricsFarblingEnabled() {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  return cfg && cfg->fingerprint_seed.has_value() && cfg->farble_text_metrics;
++}
++
++std::optional<std::array<uint8_t, 32>> DeriveSiteKey(
++    std::string_view site_scope) {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg || !cfg->fingerprint_seed.has_value() || site_scope.empty()) {
++    return std::nullopt;
++  }
++  return HmacSha256(*cfg->fingerprint_seed, site_scope);
++}
++
++void FarbleRGBA8Pixels(base::span<const uint8_t, 32> site_key,
++                       uint8_t* pixels,
++                       int width,
++                       int height,
++                       size_t row_bytes,
++                       int origin_x,
++                       int origin_y,
++                       bool is_bgra) {
++  if (!pixels || width <= 0 || height <= 0 ||
++      row_bytes < static_cast<size_t>(width) * 4u) {
++    return;
++  }
++  const uint64_t k0 = ReadLE64(site_key, 0);
++  const uint64_t k1 = ReadLE64(site_key, 8);
++  const size_t r_idx = is_bgra ? 2u : 0u;
++  const size_t g_idx = 1u;
++  const size_t b_idx = is_bgra ? 0u : 2u;
++  const size_t a_idx = 3u;
++  const std::array<size_t, 3> rgb_indices = {r_idx, g_idx, b_idx};
++
++  for (int y = 0; y < height; ++y) {
++    uint8_t* row = pixels + static_cast<size_t>(y) * row_bytes;
++    const uint64_t wy =
++        static_cast<uint64_t>(static_cast<int64_t>(origin_y) + y) *
++        0xBF58476D1CE4E5B9ULL;
++    for (int x = 0; x < width; ++x) {
++      uint8_t* px = row + static_cast<size_t>(x) * 4u;
++      // Only perturb opaque pixels; leave alpha and premul-sensitive edges untouched.
++      if (px[a_idx] != 255u) {
++        continue;
++      }
++      const uint64_t wx =
++          static_cast<uint64_t>(static_cast<int64_t>(origin_x) + x) *
++          0x9E3779B97F4A7C15ULL;
++      const uint64_t h = SplitMix64(k0 ^ wx ^ wy ^ k1);
++      // Perturb ~25% of opaque pixels by +-1 LSB on one RGB channel.
++      if ((h & 0x3ULL) != 0ULL) {
++        continue;
++      }
++      const size_t ch = rgb_indices[(h >> 2) % 3u];
++      const int delta = ((h >> 4) & 1ULL) ? 1 : -1;
++      const uint8_t cur = px[ch];
++      if (cur == 0u) {
++        px[ch] = 1u;
++      } else if (cur == 255u) {
++        px[ch] = 254u;
++      } else {
++        px[ch] = static_cast<uint8_t>(static_cast<int>(cur) + delta);
++      }
++    }
++  }
++}
++
++double ResolveTextMetricsScale(base::span<const uint8_t, 32> site_key,
++                               std::string_view font_family) {
++  if (!IsTextMetricsFarblingEnabled()) {
++    return 1.0;
++  }
++  uint64_t acc = ReadLE64(site_key, 16);
++  for (unsigned char c : font_family) {
++    acc = SplitMix64(acc ^ static_cast<uint64_t>(base::ToLowerASCII(c)));
++  }
++  const uint64_t h = SplitMix64(acc ^ ReadLE64(site_key, 24));
++  // Deterministic scale in [1 - 1e-4, 1 + 1e-4], excluding exact 0.
++  const double unit =
++      (static_cast<double>(h & 0xFFFFULL) / 65535.0) * 2.0 - 1.0;
++  double eps = unit * 1e-4;
++  if (std::fabs(eps) < 1e-6) {
++    eps = (h & 0x10000ULL) ? 1e-5 : -1e-5;
++  }
++  return 1.0 + eps;
++}
++
++void FarbleAudioSamples(base::span<const uint8_t, 32> site_key,
++                        uint32_t stream_tag,
++                        float* samples,
++                        size_t count) {
++  if (!samples || count == 0) {
++    return;
++  }
++  const uint64_t k0 = ReadLE64(site_key, 8) ^
++                      (static_cast<uint64_t>(stream_tag) * 0x9E3779B97F4A7C15ULL);
++  const uint64_t k1 = ReadLE64(site_key, 24);
++  for (size_t i = 0; i < count; ++i) {
++    const float v = samples[i];
++    if (!std::isfinite(v) || v == 0.0f) {
++      continue;
++    }
++    const uint64_t h = SplitMix64(k0 ^ (static_cast<uint64_t>(i) * 0xD1B54A32D192ED03ULL) ^ k1);
++    const float unit =
++        (static_cast<float>(h & 0xFFFFULL) / 65535.0f) * 2.0f - 1.0f;
++    samples[i] = v * (1.0f + unit * 1e-6f);
++  }
++}
++
++bool IsWebGLExtensionAllowed(const blink::UserAgentMetadata& metadata,
++                             std::string_view extension_name) {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg) {
++    return true;
++  }
++  const IdentitySlotConfig& slot = cfg->SelectSlotForMetadata(metadata);
++  const WebGLProfile profile = EffectiveWebGLProfile(*cfg, slot, metadata);
++  if (profile == WebGLProfile::kNative ||
++      profile == WebGLProfile::kDesktopMacOS) {
++    return true;
++  }
++  // Subtractive filtering only: never advertise extensions ANGLE-on-Metal
++  // cannot actually instantiate.
++  if (base::EqualsCaseInsensitiveASCII(extension_name,
++                                       "WEBGL_compressed_texture_pvrtc")) {
++    return false;
++  }
++  if (profile == WebGLProfile::kDesktopWindows ||
++      profile == WebGLProfile::kDesktopLinux) {
++    if (base::EqualsCaseInsensitiveASCII(extension_name,
++                                         "WEBGL_compressed_texture_etc") ||
++        base::EqualsCaseInsensitiveASCII(extension_name,
++                                         "WEBGL_compressed_texture_etc1") ||
++        base::EqualsCaseInsensitiveASCII(extension_name,
++                                         "WEBGL_compressed_texture_astc")) {
++      return false;
++    }
++  }
++  return true;
++}
++
++int32_t ClampWebGLLimit(const blink::UserAgentMetadata& metadata,
++                        uint32_t pname,
++                        int32_t real_value) {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg || real_value <= 0) {
++    return real_value;
++  }
++  const IdentitySlotConfig& slot = cfg->SelectSlotForMetadata(metadata);
++  constexpr uint32_t kGlMaxTextureSize = 0x0D33;
++  constexpr uint32_t kGlMaxCubeMapTextureSize = 0x851C;
++  constexpr uint32_t kGlMaxRenderbufferSize = 0x84E8;
++  constexpr uint32_t kGlMaxVertexAttribs = 0x8869;
++
++  int32_t cap = real_value;
++  if (pname == kGlMaxTextureSize && slot.webgl_max_texture_size.has_value()) {
++    cap = std::min(cap, *slot.webgl_max_texture_size);
++  } else if (pname == kGlMaxRenderbufferSize &&
++             slot.webgl_max_renderbuffer_size.has_value()) {
++    cap = std::min(cap, *slot.webgl_max_renderbuffer_size);
++  } else if (pname == kGlMaxCubeMapTextureSize &&
++             slot.webgl_max_cube_map_texture_size.has_value()) {
++    cap = std::min(cap, *slot.webgl_max_cube_map_texture_size);
++  } else if (pname == kGlMaxVertexAttribs) {
++    const WebGLProfile profile = EffectiveWebGLProfile(*cfg, slot, metadata);
++    if (profile == WebGLProfile::kDesktopWindows ||
++        profile == WebGLProfile::kDesktopLinux ||
++        profile == WebGLProfile::kMobileAndroid) {
++      cap = std::min(cap, 16);
++    }
++  }
++  return std::min(real_value, cap);
++}
++
++bool IsFontFamilyAllowedForLaunch(std::string_view family_or_face,
++                                  bool is_unique_face) {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg) {
++    return true;
++  }
++  const FontProfile profile = EffectiveFontProfile(*cfg);
++  if (profile == FontProfile::kNative || profile == FontProfile::kApple) {
++    return true;
++  }
++  if (family_or_face.empty()) {
++    return true;
++  }
++  // Never block generic CSS families or standard Blink internal names.
++  if (base::EqualsCaseInsensitiveASCII(family_or_face, "serif") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "sans-serif") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "monospace") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "cursive") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "fantasy") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "system-ui") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "math") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "emoji") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "fangsong") ||
++      StartsWithCaseInsensitive(family_or_face, "-webkit-")) {
++    return true;
++  }
++  // Block Apple-only UI family names and Apple-exclusive bundled system fonts
++  // when emulating Windows, Linux, or Android.
++  if (base::EqualsCaseInsensitiveASCII(family_or_face, "-apple-system") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "blinkmacsystemfont") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "ui-serif") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "ui-sans-serif") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "ui-monospace") ||
++      base::EqualsCaseInsensitiveASCII(family_or_face, "ui-rounded")) {
++    return false;
++  }
++  (void)is_unique_face;
++  return !IsBlockedAppleExclusiveFont(family_or_face);
++}
++
++bool AllowAppleSystemFontAliases() {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg) {
++    return true;
++  }
++  const FontProfile profile = EffectiveFontProfile(*cfg);
++  return profile == FontProfile::kNative || profile == FontProfile::kApple;
++}
++
++std::optional<ResolvedScreenMetrics> ResolveWebScreenMetrics(
++    const blink::UserAgentMetadata& metadata,
++    int viewport_width,
++    int viewport_height) {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg) {
++    return std::nullopt;
++  }
++  const IdentitySlotConfig& slot = cfg->SelectSlotForMetadata(metadata);
++  if (!slot.screen.has_value()) {
++    return std::nullopt;
++  }
++
++  ResolvedScreenMetrics m;
++  m.width = slot.screen->width;
++  m.height = slot.screen->height;
++  m.avail_width = slot.screen->avail_width;
++  m.avail_height = slot.screen->avail_height;
++  m.color_depth = slot.screen->color_depth;
++  m.is_desktop = !metadata.mobile;
++
++  // Enforce geometric coherence on foldable iPhone Duo (e.g. 951x669 unfolded):
++  // screen.width >= innerWidth && screen.height >= innerHeight.
++  if (viewport_width > m.width || viewport_height > m.height) {
++    const int avail_dx = std::max(0, m.width - m.avail_width);
++    const int avail_dy = std::max(0, m.height - m.avail_height);
++    if (m.is_desktop) {
++      m.width = std::max(m.width, std::max(1440, viewport_width));
++      m.height = std::max(m.height, std::max(900, viewport_height));
++    } else if (viewport_width >= viewport_height) {
++      // Unfolded Duo in landscape mobile slot: step up to tablet class.
++      m.width = std::max(m.width, std::max(1024, viewport_width));
++      m.height = std::max(m.height, std::max(768, viewport_height));
++    } else {
++      m.width = std::max(m.width, viewport_width);
++      m.height = std::max(m.height, viewport_height);
++    }
++    m.avail_width = std::max(viewport_width, m.width - avail_dx);
++    m.avail_height = std::max(viewport_height, m.height - avail_dy);
++  }
++  m.avail_width = std::min(m.width, std::max(m.avail_width, viewport_width));
++  m.avail_height = std::min(m.height, std::max(m.avail_height, viewport_height));
++  m.is_landscape = (m.width >= m.height);
++  m.orientation_angle = 0;
++  return m;
++}
++
++bool ShouldExposePdfViewer(const blink::UserAgentMetadata& metadata) {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg) {
++    return false;
++  }
++  const IdentitySlotConfig& slot = cfg->SelectSlotForMetadata(metadata);
++  if (slot.pdf_viewer_enabled.has_value()) {
++    return *slot.pdf_viewer_enabled;
++  }
++  return cfg->schema_version >= 2 && !metadata.mobile;
++}
++
++bool ShouldHideSpeechVoices(const blink::UserAgentMetadata& metadata) {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg) {
++    return false;
++  }
++  const bool enabled =
++      cfg->hide_speech_voices.value_or(cfg->schema_version >= 2);
++  if (!enabled) {
++    return false;
++  }
++  return metadata.platform != "macOS" && metadata.platform != "iOS";
++}
++
+ }  // namespace blink::curium
+diff --git a/third_party/blink/public/common/curium/curium_fingerprint_config.h b/third_party/blink/public/common/curium/curium_fingerprint_config.h
+index 151844a..478eca4 100644
+--- a/third_party/blink/public/common/curium/curium_fingerprint_config.h
++++ b/third_party/blink/public/common/curium/curium_fingerprint_config.h
+@@ -5,6 +5,7 @@
+ #ifndef THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_FINGERPRINT_CONFIG_H_
+ #define THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_FINGERPRINT_CONFIG_H_
+ 
++#include <array>
+ #include <cstddef>
+ #include <cstdint>
+ #include <optional>
+@@ -12,13 +13,15 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include "base/containers/span.h"
+ #include "third_party/blink/public/common/common_export.h"
+ #include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+ #include "third_party/blink/public/mojom/peerconnection/webrtc_ip_handling_policy.mojom-shared.h"
+ 
+ namespace blink::curium {
+ 
+-inline constexpr int kLaunchConfigSchemaVersion = 1;
++inline constexpr int kLaunchConfigSchemaVersion = 2;
++inline constexpr int kMinSupportedLaunchConfigSchemaVersion = 1;
+ inline constexpr size_t kMaxLaunchConfigBytes = 65536;
+ 
+ enum class ErrorCode : int {
+@@ -62,6 +65,41 @@ enum class HoverTypeOverride : int {
+   kHover = 1,
+ };
+ 
++enum class FontProfile : int {
++  kNative = 0,
++  kApple = 1,
++  kWindows = 2,
++  kLinux = 3,
++  kAndroid = 4,
++};
++
++enum class WebGLProfile : int {
++  kNative = 0,
++  kDesktopWindows = 1,
++  kDesktopMacOS = 2,
++  kDesktopLinux = 3,
++  kMobileAndroid = 4,
++};
++
++struct BLINK_COMMON_EXPORT ScreenOverrideConfig {
++  int width = 0;
++  int height = 0;
++  int avail_width = 0;
++  int avail_height = 0;
++  int color_depth = 24;
++};
++
++struct BLINK_COMMON_EXPORT ResolvedScreenMetrics {
++  int width = 0;
++  int height = 0;
++  int avail_width = 0;
++  int avail_height = 0;
++  int color_depth = 24;
++  uint16_t orientation_angle = 0;
++  bool is_landscape = false;
++  bool is_desktop = false;
++};
++
+ struct BLINK_COMMON_EXPORT ConfigError {
+   ConfigError();
+   ConfigError(ErrorCode code, std::string message);
+@@ -117,6 +155,14 @@ struct BLINK_COMMON_EXPORT IdentitySlotConfig {
+   // Apple Metal GPU vendor/renderer strings.
+   std::optional<std::string> webgl_vendor;
+   std::optional<std::string> webgl_renderer;
++
++  // Optional Build 41 (schemaVersion >= 2) per-slot web-exposed surfaces.
++  std::optional<ScreenOverrideConfig> screen;
++  std::optional<WebGLProfile> webgl_profile;
++  std::optional<int> webgl_max_texture_size;
++  std::optional<int> webgl_max_renderbuffer_size;
++  std::optional<int> webgl_max_cube_map_texture_size;
++  std::optional<bool> pdf_viewer_enabled;
+ };
+ 
+ struct BLINK_COMMON_EXPORT LaunchConfig {
+@@ -150,6 +196,16 @@ struct BLINK_COMMON_EXPORT LaunchConfig {
+   std::optional<float> device_memory_gb;
+   std::optional<std::string> timezone;
+ 
++  // Optional Build 41 (schemaVersion >= 2) anti-fingerprinting configuration.
++  // When fingerprint_seed is nullopt, all rendering/audio farbling hooks no-op.
++  std::optional<std::array<uint8_t, 32>> fingerprint_seed;
++  bool farble_canvas = true;
++  bool farble_audio = true;
++  bool farble_webgl = true;
++  bool farble_text_metrics = true;
++  std::optional<FontProfile> font_profile;
++  std::optional<bool> hide_speech_voices;
++
+   bool HasHardwareOverrides() const;
+   std::string AcceptLanguagesCSV() const;
+   const IdentitySlotConfig& DefaultIdentity() const;
+@@ -202,6 +258,71 @@ BLINK_COMMON_EXPORT std::optional<std::string> ResolveWebGLVendor(
+ BLINK_COMMON_EXPORT std::optional<std::string> ResolveWebGLRenderer(
+     const blink::UserAgentMetadata& metadata);
+ 
++// Lock-free Build 41 deterministic anti-fingerprinting primitives.
++BLINK_COMMON_EXPORT bool IsFarblingEnabled();
++BLINK_COMMON_EXPORT bool IsCanvasFarblingEnabled();
++BLINK_COMMON_EXPORT bool IsAudioFarblingEnabled();
++BLINK_COMMON_EXPORT bool IsWebGLFarblingEnabled();
++BLINK_COMMON_EXPORT bool IsTextMetricsFarblingEnabled();
++
++// Derives a 32-byte per-site key via HMAC-SHA256(fingerprint_seed, site_scope).
++BLINK_COMMON_EXPORT std::optional<std::array<uint8_t, 32>> DeriveSiteKey(
++    std::string_view site_scope);
++
++// Deterministic +-1 LSB RGB perturbation on opaque (A == 255) RGBA8/BGRA8
++// pixels using absolute canvas coordinates (origin_x + x, origin_y + y).
++BLINK_COMMON_EXPORT void FarbleRGBA8Pixels(
++    base::span<const uint8_t, 32> site_key,
++    uint8_t* pixels,
++    int width,
++    int height,
++    size_t row_bytes,
++    int origin_x,
++    int origin_y,
++    bool is_bgra);
++
++// Linear scale factor (1 + eps, |eps| <= 1e-4) for TextMetrics.
++BLINK_COMMON_EXPORT double ResolveTextMetricsScale(
++    base::span<const uint8_t, 32> site_key,
++    std::string_view font_family);
++
++// Deterministic micro-perturbation (~ -120 dB) on non-zero finite audio samples.
++BLINK_COMMON_EXPORT void FarbleAudioSamples(
++    base::span<const uint8_t, 32> site_key,
++    uint32_t stream_tag,
++    float* samples,
++    size_t count);
++
++// Subtractive OS-matched WebGL extension filter and downward limit clamps.
++BLINK_COMMON_EXPORT bool IsWebGLExtensionAllowed(
++    const blink::UserAgentMetadata& metadata,
++    std::string_view extension_name);
++BLINK_COMMON_EXPORT int32_t ClampWebGLLimit(
++    const blink::UserAgentMetadata& metadata,
++    uint32_t pname,
++    int32_t real_value);
++
++// OS-profile font filtering and Apple system-font alias gating.
++BLINK_COMMON_EXPORT bool IsFontFamilyAllowedForLaunch(
++    std::string_view family_or_face,
++    bool is_unique_face);
++BLINK_COMMON_EXPORT bool AllowAppleSystemFontAliases();
++
++// Web-only Screen/MediaValues/ScreenOrientation resolution (never mutates
++// global display::Screen; enforces Duo-safe screen >= viewport invariants).
++BLINK_COMMON_EXPORT std::optional<ResolvedScreenMetrics>
++ResolveWebScreenMetrics(const blink::UserAgentMetadata& metadata,
++                        int viewport_width,
++                        int viewport_height);
++
++// Desktop navigator.pdfViewerEnabled + W3C PDF plugin availability.
++BLINK_COMMON_EXPORT bool ShouldExposePdfViewer(
++    const blink::UserAgentMetadata& metadata);
++
++// Suppresses Apple TTS voice enumeration on non-Apple profiles.
++BLINK_COMMON_EXPORT bool ShouldHideSpeechVoices(
++    const blink::UserAgentMetadata& metadata);
++
+ }  // namespace blink::curium
+ 
+ #endif  // THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_FINGERPRINT_CONFIG_H_
+diff --git a/third_party/blink/renderer/core/css/media_values.cc b/third_party/blink/renderer/core/css/media_values.cc
+index 8d4c988..c3e1318 100644
+--- a/third_party/blink/renderer/core/css/media_values.cc
++++ b/third_party/blink/renderer/core/css/media_values.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "third_party/blink/renderer/core/css/media_values.h"
+ 
++#include "build/build_config.h"
+ #include "third_party/blink/public/common/css/scripting.h"
+ #include "third_party/blink/renderer/core/css/css_resolution_units.h"
+ #include "third_party/blink/renderer/core/css/css_to_length_conversion_data.h"
+@@ -18,6 +19,9 @@
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/local_frame_view.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/renderer/core/frame/screen.h"
++#endif
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/layout/adjust_for_absolute_zoom.h"
+ #include "third_party/blink/renderer/core/layout/layout_view.h"
+@@ -164,6 +168,12 @@ double MediaValues::CalculateDynamicViewportHeight(LocalFrame* frame) {
+ 
+ int MediaValues::CalculateDeviceWidth(LocalFrame* frame) {
+   DCHECK(frame && frame->View() && frame->GetSettings() && frame->GetPage());
++#if BUILDFLAG(IS_IOS)
++  if (std::optional<curium::ResolvedScreenMetrics> metrics =
++          ResolveCuriumScreenMetrics(frame)) {
++    return metrics->width;
++  }
++#endif
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   int device_width = screen_info.rect.width();
+@@ -176,6 +186,12 @@ int MediaValues::CalculateDeviceWidth(LocalFrame* frame) {
+ 
+ int MediaValues::CalculateDeviceHeight(LocalFrame* frame) {
+   DCHECK(frame && frame->View() && frame->GetSettings() && frame->GetPage());
++#if BUILDFLAG(IS_IOS)
++  if (std::optional<curium::ResolvedScreenMetrics> metrics =
++          ResolveCuriumScreenMetrics(frame)) {
++    return metrics->height;
++  }
++#endif
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   int device_height = screen_info.rect.height();
+diff --git a/third_party/blink/renderer/core/css/resolver/style_builder_converter.cc b/third_party/blink/renderer/core/css/resolver/style_builder_converter.cc
+index 932181b..b54c626 100644
+--- a/third_party/blink/renderer/core/css/resolver/style_builder_converter.cc
++++ b/third_party/blink/renderer/core/css/resolver/style_builder_converter.cc
+@@ -33,6 +33,9 @@
+ 
+ #include "base/notreached.h"
+ #include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "third_party/blink/renderer/core/css/basic_shape_functions.h"
+ #include "third_party/blink/renderer/core/css/css_alpha_color_value.h"
+ #include "third_party/blink/renderer/core/css/css_alternate_value.h"
+@@ -565,10 +568,12 @@ FontDescription::FamilyDescription StyleBuilderConverterBase::ConvertFontFamily(
+     }
+ #elif BUILDFLAG(IS_IOS)
+     // [ios-blink-sideload] Like Safari on iOS, and BlinkMacSystemFont on Mac,
+-    // -apple-system and BlinkMacSystemFont name the system font.
++    // -apple-system and BlinkMacSystemFont name the system font, unless
++    // Curium's non-Apple font profile disables Apple system-font aliases.
+     if (IsA<CSSFontFamilyValue>(*family) &&
+         (family_name == font_family_names::kBlinkMacSystemFont ||
+-         EqualIgnoringAsciiCase(family_name, "-apple-system"))) {
++         EqualIgnoringAsciiCase(family_name, "-apple-system")) &&
++        blink::curium::AllowAppleSystemFontAliases()) {
+       family_name = font_family_names::kSystemUi;
+     }
+ #endif
+diff --git a/third_party/blink/renderer/core/execution_context/execution_context.cc b/third_party/blink/renderer/core/execution_context/execution_context.cc
+index 0f95cf1..be0256f 100644
+--- a/third_party/blink/renderer/core/execution_context/execution_context.cc
++++ b/third_party/blink/renderer/core/execution_context/execution_context.cc
+@@ -27,6 +27,15 @@
+ 
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ 
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#include "third_party/blink/renderer/core/frame/frame.h"
++#include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/workers/worker_global_scope.h"
++#endif
++
+ #include "base/auto_reset.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/tracing/protos/chrome_track_event.pbzero.h"
+@@ -688,4 +697,59 @@ bool ExecutionContext::IsInjectionMitigatedContext() const {
+          GetContentSecurityPolicy()->TrustedTypesRequired();
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++std::optional<std::array<uint8_t, 32>> ExecutionContext::GetCuriumSiteKey()
++    const {
++  if (curium_site_key_computed_) {
++    return curium_site_key_;
++  }
++  curium_site_key_computed_ = true;
++  if (!curium::IsFarblingEnabled()) {
++    return std::nullopt;
++  }
++
++  // Unified top-frame origin resolution for both Window and Worker contexts.
++  // DedicatedWorker carries top_level_frame_security_origin_; SharedWorker
++  // passes nullptr there, so fall back to GetSecurityOrigin().
++  const SecurityOrigin* origin = nullptr;
++  if (const auto* window = DynamicTo<LocalDOMWindow>(this)) {
++    if (LocalFrame* frame = window->GetFrame()) {
++      origin = frame->Tree().Top().GetSecurityContext()->GetSecurityOrigin();
++    }
++    if (!origin) {
++      origin = GetSecurityOrigin();
++    }
++  } else if (const auto* worker = DynamicTo<WorkerGlobalScope>(this)) {
++    origin = worker->top_level_frame_security_origin();
++    if (!origin) {
++      origin = worker->GetSecurityOrigin();
++    }
++  } else {
++    origin = GetSecurityOrigin();
++  }
++
++  std::string scope;
++  if (origin) {
++    const SecurityOrigin* effective =
++        origin->GetOriginOrPrecursorOriginIfOpaque();
++    if (effective && !effective->IsOpaque()) {
++      const String registrable = effective->RegistrableDomain();
++      if (!registrable.empty()) {
++        scope = registrable.Utf8();
++      } else if (!effective->Host().empty()) {
++        scope = effective->Host().Utf8();
++      } else {
++        scope = effective->ToString().Utf8();
++      }
++    }
++  }
++  if (scope.empty()) {
++    // Keep unrelated unique opaque origins distinct instead of collapsing to "".
++    scope = "opaque:" + GetExecutionContextToken().ToString();
++  }
++  curium_site_key_ = curium::DeriveSiteKey(scope);
++  return curium_site_key_;
++}
++#endif
++
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/core/execution_context/execution_context.h b/third_party/blink/renderer/core/execution_context/execution_context.h
+index 7361d1e..2cf8e36 100644
+--- a/third_party/blink/renderer/core/execution_context/execution_context.h
++++ b/third_party/blink/renderer/core/execution_context/execution_context.h
+@@ -28,12 +28,14 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_EXECUTION_CONTEXT_EXECUTION_CONTEXT_H_
+ #define THIRD_PARTY_BLINK_RENDERER_CORE_EXECUTION_CONTEXT_EXECUTION_CONTEXT_H_
+ 
++#include <array>
+ #include <memory>
+ #include <optional>
+ #include <utility>
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "base/notreached.h"
++#include "build/build_config.h"
+ #include "net/storage_access_api/status.h"
+ #include "services/metrics/public/cpp/ukm_source_id.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink-forward.h"
+@@ -431,6 +433,12 @@ class CORE_EXPORT ExecutionContext : public Supplementable<ExecutionContext>,
+   // CSP, a la https://csp.withgoogle.com/docs/strict-csp.html.
+   bool IsInjectionMitigatedContext() const;
+ 
++#if BUILDFLAG(IS_IOS)
++  // Lazily derived per-top-level-site HMAC-SHA256 farbling key, consistent
++  // across Main Thread, iframes, and Workers (nullopt when farbling disabled).
++  std::optional<std::array<uint8_t, 32>> GetCuriumSiteKey() const;
++#endif
++
+   // Returns true if SharedArrayBuffers can be transferred via PostMessage,
+   // false otherwise. SharedArrayBuffer allows pages to craft high-precision
+   // timers useful for Spectre-style side channel attacks, so are restricted
+@@ -589,6 +597,10 @@ class CORE_EXPORT ExecutionContext : public Supplementable<ExecutionContext>,
+   bool require_trusted_types_ = false;
+ 
+   std::optional<NoiseToken> canvas_noise_token_;
++#if BUILDFLAG(IS_IOS)
++  mutable bool curium_site_key_computed_ = false;
++  mutable std::optional<std::array<uint8_t, 32>> curium_site_key_;
++#endif
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/core/frame/local_dom_window.cc b/third_party/blink/renderer/core/frame/local_dom_window.cc
+index ed51dca..a5c09cc 100644
+--- a/third_party/blink/renderer/core/frame/local_dom_window.cc
++++ b/third_party/blink/renderer/core/frame/local_dom_window.cc
+@@ -26,6 +26,7 @@
+ 
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ 
++#include <algorithm>
+ #include <memory>
+ #include <optional>
+ #include <utility>
+@@ -1205,6 +1206,14 @@ int LocalDOMWindow::orientation() const {
+     return 0;
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  if (std::optional<curium::ResolvedScreenMetrics> metrics =
++          ResolveCuriumScreenMetrics(frame)) {
++    const int angle = static_cast<int>(metrics->orientation_angle);
++    return angle == 270 ? -90 : angle;
++  }
++#endif
++
+   ChromeClient& chrome_client = frame->GetChromeClient();
+   int orientation = chrome_client.GetScreenInfo(*frame).orientation_angle;
+   // For backward compatibility, we want to return a value in the range of
+@@ -1709,6 +1718,17 @@ int LocalDOMWindow::outerHeight() const {
+     return innerHeight();
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  if (std::optional<curium::ResolvedScreenMetrics> metrics =
++          ResolveCuriumScreenMetrics(frame)) {
++    const int inner_h = innerHeight();
++    if (metrics->is_desktop) {
++      return std::max(inner_h, std::min(metrics->avail_height, inner_h + 87));
++    }
++    return inner_h;
++  }
++#endif
++
+   Page* page = frame->GetPage();
+   if (!page) {
+     return 0;
+@@ -1741,6 +1761,12 @@ int LocalDOMWindow::outerWidth() const {
+     return innerWidth();
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  if (ResolveCuriumScreenMetrics(frame).has_value()) {
++    return innerWidth();
++  }
++#endif
++
+   Page* page = frame->GetPage();
+   if (!page) {
+     return 0;
+@@ -1817,6 +1843,12 @@ int LocalDOMWindow::screenX() const {
+     return 0;
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  if (ResolveCuriumScreenMetrics(frame).has_value()) {
++    return 0;
++  }
++#endif
++
+   Page* page = frame->GetPage();
+   if (!page) {
+     return 0;
+@@ -1842,6 +1874,12 @@ int LocalDOMWindow::screenY() const {
+     return 0;
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  if (ResolveCuriumScreenMetrics(frame).has_value()) {
++    return 0;
++  }
++#endif
++
+   Page* page = frame->GetPage();
+   if (!page) {
+     return 0;
+diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
+index 8bc2c67..eaad2f1 100644
+--- a/third_party/blink/renderer/core/frame/screen.cc
++++ b/third_party/blink/renderer/core/frame/screen.cc
+@@ -30,18 +30,50 @@
+ 
+ #include "base/no_destructor.h"
+ #include "base/numerics/safe_conversions.h"
++#include "build/build_config.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/event_target_names.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/frame/local_frame_view.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
++#include "third_party/blink/renderer/core/layout/adjust_for_absolute_zoom.h"
+ #include "third_party/blink/renderer/core/page/chrome_client.h"
+ #include "ui/display/screen_info.h"
+ #include "ui/display/screen_infos.h"
+ 
+ namespace blink {
+ 
++#if BUILDFLAG(IS_IOS)
++std::optional<curium::ResolvedScreenMetrics> ResolveCuriumScreenMetrics(
++    LocalFrame* frame) {
++  if (!frame || frame->IsInFencedFrameTree()) {
++    return std::nullopt;
++  }
++  LocalDOMWindow* window = frame->DomWindow();
++  if (!window) {
++    return std::nullopt;
++  }
++  LocalFrame* sizing_frame = frame;
++  if (auto* top_local = DynamicTo<LocalFrame>(&frame->Tree().Top())) {
++    if (top_local->View()) {
++      sizing_frame = top_local;
++    }
++  }
++  int viewport_width = 0;
++  int viewport_height = 0;
++  if (LocalFrameView* view = sizing_frame->View()) {
++    const gfx::Size size = view->Size();
++    const float zoom = sizing_frame->LayoutZoomFactor();
++    viewport_width = AdjustForAbsoluteZoom::AdjustInt(size.width(), zoom);
++    viewport_height = AdjustForAbsoluteZoom::AdjustInt(size.height(), zoom);
++  }
++  return curium::ResolveWebScreenMetrics(window->GetUserAgentMetadata(),
++                                         viewport_width, viewport_height);
++}
++#endif
++
+ Screen::Screen(LocalDOMWindow* window, int64_t display_id)
+     : ExecutionContextClient(window), display_id_(display_id) {}
+ 
+@@ -110,6 +142,12 @@ unsigned Screen::colorDepth() const {
+   if (!DomWindow()) {
+     return unknown_color_depth;
+   }
++#if BUILDFLAG(IS_IOS)
++  if (std::optional<curium::ResolvedScreenMetrics> metrics =
++          ResolveCuriumScreenMetrics(DomWindow()->GetFrame())) {
++    return base::saturated_cast<unsigned>(metrics->color_depth);
++  }
++#endif
+   return GetScreenInfo().depth == 0
+              ? unknown_color_depth
+              : base::saturated_cast<unsigned>(GetScreenInfo().depth);
+@@ -174,6 +212,14 @@ gfx::Rect Screen::GetRect(bool available) const {
+   if (!DomWindow())
+     return gfx::Rect();
+   LocalFrame* frame = DomWindow()->GetFrame();
++#if BUILDFLAG(IS_IOS)
++  if (std::optional<curium::ResolvedScreenMetrics> metrics =
++          ResolveCuriumScreenMetrics(frame)) {
++    return available
++               ? gfx::Rect(0, 0, metrics->avail_width, metrics->avail_height)
++               : gfx::Rect(0, 0, metrics->width, metrics->height);
++  }
++#endif
+   const display::ScreenInfo& screen_info = GetScreenInfo();
+   gfx::Rect rect = available ? screen_info.available_rect : screen_info.rect;
+   if (frame->GetSettings()->GetReportScreenSizeInPhysicalPixelsQuirk())
+diff --git a/third_party/blink/renderer/core/frame/screen.h b/third_party/blink/renderer/core/frame/screen.h
+index 787aa75..6a06f60 100644
+--- a/third_party/blink/renderer/core/frame/screen.h
++++ b/third_party/blink/renderer/core/frame/screen.h
+@@ -29,6 +29,12 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_FRAME_SCREEN_H_
+ #define THIRD_PARTY_BLINK_RENDERER_CORE_FRAME_SCREEN_H_
+ 
++#include <optional>
++
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "third_party/blink/renderer/core/core_export.h"
+ #include "third_party/blink/renderer/core/dom/events/event_target.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_observer.h"
+@@ -44,6 +50,12 @@ struct ScreenInfo;
+ namespace blink {
+ 
+ class LocalDOMWindow;
++class LocalFrame;
++
++#if BUILDFLAG(IS_IOS)
++CORE_EXPORT std::optional<curium::ResolvedScreenMetrics>
++ResolveCuriumScreenMetrics(LocalFrame* frame);
++#endif
+ 
+ class CORE_EXPORT Screen : public EventTarget,
+                            public ExecutionContextClient,
+diff --git a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
+index 0c175da..e9815bd 100644
+--- a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
++++ b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
+@@ -9,6 +9,9 @@
+ #include "base/metrics/histogram_macros.h"
+ #include "base/types/optional_util.h"
+ #include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+@@ -192,6 +195,41 @@ CanvasAsyncBlobCreator::CanvasAsyncBlobCreator(
+                            std::min(info.height(), max_dimension));
+         src_data_.reset(info, src_data_.addr(), src_data_.rowBytes());
+       }
++
++#if BUILDFLAG(IS_IOS)
++      // Prepare an owned unpremultiplied RGBA8 copy on the owning execution
++      // context thread so worker-direct, background, and progressive PNG
++      // encoders all retain the perturbed pixels safely and match ImageDataBuffer.
++      if (curium::IsCanvasFarblingEnabled() &&
++          (src_data_.colorType() == kRGBA_8888_SkColorType ||
++           src_data_.colorType() == kBGRA_8888_SkColorType)) {
++        const SkImageInfo unpremul_info = SkImageInfo::Make(
++            src_data_.dimensions(),
++            ImageEncoderUtils::GetColorInfoForEncoder(
++                src_data_.info().colorInfo(), image_->GetHdrMetadata()));
++        if (unpremul_info.colorType() == kRGBA_8888_SkColorType &&
++            unpremul_info.alphaType() == kUnpremul_SkAlphaType) {
++          if (auto site_key = context->GetCuriumSiteKey()) {
++            SkBitmap owned_bitmap;
++            if (owned_bitmap.tryAllocPixels(unpremul_info) &&
++                src_data_.readPixels(owned_bitmap.pixmap(), 0, 0)) {
++              curium::FarbleRGBA8Pixels(
++                  *site_key, static_cast<uint8_t*>(owned_bitmap.getPixels()),
++                  owned_bitmap.width(), owned_bitmap.height(),
++                  owned_bitmap.rowBytes(), 0, 0, /*is_bgra=*/false);
++              owned_bitmap.setImmutable();
++              if (sk_sp<SkImage> owned_image = owned_bitmap.asImage()) {
++                SkPixmap owned_pixmap;
++                if (owned_image->peekPixels(&owned_pixmap)) {
++                  skia_image_ = std::move(owned_image);
++                  src_data_ = owned_pixmap;
++                }
++              }
++            }
++          }
++        }
++      }
++#endif
+     }
+   }
+ 
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index bfec342..b0b437a 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -45,6 +45,9 @@
+ #include "base/trace_event/trace_event.h"
+ #include "base/trace_event/typed_macros.h"
+ #include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "cc/layers/texture_layer.h"
+ #include "cc/trees/layer_tree_host.h"
+ #include "services/metrics/public/cpp/ukm_recorder.h"
+@@ -1463,7 +1466,8 @@ scoped_refptr<StaticBitmapImage> HTMLCanvasElement::Snapshot(
+ String HTMLCanvasElement::ToDataURLInternal(
+     const String& mime_type,
+     const double& quality,
+-    SourceDrawingBuffer source_buffer) const {
++    SourceDrawingBuffer source_buffer,
++    bool apply_curium_farbling) const {
+   base::TimeTicks start_time = base::TimeTicks::Now();
+   if (!IsPaintable())
+     return String("data:,");
+@@ -1478,6 +1482,16 @@ String HTMLCanvasElement::ToDataURLInternal(
+     if (!data_buffer)
+       return String("data:,");
+ 
++#if BUILDFLAG(IS_IOS)
++    if (apply_curium_farbling && curium::IsCanvasFarblingEnabled()) {
++      if (ExecutionContext* ctx = GetExecutionContext()) {
++        if (auto site_key = ctx->GetCuriumSiteKey()) {
++          data_buffer->ApplyCuriumFarbling(*site_key);
++        }
++      }
++    }
++#endif
++
+     String data_url = data_buffer->ToDataURL(encoding_mime_type, quality);
+     base::TimeDelta elapsed_time = base::TimeTicks::Now() - start_time;
+     float sqrt_pixels =
+@@ -1531,7 +1545,8 @@ String HTMLCanvasElement::toDataURL(const String& mime_type,
+     if (v8_value->IsNumber())
+       quality = v8_value.As<v8::Number>()->Value();
+   }
+-  return ToDataURLInternal(mime_type, quality, kBackBuffer);
++  return ToDataURLInternal(mime_type, quality, kBackBuffer,
++                           /*apply_curium_farbling=*/true);
+ }
+ 
+ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
+index d00f201..9c9870b 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
+@@ -441,7 +441,8 @@ class CORE_EXPORT HTMLCanvasElement final
+ 
+   String ToDataURLInternal(const String& mime_type,
+                            const double& quality,
+-                           SourceDrawingBuffer) const;
++                           SourceDrawingBuffer,
++                           bool apply_curium_farbling = false) const;
+ 
+   // Returns the transparent image resource for this canvas.
+   scoped_refptr<StaticBitmapImage> GetTransparentImage();
+diff --git a/third_party/blink/renderer/core/html/canvas/text_metrics.h b/third_party/blink/renderer/core/html/canvas/text_metrics.h
+index ad8d23d..a64d3bb 100644
+--- a/third_party/blink/renderer/core/html/canvas/text_metrics.h
++++ b/third_party/blink/renderer/core/html/canvas/text_metrics.h
+@@ -101,6 +101,14 @@ class CORE_EXPORT TextMetrics final : public ScriptWrappable {
+ 
+   const Font* GetFont() const { return shaped_text_->GetFont(); }
+ 
++  void ApplyCuriumScale(double scale) {
++    if (width_ > 0.0 && scale > 0.0) {
++      width_ *= scale;
++      actual_bounding_box_left_ *= scale;
++      actual_bounding_box_right_ *= scale;
++    }
++  }
++
+   void Trace(Visitor*) const override;
+ 
+  private:
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index 6ab0849..15c96b1 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -35,6 +35,9 @@
+ #include "base/trace_event/memory_dump_manager.h"
+ #include "base/trace_event/process_memory_dump.h"
+ #include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "cc/base/math_util.h"
+ #include "cc/paint/paint_canvas.h"
+ #include "cc/paint/paint_flags.h"
+@@ -1638,6 +1641,23 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+           snapshot->PaintImageForCurrentFrame().GetSkImageInfo().bounds();
+       DCHECK(!bounds.intersect(SkIRect::MakeXYWH(sx, sy, sw, sh)));
+     }
++#if BUILDFLAG(IS_IOS)
++    else if (curium::IsCanvasFarblingEnabled()) {
++      if (ExecutionContext* ctx = GetTopExecutionContext()) {
++        if (auto site_key = ctx->GetCuriumSiteKey()) {
++          SkPixmap pixmap = image_data->GetSkPixmap();
++          if ((pixmap.colorType() == kRGBA_8888_SkColorType ||
++               pixmap.colorType() == kBGRA_8888_SkColorType) &&
++              pixmap.alphaType() == kUnpremul_SkAlphaType) {
++            curium::FarbleRGBA8Pixels(
++                *site_key, static_cast<uint8_t*>(pixmap.writable_addr()),
++                pixmap.width(), pixmap.height(), pixmap.rowBytes(), sx, sy,
++                pixmap.colorType() == kBGRA_8888_SkColorType);
++          }
++        }
++      }
++    }
++#endif
+   }
+ 
+   return image_data;
+@@ -2370,7 +2390,22 @@ void BaseRenderingContext2D::DrawTextInternal(
+ }
+ 
+ TextMetrics* BaseRenderingContext2D::measureText(const String& text) {
+-  return MakeGarbageCollected<TextMetrics>(*shapeText(text));
++  TextMetrics* metrics = MakeGarbageCollected<TextMetrics>(*shapeText(text));
++#if BUILDFLAG(IS_IOS)
++  if (metrics->width() > 0.0 && curium::IsTextMetricsFarblingEnabled()) {
++    if (ExecutionContext* ctx = GetTopExecutionContext()) {
++      if (auto site_key = ctx->GetCuriumSiteKey()) {
++        std::string family;
++        if (const Font* font = metrics->GetFont()) {
++          family = font->GetFontDescription().Family().FamilyName().Utf8();
++        }
++        metrics->ApplyCuriumScale(
++            curium::ResolveTextMetricsScale(*site_key, family));
++      }
++    }
++  }
++#endif
++  return metrics;
+ }
+ 
+ ShapedText* BaseRenderingContext2D::shapeText(const String& text) {
+diff --git a/third_party/blink/renderer/modules/plugins/dom_plugin_array.cc b/third_party/blink/renderer/modules/plugins/dom_plugin_array.cc
+index 3608837..8346cc6 100644
+--- a/third_party/blink/renderer/modules/plugins/dom_plugin_array.cc
++++ b/third_party/blink/renderer/modules/plugins/dom_plugin_array.cc
+@@ -21,6 +21,9 @@
+ #include "third_party/blink/renderer/modules/plugins/dom_plugin_array.h"
+ 
+ #include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+@@ -136,6 +139,12 @@ HeapVector<Member<DOMMimeType>> DOMPluginArray::GetFixedMimeTypeArray() {
+ }
+ 
+ bool DOMPluginArray::IsPdfViewerAvailable() {
++#if BUILDFLAG(IS_IOS)
++  if (window_ &&
++      curium::ShouldExposePdfViewer(window_->GetUserAgentMetadata())) {
++    return true;
++  }
++#endif
+ #if BUILDFLAG(IS_ANDROID)
+   // TODO(crbug.com/556858610, crbug.com/556857897): Other desktop platforms
+   // dynamically check whether PDF viewing is handled by an extension or
+diff --git a/third_party/blink/renderer/modules/screen_orientation/screen_orientation_controller.cc b/third_party/blink/renderer/modules/screen_orientation/screen_orientation_controller.cc
+index a8d9885..daa5317 100644
+--- a/third_party/blink/renderer/modules/screen_orientation/screen_orientation_controller.cc
++++ b/third_party/blink/renderer/modules/screen_orientation/screen_orientation_controller.cc
+@@ -6,12 +6,16 @@
+ 
+ #include <memory>
+ #include <utility>
++#include "build/build_config.h"
+ #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/core/dom/events/event.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/local_frame_view.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/renderer/core/frame/screen.h"
++#endif
+ #include "third_party/blink/renderer/core/fullscreen/scoped_allow_fullscreen.h"
+ #include "third_party/blink/renderer/core/page/chrome_client.h"
+ #include "third_party/blink/renderer/core/page/page.h"
+@@ -112,6 +116,17 @@ void ScreenOrientationController::UpdateOrientation() {
+   DCHECK(GetPage());
+   ChromeClient& chrome_client = GetPage()->GetChromeClient();
+   LocalFrame& frame = *DomWindow()->GetFrame();
++#if BUILDFLAG(IS_IOS)
++  if (std::optional<curium::ResolvedScreenMetrics> metrics =
++          ResolveCuriumScreenMetrics(&frame)) {
++    orientation_->SetType(
++        metrics->is_landscape
++            ? display::mojom::blink::ScreenOrientation::kLandscapePrimary
++            : display::mojom::blink::ScreenOrientation::kPortraitPrimary);
++    orientation_->SetAngle(metrics->orientation_angle);
++    return;
++  }
++#endif
+   const display::ScreenInfo& screen_info = chrome_client.GetScreenInfo(frame);
+   display::mojom::blink::ScreenOrientation orientation_type =
+       screen_info.orientation_type;
+@@ -157,6 +172,12 @@ void ScreenOrientationController::PageVisibilityChanged() {
+   LocalFrame& frame = *DomWindow()->GetFrame();
+   uint16_t current_angle =
+       GetPage()->GetChromeClient().GetScreenInfo(frame).orientation_angle;
++#if BUILDFLAG(IS_IOS)
++  if (std::optional<curium::ResolvedScreenMetrics> metrics =
++          ResolveCuriumScreenMetrics(&frame)) {
++    current_angle = metrics->orientation_angle;
++  }
++#endif
+ 
+   // FIXME: sendOrientationChangeEvent() currently send an event all the
+   // children of the frame, so it should only be called on the frame on
+diff --git a/third_party/blink/renderer/modules/speech/speech_synthesis.cc b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+index 6c5b40a..8550cf5 100644
+--- a/third_party/blink/renderer/modules/speech/speech_synthesis.cc
++++ b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+@@ -28,6 +28,9 @@
+ #include <tuple>
+ 
+ #include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -84,6 +87,13 @@ SpeechSynthesis::SpeechSynthesis(LocalDOMWindow& window)
+ 
+ void SpeechSynthesis::OnSetVoiceList(
+     Vector<mojom::blink::SpeechSynthesisVoicePtr> mojom_voices) {
++#if BUILDFLAG(IS_IOS)
++  if (LocalDOMWindow* window = GetSupplementable();
++      window && curium::ShouldHideSpeechVoices(window->GetUserAgentMetadata())) {
++    voice_list_.clear();
++    return;
++  }
++#endif
+   voice_list_.clear();
+   for (auto& mojom_voice : mojom_voices) {
+     voice_list_.push_back(
+@@ -93,6 +103,13 @@ void SpeechSynthesis::OnSetVoiceList(
+ }
+ 
+ const HeapVector<Member<SpeechSynthesisVoice>>& SpeechSynthesis::getVoices() {
++#if BUILDFLAG(IS_IOS)
++  if (LocalDOMWindow* window = GetSupplementable();
++      window && curium::ShouldHideSpeechVoices(window->GetUserAgentMetadata())) {
++    voice_list_.clear();
++    return voice_list_;
++  }
++#endif
+   // Kick off initialization here to ensure voice list gets populated.
+   std::ignore = TryEnsureMojomSynthesis();
+   return voice_list_;
+diff --git a/third_party/blink/renderer/modules/webaudio/analyser_node.cc b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
+index 4bc4b15..e242ea0 100644
+--- a/third_party/blink/renderer/modules/webaudio/analyser_node.cc
++++ b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
+@@ -25,6 +25,12 @@
+ 
+ #include "third_party/blink/renderer/modules/webaudio/analyser_node.h"
+ 
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#endif
++
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_analyser_options.h"
+ #include "third_party/blink/renderer/modules/webaudio/analyser_handler.h"
+ #include "third_party/blink/renderer/modules/webaudio/audio_graph_tracer.h"
+@@ -126,6 +132,18 @@ double AnalyserNode::smoothingTimeConstant() const {
+ void AnalyserNode::getFloatFrequencyData(NotShared<DOMFloat32Array> array) {
+   GetAnalyserHandler().GetFloatFrequencyData(array.Get(),
+                                              context()->currentTime());
++#if BUILDFLAG(IS_IOS)
++  if (array && array->Data() && array->length() > 0 &&
++      curium::IsAudioFarblingEnabled()) {
++    if (ExecutionContext* ctx =
++            context() ? context()->GetExecutionContext() : nullptr) {
++      if (auto site_key = ctx->GetCuriumSiteKey()) {
++        curium::FarbleAudioSamples(*site_key, 0xA0A10001u, array->Data(),
++                                   array->length());
++      }
++    }
++  }
++#endif
+ }
+ 
+ void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
+@@ -135,6 +153,18 @@ void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
+ 
+ void AnalyserNode::getFloatTimeDomainData(NotShared<DOMFloat32Array> array) {
+   GetAnalyserHandler().GetFloatTimeDomainData(array.Get());
++#if BUILDFLAG(IS_IOS)
++  if (array && array->Data() && array->length() > 0 &&
++      curium::IsAudioFarblingEnabled()) {
++    if (ExecutionContext* ctx =
++            context() ? context()->GetExecutionContext() : nullptr) {
++      if (auto site_key = ctx->GetCuriumSiteKey()) {
++        curium::FarbleAudioSamples(*site_key, 0xA0A10002u, array->Data(),
++                                   array->length());
++      }
++    }
++  }
++#endif
+ }
+ 
+ void AnalyserNode::getByteTimeDomainData(NotShared<DOMUint8Array> array) {
+diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
+index a798c39..a9b505d 100644
+--- a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
++++ b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
+@@ -25,6 +25,11 @@
+ 
+ #include "third_party/blink/renderer/modules/webaudio/offline_audio_context.h"
+ 
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
++
+ #include <limits>
+ #include <optional>
+ 
+@@ -604,6 +609,22 @@ void OfflineAudioContext::OnChunkRendered() {
+   Member<AudioBuffer> rendered_buffer = pending_render_targets_.front();
+ 
+   CHECK(rendered_buffer);
++#if BUILDFLAG(IS_IOS)
++  if (curium::IsAudioFarblingEnabled()) {
++    if (ExecutionContext* ctx = GetExecutionContext()) {
++      if (auto site_key = ctx->GetCuriumSiteKey()) {
++        const unsigned channels = rendered_buffer->numberOfChannels();
++        for (unsigned ch = 0; ch < channels; ++ch) {
++          NotShared<DOMFloat32Array> arr = rendered_buffer->getChannelData(ch);
++          if (arr && arr->Data() && arr->length() > 0) {
++            curium::FarbleAudioSamples(*site_key, 0xA0D10000u + ch, arr->Data(),
++                                       arr->length());
++          }
++        }
++      }
++    }
++  }
++#endif
+   // Keep the target queued across `Resolve()` so synchronous thenable getters
+   // can enqueue more chunks without starting a duplicate render.
+   resolver->Resolve(rendered_buffer.Get());
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index 2f4ce19..5dfc800 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -1597,15 +1597,34 @@ void WebGLRenderingContextBase::InitializeNewContext() {
+ 
+   GLint num_vertex_attribs = 0;
+   ContextGL()->GetIntegerv(GL_MAX_VERTEX_ATTRIBS, &num_vertex_attribs);
++#if BUILDFLAG(IS_IOS)
++  if (ExecutionContext* ctx = GetExecutionContext()) {
++    num_vertex_attribs = curium::ClampWebGLLimit(
++        ctx->GetUserAgentMetadata(), GL_MAX_VERTEX_ATTRIBS, num_vertex_attribs);
++  }
++#endif
+   max_vertex_attribs_ = num_vertex_attribs;
+ 
+   max_texture_size_ = 0;
+   ContextGL()->GetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size_);
++#if BUILDFLAG(IS_IOS)
++  if (ExecutionContext* ctx = GetExecutionContext()) {
++    max_texture_size_ = curium::ClampWebGLLimit(
++        ctx->GetUserAgentMetadata(), GL_MAX_TEXTURE_SIZE, max_texture_size_);
++  }
++#endif
+   max_texture_level_ =
+       WebGLTexture::ComputeLevelCount(max_texture_size_, max_texture_size_, 1);
+   max_cube_map_texture_size_ = 0;
+   ContextGL()->GetIntegerv(GL_MAX_CUBE_MAP_TEXTURE_SIZE,
+                            &max_cube_map_texture_size_);
++#if BUILDFLAG(IS_IOS)
++  if (ExecutionContext* ctx = GetExecutionContext()) {
++    max_cube_map_texture_size_ = curium::ClampWebGLLimit(
++        ctx->GetUserAgentMetadata(), GL_MAX_CUBE_MAP_TEXTURE_SIZE,
++        max_cube_map_texture_size_);
++  }
++#endif
+   max3d_texture_size_ = 0;
+   max3d_texture_level_ = 0;
+   max_array_texture_layers_ = 0;
+@@ -1620,6 +1639,13 @@ void WebGLRenderingContextBase::InitializeNewContext() {
+       max_cube_map_texture_size_, max_cube_map_texture_size_, 1);
+   max_renderbuffer_size_ = 0;
+   ContextGL()->GetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_renderbuffer_size_);
++#if BUILDFLAG(IS_IOS)
++  if (ExecutionContext* ctx = GetExecutionContext()) {
++    max_renderbuffer_size_ = curium::ClampWebGLLimit(
++        ctx->GetUserAgentMetadata(), GL_MAX_RENDERBUFFER_SIZE,
++        max_renderbuffer_size_);
++  }
++#endif
+ 
+   // These two values from EXT_draw_buffers are lazily queried.
+   max_draw_buffers_ = 0;
+@@ -4001,6 +4027,15 @@ bool WebGLRenderingContextBase::ExtensionSupportedAndAllowed(
+     return false;
+   if (disabled_extensions_.Contains(String(tracker->ExtensionName())))
+     return false;
++#if BUILDFLAG(IS_IOS)
++  if (ExecutionContext* ctx = GetExecutionContext()) {
++    if (!curium::IsWebGLExtensionAllowed(
++            ctx->GetUserAgentMetadata(),
++            String(tracker->ExtensionName()).Utf8())) {
++      return false;
++    }
++  }
++#endif
+   return true;
+ }
+ 
+@@ -5532,6 +5567,30 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+       return;
+     }
+     ContextGL()->ReadPixels(x, y, width, height, format, type, data);
++#if BUILDFLAG(IS_IOS)
++    if (curium::IsWebGLFarblingEnabled() && format == GL_RGBA &&
++        type == GL_UNSIGNED_BYTE && data && !buffer.has_value() && width > 0 &&
++        height > 0) {
++      const WebGLImageConversion::PixelStoreParams pack =
++          GetPackPixelStoreParams();
++      if (pack.row_length == 0 && pack.skip_pixels == 0 &&
++          pack.skip_rows == 0) {
++        const size_t align = std::max<size_t>(1, static_cast<size_t>(pack.alignment));
++        const size_t unaligned_row = static_cast<size_t>(width) * 4u;
++        const size_t row_bytes = ((unaligned_row + align - 1u) / align) * align;
++        const size_t total_needed =
++            static_cast<size_t>(height - 1) * row_bytes + unaligned_row;
++        if (total_needed <= buffer_size.ValueOrDie()) {
++          if (ExecutionContext* ctx = GetExecutionContext()) {
++            if (auto site_key = ctx->GetCuriumSiteKey()) {
++              curium::FarbleRGBA8Pixels(*site_key, data, width, height,
++                                        row_bytes, x, y, /*is_bgra=*/false);
++            }
++          }
++        }
++      }
++    }
++#endif
+   }
+ }
+ 
+@@ -8160,6 +8219,11 @@ ScriptValue WebGLRenderingContextBase::GetIntParameter(
+   GLint value = 0;
+   if (!isContextLost()) {
+     ContextGL()->GetIntegerv(pname, &value);
++#if BUILDFLAG(IS_IOS)
++    if (ExecutionContext* ctx = ExecutionContext::From(script_state)) {
++      value = curium::ClampWebGLLimit(ctx->GetUserAgentMetadata(), pname, value);
++    }
++#endif
+     switch (pname) {
+       case GL_IMPLEMENTATION_COLOR_READ_FORMAT:
+       case GL_IMPLEMENTATION_COLOR_READ_TYPE:
+diff --git a/third_party/blink/renderer/platform/fonts/font_cache.cc b/third_party/blink/renderer/platform/fonts/font_cache.cc
+index f6a0e22..df06988 100644
+--- a/third_party/blink/renderer/platform/fonts/font_cache.cc
++++ b/third_party/blink/renderer/platform/fonts/font_cache.cc
+@@ -47,6 +47,9 @@
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
+ #include "skia/ext/font_utils.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/public/platform/web_font_prewarmer.h"
+@@ -160,6 +163,16 @@ const FontPlatformData* FontCache::GetFontPlatformData(
+     AlternateFontName alternate_font_name) {
+   TRACE_EVENT0("fonts", "FontCache::GetFontPlatformData");
+ 
++#if BUILDFLAG(IS_IOS)
++  if (creation_params.CreationType() == FontFaceCreationType::kFamily &&
++      alternate_font_name != AlternateFontName::kLastResort &&
++      !curium::IsFontFamilyAllowedForLaunch(
++          creation_params.Family().Utf8(),
++          alternate_font_name == AlternateFontName::kLocalUniqueFace)) {
++    return nullptr;
++  }
++#endif
++
+ // [ios-blink-sideload] On iOS, as on Mac, system-ui is created and cached like
+ // any other family (see MakeIOSSystemFontTypeface()).
+ #if !BUILDFLAG(IS_APPLE)
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+index 059250a..b1296c5 100644
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+@@ -36,6 +36,10 @@
+ #include "base/logging.h"
+ #include "base/memory/ptr_util.h"
+ #include "base/types/optional_util.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#endif
+ #include "third_party/blink/renderer/platform/image-encoders/image_encoder_utils.h"
+ #include "third_party/blink/renderer/platform/wtf/text/base64.h"
+ #include "third_party/blink/renderer/platform/wtf/text/strcat.h"
+@@ -145,6 +149,51 @@ base::span<const uint8_t> ImageDataBuffer::PixelData() const {
+   return gfx::SkPixmapToSpan(pixmap_);
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++bool ImageDataBuffer::ApplyCuriumFarbling(
++    base::span<const uint8_t, 32> site_key) {
++  if (!is_valid_) {
++    return false;
++  }
++  const SkColorType ct = pixmap_.colorType();
++  if (ct != kRGBA_8888_SkColorType && ct != kBGRA_8888_SkColorType) {
++    return false;
++  }
++  const SkImageInfo info =
++      SkImageInfo::Make(pixmap_.dimensions(), kRGBA_8888_SkColorType,
++                        kUnpremul_SkAlphaType, pixmap_.refColorSpace());
++  const size_t row_bytes = info.minRowBytes();
++  const size_t size = info.computeByteSize(row_bytes);
++  if (SkImageInfo::ByteSizeOverflowed(size)) {
++    return false;
++  }
++  sk_sp<SkData> owned_data = SkData::MakeZeroInitialized(size);
++  if (!owned_data) {
++    return false;
++  }
++  SkPixmap owned_pixmap(info, owned_data->writable_data(), row_bytes);
++  if (!pixmap_.readPixels(owned_pixmap, 0, 0)) {
++    return false;
++  }
++  curium::FarbleRGBA8Pixels(site_key,
++                            static_cast<uint8_t*>(owned_data->writable_data()),
++                            info.width(), info.height(), row_bytes, 0, 0,
++                            /*is_bgra=*/false);
++  sk_sp<SkImage> owned_image =
++      SkImages::RasterFromData(info, std::move(owned_data), row_bytes);
++  if (!owned_image) {
++    return false;
++  }
++  SkPixmap bound_pixmap;
++  if (!owned_image->peekPixels(&bound_pixmap)) {
++    return false;
++  }
++  retained_image_ = std::move(owned_image);
++  pixmap_ = bound_pixmap;
++  return true;
++}
++#endif
++
+ bool ImageDataBuffer::EncodeImage(const ImageEncodingMimeType mime_type,
+                                   const double& quality,
+                                   Vector<unsigned char>* encoded_image) const {
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.h b/third_party/blink/renderer/platform/graphics/image_data_buffer.h
+index 8bcc283..b74433b 100644
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.h
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.h
+@@ -32,6 +32,7 @@
+ 
+ #include "base/containers/span.h"
+ #include "base/memory/scoped_refptr.h"
++#include "build/build_config.h"
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/image-encoders/image_encoder.h"
+ #include "third_party/blink/renderer/platform/platform_export.h"
+@@ -62,6 +63,13 @@ class PLATFORM_EXPORT ImageDataBuffer {
+ 
+   base::span<const uint8_t> PixelData() const;
+ 
++#if BUILDFLAG(IS_IOS)
++  // Copies pixels into an owned unpremultiplied RGBA8 buffer and applies
++  // deterministic Curium anti-fingerprinting perturbation without mutating
++  // borrowed or GPU-backed backing stores.
++  bool ApplyCuriumFarbling(base::span<const uint8_t, 32> site_key);
++#endif
++
+  private:
+   ImageDataBuffer(const SkPixmap&, const gfx::HDRMetadata&);
+   ImageDataBuffer(scoped_refptr<StaticBitmapImage>);

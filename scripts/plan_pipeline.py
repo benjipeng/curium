@@ -51,7 +51,7 @@ STAGE_FILES = {
     "apple": ["scripts/stages/apple.sh", "scripts/bootstrap_macos_host_tools.sh"],
     "compile": ["scripts/stages/compile.sh", "scripts/shard_artifact.py"],
     "link": ["scripts/stages/link.sh", "scripts/shard_artifact.py"],
-    "package": ["scripts/stages/package.sh", "scripts/package_ipa.sh", "helpers/extensions_ui"],
+    "package": ["scripts/stages/package.sh", "scripts/package_ipa.sh"],
 }
 # Never part of a key: transport, reporting, budgets, audits, and the producers
 # of the source/SDK artifacts (which enter keys by digest instead).

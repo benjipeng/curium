@@ -3,7 +3,7 @@ From: chromium-blink-ios <noreply@github.com>
 Subject: [PATCH] iOS Blink: single-process, dual-mode JIT/jitless V8, and RAM-scaled budgets
 
 diff --git a/content/app/content_main.cc b/content/app/content_main.cc
-index 53ad968..0b7b0ae 100644
+index 53ad968..4411bf6 100644
 --- a/content/app/content_main.cc
 +++ b/content/app/content_main.cc
 @@ -26,7 +26,13 @@
@@ -20,7 +20,7 @@ index 53ad968..0b7b0ae 100644
  #include "base/task/single_thread_task_executor.h"
  #include "base/task/thread_pool/thread_pool_instance.h"
  #include "base/threading/platform_thread.h"
-@@ -113,6 +119,151 @@ void SetupSignalHandlers() {
+@@ -113,6 +119,156 @@ void SetupSignalHandlers() {
  
  #endif  // BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_ANDROID)
  
@@ -82,7 +82,7 @@ index 53ad968..0b7b0ae 100644
 +  //    when a debugger is attached ("Launch with JIT").
 +  //  - Outside LiveContainer, devices stay jitless so Xcode/LLDB sessions
 +  //    never hit spurious brk traps; the Simulator still uses native MAP_JIT.
-+  bool jit_enabled = false;
++  int jit_mode = 0;
 +  const bool force_disable_jit = command_line->HasSwitch("curium-disable-jit");
 +  if (!force_disable_jit && V8IOSJitPrepareForProcess != nullptr) {
 +    const bool explicit_enable_jit =
@@ -103,9 +103,8 @@ index 53ad968..0b7b0ae 100644
 +        pool_mb = static_cast<size_t>(parsed);
 +      }
 +    }
-+    const int jit_mode =
++    jit_mode =
 +        V8IOSJitPrepareForProcess(pool_mb * 1024ULL * 1024ULL, allow_txm_brk);
-+    jit_enabled = (jit_mode != 0);
 +  }
 +
 +  // gin applies --js-flags one comma-separated item at a time, after V8's
@@ -115,6 +114,12 @@ index 53ad968..0b7b0ae 100644
 +  const std::string existing_js_flags =
 +      command_line->GetSwitchValueASCII(kJsFlagsSwitch);
 +  std::vector<std::string> js_flags;
++  constexpr int kTxmDualMap = 3;  // V8IOSJitPrepareForProcess ABI.
++  if (jit_mode == kTxmDualMap) {
++    // Leave room for JS and other modules in the shared range. V8 can still
++    // reserve more for jump tables and grow later. Caller flags take precedence.
++    js_flags.push_back("--wasm-max-initial-code-space-reservation=8");
++  }
 +  if (!existing_js_flags.empty()) {
 +    js_flags.push_back(existing_js_flags);
 +  }
@@ -126,7 +131,7 @@ index 53ad968..0b7b0ae 100644
 +    js_flags.push_back("--max-semi-space-size=" +
 +                       base::NumberToString(semi_space_mb));
 +  }
-+  if (!jit_enabled) {
++  if (jit_mode == 0) {
 +    // DrumBrake runs WebAssembly only with --wasm-jitless under --jitless.
 +    js_flags.push_back("--jitless");
 +    js_flags.push_back("--wasm-jitless");
@@ -172,7 +177,7 @@ index 53ad968..0b7b0ae 100644
  bool IsSubprocess() {
    auto type = base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
        switches::kProcessType);
-@@ -288,6 +439,9 @@ NO_STACK_PROTECTOR int RunContentProcess(
+@@ -288,6 +444,9 @@ NO_STACK_PROTECTOR int RunContentProcess(
      // Enable spatial navigation; we interpret remote control swipes as arrow
      // keys.
      command_line->AppendSwitch(switches::kEnableSpatialNavigation);

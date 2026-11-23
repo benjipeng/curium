@@ -116,6 +116,13 @@ temporary Build 35 engine hooks were retired in Build 37 (`0099`–`0104`).
 
 Built in run `44939797575` (`8b550ce`) after green `graph-diagnose.yml` (`44938172892` graph + `44938715790` `compile_extensions=true`).
 
+- [ ] **Verify smaller initial Wasm reservations on TXM (next engine, `0001`).**
+  Target at most 8 MiB for a module's first reservation; jump tables can require
+  more. Build 40 on Simulator reported the explicit flag with both JITs enabled
+  and passed JS ↔ Wasm calls on a page and three workers. On device, compare a
+  large module and repeated tab/worker loads against Build 40 before resizing
+  the 64 MiB pool. This V8 pin requires global jitless for DrumBrake; crossing
+  its committed-code cap is fatal.
 - [x] **Unstripped framework symbols artifact (`0098`).** Landed Build 37.
 - [x] **Single-process extension coexistence (`0099`).** Landed Build 37.
 - [x] **Extension APIs & native permissions prompt (`0100`).** Landed Build 37.
@@ -126,24 +133,50 @@ Built in run `44939797575` (`8b550ce`) after green `graph-diagnose.yml` (`449381
 - [x] **Authentic Chrome dual identity, Client Hints delegate & `Accept-Language` (`0105`).** Landed Build 38/39.
 - [x] **Modular launch-scoped fingerprint contract, isolated profile roots, Zstd baseline, OOPIF Desktop inheritance & optional native-first hardware/GPU overrides (`0106`).**
   Landed Build 40 (`8b550ce`, run `44939797575`) and verified end-to-end on `iphone_duo_27_2` Simulator (Zstd HTTPS decode + Range `identity` control, cross-origin OOPIF + nested `about:blank`/`srcdoc`/Worker + sync `window.open('')`/`window.open('about:blank')`, cold `A → B → A → Default` 4-store isolation, Win11 x64 partial `majorVersion=158` coherence + Window/Worker HW/GPU/TZ parity, DNT/GPC, fail-closed recovery, and fixed-proxy `<-loopback>` zero-direct-leak).
-- [ ] **Package Blink's localized permission element strings (deferred to next engine wave).**
+- [ ] **Package Blink's localized permission element strings (Build 41 wave, `0107`).**
   On `iphone_duo_27_2`, navigating to `google.com` in `0.1.11-b15` with Build 40
   triggered a renderer `SIGTRAP` in `ui::ResourceBundle::GetLocalizedStringImpl`
   for resource `47053` (absent from `resources.pak`). Mitigated downstream on
   Build 40 via `--disable-blink-features=CameraAndMicrophoneElements,UserMediaElement,GeolocationElement`
   in `CuriumRuntime.m`; standard media capture and geolocation APIs stay active.
-  Deferred: repack `permission_element_generated_strings.pak` and
-  `permission_element_strings_en-US.pak` into `resources.pak` (with a `link.sh`
-  data-pack check) in the next full engine wave.
-- [ ] **Flip geolocation prompt order & harden cross-origin iframe media checks (deferred to next engine wave).**
-  Build 40 already supports location (iOS prompt first, then site prompt) and
-  delegates camera/microphone prompts to Swift (`CuriumBrowserStore`). Defer
-  moving iOS `GeolocationSystemPermissionManager::RequestSystemPermission()`
-  after site approval and adding `IsCurrentMediaOrigin` in `content_web_state.mm`
-  to the next engine wave. Note: before running Pipeline 1 under `benjipeng/curium`,
-  copy the existing GHCR source/stub/ccache images from
-  `ghcr.io/benjipeng/chromium-blink-ios/*` to `ghcr.io/benjipeng/curium/*`.
-- [ ] **Drop `helpers/extensions_ui` from packaging.** Deferred to next engine wave.
+  Drafted in `0107` on `feat/build-41-engine-wave`: repacks
+  `permission_element_generated_strings.pak` and localized
+  `permission_element_strings_<locale>.pak`, with a DataPack v5 assertion for
+  resource `47053` in `scripts/stages/link.sh`.
+- [ ] **Flip geolocation prompt order & harden cross-origin iframe media checks (Build 41 wave, `0107`).**
+  Drafted in `0107` on `feat/build-41-engine-wave`: handles
+  `GEOLOCATION_APPROXIMATE`, requests iOS geolocation authorization after site
+  approval, and adds `IsCurrentMediaOrigin` in `content_web_state.mm`. Note:
+  before running Pipeline 1 under `benjipeng/curium`, copy the existing GHCR
+  source/stub/ccache images from `ghcr.io/benjipeng/chromium-blink-ios/*` to
+  `ghcr.io/benjipeng/curium/*`.
+- [ ] **Drop `helpers/extensions_ui` from packaging (Build 41 wave).**
+  Removed `helpers/extensions_ui/`, its `package_ipa.sh` build/inject step, and
+  `plan_pipeline.py` entry on `feat/build-41-engine-wave`.
+- [ ] **Downloads/PDFKit handoff & Media Radar engine contract (Build 41 wave, `0108`).**
+  Drafted in `0108` + `EngineContract/CrIOSBrowserHostV1.h`: keeps
+  `enable_pdf = false`, adds `@optional` `isExplicitDownload`/`isMainFrame`/
+  `httpMethod` on `CrIOSDownloadTaskV1`, fixes `CuriumBrowserHost._downloads`
+  retention leak with terminal snapshots, adds `@optional` `effectiveUserAgent`
+  on `CrIOSTabHostingV1`, and adds pre-filtered `browserHost:tab:didLoadResourceEvent:`.
+- [ ] **Universal PiP upstreaming & native Blink C++ PiP guard (Build 41 wave, `0109`).**
+  Drafted in `0109`: folds `CuriumPiPHooks.m` HLS/VOD skip fixes, iOS 27.2
+  `setPlaying:` coalescing, `ClientSharedImage::CloneGpuMemoryBufferHandle()`
+  IOSurface fallback, and muted `MixWithOthers` audio session into
+  `ios_video_overlay_window.mm`/`ios_pip_frame_hub.mm`; prioritizes iOS PiP in
+  `ShouldPausePlaybackWhenHidden`; adds native Blink C++ PiP guard
+  (`disablePictureInPicture`, `AttributeChanged`, `exitPictureInPicture`,
+  `pauseForBindings` with `MediaSession` pause-action timestamp preservation) so
+  `MAIN`-world `pip_guard.js` can be retired after Build 41 pins.
+- [ ] **Native Blink C++ anti-fingerprinting (`schemaVersion: 2`, Build 41 wave, `0110`).**
+  Drafted in `0110`: backward-compatible `schemaVersion: 1|2` launch config,
+  per-`ExecutionContext` `HMAC-SHA256(seed, top_level_site)` farbling across
+  Canvas 2D & `OffscreenCanvas`, `measureText`, `OfflineAudioContext` &
+  `AnalyserNode`, subtractive/clamped WebGL + client-memory `readPixels`,
+  OS-profile `FontCache` filtering & `0005` Apple alias gating, Duo-coherent
+  Web-only `Screen`/`MediaValues`/`outer*`/`ScreenOrientation`, desktop
+  `DOMPluginArray::IsPdfViewerAvailable()`, and non-Apple `speechSynthesis`
+  voice hiding.
 
 ## Environment
 
