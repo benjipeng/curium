@@ -1,19 +1,39 @@
 import Foundation
 
-/// Built-in downstream fingerprint profiles. Adding or tuning presets requires
+/// Current full Stable Google Chrome release baseline anchored across all verified templates.
+enum CuriumChromeStableBaseline {
+    static let majorVersion = "158"
+    static let fullVersion = "158.0.8127.37"
+    static let productVersion = "Chrome/158.0.0.0"
+    static let macOSPlatformVersion = "27.2.1"
+    static let androidPlatformVersion = "15.0.0"
+}
+
+/// Verified built-in downstream fingerprint profiles. Adding or tuning presets requires
 /// only Swift edits — no Chromium rebuild needed.
 enum CuriumFingerprintPresets {
+    /// Curated, empirically verified built-in presets exposed as creation archetypes.
+    /// Ordered with the highest-fidelity native Apple Silicon desktop archetype first.
     static let allBuiltIns: [CuriumFingerprintProfile] = [
-        defaultAuthenticChrome,
-        iosBlinkAuthentic,
         macosDesktopFirst,
-        windowsWorkstation,
-        linuxDesktop,
-        pixelAndroid,
+        defaultAuthenticChrome,
         privacyHardened,
     ]
 
     static let builtInIDs: Set<String> = Set(allBuiltIns.map(\.id))
+
+    /// Legacy v1 built-in preset IDs retired from new-profile templates after empirical
+    /// anti-detect feasibility testing (unverified x86_64 or impossible iOS Blink stacks).
+    /// Retained strictly as reserved slugs so APFS directories and v1->v2 migrations stay safe.
+    static let retiredLegacyBuiltInIDs: Set<String> = [
+        "ios-blink",
+        "win11-workstation",
+        "linux-desktop",
+        "pixel-android",
+    ]
+
+    /// Complete set of current + retired built-in slugs reserved against direct upsert collisions.
+    static let reservedBuiltInIDs: Set<String> = builtInIDs.union(retiredLegacyBuiltInIDs)
 
     /// Exact unconfigured Build 39 (`patches/0105`) baseline used exclusively when
     /// `selectedProfileID == nil` (`CuriumConfigureLaunchFingerprint(nil, nil)`), keeping
@@ -61,22 +81,72 @@ enum CuriumFingerprintPresets {
         hardware: .native
     )
 
-    /// Standard dual-slot Authentic Chrome profile: Android 15 Mobile masked with coherent
-    /// non-Apple GPU, screen, 8-core/8 GB hardware, Android font filtering, and hidden Apple
-    /// speech voices, paired with a native macOS arm64 Desktop slot.
-    static let defaultAuthenticChrome = CuriumFingerprintProfile(
-        id: "default",
-        displayName: "Authentic Chrome (Default)",
-        notes: "Android 15 Chrome on Mobile with coherent non-Apple Adreno WebGL, 412×915 screen, Android font filtering, and 8-core/8 GB hardware, paired with a macOS arm64 Desktop slot.",
+    /// Shared macOS arm64 Chrome 158 Stable desktop slot aligned with real macOS Chrome 158
+    /// (`platformVersion: "27.2.1"`, `webglProfile: .native`, desktop input & PDF viewer enabled).
+    static let stableMacOSDesktopSlot = CuriumIdentitySlot(
+        osCpu: "Macintosh; Intel Mac OS X 10_15_7",
+        productVersion: CuriumChromeStableBaseline.productVersion,
+        appendMobileToken: false,
+        primaryBrand: "Google Chrome",
+        majorVersion: CuriumChromeStableBaseline.majorVersion,
+        fullVersion: CuriumChromeStableBaseline.fullVersion,
+        platform: "macOS",
+        platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+        architecture: "arm",
+        bitness: "64",
+        model: "",
+        mobile: false,
+        wow64: false,
+        formFactors: ["Desktop"],
+        navigatorPlatform: "MacIntel",
+        maxTouchPoints: 0,
+        pointerType: .fine,
+        hoverType: .hover,
+        webglProfile: .native,
+        pdfViewerEnabled: true
+    )
+
+    /// Recommended desktop-first macOS ARM64 Chrome 158 Stable profile sharing native
+    /// Apple Silicon architecture (`127`), CoreText, CoreAudio, and Metal foundations.
+    static let macosDesktopFirst = CuriumFingerprintProfile(
+        id: "macos-desktop",
+        displayName: "macOS Desktop (Apple Silicon)",
+        notes: "Verified macOS arm64 Chrome 158 Stable profile across all tabs and workers with native Apple Silicon architecture, selectable M1–M5 chips, and 8–32 GB RAM tiers.",
         isBuiltIn: true,
         revision: 2,
+        defaultSlot: .desktop,
+        mobile: stableMacOSDesktopSlot,
+        desktop: stableMacOSDesktopSlot,
+        languages: nil,
+        proxy: .system,
+        webrtcIpHandlingPolicy: .default,
+        enableDoNotTrack: false,
+        enableGlobalPrivacyControl: false,
+        hardware: .native,
+        fontProfile: .apple,
+        hideSpeechVoices: false
+    )
+
+    /// Verified dual-slot Mobile Chrome 158 Stable profile: Android 15 Reduced-UA Mobile
+    /// masked with coherent non-Apple Adreno WebGL strings, explicit `webglProfile: .native`
+    /// (avoiding extension-stripping VM penalties), 412×915 screen, Android font filtering,
+    /// and 8-core/8 GB hardware, paired with a macOS arm64 Chrome 158 Desktop slot.
+    static let defaultAuthenticChrome = CuriumFingerprintProfile(
+        id: "default",
+        displayName: "Mobile Chrome (Android 15)",
+        notes: "Android 15 Chrome 158 Stable on Mobile with coherent Adreno/Mali WebGL strings, native WebGL extension profile (no VM stripping penalty), 412×915 screen, Android font filtering, and 8-core/8 GB hardware, paired with a macOS arm64 Desktop slot.",
+        isBuiltIn: true,
+        revision: 3,
         defaultSlot: .mobile,
         mobile: CuriumIdentitySlot(
             osCpu: "Linux; Android 10; K",
+            productVersion: CuriumChromeStableBaseline.productVersion,
             appendMobileToken: true,
             primaryBrand: "Google Chrome",
+            majorVersion: CuriumChromeStableBaseline.majorVersion,
+            fullVersion: CuriumChromeStableBaseline.fullVersion,
             platform: "Android",
-            platformVersion: "15.0.0",
+            platformVersion: CuriumChromeStableBaseline.androidPlatformVersion,
             architecture: "",
             bitness: "",
             model: "",
@@ -87,9 +157,9 @@ enum CuriumFingerprintPresets {
             webglVendor: "Google Inc. (Qualcomm)",
             webglRenderer: "ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2)",
             screen: .mobilePixel9,
-            webglProfile: .mobileAndroid
+            webglProfile: .native
         ),
-        desktop: build39NativeBaseline.desktop,
+        desktop: stableMacOSDesktopSlot,
         languages: nil,
         proxy: .system,
         webrtcIpHandlingPolicy: .default,
@@ -104,291 +174,36 @@ enum CuriumFingerprintPresets {
         hideSpeechVoices: true
     )
 
-    /// iOS 18_7 mobile UA with macOS desktop slot and 100% native Apple hardware & GPU.
-    static let iosBlinkAuthentic = CuriumFingerprintProfile(
-        id: "ios-blink",
-        displayName: "iOS Blink + macOS Desktop",
-        notes: "Isolated profile using iOS 18_7 mobile UA and macOS Desktop slot with native Apple hardware.",
-        isBuiltIn: true,
-        revision: 1,
-        defaultSlot: .mobile,
-        mobile: CuriumIdentitySlot(
-            osCpu: "iPhone; CPU iPhone OS 18_7 like Mac OS X",
-            appendMobileToken: true,
-            primaryBrand: "Google Chrome",
-            platform: "iOS",
-            platformVersion: "18.7.0",
-            architecture: "arm",
-            bitness: "64",
-            model: "",
-            mobile: true,
-            wow64: false,
-            formFactors: ["Mobile"],
-            navigatorPlatform: "iPhone"
-        ),
-        desktop: CuriumIdentitySlot(
-            osCpu: "Macintosh; Intel Mac OS X 10_15_7",
-            appendMobileToken: false,
-            primaryBrand: "Google Chrome",
-            platform: "macOS",
-            architecture: "arm",
-            bitness: "64",
-            model: "",
-            mobile: false,
-            wow64: false,
-            formFactors: ["Desktop"],
-            navigatorPlatform: "MacIntel"
-        ),
-        languages: nil,
-        proxy: .system,
-        webrtcIpHandlingPolicy: .default,
-        enableDoNotTrack: false,
-        enableGlobalPrivacyControl: false,
-        hardware: .native
-    )
-
-    /// Desktop-first macOS Chrome profile (including ServiceWorkers & SharedWorkers) with native Apple Silicon.
-    static let macosDesktopFirst = CuriumFingerprintProfile(
-        id: "macos-desktop",
-        displayName: "macOS Desktop-First",
-        notes: "Isolated profile presenting macOS arm64 Chrome across all tabs and ServiceWorkers with native Apple hardware.",
-        isBuiltIn: true,
-        revision: 1,
-        defaultSlot: .desktop,
-        mobile: CuriumIdentitySlot(
-            osCpu: "Macintosh; Intel Mac OS X 10_15_7",
-            appendMobileToken: false,
-            primaryBrand: "Google Chrome",
-            platform: "macOS",
-            architecture: "arm",
-            bitness: "64",
-            model: "",
-            mobile: false,
-            wow64: false,
-            formFactors: ["Desktop"],
-            navigatorPlatform: "MacIntel"
-        ),
-        desktop: CuriumIdentitySlot(
-            osCpu: "Macintosh; Intel Mac OS X 10_15_7",
-            appendMobileToken: false,
-            primaryBrand: "Google Chrome",
-            platform: "macOS",
-            architecture: "arm",
-            bitness: "64",
-            model: "",
-            mobile: false,
-            wow64: false,
-            formFactors: ["Desktop"],
-            navigatorPlatform: "MacIntel"
-        ),
-        languages: nil,
-        proxy: .system,
-        webrtcIpHandlingPolicy: .default,
-        enableDoNotTrack: false,
-        enableGlobalPrivacyControl: false,
-        hardware: .native
-    )
-
-    /// Example profile with opt-in non-Apple hardware, GPU, font, and web screen overrides (Windows 11 x64 workstation).
-    static let windowsWorkstation = CuriumFingerprintProfile(
-        id: "win11-workstation",
-        displayName: "Windows 11 Workstation",
-        notes: "Isolated Windows 11 x64 Desktop profile with opt-in CPU, memory, desktop pointer, Windows font filtering, 1080p web screen, and Intel ANGLE WebGL overrides.",
-        isBuiltIn: true,
-        revision: 2,
-        defaultSlot: .desktop,
-        mobile: CuriumIdentitySlot(
-            osCpu: "Windows NT 10.0; Win64; x64",
-            appendMobileToken: false,
-            primaryBrand: "Google Chrome",
-            platform: "Windows",
-            platformVersion: "19.0.0",
-            architecture: "x86",
-            bitness: "64",
-            model: "",
-            mobile: false,
-            wow64: false,
-            formFactors: ["Desktop"],
-            navigatorPlatform: "Win32",
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
-            screen: .desktop1080pWindows,
-            webglProfile: .desktopWindows,
-            pdfViewerEnabled: true
-        ),
-        desktop: CuriumIdentitySlot(
-            osCpu: "Windows NT 10.0; Win64; x64",
-            appendMobileToken: false,
-            primaryBrand: "Google Chrome",
-            platform: "Windows",
-            platformVersion: "19.0.0",
-            architecture: "x86",
-            bitness: "64",
-            model: "",
-            mobile: false,
-            wow64: false,
-            formFactors: ["Desktop"],
-            navigatorPlatform: "Win32",
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
-            screen: .desktop1080pWindows,
-            webglProfile: .desktopWindows,
-            pdfViewerEnabled: true
-        ),
-        languages: ["en-US", "en"],
-        proxy: .system,
-        webrtcIpHandlingPolicy: .defaultPublicInterfaceOnly,
-        enableDoNotTrack: false,
-        enableGlobalPrivacyControl: false,
-        hardware: CuriumHardwareOverrides(
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            timezone: nil
-        ),
-        fontProfile: .windows,
-        hideSpeechVoices: true
-    )
-
-    /// Desktop-first Linux x86_64 profile with coherent Mesa/Intel WebGL, Linux font filtering & desktop input capabilities.
-    static let linuxDesktop = CuriumFingerprintProfile(
-        id: "linux-desktop",
-        displayName: "Linux Desktop (x86_64)",
-        notes: "Isolated Linux x86_64 Chrome workstation with empty Sec-CH-UA-Platform-Version (matching upstream Linux Chrome), Linux font filtering, 1080p web screen, and Mesa Intel WebGL.",
-        isBuiltIn: true,
-        revision: 2,
-        defaultSlot: .desktop,
-        mobile: CuriumIdentitySlot(
-            osCpu: "X11; Linux x86_64",
-            appendMobileToken: false,
-            primaryBrand: "Google Chrome",
-            platform: "Linux",
-            platformVersion: "",
-            architecture: "x86",
-            bitness: "64",
-            model: "",
-            mobile: false,
-            wow64: false,
-            formFactors: ["Desktop"],
-            navigatorPlatform: "Linux x86_64",
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL 4.6)",
-            screen: .desktop1080pLinux,
-            webglProfile: .desktopLinux,
-            pdfViewerEnabled: true
-        ),
-        desktop: CuriumIdentitySlot(
-            osCpu: "X11; Linux x86_64",
-            appendMobileToken: false,
-            primaryBrand: "Google Chrome",
-            platform: "Linux",
-            platformVersion: "",
-            architecture: "x86",
-            bitness: "64",
-            model: "",
-            mobile: false,
-            wow64: false,
-            formFactors: ["Desktop"],
-            navigatorPlatform: "Linux x86_64",
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL 4.6)",
-            screen: .desktop1080pLinux,
-            webglProfile: .desktopLinux,
-            pdfViewerEnabled: true
-        ),
-        languages: ["en-US", "en"],
-        proxy: .system,
-        webrtcIpHandlingPolicy: .defaultPublicInterfaceOnly,
-        enableDoNotTrack: false,
-        enableGlobalPrivacyControl: false,
-        hardware: CuriumHardwareOverrides(
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            timezone: nil
-        ),
-        fontProfile: .linux,
-        hideSpeechVoices: true
-    )
-
-    /// Pixel 9 Android 15 mobile profile with Chrome Reduced UA, Pixel 9 CH model, Mali-G715 WebGL, Android font filtering, and 8-core/8 GB hardware.
-    static let pixelAndroid = CuriumFingerprintProfile(
-        id: "pixel-android",
-        displayName: "Pixel 9 (Android 15)",
-        notes: "Isolated Pixel 9 Android 15 mobile identity (Reduced UA with Pixel 9 Client Hint model, Mali-G715 WebGL, Android font filtering, and 8-core/8 GB hardware) paired with a macOS Desktop slot.",
-        isBuiltIn: true,
-        revision: 3,
-        defaultSlot: .mobile,
-        mobile: CuriumIdentitySlot(
-            osCpu: "Linux; Android 10; K",
-            appendMobileToken: true,
-            primaryBrand: "Google Chrome",
-            platform: "Android",
-            platformVersion: "15.0.0",
-            architecture: "",
-            bitness: "",
-            model: "Pixel 9",
-            mobile: true,
-            wow64: false,
-            formFactors: ["Mobile"],
-            navigatorPlatform: "Linux armv81",
-            webglVendor: "Google Inc. (ARM)",
-            webglRenderer: "ANGLE (ARM, Mali-G715, OpenGL ES 3.2)",
-            screen: .mobilePixel9,
-            webglProfile: .mobileAndroid
-        ),
-        desktop: defaultAuthenticChrome.desktop,
-        languages: nil,
-        proxy: .system,
-        webrtcIpHandlingPolicy: .default,
-        enableDoNotTrack: false,
-        enableGlobalPrivacyControl: false,
-        hardware: CuriumHardwareOverrides(
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            timezone: nil
-        ),
-        fontProfile: .android,
-        hideSpeechVoices: true
-    )
-
-    /// Privacy-hardened Android 15 profile masking non-Apple mobile hardware while enabling deterministic per-site C++ farbling, WebRTC UDP lockdown & GPC.
-    /// `fingerprintSeed` is intentionally `nil` here; `CuriumFingerprintStore` materializes and persists a fresh per-install 256-bit random seed.
+    /// Privacy-hardened macOS ARM64 Chrome 158 Stable profile built on the verified
+    /// Apple Silicon desktop stack with deterministic per-site C++ farbling, non-proxied
+    /// WebRTC UDP lockdown, and Global Privacy Control (`Sec-GPC: 1`).
+    /// `fingerprintSeed` is intentionally `nil` here; `CuriumFingerprintStore` materializes
+    /// and persists a fresh per-install 256-bit random seed.
     static let privacyHardened = CuriumFingerprintProfile(
         id: "privacy-hardened",
-        displayName: "Privacy Hardened",
-        notes: "Isolated Android 15 Mobile profile with coherent non-Apple GPU/screen/fonts, deterministic per-site Canvas/Audio/WebGL/TextMetrics farbling, non-proxied WebRTC UDP disabled, and Global Privacy Control enabled.",
+        displayName: "Privacy Hardened (macOS)",
+        notes: "Verified macOS arm64 Chrome 158 Stable profile with deterministic per-site Canvas/Audio/WebGL/TextMetrics farbling, non-proxied WebRTC UDP disabled, and Global Privacy Control enabled.",
         isBuiltIn: true,
-        revision: 3,
-        defaultSlot: .mobile,
-        mobile: defaultAuthenticChrome.mobile,
-        desktop: defaultAuthenticChrome.desktop,
+        revision: 4,
+        defaultSlot: .desktop,
+        mobile: stableMacOSDesktopSlot,
+        desktop: stableMacOSDesktopSlot,
         languages: nil,
         proxy: .system,
         webrtcIpHandlingPolicy: .disableNonProxiedUdp,
         enableDoNotTrack: false,
         enableGlobalPrivacyControl: true,
-        hardware: defaultAuthenticChrome.hardware,
+        hardware: .native,
         fingerprintSeed: nil,
         farbling: .allEnabled,
-        fontProfile: .android,
-        hideSpeechVoices: true
+        fontProfile: .apple,
+        hideSpeechVoices: false
     )
 
     /// Rolls a coherent hardware/GPU/screen variant for `profile` from its matching
     /// device pool, selecting a variant distinct from `profile`'s current hardware/GPU
     /// signature and preferring variants unused by `existingProfiles`.
-    /// Returns `nil` for native-only archetypes without a hardware variant pool.
+    /// Returns `nil` for legacy/custom archetypes without a verified hardware variant pool.
     /// Never mutates `id`, `displayName`, `proxy`, `timezone`, `languages`, or `fingerprintSeed`.
     static func rollCoherentHardwareVariant(
         for profile: CuriumFingerprintProfile,
@@ -407,8 +222,8 @@ enum CuriumFingerprintPresets {
     }
 }
 
-/// Coherent hardware, GPU, screen, and Client Hint variant for multi-variant fingerprint
-/// templates. Every variant obeys Build 42 C++ schema v2 limits and passes
+/// Coherent hardware, GPU, screen, Chrome version, and Client Hint variant for multi-variant
+/// fingerprint templates. Every variant obeys Build 42 C++ schema v2 limits and passes
 /// `CuriumFingerprintValidator.validate(_:)` with zero errors and zero warnings.
 struct CuriumHardwareProfileVariant: Identifiable, Equatable, Sendable {
     let id: String
@@ -419,6 +234,9 @@ struct CuriumHardwareProfileVariant: Identifiable, Equatable, Sendable {
     /// slot overrides exclusively to `mobile`.
     let appliesToBothSlots: Bool
 
+    let majorVersion: String?
+    let fullVersion: String?
+    let productVersion: String?
     let platformVersion: String?
     let model: String?
     let architecture: String?
@@ -440,6 +258,58 @@ struct CuriumHardwareProfileVariant: Identifiable, Equatable, Sendable {
     let fontProfile: CuriumFontProfile
     let hideSpeechVoices: Bool?
 
+    init(
+        id: String,
+        poolID: String,
+        label: String,
+        appliesToBothSlots: Bool,
+        majorVersion: String? = CuriumChromeStableBaseline.majorVersion,
+        fullVersion: String? = CuriumChromeStableBaseline.fullVersion,
+        productVersion: String? = CuriumChromeStableBaseline.productVersion,
+        platformVersion: String?,
+        model: String?,
+        architecture: String?,
+        bitness: String?,
+        navigatorPlatform: String?,
+        webglVendor: String,
+        webglRenderer: String,
+        webglProfile: CuriumWebGLProfile,
+        screen: CuriumScreenOverride,
+        maxTouchPoints: Int?,
+        pointerType: CuriumPointerType?,
+        hoverType: CuriumHoverType?,
+        pdfViewerEnabled: Bool?,
+        hardwareConcurrency: Int,
+        deviceMemoryGB: Double,
+        fontProfile: CuriumFontProfile,
+        hideSpeechVoices: Bool?
+    ) {
+        self.id = id
+        self.poolID = poolID
+        self.label = label
+        self.appliesToBothSlots = appliesToBothSlots
+        self.majorVersion = majorVersion
+        self.fullVersion = fullVersion
+        self.productVersion = productVersion
+        self.platformVersion = platformVersion
+        self.model = model
+        self.architecture = architecture
+        self.bitness = bitness
+        self.navigatorPlatform = navigatorPlatform
+        self.webglVendor = webglVendor
+        self.webglRenderer = webglRenderer
+        self.webglProfile = webglProfile
+        self.screen = screen
+        self.maxTouchPoints = maxTouchPoints
+        self.pointerType = pointerType
+        self.hoverType = hoverType
+        self.pdfViewerEnabled = pdfViewerEnabled
+        self.hardwareConcurrency = hardwareConcurrency
+        self.deviceMemoryGB = deviceMemoryGB
+        self.fontProfile = fontProfile
+        self.hideSpeechVoices = hideSpeechVoices
+    }
+
     /// Applies this hardware/GPU/screen variant to `profile` without touching `id`,
     /// `displayName`, `proxy`, `hardware.timezone`, `languages`, or `fingerprintSeed`.
     func apply(to profile: CuriumFingerprintProfile) -> CuriumFingerprintProfile {
@@ -451,6 +321,15 @@ struct CuriumHardwareProfileVariant: Identifiable, Equatable, Sendable {
             }
         } else {
             applySlotFields(to: &copy.mobile)
+            // Keep the companion macOS Desktop slot aligned with Stable Chrome 158 when
+            // upgrading an unconfigured Build 39 baseline profile onto a verified variant.
+            if copy.desktop.platform == "macOS" && copy.desktop.majorVersion == nil {
+                copy.desktop.majorVersion = majorVersion
+                copy.desktop.fullVersion = fullVersion
+                copy.desktop.productVersion = productVersion
+                copy.desktop.platformVersion = copy.desktop.platformVersion ?? CuriumChromeStableBaseline.macOSPlatformVersion
+                copy.desktop.webglProfile = copy.desktop.webglProfile ?? .native
+            }
         }
         copy.hardware.hardwareConcurrency = hardwareConcurrency
         copy.hardware.deviceMemoryGB = deviceMemoryGB
@@ -505,6 +384,15 @@ struct CuriumHardwareProfileVariant: Identifiable, Equatable, Sendable {
     }
 
     private func applySlotFields(to slot: inout CuriumIdentitySlot) {
+        if let majorVersion {
+            slot.majorVersion = majorVersion
+        }
+        if let fullVersion {
+            slot.fullVersion = fullVersion
+        }
+        if let productVersion {
+            slot.productVersion = productVersion
+        }
         if let platformVersion {
             slot.platformVersion = platformVersion
         }
@@ -539,498 +427,216 @@ struct CuriumHardwareProfileVariant: Identifiable, Equatable, Sendable {
     }
 }
 
-/// Curated coherent hardware/GPU/screen pools for multi-variant fingerprint templates.
+/// Curated coherent hardware/GPU/screen pools for verified fingerprint templates.
 enum CuriumFingerprintDevicePools {
-    static let windowsWorkstation: [CuriumHardwareProfileVariant] = [
-        CuriumHardwareProfileVariant(
-            id: "win11-intel-iris-xe-1080p",
-            poolID: CuriumFingerprintPresets.windowsWorkstation.id,
-            label: "Intel Iris Xe · 1920×1080",
-            appliesToBothSlots: true,
-            platformVersion: "19.0.0",
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: nil,
-            webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
-            webglProfile: .desktopWindows,
-            screen: CuriumScreenOverride(width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, colorDepth: 24),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            fontProfile: .windows,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "win11-nvidia-rtx3060-1440p",
-            poolID: CuriumFingerprintPresets.windowsWorkstation.id,
-            label: "NVIDIA RTX 3060 · 2560×1440",
-            appliesToBothSlots: true,
-            platformVersion: "19.0.0",
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: nil,
-            webglVendor: "Google Inc. (NVIDIA)",
-            webglRenderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-            webglProfile: .desktopWindows,
-            screen: CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2560, availHeight: 1400, colorDepth: 24),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 12,
-            deviceMemoryGB: 8,
-            fontProfile: .windows,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "win11-amd-rx6700xt-1080p",
-            poolID: CuriumFingerprintPresets.windowsWorkstation.id,
-            label: "AMD Radeon RX 6700 XT · 1920×1080",
-            appliesToBothSlots: true,
-            platformVersion: "15.0.0",
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: nil,
-            webglVendor: "Google Inc. (AMD)",
-            webglRenderer: "ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)",
-            webglProfile: .desktopWindows,
-            screen: CuriumScreenOverride(width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, colorDepth: 24),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 16,
-            deviceMemoryGB: 8,
-            fontProfile: .windows,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "win11-intel-uhd770-864p",
-            poolID: CuriumFingerprintPresets.windowsWorkstation.id,
-            label: "Intel UHD 770 · 1536×864",
-            appliesToBothSlots: true,
-            platformVersion: "15.0.0",
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: nil,
-            webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Intel(R) UHD Graphics 770 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-            webglProfile: .desktopWindows,
-            screen: CuriumScreenOverride(width: 1536, height: 864, availWidth: 1536, availHeight: 824, colorDepth: 24),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 6,
-            deviceMemoryGB: 4,
-            fontProfile: .windows,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "win11-nvidia-rtx4060-1050p",
-            poolID: CuriumFingerprintPresets.windowsWorkstation.id,
-            label: "NVIDIA RTX 4060 · 1680×1050",
-            appliesToBothSlots: true,
-            platformVersion: "19.0.0",
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: nil,
-            webglVendor: "Google Inc. (NVIDIA)",
-            webglRenderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-            webglProfile: .desktopWindows,
-            screen: CuriumScreenOverride(width: 1680, height: 1050, availWidth: 1680, availHeight: 1010, colorDepth: 24),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 16,
-            deviceMemoryGB: 8,
-            fontProfile: .windows,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "win11-amd-radeon-864p",
-            poolID: CuriumFingerprintPresets.windowsWorkstation.id,
-            label: "AMD Radeon Graphics · 1536×864",
-            appliesToBothSlots: true,
-            platformVersion: "15.0.0",
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: nil,
-            webglVendor: "Google Inc. (AMD)",
-            webglRenderer: "ANGLE (AMD, AMD Radeon(TM) Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
-            webglProfile: .desktopWindows,
-            screen: CuriumScreenOverride(width: 1536, height: 864, availWidth: 1536, availHeight: 824, colorDepth: 24),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 4,
-            deviceMemoryGB: 8,
-            fontProfile: .windows,
-            hideSpeechVoices: true
-        ),
-    ]
+    /// Apple Silicon M1–M5 Max tiers spanning 8–18 CPU cores, 8 / 16 / 32 GB RAM
+    /// (matching real macOS Chrome 158 `navigator.deviceMemory` buckets), and 24-bit Mac displays.
+    private static func makeMacOSAppleSiliconVariants(poolID: String) -> [CuriumHardwareProfileVariant] {
+        [
+            CuriumHardwareProfileVariant(
+                id: "\(poolID)-m1-8c-8g-1440x900",
+                poolID: poolID,
+                label: "Apple M1 · 8c · 8 GB · 1440×900",
+                appliesToBothSlots: true,
+                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                model: "",
+                architecture: "arm",
+                bitness: "64",
+                navigatorPlatform: "MacIntel",
+                webglVendor: "Google Inc. (Apple)",
+                webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
+                webglProfile: .native,
+                screen: CuriumScreenOverride(width: 1440, height: 900, availWidth: 1440, availHeight: 875, colorDepth: 24),
+                maxTouchPoints: 0,
+                pointerType: .fine,
+                hoverType: .hover,
+                pdfViewerEnabled: true,
+                hardwareConcurrency: 8,
+                deviceMemoryGB: 8,
+                fontProfile: .apple,
+                hideSpeechVoices: false
+            ),
+            CuriumHardwareProfileVariant(
+                id: "\(poolID)-m2-8c-8g-1470x956",
+                poolID: poolID,
+                label: "Apple M2 · 8c · 8 GB · 1470×956",
+                appliesToBothSlots: true,
+                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                model: "",
+                architecture: "arm",
+                bitness: "64",
+                navigatorPlatform: "MacIntel",
+                webglVendor: "Google Inc. (Apple)",
+                webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
+                webglProfile: .native,
+                screen: CuriumScreenOverride(width: 1470, height: 956, availWidth: 1470, availHeight: 919, colorDepth: 24),
+                maxTouchPoints: 0,
+                pointerType: .fine,
+                hoverType: .hover,
+                pdfViewerEnabled: true,
+                hardwareConcurrency: 8,
+                deviceMemoryGB: 8,
+                fontProfile: .apple,
+                hideSpeechVoices: false
+            ),
+            CuriumHardwareProfileVariant(
+                id: "\(poolID)-m3-8c-16g-1512x982",
+                poolID: poolID,
+                label: "Apple M3 · 8c · 16 GB · 1512×982",
+                appliesToBothSlots: true,
+                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                model: "",
+                architecture: "arm",
+                bitness: "64",
+                navigatorPlatform: "MacIntel",
+                webglVendor: "Google Inc. (Apple)",
+                webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)",
+                webglProfile: .native,
+                screen: CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 944, colorDepth: 24),
+                maxTouchPoints: 0,
+                pointerType: .fine,
+                hoverType: .hover,
+                pdfViewerEnabled: true,
+                hardwareConcurrency: 8,
+                deviceMemoryGB: 16,
+                fontProfile: .apple,
+                hideSpeechVoices: false
+            ),
+            CuriumHardwareProfileVariant(
+                id: "\(poolID)-m3pro-12c-16g-1728x1117",
+                poolID: poolID,
+                label: "Apple M3 Pro · 12c · 16 GB · 1728×1117",
+                appliesToBothSlots: true,
+                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                model: "",
+                architecture: "arm",
+                bitness: "64",
+                navigatorPlatform: "MacIntel",
+                webglVendor: "Google Inc. (Apple)",
+                webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Pro, Unspecified Version)",
+                webglProfile: .native,
+                screen: CuriumScreenOverride(width: 1728, height: 1117, availWidth: 1728, availHeight: 1079, colorDepth: 24),
+                maxTouchPoints: 0,
+                pointerType: .fine,
+                hoverType: .hover,
+                pdfViewerEnabled: true,
+                hardwareConcurrency: 12,
+                deviceMemoryGB: 16,
+                fontProfile: .apple,
+                hideSpeechVoices: false
+            ),
+            CuriumHardwareProfileVariant(
+                id: "\(poolID)-m4-10c-16g-1680x1050",
+                poolID: poolID,
+                label: "Apple M4 · 10c · 16 GB · 1680×1050",
+                appliesToBothSlots: true,
+                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                model: "",
+                architecture: "arm",
+                bitness: "64",
+                navigatorPlatform: "MacIntel",
+                webglVendor: "Google Inc. (Apple)",
+                webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)",
+                webglProfile: .native,
+                screen: CuriumScreenOverride(width: 1680, height: 1050, availWidth: 1680, availHeight: 1012, colorDepth: 24),
+                maxTouchPoints: 0,
+                pointerType: .fine,
+                hoverType: .hover,
+                pdfViewerEnabled: true,
+                hardwareConcurrency: 10,
+                deviceMemoryGB: 16,
+                fontProfile: .apple,
+                hideSpeechVoices: false
+            ),
+            CuriumHardwareProfileVariant(
+                id: "\(poolID)-m4pro-14c-32g-1728x1117",
+                poolID: poolID,
+                label: "Apple M4 Pro · 14c · 32 GB · 1728×1117",
+                appliesToBothSlots: true,
+                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                model: "",
+                architecture: "arm",
+                bitness: "64",
+                navigatorPlatform: "MacIntel",
+                webglVendor: "Google Inc. (Apple)",
+                webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version)",
+                webglProfile: .native,
+                screen: CuriumScreenOverride(width: 1728, height: 1117, availWidth: 1728, availHeight: 1079, colorDepth: 24),
+                maxTouchPoints: 0,
+                pointerType: .fine,
+                hoverType: .hover,
+                pdfViewerEnabled: true,
+                hardwareConcurrency: 14,
+                deviceMemoryGB: 32,
+                fontProfile: .apple,
+                hideSpeechVoices: false
+            ),
+            CuriumHardwareProfileVariant(
+                id: "\(poolID)-m4max-16c-32g-2560x1440",
+                poolID: poolID,
+                label: "Apple M4 Max · 16c · 32 GB · 2560×1440",
+                appliesToBothSlots: true,
+                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                model: "",
+                architecture: "arm",
+                bitness: "64",
+                navigatorPlatform: "MacIntel",
+                webglVendor: "Google Inc. (Apple)",
+                webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Max, Unspecified Version)",
+                webglProfile: .native,
+                screen: CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2560, availHeight: 1409, colorDepth: 24),
+                maxTouchPoints: 0,
+                pointerType: .fine,
+                hoverType: .hover,
+                pdfViewerEnabled: true,
+                hardwareConcurrency: 16,
+                deviceMemoryGB: 32,
+                fontProfile: .apple,
+                hideSpeechVoices: false
+            ),
+            CuriumHardwareProfileVariant(
+                id: "\(poolID)-m5max-18c-32g-2560x1440",
+                poolID: poolID,
+                label: "Apple M5 Max · 18c · 32 GB · 2560×1440",
+                appliesToBothSlots: true,
+                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                model: "",
+                architecture: "arm",
+                bitness: "64",
+                navigatorPlatform: "MacIntel",
+                webglVendor: "Google Inc. (Apple)",
+                webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Max, Unspecified Version)",
+                webglProfile: .native,
+                screen: CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2560, availHeight: 1409, colorDepth: 24),
+                maxTouchPoints: 0,
+                pointerType: .fine,
+                hoverType: .hover,
+                pdfViewerEnabled: true,
+                hardwareConcurrency: 18,
+                deviceMemoryGB: 32,
+                fontProfile: .apple,
+                hideSpeechVoices: false
+            ),
+        ]
+    }
 
-    static let linuxDesktop: [CuriumHardwareProfileVariant] = [
-        CuriumHardwareProfileVariant(
-            id: "linux-intel-adl-1080p",
-            poolID: CuriumFingerprintPresets.linuxDesktop.id,
-            label: "Mesa Intel ADL GT2 · 1920×1080",
-            appliesToBothSlots: true,
-            platformVersion: "",
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: "Linux x86_64",
-            webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL 4.6)",
-            webglProfile: .desktopLinux,
-            screen: CuriumScreenOverride(width: 1920, height: 1080, availWidth: 1920, availHeight: 1050, colorDepth: 24),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            fontProfile: .linux,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "linux-amd-rx6700xt-1440p",
-            poolID: CuriumFingerprintPresets.linuxDesktop.id,
-            label: "Mesa AMD RX 6700 XT · 2560×1440",
-            appliesToBothSlots: true,
-            platformVersion: "",
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: "Linux x86_64",
-            webglVendor: "Google Inc. (AMD)",
-            webglRenderer: "ANGLE (AMD, AMD Radeon RX 6700 XT (radeonsi, navi22, LLVM 18.1.3, DRM 3.57), OpenGL 4.6)",
-            webglProfile: .desktopLinux,
-            screen: CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2560, availHeight: 1410, colorDepth: 24),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 16,
-            deviceMemoryGB: 8,
-            fontProfile: .linux,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "linux-intel-tgl-1050p",
-            poolID: CuriumFingerprintPresets.linuxDesktop.id,
-            label: "Mesa Intel Xe TGL · 1680×1050",
-            appliesToBothSlots: true,
-            platformVersion: "",
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: "Linux x86_64",
-            webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Mesa Intel(R) Xe Graphics (TGL GT2), OpenGL 4.6)",
-            webglProfile: .desktopLinux,
-            screen: CuriumScreenOverride(width: 1680, height: 1050, availWidth: 1680, availHeight: 1020, colorDepth: 24),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 4,
-            deviceMemoryGB: 8,
-            fontProfile: .linux,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "linux-amd-rembrandt-1080p",
-            poolID: CuriumFingerprintPresets.linuxDesktop.id,
-            label: "Mesa AMD Rembrandt · 1920×1080",
-            appliesToBothSlots: true,
-            platformVersion: "",
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: "Linux x86_64",
-            webglVendor: "Google Inc. (AMD)",
-            webglRenderer: "ANGLE (AMD, AMD Radeon Graphics (radeonsi, rembrandt, LLVM 18.1.3, DRM 3.57), OpenGL 4.6)",
-            webglProfile: .desktopLinux,
-            screen: CuriumScreenOverride(width: 1920, height: 1080, availWidth: 1920, availHeight: 1050, colorDepth: 24),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 12,
-            deviceMemoryGB: 8,
-            fontProfile: .linux,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "linux-intel-uhd770-1440p",
-            poolID: CuriumFingerprintPresets.linuxDesktop.id,
-            label: "Mesa Intel UHD 770 · 2560×1440",
-            appliesToBothSlots: true,
-            platformVersion: "",
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: "Linux x86_64",
-            webglVendor: "Google Inc. (Intel)",
-            webglRenderer: "ANGLE (Intel, Mesa Intel(R) UHD Graphics 770 (ADL-S GT1), OpenGL 4.6)",
-            webglProfile: .desktopLinux,
-            screen: CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2560, availHeight: 1410, colorDepth: 24),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 12,
-            deviceMemoryGB: 8,
-            fontProfile: .linux,
-            hideSpeechVoices: true
-        ),
-    ]
-
-    static let macosDesktop: [CuriumHardwareProfileVariant] = [
-        CuriumHardwareProfileVariant(
-            id: "macos-apple-m1-1440x900",
-            poolID: CuriumFingerprintPresets.macosDesktopFirst.id,
-            label: "Apple M1 · 1440×900",
-            appliesToBothSlots: true,
-            platformVersion: nil,
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: nil,
-            webglVendor: "Google Inc. (Apple)",
-            webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
-            webglProfile: .desktopMacOS,
-            screen: CuriumScreenOverride(width: 1440, height: 900, availWidth: 1440, availHeight: 875, colorDepth: 30),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            fontProfile: .apple,
-            hideSpeechVoices: nil
-        ),
-        CuriumHardwareProfileVariant(
-            id: "macos-apple-m2-1470x956",
-            poolID: CuriumFingerprintPresets.macosDesktopFirst.id,
-            label: "Apple M2 · 1470×956",
-            appliesToBothSlots: true,
-            platformVersion: nil,
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: nil,
-            webglVendor: "Google Inc. (Apple)",
-            webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
-            webglProfile: .desktopMacOS,
-            screen: CuriumScreenOverride(width: 1470, height: 956, availWidth: 1470, availHeight: 919, colorDepth: 30),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            fontProfile: .apple,
-            hideSpeechVoices: nil
-        ),
-        CuriumHardwareProfileVariant(
-            id: "macos-apple-m3-1512x982",
-            poolID: CuriumFingerprintPresets.macosDesktopFirst.id,
-            label: "Apple M3 · 1512×982",
-            appliesToBothSlots: true,
-            platformVersion: nil,
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: nil,
-            webglVendor: "Google Inc. (Apple)",
-            webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)",
-            webglProfile: .desktopMacOS,
-            screen: CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 944, colorDepth: 30),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            fontProfile: .apple,
-            hideSpeechVoices: nil
-        ),
-        CuriumHardwareProfileVariant(
-            id: "macos-apple-m3pro-1728x1117",
-            poolID: CuriumFingerprintPresets.macosDesktopFirst.id,
-            label: "Apple M3 Pro · 1728×1117",
-            appliesToBothSlots: true,
-            platformVersion: nil,
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: nil,
-            webglVendor: "Google Inc. (Apple)",
-            webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Pro, Unspecified Version)",
-            webglProfile: .desktopMacOS,
-            screen: CuriumScreenOverride(width: 1728, height: 1117, availWidth: 1728, availHeight: 1079, colorDepth: 30),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 12,
-            deviceMemoryGB: 8,
-            fontProfile: .apple,
-            hideSpeechVoices: nil
-        ),
-        CuriumHardwareProfileVariant(
-            id: "macos-apple-m4-1680x1050",
-            poolID: CuriumFingerprintPresets.macosDesktopFirst.id,
-            label: "Apple M4 · 1680×1050",
-            appliesToBothSlots: true,
-            platformVersion: nil,
-            model: nil,
-            architecture: nil,
-            bitness: nil,
-            navigatorPlatform: nil,
-            webglVendor: "Google Inc. (Apple)",
-            webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)",
-            webglProfile: .desktopMacOS,
-            screen: CuriumScreenOverride(width: 1680, height: 1050, availWidth: 1680, availHeight: 1012, colorDepth: 30),
-            maxTouchPoints: 0,
-            pointerType: .fine,
-            hoverType: .hover,
-            pdfViewerEnabled: true,
-            hardwareConcurrency: 10,
-            deviceMemoryGB: 8,
-            fontProfile: .apple,
-            hideSpeechVoices: nil
-        ),
-    ]
-
-    static let pixelAndroid: [CuriumHardwareProfileVariant] = [
-        CuriumHardwareProfileVariant(
-            id: "android-pixel-9",
-            poolID: CuriumFingerprintPresets.pixelAndroid.id,
-            label: "Pixel 9 · 412×915",
-            appliesToBothSlots: false,
-            platformVersion: "15.0.0",
-            model: "Pixel 9",
-            architecture: "",
-            bitness: "",
-            navigatorPlatform: "Linux armv81",
-            webglVendor: "Google Inc. (ARM)",
-            webglRenderer: "ANGLE (ARM, Mali-G715, OpenGL ES 3.2)",
-            webglProfile: .mobileAndroid,
-            screen: CuriumScreenOverride(width: 412, height: 915, availWidth: 412, availHeight: 915, colorDepth: 24),
-            maxTouchPoints: nil,
-            pointerType: nil,
-            hoverType: nil,
-            pdfViewerEnabled: nil,
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            fontProfile: .android,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "android-pixel-9-pro",
-            poolID: CuriumFingerprintPresets.pixelAndroid.id,
-            label: "Pixel 9 Pro · 427×952",
-            appliesToBothSlots: false,
-            platformVersion: "15.0.0",
-            model: "Pixel 9 Pro",
-            architecture: "",
-            bitness: "",
-            navigatorPlatform: "Linux armv81",
-            webglVendor: "Google Inc. (ARM)",
-            webglRenderer: "ANGLE (ARM, Mali-G715-Immortalis MC7, OpenGL ES 3.2)",
-            webglProfile: .mobileAndroid,
-            screen: CuriumScreenOverride(width: 427, height: 952, availWidth: 427, availHeight: 952, colorDepth: 24),
-            maxTouchPoints: nil,
-            pointerType: nil,
-            hoverType: nil,
-            pdfViewerEnabled: nil,
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            fontProfile: .android,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "android-pixel-8a",
-            poolID: CuriumFingerprintPresets.pixelAndroid.id,
-            label: "Pixel 8a · 412×915",
-            appliesToBothSlots: false,
-            platformVersion: "15.0.0",
-            model: "Pixel 8a",
-            architecture: "",
-            bitness: "",
-            navigatorPlatform: "Linux armv81",
-            webglVendor: "Google Inc. (ARM)",
-            webglRenderer: "ANGLE (ARM, Mali-G715 MC7, OpenGL ES 3.2)",
-            webglProfile: .mobileAndroid,
-            screen: CuriumScreenOverride(width: 412, height: 915, availWidth: 412, availHeight: 915, colorDepth: 24),
-            maxTouchPoints: nil,
-            pointerType: nil,
-            hoverType: nil,
-            pdfViewerEnabled: nil,
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            fontProfile: .android,
-            hideSpeechVoices: true
-        ),
-        CuriumHardwareProfileVariant(
-            id: "android-galaxy-s24",
-            poolID: CuriumFingerprintPresets.pixelAndroid.id,
-            label: "Galaxy S24 (SM-S921B) · 360×780",
-            appliesToBothSlots: false,
-            platformVersion: "15.0.0",
-            model: "SM-S921B",
-            architecture: "",
-            bitness: "",
-            navigatorPlatform: "Linux armv81",
-            webglVendor: "Google Inc. (Qualcomm)",
-            webglRenderer: "ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2)",
-            webglProfile: .mobileAndroid,
-            screen: CuriumScreenOverride(width: 360, height: 780, availWidth: 360, availHeight: 780, colorDepth: 24),
-            maxTouchPoints: nil,
-            pointerType: nil,
-            hoverType: nil,
-            pdfViewerEnabled: nil,
-            hardwareConcurrency: 8,
-            deviceMemoryGB: 8,
-            fontProfile: .android,
-            hideSpeechVoices: true
-        ),
-    ]
-
-    /// Coherent non-Apple Android 15 Reduced-UA hardware variants (`model == ""`) shared
-    /// by `Authentic Chrome` (`"default"`) and `Privacy Hardened` (`"privacy-hardened"`).
-    /// Applies strictly to the `mobile` slot so the `desktop` macOS slot stays native Apple.
-    private static func makeAndroidStandardVariants(poolID: String) -> [CuriumHardwareProfileVariant] {
+    /// Coherent non-Apple Android 15 Mobile Chrome 158 variants with explicit `webglProfile: .native`
+    /// so WebGL extension stripping never triggers false-positive virtual machine penalties.
+    private static func makeAndroidMobileVariants(poolID: String) -> [CuriumHardwareProfileVariant] {
         [
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-adreno750-412x915",
                 poolID: poolID,
-                label: "Qualcomm Adreno 750 · 412×915",
+                label: "Qualcomm Adreno 750 · 8c · 8 GB · 412×915",
                 appliesToBothSlots: false,
-                platformVersion: "15.0.0",
+                platformVersion: CuriumChromeStableBaseline.androidPlatformVersion,
                 model: "",
                 architecture: "",
                 bitness: "",
                 navigatorPlatform: "Linux armv81",
                 webglVendor: "Google Inc. (Qualcomm)",
                 webglRenderer: "ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2)",
-                webglProfile: .mobileAndroid,
+                webglProfile: .native,
                 screen: CuriumScreenOverride(width: 412, height: 915, availWidth: 412, availHeight: 915, colorDepth: 24),
                 maxTouchPoints: nil,
                 pointerType: nil,
@@ -1044,16 +650,16 @@ enum CuriumFingerprintDevicePools {
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-mali-g715-412x915",
                 poolID: poolID,
-                label: "ARM Mali-G715 · 412×915",
+                label: "ARM Mali-G715 · 8c · 8 GB · 412×915",
                 appliesToBothSlots: false,
-                platformVersion: "15.0.0",
+                platformVersion: CuriumChromeStableBaseline.androidPlatformVersion,
                 model: "",
                 architecture: "",
                 bitness: "",
                 navigatorPlatform: "Linux armv81",
                 webglVendor: "Google Inc. (ARM)",
                 webglRenderer: "ANGLE (ARM, Mali-G715, OpenGL ES 3.2)",
-                webglProfile: .mobileAndroid,
+                webglProfile: .native,
                 screen: CuriumScreenOverride(width: 412, height: 915, availWidth: 412, availHeight: 915, colorDepth: 24),
                 maxTouchPoints: nil,
                 pointerType: nil,
@@ -1067,16 +673,16 @@ enum CuriumFingerprintDevicePools {
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-adreno740-393x873",
                 poolID: poolID,
-                label: "Qualcomm Adreno 740 · 393×873",
+                label: "Qualcomm Adreno 740 · 8c · 8 GB · 393×873",
                 appliesToBothSlots: false,
-                platformVersion: "15.0.0",
+                platformVersion: CuriumChromeStableBaseline.androidPlatformVersion,
                 model: "",
                 architecture: "",
                 bitness: "",
                 navigatorPlatform: "Linux armv81",
                 webglVendor: "Google Inc. (Qualcomm)",
                 webglRenderer: "ANGLE (Qualcomm, Adreno (TM) 740, OpenGL ES 3.2)",
-                webglProfile: .mobileAndroid,
+                webglProfile: .native,
                 screen: CuriumScreenOverride(width: 393, height: 873, availWidth: 393, availHeight: 873, colorDepth: 24),
                 maxTouchPoints: nil,
                 pointerType: nil,
@@ -1090,16 +696,16 @@ enum CuriumFingerprintDevicePools {
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-adreno730-360x800",
                 poolID: poolID,
-                label: "Qualcomm Adreno 730 · 360×800",
+                label: "Qualcomm Adreno 730 · 8c · 4 GB · 360×800",
                 appliesToBothSlots: false,
-                platformVersion: "15.0.0",
+                platformVersion: CuriumChromeStableBaseline.androidPlatformVersion,
                 model: "",
                 architecture: "",
                 bitness: "",
                 navigatorPlatform: "Linux armv81",
                 webglVendor: "Google Inc. (Qualcomm)",
                 webglRenderer: "ANGLE (Qualcomm, Adreno (TM) 730, OpenGL ES 3.2)",
-                webglProfile: .mobileAndroid,
+                webglProfile: .native,
                 screen: CuriumScreenOverride(width: 360, height: 800, availWidth: 360, availHeight: 800, colorDepth: 24),
                 maxTouchPoints: nil,
                 pointerType: nil,
@@ -1111,19 +717,42 @@ enum CuriumFingerprintDevicePools {
                 hideSpeechVoices: true
             ),
             CuriumHardwareProfileVariant(
-                id: "\(poolID)-mali-g720-412x915",
+                id: "\(poolID)-pixel9-mali-412x915",
                 poolID: poolID,
-                label: "ARM Mali-G720-Immortalis · 412×915",
+                label: "Pixel 9 · Mali-G715 MC7 · 8 GB · 412×915",
                 appliesToBothSlots: false,
-                platformVersion: "15.0.0",
-                model: "",
+                platformVersion: CuriumChromeStableBaseline.androidPlatformVersion,
+                model: "Pixel 9",
                 architecture: "",
                 bitness: "",
                 navigatorPlatform: "Linux armv81",
                 webglVendor: "Google Inc. (ARM)",
-                webglRenderer: "ANGLE (ARM, Mali-G720-Immortalis MC12, OpenGL ES 3.2)",
-                webglProfile: .mobileAndroid,
+                webglRenderer: "ANGLE (ARM, Mali-G715-Immortalis MC7, OpenGL ES 3.2)",
+                webglProfile: .native,
                 screen: CuriumScreenOverride(width: 412, height: 915, availWidth: 412, availHeight: 915, colorDepth: 24),
+                maxTouchPoints: nil,
+                pointerType: nil,
+                hoverType: nil,
+                pdfViewerEnabled: nil,
+                hardwareConcurrency: 8,
+                deviceMemoryGB: 8,
+                fontProfile: .android,
+                hideSpeechVoices: true
+            ),
+            CuriumHardwareProfileVariant(
+                id: "\(poolID)-galaxys25-adreno830-360x780",
+                poolID: poolID,
+                label: "Galaxy S25 · Adreno 830 · 8 GB · 360×780",
+                appliesToBothSlots: false,
+                platformVersion: CuriumChromeStableBaseline.androidPlatformVersion,
+                model: "SM-S931B",
+                architecture: "",
+                bitness: "",
+                navigatorPlatform: "Linux armv81",
+                webglVendor: "Google Inc. (Qualcomm)",
+                webglRenderer: "ANGLE (Qualcomm, Adreno (TM) 830, OpenGL ES 3.2)",
+                webglProfile: .native,
+                screen: CuriumScreenOverride(width: 360, height: 780, availWidth: 360, availHeight: 780, colorDepth: 24),
                 maxTouchPoints: nil,
                 pointerType: nil,
                 hoverType: nil,
@@ -1136,19 +765,19 @@ enum CuriumFingerprintDevicePools {
         ]
     }
 
-    static let androidAuthenticChrome: [CuriumHardwareProfileVariant] =
-        makeAndroidStandardVariants(poolID: CuriumFingerprintPresets.defaultAuthenticChrome.id)
+    static let macosDesktop: [CuriumHardwareProfileVariant] =
+        makeMacOSAppleSiliconVariants(poolID: CuriumFingerprintPresets.macosDesktopFirst.id)
 
-    static let androidPrivacyHardened: [CuriumHardwareProfileVariant] =
-        makeAndroidStandardVariants(poolID: CuriumFingerprintPresets.privacyHardened.id)
+    static let macosPrivacyHardened: [CuriumHardwareProfileVariant] =
+        makeMacOSAppleSiliconVariants(poolID: CuriumFingerprintPresets.privacyHardened.id)
+
+    static let androidAuthenticChrome: [CuriumHardwareProfileVariant] =
+        makeAndroidMobileVariants(poolID: CuriumFingerprintPresets.defaultAuthenticChrome.id)
 
     static let allPools: [String: [CuriumHardwareProfileVariant]] = [
-        CuriumFingerprintPresets.defaultAuthenticChrome.id: androidAuthenticChrome,
-        CuriumFingerprintPresets.privacyHardened.id: androidPrivacyHardened,
-        CuriumFingerprintPresets.windowsWorkstation.id: windowsWorkstation,
-        CuriumFingerprintPresets.linuxDesktop.id: linuxDesktop,
         CuriumFingerprintPresets.macosDesktopFirst.id: macosDesktop,
-        CuriumFingerprintPresets.pixelAndroid.id: pixelAndroid,
+        CuriumFingerprintPresets.defaultAuthenticChrome.id: androidAuthenticChrome,
+        CuriumFingerprintPresets.privacyHardened.id: macosPrivacyHardened,
     ]
 
     static func variants(forTemplateID templateID: String?) -> [CuriumHardwareProfileVariant] {
@@ -1159,6 +788,19 @@ enum CuriumFingerprintDevicePools {
         return allPools[key] ?? []
     }
 
+    static func variant(forTemplateID templateID: String?, variantID: String?) -> CuriumHardwareProfileVariant? {
+        guard let targetID = variantID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !targetID.isEmpty else {
+            return nil
+        }
+        return variants(forTemplateID: templateID).first { $0.id.lowercased() == targetID }
+    }
+
+    static func variants(forProfile profile: CuriumFingerprintProfile) -> [CuriumHardwareProfileVariant] {
+        guard let poolID = poolID(for: profile) else { return [] }
+        return variants(forTemplateID: poolID)
+    }
+
     static func poolID(for profile: CuriumFingerprintProfile) -> String? {
         let templateKey = profile.templateID?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1166,23 +808,14 @@ enum CuriumFingerprintDevicePools {
         let primarySlot = profile.defaultSlot == .desktop ? profile.desktop : profile.mobile
         let platformPool: String?
         switch primarySlot.platform {
-        case "Windows":
-            platformPool = CuriumFingerprintPresets.windowsWorkstation.id
-        case "Linux":
-            platformPool = CuriumFingerprintPresets.linuxDesktop.id
         case "macOS":
-            platformPool = CuriumFingerprintPresets.macosDesktopFirst.id
-        case "Android":
-            let hasModel = primarySlot.model?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .isEmpty == false
-            if hasModel {
-                platformPool = CuriumFingerprintPresets.pixelAndroid.id
-            } else if templateKey == CuriumFingerprintPresets.privacyHardened.id {
+            if templateKey == CuriumFingerprintPresets.privacyHardened.id {
                 platformPool = CuriumFingerprintPresets.privacyHardened.id
             } else {
-                platformPool = CuriumFingerprintPresets.defaultAuthenticChrome.id
+                platformPool = CuriumFingerprintPresets.macosDesktopFirst.id
             }
+        case "Android":
+            platformPool = CuriumFingerprintPresets.defaultAuthenticChrome.id
         default:
             platformPool = nil
         }
@@ -1248,7 +881,7 @@ enum CuriumFingerprintDevicePools {
     }
 }
 
-/// Curated creation template wrapping one of the 7 built-in fingerprint archetypes.
+/// Curated creation template wrapping one of the verified fingerprint archetypes.
 /// Templates are never persisted as live profiles until instantiated by the user.
 struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
     let id: String
@@ -1261,67 +894,31 @@ struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
 
     static let allTemplates: [CuriumProfileTemplate] = [
         CuriumProfileTemplate(
+            id: CuriumFingerprintPresets.macosDesktopFirst.id,
+            title: "macOS Desktop (Apple Silicon)",
+            subtitle: "Chrome 158 Stable on native Apple Silicon (M1–M5 Max, 8–32 GB RAM). Strongest cross-signal match.",
+            badge: "Recommended",
+            defaultSymbolName: "laptopcomputer",
+            defaultPalette: .neptunium,
+            baseProfile: CuriumFingerprintPresets.macosDesktopFirst
+        ),
+        CuriumProfileTemplate(
             id: CuriumFingerprintPresets.defaultAuthenticChrome.id,
-            title: "Authentic Chrome",
-            subtitle: "Android 15 Mobile (non-Apple GPU, screen & fonts) + macOS Desktop.",
-            badge: "Standard",
+            title: "Mobile Chrome (Android 15)",
+            subtitle: "Chrome 158 Stable mobile layout (Adreno/Mali GPU, native WebGL profile, 8 GB RAM) + macOS Desktop slot.",
+            badge: "Mobile",
             defaultSymbolName: "person.crop.circle",
             defaultPalette: .violet,
             baseProfile: CuriumFingerprintPresets.defaultAuthenticChrome
         ),
         CuriumProfileTemplate(
             id: CuriumFingerprintPresets.privacyHardened.id,
-            title: "Privacy Hardened",
-            subtitle: "Android 15 Mobile with non-Apple GPU/fonts, per-site farbling, GPC, and WebRTC UDP off.",
+            title: "Privacy Hardened (macOS)",
+            subtitle: "macOS Chrome 158 Stable with per-site farbling, Global Privacy Control, and non-proxied WebRTC UDP off.",
             badge: "Private",
             defaultSymbolName: "shield.lefthalf.filled",
             defaultPalette: .thorium,
             baseProfile: CuriumFingerprintPresets.privacyHardened
-        ),
-        CuriumProfileTemplate(
-            id: CuriumFingerprintPresets.macosDesktopFirst.id,
-            title: "macOS Desktop",
-            subtitle: "macOS arm64 Chrome across all tabs and workers with native Apple Silicon.",
-            badge: "Desktop",
-            defaultSymbolName: "laptopcomputer",
-            defaultPalette: .neptunium,
-            baseProfile: CuriumFingerprintPresets.macosDesktopFirst
-        ),
-        CuriumProfileTemplate(
-            id: CuriumFingerprintPresets.iosBlinkAuthentic.id,
-            title: "iOS Mobile + macOS",
-            subtitle: "iOS 18.7 mobile UA with macOS desktop slot and native Apple hardware.",
-            badge: "Mobile",
-            defaultSymbolName: "iphone",
-            defaultPalette: .californium,
-            baseProfile: CuriumFingerprintPresets.iosBlinkAuthentic
-        ),
-        CuriumProfileTemplate(
-            id: CuriumFingerprintPresets.windowsWorkstation.id,
-            title: "Windows 11 Workstation",
-            subtitle: "Windows x64 desktop with 1080p screen, font filtering, and Intel ANGLE GPU.",
-            badge: "Work",
-            defaultSymbolName: "desktopcomputer",
-            defaultPalette: .americium,
-            baseProfile: CuriumFingerprintPresets.windowsWorkstation
-        ),
-        CuriumProfileTemplate(
-            id: CuriumFingerprintPresets.linuxDesktop.id,
-            title: "Linux Desktop",
-            subtitle: "Linux x86_64 workstation with Linux font filtering and Mesa Intel WebGL.",
-            badge: "Dev",
-            defaultSymbolName: "terminal",
-            defaultPalette: .thorium,
-            baseProfile: CuriumFingerprintPresets.linuxDesktop
-        ),
-        CuriumProfileTemplate(
-            id: CuriumFingerprintPresets.pixelAndroid.id,
-            title: "Pixel 9 Android",
-            subtitle: "Pixel 9 Android 15 Reduced UA with Mali/Adreno GPU, screen, and Android font filtering.",
-            badge: "Android",
-            defaultSymbolName: "globe",
-            defaultPalette: .berkelium,
-            baseProfile: CuriumFingerprintPresets.pixelAndroid
         ),
     ]
 
@@ -1331,6 +928,10 @@ struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
 
     var hardwareVariantCount: Int {
         CuriumFingerprintDevicePools.variants(forTemplateID: id).count
+    }
+
+    var supportsNativeHardwareBaseline: Bool {
+        baseProfile.usesNativeHardwareAndGPU
     }
 
     static func template(for id: String?) -> CuriumProfileTemplate? {
@@ -1350,6 +951,7 @@ struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
         searchEngine: CuriumSearchEngine? = nil,
         enableFarbling: Bool = true,
         randomizeHardwareVariant: Bool = true,
+        hardwareVariantID: String? = nil,
         avoidingExisting existingProfiles: [CuriumFingerprintProfile] = [],
         proxy: CuriumProxyConfig? = nil,
         timezone: String? = nil,
@@ -1371,13 +973,18 @@ struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
         profile.createdAt = now
         profile.lastUsedAt = nil
 
-        if randomizeHardwareVariant,
-           hasHardwareVariantPool,
-           let variant = CuriumFingerprintDevicePools.selectVariant(
-               forPoolID: self.id,
-               avoiding: existingProfiles,
-               excluding: nil
-           ) {
+        if let explicitVariant = CuriumFingerprintDevicePools.variant(
+            forTemplateID: self.id,
+            variantID: hardwareVariantID
+        ) {
+            profile = explicitVariant.apply(to: profile)
+        } else if randomizeHardwareVariant,
+                  hasHardwareVariantPool,
+                  let variant = CuriumFingerprintDevicePools.selectVariant(
+                      forPoolID: self.id,
+                      avoiding: existingProfiles,
+                      excluding: nil
+                  ) {
             profile = variant.apply(to: profile)
         }
 

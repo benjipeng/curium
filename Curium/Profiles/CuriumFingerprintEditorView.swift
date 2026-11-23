@@ -736,10 +736,26 @@ struct CuriumFingerprintEditorView: View {
             ))
             .accessibilityIdentifier("curium.editor.hwOverride")
 
-            if CuriumFingerprintPresets.rollCoherentHardwareVariant(
-                for: draft,
-                avoiding: store.profiles.filter { $0.id != draft.id }
-            ) != nil {
+            let poolVariants = CuriumFingerprintDevicePools.variants(forProfile: draft)
+            if !poolVariants.isEmpty {
+                Menu {
+                    ForEach(poolVariants) { variant in
+                        Button {
+                            draft = variant.apply(to: draft)
+                            hardwareOverrideEnabled = !draft.usesNativeHardwareAndGPU
+                        } label: {
+                            if variant.matches(draft) {
+                                Label(variant.label, systemImage: "checkmark")
+                            } else {
+                                Text(variant.label)
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Choose Hardware Variant…", systemImage: "cpu")
+                }
+                .accessibilityIdentifier("curium.editor.chooseHardware")
+
                 Button {
                     if let rolled = CuriumFingerprintPresets.rollCoherentHardwareVariant(
                         for: draft,
@@ -773,7 +789,7 @@ struct CuriumFingerprintEditorView: View {
             } else {
                 Picker("CPU Cores", selection: $draft.hardware.hardwareConcurrency) {
                     Text("Native Device").tag(Int?.none)
-                    ForEach([2, 4, 6, 8, 10, 12, 16, 24, 32], id: \.self) { count in
+                    ForEach([2, 4, 6, 8, 10, 12, 14, 16, 18, 24, 32], id: \.self) { count in
                         Text("\(count) cores").tag(Int?.some(count))
                     }
                 }
@@ -809,6 +825,30 @@ struct CuriumFingerprintEditorView: View {
                     Button("Clear WebGL (Native Apple Metal)") {
                         applyWebGLPreset(vendor: nil, renderer: nil)
                     }
+                    Button("Apple M1 (macOS Metal)") {
+                        applyAppleSiliconWebGLPreset(chip: "Apple M1")
+                    }
+                    Button("Apple M2 (macOS Metal)") {
+                        applyAppleSiliconWebGLPreset(chip: "Apple M2")
+                    }
+                    Button("Apple M3 (macOS Metal)") {
+                        applyAppleSiliconWebGLPreset(chip: "Apple M3")
+                    }
+                    Button("Apple M3 Pro (macOS Metal)") {
+                        applyAppleSiliconWebGLPreset(chip: "Apple M3 Pro")
+                    }
+                    Button("Apple M4 (macOS Metal)") {
+                        applyAppleSiliconWebGLPreset(chip: "Apple M4")
+                    }
+                    Button("Apple M4 Pro (macOS Metal)") {
+                        applyAppleSiliconWebGLPreset(chip: "Apple M4 Pro")
+                    }
+                    Button("Apple M4 Max (macOS Metal)") {
+                        applyAppleSiliconWebGLPreset(chip: "Apple M4 Max")
+                    }
+                    Button("Apple M5 Max (macOS Metal)") {
+                        applyAppleSiliconWebGLPreset(chip: "Apple M5 Max")
+                    }
                     Button("Qualcomm Adreno 750 (Android Mobile)") {
                         applyMobileWebGLPreset(
                             vendor: "Google Inc. (Qualcomm)",
@@ -819,24 +859,6 @@ struct CuriumFingerprintEditorView: View {
                         applyMobileWebGLPreset(
                             vendor: "Google Inc. (ARM)",
                             renderer: "ANGLE (ARM, Mali-G715, OpenGL ES 3.2)"
-                        )
-                    }
-                    Button("Intel Iris Xe (Windows D3D11)") {
-                        applyWebGLPreset(
-                            vendor: "Google Inc. (Intel)",
-                            renderer: "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"
-                        )
-                    }
-                    Button("Mesa Intel ADL GT2 (Linux OpenGL)") {
-                        applyWebGLPreset(
-                            vendor: "Google Inc. (Intel)",
-                            renderer: "ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL 4.6)"
-                        )
-                    }
-                    Button("NVIDIA RTX 4070 (Windows D3D11)") {
-                        applyWebGLPreset(
-                            vendor: "Google Inc. (NVIDIA)",
-                            renderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)"
                         )
                     }
                 } label: {
@@ -1105,12 +1127,25 @@ struct CuriumFingerprintEditorView: View {
         draft.desktop.webglRenderer = renderer
     }
 
+    private func applyAppleSiliconWebGLPreset(chip: String) {
+        let vendor = "Google Inc. (Apple)"
+        let renderer = "ANGLE (Apple, ANGLE Metal Renderer: \(chip), Unspecified Version)"
+        draft.desktop.webglVendor = vendor
+        draft.desktop.webglRenderer = renderer
+        draft.desktop.webglProfile = .native
+        if draft.mobile.mobile != true {
+            draft.mobile.webglVendor = vendor
+            draft.mobile.webglRenderer = renderer
+            draft.mobile.webglProfile = .native
+        }
+    }
+
     private func applyMobileWebGLPreset(vendor: String, renderer: String) {
         draft.mobile.webglVendor = vendor
         draft.mobile.webglRenderer = renderer
-        if draft.mobile.webglProfile == nil || draft.mobile.webglProfile == .native {
-            draft.mobile.webglProfile = .mobileAndroid
-        }
+        // Explicitly preserve native WebGL extension exposure; `.mobileAndroid` extension
+        // stripping triggers +11 virtual-machine false positives on Blink-on-iOS.
+        draft.mobile.webglProfile = .native
     }
 
     private func selectCurrentProfile() {

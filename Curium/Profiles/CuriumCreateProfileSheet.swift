@@ -1,9 +1,12 @@
 import SwiftUI
 
 /// Guided local profile creation sheet with live persona preview, curated 16-symbol
-/// icon grid, 6 actinide accent swatches, 7 fingerprint archetypes, per-profile
-/// farbling & hardware variant controls, optional proxy/locale, and defaults.
+/// icon grid, 6 actinide accent swatches, verified Chrome 158 fingerprint archetypes,
+/// selectable chip/RAM/screen hardware variants, optional proxy/locale, and defaults.
 struct CuriumCreateProfileSheet: View {
+    private static let autoDistinctVariantTag = "__auto_distinct__"
+    private static let nativeHardwareTag = "__native_hw__"
+
     private enum ProxyModeChoice: String, CaseIterable, Identifiable {
         case system
         case direct
@@ -89,13 +92,13 @@ struct CuriumCreateProfileSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var displayName = ""
-    @State private var selectedTemplateID: String = CuriumProfileTemplate.allTemplates.first?.id ?? "default"
-    @State private var selectedSymbol: String = CuriumProfileTemplate.allTemplates.first?.defaultSymbolName ?? "person.crop.circle"
-    @State private var selectedPalette: CuriumPalette = CuriumProfileTemplate.allTemplates.first?.defaultPalette ?? .violet
+    @State private var selectedTemplateID: String = CuriumProfileTemplate.allTemplates.first?.id ?? "macos-desktop"
+    @State private var selectedSymbol: String = CuriumProfileTemplate.allTemplates.first?.defaultSymbolName ?? "laptopcomputer"
+    @State private var selectedPalette: CuriumPalette = CuriumProfileTemplate.allTemplates.first?.defaultPalette ?? .neptunium
     @State private var userPickedSymbol = false
     @State private var userPickedPalette = false
     @State private var enableFarbling = true
-    @State private var randomizeHardwareVariant = true
+    @State private var selectedHardwareChoice: String = CuriumCreateProfileSheet.autoDistinctVariantTag
     @State private var isNetworkLocaleExpanded = false
     @State private var proxyModeSelection: ProxyModeChoice = .system
     @State private var fixedProxyRules = ""
@@ -358,6 +361,7 @@ struct CuriumCreateProfileSheet: View {
                 let isSelected = selectedTemplateID == template.id
                 Button {
                     selectedTemplateID = template.id
+                    selectedHardwareChoice = Self.autoDistinctVariantTag
                     if !userPickedSymbol {
                         selectedSymbol = template.defaultSymbolName
                     }
@@ -424,20 +428,30 @@ struct CuriumCreateProfileSheet: View {
     }
 
     private var fingerprintProtectionSection: some View {
-        Section {
+        let poolVariants = CuriumFingerprintDevicePools.variants(forTemplateID: selectedTemplate.id)
+
+        return Section {
             Toggle("Unique Per-Site Farbling Seed", isOn: $enableFarbling)
                 .accessibilityIdentifier("curium.createProfile.farbling")
 
-            if selectedTemplate.hasHardwareVariantPool {
-                Toggle("Distinct Hardware & GPU Variant", isOn: $randomizeHardwareVariant)
-                    .accessibilityIdentifier("curium.createProfile.randomizeHW")
+            if !poolVariants.isEmpty {
+                Picker("Hardware & Chip", selection: $selectedHardwareChoice) {
+                    Text("Auto (Distinct Variant)").tag(Self.autoDistinctVariantTag)
+                    ForEach(poolVariants) { variant in
+                        Text(variant.label).tag(variant.id)
+                    }
+                    if selectedTemplate.supportsNativeHardwareBaseline {
+                        Text("Native Device Hardware").tag(Self.nativeHardwareTag)
+                    }
+                }
+                .accessibilityIdentifier("curium.createProfile.hardwareVariant")
             }
         } header: {
             Text("Fingerprint Protection")
         } footer: {
-            if selectedTemplate.hasHardwareVariantPool {
+            if !poolVariants.isEmpty {
                 Text(
-                    "Every new profile gets its own 256-bit deterministic farbling seed and a distinct realistic GPU, screen, and CPU variant so profiles stay separated across fingerprinting checks."
+                    "Choose Auto to assign a distinct chip, RAM tier, and display automatically, or pick an exact configuration (such as Apple M1–M5 Max with 8–32 GB RAM). Every new profile also gets its own 256-bit deterministic farbling seed."
                 )
             } else {
                 Text(
@@ -585,6 +599,19 @@ struct CuriumCreateProfileSheet: View {
         let timezone = selectedTimezone.isEmpty ? nil : selectedTimezone
         let languages = selectedLanguagePreset.tags
 
+        let randomizeVariant: Bool
+        let explicitVariantID: String?
+        if !selectedTemplate.hasHardwareVariantPool || selectedHardwareChoice == Self.nativeHardwareTag {
+            randomizeVariant = false
+            explicitVariantID = nil
+        } else if selectedHardwareChoice == Self.autoDistinctVariantTag {
+            randomizeVariant = true
+            explicitVariantID = nil
+        } else {
+            randomizeVariant = false
+            explicitVariantID = selectedHardwareChoice
+        }
+
         guard let created = fingerprintStore.createProfile(
             fromTemplate: selectedTemplateID,
             displayName: trimmedDisplayName,
@@ -593,7 +620,8 @@ struct CuriumCreateProfileSheet: View {
             siteMode: selectedSiteMode,
             searchEngine: selectedSearchEngine,
             enableFarbling: enableFarbling,
-            randomizeHardwareVariant: selectedTemplate.hasHardwareVariantPool ? randomizeHardwareVariant : false,
+            randomizeHardwareVariant: randomizeVariant,
+            hardwareVariantID: explicitVariantID,
             proxy: proxyConfig,
             timezone: timezone,
             languages: languages

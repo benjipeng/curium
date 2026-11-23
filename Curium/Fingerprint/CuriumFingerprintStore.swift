@@ -321,6 +321,7 @@ final class CuriumFingerprintStore {
         searchEngine: CuriumSearchEngine? = nil,
         enableFarbling: Bool = true,
         randomizeHardwareVariant: Bool = true,
+        hardwareVariantID: String? = nil,
         proxy: CuriumProxyConfig? = nil,
         timezone: String? = nil,
         languages: [String]? = nil
@@ -343,6 +344,7 @@ final class CuriumFingerprintStore {
             searchEngine: searchEngine,
             enableFarbling: enableFarbling,
             randomizeHardwareVariant: randomizeHardwareVariant,
+            hardwareVariantID: hardwareVariantID,
             avoidingExisting: profiles,
             proxy: proxy,
             timezone: timezone,
@@ -500,7 +502,7 @@ final class CuriumFingerprintStore {
             if retiredProfileIDs.contains(loweredID) {
                 report.errors.append("Profile ID \"\(normalized.id)\" was previously deleted and retired. Choose a different ID or create a new profile.")
             }
-            let builtInLowered = Set(CuriumFingerprintPresets.builtInIDs.map { $0.lowercased() })
+            let builtInLowered = Set(CuriumFingerprintPresets.reservedBuiltInIDs.map { $0.lowercased() })
             if builtInLowered.contains(loweredID) {
                 report.errors.append("Template ID \"\(normalized.id)\" is reserved for new profiles. Create from template or import with a fresh slug.")
             }
@@ -634,7 +636,7 @@ final class CuriumFingerprintStore {
             cachesRoot: cachesRoot ?? self.cachesRoot,
             curiumSupportRoot: self.curiumSupportRoot
         ).map { $0.lowercased() }
-        let builtInLowered = Set(CuriumFingerprintPresets.builtInIDs.map { $0.lowercased() })
+        let builtInLowered = Set(CuriumFingerprintPresets.reservedBuiltInIDs.map { $0.lowercased() })
         let occupiedLowered = Set(profiles.map { $0.id.lowercased() })
             .union(retiredProfileIDs)
             .union(builtInLowered)
@@ -668,7 +670,7 @@ final class CuriumFingerprintStore {
         if let newID {
             let trimmedNewID = newID.trimmingCharacters(in: .whitespacesAndNewlines)
             let loweredNew = trimmedNewID.lowercased()
-            let builtInLowered = Set(CuriumFingerprintPresets.builtInIDs.map { $0.lowercased() })
+            let builtInLowered = Set(CuriumFingerprintPresets.reservedBuiltInIDs.map { $0.lowercased() })
             guard CuriumFingerprintValidator.isValidProfileID(trimmedNewID),
                   loweredNew != "default",
                   !builtInLowered.contains(loweredNew),
@@ -885,7 +887,7 @@ final class CuriumFingerprintStore {
     }
 
     private func occupiedSlugsLowered() -> Set<String> {
-        let builtInLowered = Set(CuriumFingerprintPresets.builtInIDs.map { $0.lowercased() })
+        let builtInLowered = Set(CuriumFingerprintPresets.reservedBuiltInIDs.map { $0.lowercased() })
         return Set(profiles.map { $0.id.lowercased() })
             .union(retiredProfileIDs)
             .union(builtInLowered)
@@ -988,6 +990,7 @@ final class CuriumFingerprintStore {
         let builtInByLowered = Dictionary(
             uniqueKeysWithValues: CuriumFingerprintPresets.allBuiltIns.map { ($0.id.lowercased(), $0) }
         )
+        let reservedBuiltInLowered = Set(CuriumFingerprintPresets.reservedBuiltInIDs.map { $0.lowercased() })
 
         var migratedSeeds: Set<String> = []
         var result: [CuriumFingerprintProfile] = []
@@ -1000,7 +1003,8 @@ final class CuriumFingerprintStore {
             defaultProfile.id = "default"
             defaultProfile.isBuiltIn = false
             if defaultProfile.displayName.isEmpty
-                || defaultProfile.displayName == CuriumFingerprintPresets.defaultAuthenticChrome.displayName {
+                || defaultProfile.displayName == CuriumFingerprintPresets.defaultAuthenticChrome.displayName
+                || defaultProfile.displayName == CuriumFingerprintPresets.build39NativeBaseline.displayName {
                 defaultProfile.displayName = "Personal"
             }
             if defaultProfile.symbolName == nil { defaultProfile.symbolName = "person.crop.circle" }
@@ -1017,20 +1021,21 @@ final class CuriumFingerprintStore {
         }
         result.append(defaultProfile)
 
-        // 2. Stored custom profiles + conditionally promoted v1 built-ins.
+        // 2. Stored custom profiles + conditionally promoted v1 built-ins (including retired legacy slugs).
         for raw in decoded.profiles {
             let key = raw.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard !key.isEmpty, !seenLowered.contains(key) else { continue }
 
-            if let builtInPreset = builtInByLowered[key] {
+            if reservedBuiltInLowered.contains(key) {
                 let shouldPromote = (selectedLowered == key) || diskSlugsLowered.contains(key)
                 guard shouldPromote else { continue }
                 seenLowered.insert(key)
                 var promoted = raw.normalizedForPersistence()
-                promoted.id = builtInPreset.id
+                let canonicalID = builtInByLowered[key]?.id ?? key
+                promoted.id = canonicalID
                 promoted.isBuiltIn = false
-                promoted.templateID = promoted.templateID ?? builtInPreset.id
-                let template = CuriumProfileTemplate.template(for: builtInPreset.id)
+                promoted.templateID = promoted.templateID ?? canonicalID
+                let template = CuriumProfileTemplate.template(for: canonicalID)
                 if promoted.symbolName == nil {
                     promoted.symbolName = template?.defaultSymbolName ?? "person.crop.circle"
                 }
