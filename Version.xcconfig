@@ -1,6 +1,6 @@
 PRODUCT_BUNDLE_IDENTIFIER = com.appautomaton.curium
-MARKETING_VERSION = 0.1.13
-CURRENT_PROJECT_VERSION = 25
+MARKETING_VERSION = 0.1.14
+CURRENT_PROJECT_VERSION = 26
 
 // Resolve both SDKs from Xcode 27.2; simulator builds override SDKROOT.
 SDKROOT = iphoneos
