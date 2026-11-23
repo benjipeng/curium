@@ -8,21 +8,18 @@ the pinned engine first, translate to `patches/` once proven.
 ## Pinned
 
 - **Repository:** `benjipeng/curium` (renamed from `benjipeng/chromium-blink-ios`).
-- **Engine:** Build 41, `Kernel.lock` → `b95f677` (run `45092671606`, artifact
-  `14784534096`, Chromium `160.0.8171.0`), patches `0001`–`0110`, with separate
+- **Engine:** Build 42, `Kernel.lock` → `29fd035` (run `45112215845`, artifact
+  `14792713617`, Chromium `160.0.8171.0`), patches `0001`–`0110`, with separate
   unstripped symbols artifact (`Chromium-Blink-160.0.8171.0-arm64-symbols`, ID
-  `14784852087`). GHCR cache packages migrated to `ghcr.io/benjipeng/curium/*`.
-- **App / On `ac_duo`:** `Curium-0.1.11-b15-arm64.ipa` (Build 40 + native Swift
-  Fingerprint Profile Studio, `eb127cb`, verified on `iphone_duo_27_2` Simulator
-  and tested on `ac_duo` via LiveContainer). Previous `0.1.11-b17` (`57a095c`)
-  also verified on `ac_duo`.
-- **Local candidate:** `Curium-0.1.13-b23` on `feat/build-41-engine-wave`
-  (Build 41 downstream integration: retired `CuriumPiPHooks.{h,m}`, retired
-  `--disable-blink-features` permission-element workaround, retired `MAIN`-world
-  `pip_guard.js`, wired `schemaVersion: 2` native Blink anti-fingerprinting UI /
-  presets / validator, wired Build 41 PDFKit handoff flags & `CuriumMediaRadar`;
-  verified live with real Blink on `iphone_duo_27_2` Simulator, `sdk 27.2`,
-  `38/38` `CuriumTests` passing).
+  `14793005935`). GHCR cache packages migrated to `ghcr.io/benjipeng/curium/*`.
+- **App / On `ac_duo`:** `Curium-0.1.11-b15-arm64.ipa` (Build 40, `eb127cb`) /
+  `Curium-0.1.13-b23-arm64.ipa` (Build 41 staged in LiveContainer `Documents/`).
+- **Local candidate:** `Curium-0.1.13-b24` on `feat/build-41-engine-wave`
+  (Build 42 pinned + `httpMethod`/`.ts`/`.m4s` Media Radar filtering +
+  `Sendable` isolated-world JS evaluator wrapper; verified live with real Blink
+  on `iphone_duo_27_2` Simulator, `sdk 27.2`, `39/39` `CuriumTests` passing,
+  `21/21` real-Blink Build 42 assertions passing, Release ARM64 IPA packaged at
+  `dist/Curium-0.1.13-b24-arm64.ipa`).
 
 ## App (on the pinned engine)
 
@@ -124,43 +121,39 @@ permission element disable flag → `0107`) workarounds are retired.
 | `V8IOSJitPrepareForProcess` pre-`ChromeMain` probe (`CuriumRuntime.m`) | Prepares V8's iOS TXM / Simulator JIT pool before Crashpad installs exception handlers. | Permanent: shell-controlled JIT preference. |
 | `+[MetricsMediator logLaunchMetricsWithStartupInformation:connectedScenes:]` (`CuriumRuntime.m`) | No-op. Launch metrics walk Chrome's tab model for uploads Curium never makes. | None planned. |
 
-## Engine wave (Build 41 landed & pinned in `Kernel.lock`)
+## Engine wave (Build 42 landed & pinned in `Kernel.lock`)
 
-Built in run `45092671606` (`b95f677`) after green `graph-diagnose.yml` (`45090912166`, `47406 targets`, `169 device objects`).
+Built in run `45112215845` (`29fd035`) after green `graph-diagnose.yml` (`45111093963`, `172 device objects`, `0` errors).
 
 - [ ] **Verify smaller initial Wasm reservations on TXM (`ac_duo`, `0001`).**
-  Landed in Build 41 (`0001` targets at most 8 MiB for a module's first
+  Landed in Build 41/42 (`0001` targets at most 8 MiB for a module's first
   reservation; jump tables can require more). Simulator verified `256` JS ↔ Wasm
   calls under `Native MAP_JIT`. On physical `ac_duo`, compare a large module and
   repeated tab/worker loads against Build 40 before resizing the 64 MiB pool.
   This V8 pin requires global jitless for DrumBrake; crossing its committed-code
   cap is fatal.
-- [ ] **Build 42 kernel polish & Media Radar wave (drafted in `0108` + `0110`, pending CI build & pin).**
-  Audited `LGTM` across `104/104` patches (`324` pinned files):
-  1. `0110` `canvas_async_blob_creator.cc`: normalize owned unpremul export copy
-     to `kRGBA_8888_SkColorType` (guarding `RGBA8 || BGRA8` so HDR/`F16` stays
-     untouched) so Metal `HTMLCanvasElement.toBlob()` matches `toDataURL()` and
-     `OffscreenCanvas.convertToBlob()`.
-  2. `0110` `base_rendering_context_2d.cc`: hash null-checked resolved
-     `PrimaryFont()->PlatformData().Typeface()->getFamilyName()` (no CSS family
-     fallback) so blocked/missing fonts align to `0.0000 px`.
+- [x] **Build 42 kernel polish & Media Radar wave (`0108` + `0110`, run `45112215845`).**
+  Landed and verified live with real Blink on `iphone_duo_27_2` Simulator (`21/21`
+  real-Blink assertions passing):
+  1. `0110` `canvas_async_blob_creator.cc`: Metal `HTMLCanvasElement.toBlob()`,
+     `toDataURL()`, and `OffscreenCanvas.convertToBlob()` match byte-for-byte on
+     both `127.0.0.1` and `localhost` and diverge across sites (HDR/`F16` untouched).
+  2. `0110` `base_rendering_context_2d.cc`: `Menlo`, `Avenir`, and `__NoSuchFont__`
+     all match `monospace` to exact `0.0000 px` via `PrimaryFont()->PlatformData().Typeface()->getFamilyName()`.
   3. `0110` `screen.cc` + `curium_fingerprint_config.{h,cc}` + `local_dom_window.cc`:
-     use `RootWindowRect` physical DIPs (guarded on `page && View() && GetWidgetForLocalRoot()`),
-     trigger stretch on `avail_*` preserving `(avail_dx, avail_dy)`, and clamp
-     `outerWidth`/`outerHeight` (`base::ClampAdd(inner_h, 87)` on desktop).
-  4. `0110` `font_cache_ios.mm`: filter `family_name` in
-     `PlatformFallbackFontForCharacter` (`nullptr` when disallowed) to close the
-     CJK/non-Latin font-enumeration bypass without tofu.
-  5. `0110` `webgl_rendering_context_base.cc` + `analyser_node.cc`: support
-     `PACK_ROW_LENGTH`/`PACK_SKIP_*` with checked bounds + `GetError()`/`synthetic_errors_`
-     preservation around `ReadPixels`, and clamp `AnalyserNode` float farbling
-     to `frequencyBinCount()` / `fftSize()`.
+     `RootWindowRect` physical DIPs report exact `1920×1080` (`avail 1920×1040`,
+     `landscape-primary`, `outerH = 1040 <= availHeight`, `mqDeviceWidth1920 && mqDeviceHeight1080`)
+     even on folded portrait outer display without `<meta viewport>`.
+  4. `0110` `font_cache_ios.mm`: `"PingFang SC", Arial` matches `"__NoSuchFont__", Arial`
+     to exact `0.0000 px` on CJK/emoji with clean rendering and zero tofu.
+  5. `0110` `webgl_rendering_context_base.cc` + `analyser_node.cc`: `PACK_ROW_LENGTH`/
+     `PACK_SKIP_*` bounds + `GetError()`/`synthetic_errors_` preservation landed;
+     `AnalyserNode` frequency/time-domain tail sentinels verified 100% untouched.
   6. `0108` `curium_tab_host.mm` + `CrIOSBrowserHostV1.h` + `download_item_utils.{h,cc}` + `download_manager_impl.cc`:
-     expose `httpMethod` in `didLoadResourceEvent:`, add `@optional`
-     `evaluateJavaScriptInIsolatedWorld:allFrames:completion:` (world
-     `ISOLATED_WORLD_ID_CONTENT_END`, `WeakDocumentPtr` + `5s` weak `OneShotTimer`,
-     fenced/guest subtree pruning), and propagate authoritative `DownloadCreateInfo::method`
-     into `ContentDownloadTask`.
+     `httpMethod=GET` logged by Media Radar (filtering `POST` and `.ts`/`.m4s`),
+     `<form method="GET">` PDF opens directly in inline `PDFKit` preview (`Page 1 of 1`),
+     and `@optional` `evaluateJavaScriptInIsolatedWorld:allFrames:completion:` selector
+     compiled and wrapped in `CuriumTabModel`.
 - [x] **Unstripped framework symbols artifact (`0098`).** Landed Build 37.
 - [x] **Single-process extension coexistence (`0099`).** Landed Build 37.
 - [x] **Extension APIs & native permissions prompt (`0100`).** Landed Build 37.

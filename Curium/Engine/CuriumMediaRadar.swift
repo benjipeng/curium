@@ -16,6 +16,7 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
     let url: URL
     let originalURL: URL?
     let mimeType: String?
+    let httpMethod: String?
     let httpStatusCode: Int
     let contentLength: Int64
     let requestDestination: String
@@ -34,6 +35,14 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
         guard let url = raw["url"] as? URL,
               let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
+            return nil
+        }
+
+        let rawMethod = (raw["httpMethod"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        let httpMethod = (rawMethod?.isEmpty == false) ? rawMethod : nil
+        if let httpMethod, httpMethod != "GET" {
             return nil
         }
 
@@ -64,6 +73,7 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
             url: url,
             originalURL: originalURL,
             mimeType: mime?.isEmpty == false ? mime : nil,
+            httpMethod: httpMethod,
             httpStatusCode: status,
             contentLength: contentLength,
             requestDestination: dest,
@@ -80,6 +90,12 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
         let pathExt = url.pathExtension.lowercased()
         let mime = mimeType ?? ""
 
+        // Ignore segmented transport chunks (.ts/.m4s/mp2t) so HLS/DASH streams do not
+        // flood the bounded per-tab radar ahead of their master/media manifests.
+        if pathExt == "ts" || pathExt == "m4s" || mime.contains("mp2t") {
+            return nil
+        }
+
         if pathExt == "m3u8" || mime == "application/vnd.apple.mpegurl" || mime == "application/x-mpegurl"
             || mime == "audio/mpegurl" || mime == "audio/x-mpegurl"
         {
@@ -89,7 +105,7 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
             return .dash
         }
         if mime.hasPrefix("video/")
-            || ["mp4", "m4v", "webm", "mov", "mkv", "ts", "m4s"].contains(pathExt)
+            || ["mp4", "m4v", "webm", "mov", "mkv"].contains(pathExt)
             || destination == "video"
         {
             return .video
@@ -145,5 +161,60 @@ final class CuriumMediaRadar {
 
     func clear(tabID: String) {
         eventsByTabID.removeValue(forKey: tabID)
+    }
+}
+
+/// Sendable JSON value decoded from Build 42's isolated-world JavaScript evaluator.
+enum CuriumJSONValue: Equatable, Sendable {
+    case null
+    case bool(Bool)
+    case number(Double)
+    case string(String)
+    case array([CuriumJSONValue])
+    case object([String: CuriumJSONValue])
+
+    static func fromFoundation(_ raw: Any?) -> CuriumJSONValue? {
+        guard let raw else { return nil }
+        if raw is NSNull { return .null }
+        if let num = raw as? NSNumber {
+            if CFGetTypeID(num) == CFBooleanGetTypeID() {
+                return .bool(num.boolValue)
+            }
+            return .number(num.doubleValue)
+        }
+        if let str = raw as? String { return .string(str) }
+        if let arr = raw as? [Any] {
+            return .array(arr.map { fromFoundation($0) ?? .null })
+        }
+        if let dict = raw as? [String: Any] {
+            var out: [String: CuriumJSONValue] = [:]
+            out.reserveCapacity(dict.count)
+            for (k, v) in dict {
+                out[k] = fromFoundation(v) ?? .null
+            }
+            return .object(out)
+        }
+        return nil
+    }
+}
+
+/// One frame's parsed output from Build 42's `evaluateJavaScriptInIsolatedWorld:allFrames:completion:`.
+struct CuriumIsolatedFrameEvalResult: Equatable, Sendable {
+    let isMainFrame: Bool
+    let frameURL: URL?
+    let frameOrigin: String?
+    let result: CuriumJSONValue?
+
+    static func parse(from raw: [String: Any]) -> CuriumIsolatedFrameEvalResult {
+        let isMain = (raw["isMainFrame"] as? NSNumber)?.boolValue ?? false
+        let frameURL = raw["frameURL"] as? URL
+        let frameOrigin = raw["frameOrigin"] as? String
+        let result = CuriumJSONValue.fromFoundation(raw["result"])
+        return CuriumIsolatedFrameEvalResult(
+            isMainFrame: isMain,
+            frameURL: frameURL,
+            frameOrigin: frameOrigin,
+            result: result
+        )
     }
 }

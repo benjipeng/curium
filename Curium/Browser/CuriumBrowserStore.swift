@@ -89,6 +89,39 @@ final class CuriumTabModel: Identifiable {
         syncBlankStartPage()
     }
 
+    /// Evaluates a synchronous JavaScript expression in Build 42's isolated content world
+    /// across the primary main frame (`allFrames == false`) or all active live frames
+    /// (`allFrames == true`). Returns an empty array on Build <= 41 engines or detached tabs.
+    func evaluateJavaScriptInIsolatedWorld(
+        _ script: String,
+        allFrames: Bool = true
+    ) async throws -> [CuriumIsolatedFrameEvalResult] {
+        try await withCheckedThrowingContinuation { continuation in
+            startIsolatedWorldEvaluation(script, allFrames: allFrames) { result in
+                continuation.resume(with: result)
+            }
+        }
+    }
+
+    private func startIsolatedWorldEvaluation(
+        _ script: String,
+        allFrames: Bool,
+        completion: @escaping @MainActor (Result<[CuriumIsolatedFrameEvalResult], Error>) -> Void
+    ) {
+        guard let engine,
+              let evaluate = engine.evaluateJavaScript(inIsolatedWorld:allFrames:completion:) else {
+            completion(.success([]))
+            return
+        }
+        evaluate(script, allFrames) { rawResults, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            completion(.success((rawResults ?? []).map(CuriumIsolatedFrameEvalResult.parse(from:))))
+        }
+    }
+
     /// Reports the engine title when history needs to reconsider this tab.
     fileprivate func refresh(from engine: any CrIOSTabHostingV1) -> (title: String, titleChanged: Bool)? {
         let nextView = engine.webView
@@ -856,7 +889,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         ) {
             CuriumDiagnostics.shared.record(
                 "media-radar",
-                "[\(captured.kind.rawValue)] \(captured.url.host() ?? "")\(captured.url.path) mime=\(captured.mimeType ?? "-") status=\(captured.httpStatusCode) len=\(captured.contentLength)"
+                "[\(captured.kind.rawValue)] \(captured.url.host() ?? "")\(captured.url.path) method=\(captured.httpMethod ?? "-") mime=\(captured.mimeType ?? "-") status=\(captured.httpStatusCode) len=\(captured.contentLength)"
             )
         }
     }

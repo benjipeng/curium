@@ -605,9 +605,7 @@ struct CuriumFingerprintStudioSheet: View {
                         alertMessage = "Profile entry deleted, but storage wipe skipped: \(error.localizedDescription)"
                     }
                 }
-                await MainActor.run {
-                    Task { await refreshUsage() }
-                }
+                await refreshUsage()
             }
         } else {
             if wipeStorage && isActive {

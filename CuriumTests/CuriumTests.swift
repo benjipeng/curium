@@ -63,6 +63,21 @@ private final class MockTabHost: NSObject, CrIOSTabHostingV1, CrIOSTabBrowserCon
         snapshotCallCount += 1
         completion(snapshotImageToReturn)
     }
+
+    var isolatedEvalHandler: ((String, Bool) -> ([[String: Any]]?, Error?))?
+
+    func evaluateJavaScript(
+        inIsolatedWorld script: String,
+        allFrames: Bool,
+        completion: @escaping @MainActor ([[String: Any]]?, Error?) -> Void
+    ) {
+        if let handler = isolatedEvalHandler {
+            let (results, error) = handler(script, allFrames)
+            completion(results, error)
+        } else {
+            completion([], nil)
+        }
+    }
 }
 
 @MainActor
@@ -1816,20 +1831,27 @@ struct CuriumBuild41ContractTests {
 
         let hlsURL = try #require(URL(string: "https://cdn.example/master.m3u8"))
         let mp4URL = try #require(URL(string: "https://cdn.example/clip.mp4"))
+        let segTSURL = try #require(URL(string: "https://cdn.example/seg001.ts"))
+        let segM4SURL = try #require(URL(string: "https://cdn.example/chunk01.m4s"))
         let errURL = try #require(URL(string: "https://cdn.example/missing.mp4"))
         let jsonURL = try #require(URL(string: "https://api.example/data.json"))
 
-        // Non-media JSON and 404 video are ignored.
-        #expect(store.mediaRadar.ingest(rawEvent: ["url": jsonURL, "mimeType": "application/json", "httpStatusCode": 200], tabID: "t1", effectiveUserAgent: "CuriumTest/1") == nil)
-        #expect(store.mediaRadar.ingest(rawEvent: ["url": errURL, "mimeType": "video/mp4", "httpStatusCode": 404], tabID: "t1", effectiveUserAgent: "CuriumTest/1") == nil)
+        // Non-media JSON, 404 video, non-GET preflights/POSTs, and .ts/.m4s segments are ignored.
+        #expect(store.mediaRadar.ingest(rawEvent: ["url": jsonURL, "mimeType": "application/json", "httpMethod": "GET", "httpStatusCode": 200], tabID: "t1", effectiveUserAgent: "CuriumTest/1") == nil)
+        #expect(store.mediaRadar.ingest(rawEvent: ["url": errURL, "mimeType": "video/mp4", "httpMethod": "GET", "httpStatusCode": 404], tabID: "t1", effectiveUserAgent: "CuriumTest/1") == nil)
+        #expect(store.mediaRadar.ingest(rawEvent: ["url": hlsURL, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "OPTIONS", "httpStatusCode": 204], tabID: "t1", effectiveUserAgent: "CuriumTest/1") == nil)
+        #expect(store.mediaRadar.ingest(rawEvent: ["url": mp4URL, "mimeType": "video/mp4", "httpMethod": "POST", "httpStatusCode": 200], tabID: "t1", effectiveUserAgent: "CuriumTest/1") == nil)
+        #expect(store.mediaRadar.ingest(rawEvent: ["url": segTSURL, "mimeType": "video/mp2t", "httpMethod": "GET", "httpStatusCode": 200], tabID: "t1", effectiveUserAgent: "CuriumTest/1") == nil)
+        #expect(store.mediaRadar.ingest(rawEvent: ["url": segM4SURL, "mimeType": "video/iso.segment", "httpMethod": "GET", "httpStatusCode": 200], tabID: "t1", effectiveUserAgent: "CuriumTest/1") == nil)
 
-        // HLS & MP4 are captured with UA and deduplicated.
+        // HLS & MP4 are captured with httpMethod + UA and deduplicated.
         let e1 = try #require(store.mediaRadar.ingest(
-            rawEvent: ["url": hlsURL, "mimeType": "application/vnd.apple.mpegurl", "httpStatusCode": 200, "contentLength": 4096, "requestDestination": "empty"],
+            rawEvent: ["url": hlsURL, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200, "contentLength": 4096, "requestDestination": "empty"],
             tabID: "t1",
             effectiveUserAgent: "CuriumTest/160"
         ))
         #expect(e1.kind == .hls)
+        #expect(e1.httpMethod == "GET")
         #expect(e1.effectiveUserAgent == "CuriumTest/160")
 
         store.browserHost(host, tab: tab, didLoadResourceEvent: [
@@ -1841,7 +1863,7 @@ struct CuriumBuild41ContractTests {
         ])
         // Re-ingesting same HLS URL updates in place without duplicating.
         _ = store.mediaRadar.ingest(
-            rawEvent: ["url": hlsURL, "mimeType": "application/vnd.apple.mpegurl", "httpStatusCode": 200, "contentLength": 8192, "requestDestination": "empty"],
+            rawEvent: ["url": hlsURL, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200, "contentLength": 8192, "requestDestination": "empty"],
             tabID: "t1",
             effectiveUserAgent: "CuriumTest/160"
         )
@@ -1853,5 +1875,43 @@ struct CuriumBuild41ContractTests {
 
         store.browserHost(host, tab: tab, didCommitNavigationTo: URL(string: "https://video.example/other")!, navigationID: 2, isSameDocument: false, isReload: false)
         #expect(store.mediaRadar.events(for: "t1").isEmpty)
+    }
+
+    @Test("Build 42 isolated-world JS evaluator wrapper parses main and subframe results")
+    @MainActor
+    func isolatedWorldEvaluatorWrapper() async throws {
+        let host = MockBrowserHost()
+        let tab = MockTabHost(tabID: "t1", url: URL(string: "https://page.example/watch"))
+        let iframeURL = try #require(URL(string: "https://player.cdn.example/embed"))
+        tab.isolatedEvalHandler = { script, allFrames in
+            #expect(script == "1+1")
+            #expect(allFrames == true)
+            return ([
+                [
+                    "isMainFrame": NSNumber(value: true),
+                    "frameURL": URL(string: "https://page.example/watch")!,
+                    "frameOrigin": "https://page.example",
+                    "result": ["videos": 1],
+                ],
+                [
+                    "isMainFrame": NSNumber(value: false),
+                    "frameURL": iframeURL,
+                    "frameOrigin": "https://player.cdn.example",
+                    "result": ["videos": 2],
+                ],
+            ], nil)
+        }
+        host.tabs = [tab]
+        host.activeTab = tab
+        let store = CuriumBrowserStore(host: host)
+
+        let active = try #require(store.activeTab)
+        let frames = try await active.evaluateJavaScriptInIsolatedWorld("1+1", allFrames: true)
+        #expect(frames.count == 2)
+        #expect(frames[0].isMainFrame == true)
+        #expect(frames[0].frameOrigin == "https://page.example")
+        #expect(frames[1].isMainFrame == false)
+        #expect(frames[1].frameURL == iframeURL)
+        #expect(frames[1].result == .object(["videos": .number(2)]))
     }
 }
