@@ -10,6 +10,19 @@ struct CuriumSavedDownload: Identifiable, Equatable, Sendable {
     let isPDF: Bool
 
     var id: URL { url }
+
+    var isVideo: Bool {
+        CuriumDownloadStorage.isVideo(mimeType: nil, filename: filename, url: url)
+    }
+
+    var isAudio: Bool {
+        CuriumDownloadStorage.isAudio(mimeType: nil, filename: filename, url: url)
+    }
+
+    var symbolName: String {
+        if isPDF { return "doc.richtext" }
+        return CuriumDownloadStorage.symbolName(mimeType: nil, filename: filename, url: url)
+    }
 }
 
 /// Manages strict separation between ephemeral inline PDF preview cache files
@@ -161,6 +174,87 @@ enum CuriumDownloadStorage {
             return true
         }
         return false
+    }
+
+    private static let videoExtensions: Set<String> = [
+        "mp4", "m4v", "mov", "webm", "mkv", "ts", "m3u8",
+    ]
+    private static let audioExtensions: Set<String> = [
+        "mp3", "m4a", "aac", "ogg", "opus", "flac", "wav",
+    ]
+
+    nonisolated static func isVideo(mimeType: String?, filename: String, url: URL? = nil) -> Bool {
+        let normalizedMIME = normalizedMIMEType(mimeType)
+        let filenameExt = (filename as NSString).pathExtension.lowercased()
+        if let normalizedMIME, !normalizedMIME.isEmpty {
+            if normalizedMIME.hasPrefix("video/")
+                || normalizedMIME == "application/vnd.apple.mpegurl"
+                || normalizedMIME == "application/x-mpegurl"
+                || normalizedMIME == "audio/mpegurl"
+                || normalizedMIME == "audio/x-mpegurl"
+            {
+                return true
+            }
+            if !isGenericBinaryMIME(normalizedMIME) {
+                return videoExtensions.contains(filenameExt)
+            }
+        }
+        if videoExtensions.contains(filenameExt) {
+            return true
+        }
+        if filenameExt.isEmpty, let url, videoExtensions.contains(url.pathExtension.lowercased()) {
+            return true
+        }
+        return false
+    }
+
+    nonisolated static func isAudio(mimeType: String?, filename: String, url: URL? = nil) -> Bool {
+        let normalizedMIME = normalizedMIMEType(mimeType)
+        let filenameExt = (filename as NSString).pathExtension.lowercased()
+        if let normalizedMIME, !normalizedMIME.isEmpty {
+            if normalizedMIME == "audio/mpegurl" || normalizedMIME == "audio/x-mpegurl" {
+                return false
+            }
+            if normalizedMIME.hasPrefix("audio/") {
+                return true
+            }
+            if !isGenericBinaryMIME(normalizedMIME) {
+                return audioExtensions.contains(filenameExt)
+            }
+        }
+        if audioExtensions.contains(filenameExt) {
+            return true
+        }
+        if filenameExt.isEmpty, let url, audioExtensions.contains(url.pathExtension.lowercased()) {
+            return true
+        }
+        return false
+    }
+
+    nonisolated static func symbolName(mimeType: String?, filename: String, url: URL? = nil) -> String {
+        if isPDF(mimeType: mimeType, filename: filename, url: url) {
+            return "doc.richtext"
+        }
+        if isVideo(mimeType: mimeType, filename: filename, url: url) {
+            return "film"
+        }
+        if isAudio(mimeType: mimeType, filename: filename, url: url) {
+            return "waveform"
+        }
+        return "doc"
+    }
+
+    private nonisolated static func normalizedMIMEType(_ mimeType: String?) -> String? {
+        mimeType?
+            .split(separator: ";", maxSplits: 1).first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    private nonisolated static func isGenericBinaryMIME(_ normalizedMIME: String) -> Bool {
+        normalizedMIME == "application/octet-stream"
+            || normalizedMIME == "binary/octet-stream"
+            || normalizedMIME == "application/binary"
     }
 
     // MARK: - Durable Downloads Root Resolution

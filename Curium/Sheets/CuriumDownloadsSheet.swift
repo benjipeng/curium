@@ -183,8 +183,12 @@ struct CuriumDownloadsSheet: View {
     private func activeDownloadRow(_ item: CuriumDownload) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
-                Image(systemName: item.isPDF ? "doc.richtext" : "doc")
-                    .foregroundStyle(.secondary)
+                Image(systemName: item.symbolName)
+                    .foregroundStyle(
+                        (item.isPDF || item.isVideo || item.isAudio)
+                            ? AnyShapeStyle(.tint)
+                            : AnyShapeStyle(.secondary)
+                    )
                 VStack(alignment: .leading, spacing: 2) {
                     Text(item.filename)
                         .font(.body.weight(.medium))
@@ -269,9 +273,13 @@ struct CuriumDownloadsSheet: View {
                 openFile(url: file.url, filename: file.filename, isPDF: file.isPDF)
             } label: {
                 HStack(spacing: 12) {
-                    Image(systemName: file.isPDF ? "doc.richtext" : "doc")
+                    Image(systemName: file.symbolName)
                         .font(.title3)
-                        .foregroundStyle(file.isPDF ? Color.accentColor : Color.secondary)
+                        .foregroundStyle(
+                            (file.isPDF || file.isVideo || file.isAudio)
+                                ? AnyShapeStyle(.tint)
+                                : AnyShapeStyle(.secondary)
+                        )
                         .frame(width: 26)
                     VStack(alignment: .leading, spacing: 3) {
                         Text(file.filename)

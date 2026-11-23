@@ -530,6 +530,9 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     @ObservationIgnored private var onDemandSnapshotTokens: [String: UUID] = [:]
     @ObservationIgnored private var savedDownloadsGeneration = 0
     @ObservationIgnored private var mediaPermissions: CuriumMediaPermissionCoordinator!
+    @ObservationIgnored private let backgroundKeepAlive = CuriumBackgroundKeepAlive()
+    @ObservationIgnored private var cachedDOMScanByTabID: [String: (pageTitle: String?, entries: [CuriumDOMMediaEntry], blobVideoCount: Int, scannedAt: Date)] = [:]
+    @ObservationIgnored private var cachedHLSInspections: [URL: CuriumHLSMasterInspection] = [:]
     @ObservationIgnored private let fingerprintStore: CuriumFingerprintStore
     @ObservationIgnored private let downloadsRootOverride: URL?
     @ObservationIgnored private let pdfPreviewCacheRootOverride: URL?
@@ -547,6 +550,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     var downloadsRoot: URL? { downloadsRootOverride }
     var isEngineReady: Bool { host != nil }
+    var activeTabMediaCount: Int { mediaRadar.events(for: activeTab?.id).count }
     var pendingOrActiveDownloadCount: Int {
         downloads.reduce(into: 0) { count, item in
             if item.state == .pending || item.isActive { count += 1 }
@@ -660,6 +664,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func handleSceneDidEnterBackground() {
         isSceneBackgrounded = true
+        syncBackgroundKeepAlive()
+        backgroundKeepAlive.setBackgrounded(true)
         syncMediaPermissionPresentationGate()
         cancelAllSnapshotCaptures()
         saveOpenTabsSession()
@@ -809,6 +815,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func handleSceneWillEnterForeground() {
         isSceneBackgrounded = false
+        backgroundKeepAlive.setBackgrounded(false)
         isUnderMemoryPressure = false
         syncMediaPermissionPresentationGate()
         if let activeTab { scheduleSnapshot(for: activeTab) }
@@ -1072,7 +1079,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         onDemandSnapshotTasks.removeValue(forKey: tab.id)?.cancel()
         onDemandSnapshotTokens.removeValue(forKey: tab.id)
         mediaPermissions.invalidate(tabID: tab.id)
-        mediaRadar.clear(tabID: tab.id)
+        clearMediaCaches(for: tab.id)
         if let host {
             _ = host.closeTab(withID: tab.id)
             if tabsByID[tab.id] != nil { updateTabs(from: host) }
@@ -1152,7 +1159,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     ) {
         if !isSameDocument {
             mediaPermissions.invalidate(tabID: tab.tabID)
-            mediaRadar.clear(tabID: tab.tabID)
+            clearMediaCaches(for: tab.tabID)
             tabsByID[tab.tabID]?.dismissPDFSession()
             scheduleSessionSave()
         }
@@ -1276,15 +1283,285 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
         let item = CuriumDownload(task: download)
         guard !downloads.contains(where: { $0.id == item.id }) else { return }
+        item.onActivityChange = { [weak self] in
+            self?.syncBackgroundKeepAlive()
+        }
         downloads.insert(item, at: 0)
         activeDownloadBanner = item
     }
 
     func startDownload(_ item: CuriumDownload) async {
+        item.onActivityChange = { [weak self] in
+            self?.syncBackgroundKeepAlive()
+        }
+        syncBackgroundKeepAlive()
+        defer { syncBackgroundKeepAlive() }
         let saved = await item.start(downloadsRoot: downloadsRootOverride)
         if saved != nil {
             refreshSavedDownloads()
         }
+    }
+
+    // MARK: - Media Radar, HLS Inspection & Authenticated Media Downloads
+
+    func currentMediaSnapshot(for tabID: String? = nil) -> CuriumMediaScanSnapshot {
+        let resolvedTabID = tabID ?? activeTab?.id ?? ""
+        let targetTab = tabsByID[resolvedTabID] ?? (activeTab?.id == resolvedTabID ? activeTab : nil)
+        let networkEvents = mediaRadar.events(for: resolvedTabID)
+        let cachedDOM = cachedDOMScanByTabID[resolvedTabID]
+        let pageTitle = cachedDOM?.pageTitle ?? meaningfulTabTitle(for: targetTab)
+        let effectiveUA = targetTab?.engine?.effectiveUserAgent ?? nil
+
+        return CuriumMediaDOMScanner.merge(
+            tabID: resolvedTabID,
+            pageTitle: pageTitle,
+            networkEvents: networkEvents,
+            domEntries: cachedDOM?.entries ?? [],
+            blobVideoCount: cachedDOM?.blobVideoCount ?? 0,
+            effectiveUserAgent: effectiveUA,
+            now: cachedDOM?.scannedAt ?? .now
+        )
+    }
+
+    func scanActiveTabMedia() async -> CuriumMediaScanSnapshot {
+        guard let tab = activeTab else {
+            return CuriumMediaScanSnapshot(
+                tabID: "",
+                pageTitle: nil,
+                candidates: [],
+                detectedBlobVideoCount: 0,
+                scannedAt: .now
+            )
+        }
+
+        let targetTabID = tab.id
+        let initialURL = tab.url
+        let frames: [CuriumIsolatedFrameEvalResult]
+        if tab.engine != nil {
+            frames = (try? await tab.evaluateJavaScriptInIsolatedWorld(
+                CuriumMediaDOMScanner.probeScript,
+                allFrames: true
+            )) ?? []
+        } else {
+            frames = []
+        }
+
+        let parsed = CuriumMediaDOMScanner.parseProbeResults(frames)
+        let scannedAt = Date.now
+
+        if tabsByID[targetTabID] === tab && tab.url == initialURL {
+            cachedDOMScanByTabID[targetTabID] = (
+                pageTitle: parsed.pageTitle,
+                entries: parsed.entries,
+                blobVideoCount: parsed.blobVideoCount,
+                scannedAt: scannedAt
+            )
+        }
+
+        let pageTitle = parsed.pageTitle ?? meaningfulTabTitle(for: tab)
+        let effectiveUA = tab.engine?.effectiveUserAgent ?? nil
+        let snapshot = CuriumMediaDOMScanner.merge(
+            tabID: targetTabID,
+            pageTitle: pageTitle,
+            networkEvents: mediaRadar.events(for: targetTabID),
+            domEntries: parsed.entries,
+            blobVideoCount: parsed.blobVideoCount,
+            effectiveUserAgent: effectiveUA,
+            now: scannedAt
+        )
+
+        CuriumDiagnostics.shared.record(
+            "media-radar",
+            "scan frames=\(frames.count) candidates=\(snapshot.candidates.count) blobs=\(snapshot.detectedBlobVideoCount)"
+        )
+        return snapshot
+    }
+
+    func inspectHLSStream(
+        for candidate: CuriumMediaCandidate,
+        inTabID tabID: String
+    ) async throws -> CuriumHLSMasterInspection {
+        guard CuriumHLSParser.isAllowedHTTPURL(candidate.url) else {
+            throw CuriumMediaDownloadError.disallowedURLScheme(candidate.url.scheme ?? "unknown")
+        }
+        let context = await makeMediaRequestContext(for: candidate.url, candidate: candidate, inTabID: tabID)
+        let inspection = try await CuriumMediaNetworking.inspectHLS(url: candidate.url, context: context)
+        if cachedHLSInspections.count >= 32 {
+            cachedHLSInspections.removeAll(keepingCapacity: true)
+        }
+        cachedHLSInspections[candidate.url] = inspection
+
+        let encTag: String
+        switch inspection.encryption {
+        case .none: encTag = "none"
+        case .aes128: encTag = "aes128"
+        case .unsupportedDRM(let method): encTag = "drm:\(method)"
+        }
+        CuriumDiagnostics.shared.record(
+            "media-hls",
+            "inspect host=\(candidate.host) master=\(inspection.isMasterPlaylist) variants=\(inspection.variants.count) segments=\(inspection.directSegmentCount) live=\(inspection.isLiveStream) fmp4=\(inspection.isFMP4) enc=\(encTag)"
+        )
+        return inspection
+    }
+
+    @discardableResult
+    func startMediaDownload(
+        candidate: CuriumMediaCandidate,
+        hlsVariant: CuriumHLSVariant? = nil,
+        inTabID tabID: String
+    ) async -> CuriumDownload? {
+        guard candidate.kind != .dash else {
+            return nil
+        }
+
+        let targetURL = (candidate.kind == .hls ? hlsVariant?.url : nil) ?? candidate.url
+        guard CuriumHLSParser.isAllowedHTTPURL(targetURL) else {
+            errorMessage = CuriumMediaDownloadError.disallowedURLScheme(targetURL.scheme ?? "unknown").localizedDescription
+            return nil
+        }
+
+        let context = await makeMediaRequestContext(for: targetURL, candidate: candidate, inTabID: tabID)
+        let downloadTask: any CrIOSDownloadTaskV1
+
+        switch candidate.kind {
+        case .hls:
+            let cachedInspection = cachedHLSInspections[candidate.url]
+            let prefersMP4 = hlsVariant?.audioURI != nil || cachedInspection?.isFMP4 == true
+            let ext = prefersMP4 ? "mp4" : "ts"
+            let baseStem = (candidate.suggestedFilename as NSString).deletingPathExtension
+            let labeledStem: String
+            if let res = hlsVariant?.resolutionLabel, !res.isEmpty {
+                labeledStem = "\(baseStem) (\(res))"
+            } else {
+                labeledStem = baseStem
+            }
+            let filename = CuriumDownloadStorage.sanitizedFilename(
+                "\(labeledStem).\(ext)",
+                fallback: "Video.\(ext)"
+            )
+            downloadTask = CuriumHLSMediaDownloadTask(
+                sourceTabID: tabID,
+                playlistURL: targetURL,
+                audioPlaylistURL: hlsVariant?.audioURI,
+                suggestedFilename: filename,
+                mimeType: prefersMP4 ? "video/mp4" : "video/mp2t",
+                context: context,
+                cookieProvider: { [weak self] url in
+                    await self?.resolveCookieHeader(for: url, inTabID: tabID)
+                }
+            )
+
+        case .video, .audio:
+            downloadTask = CuriumDirectMediaDownloadTask(
+                sourceTabID: tabID,
+                url: targetURL,
+                suggestedFilename: candidate.suggestedFilename,
+                mimeType: candidate.mimeType,
+                expectedBytes: candidate.contentLength,
+                context: context
+            )
+
+        case .dash:
+            return nil
+        }
+
+        let item = CuriumDownload(task: downloadTask)
+        item.onActivityChange = { [weak self] in
+            self?.syncBackgroundKeepAlive()
+        }
+        downloads.insert(item, at: 0)
+        activeDownloadBanner = item
+
+        CuriumDiagnostics.shared.record(
+            "media-download",
+            "start kind=\(candidate.kind.rawValue) host=\(targetURL.host ?? "-")"
+        )
+
+        Task { @MainActor [weak self] in
+            await self?.startDownload(item)
+        }
+        return item
+    }
+
+    private func makeMediaRequestContext(
+        for url: URL,
+        candidate: CuriumMediaCandidate?,
+        inTabID tabID: String
+    ) async -> CuriumMediaRequestContext {
+        let cookieHeader = await resolveCookieHeader(for: url, inTabID: tabID)
+        let activeProxy = fingerprintStore.profile(id: activeProfileID)?.proxy
+            ?? fingerprintStore.activeProfile.proxy
+        let targetTab = tabsByID[tabID] ?? (activeTab?.id == tabID ? activeTab : nil)
+        let userAgent = candidate?.effectiveUserAgent ?? (targetTab?.engine?.effectiveUserAgent ?? nil)
+        let referrer = candidate?.referrer ?? targetTab?.url
+        let origin = candidate?.frameOrigin ?? Self.originString(for: referrer)
+
+        return CuriumMediaRequestContext(
+            cookieHeader: cookieHeader,
+            userAgent: userAgent,
+            referrer: referrer,
+            origin: origin,
+            proxy: activeProxy
+        )
+    }
+
+    private func resolveCookieHeader(for url: URL, inTabID tabID: String) async -> String? {
+        guard let host,
+              CuriumHLSParser.isAllowedHTTPURL(url),
+              host.responds(to: NSSelectorFromString("cookieHeaderForURL:inTabWithID:completion:")) else {
+            return nil
+        }
+        return await withCheckedContinuation { continuation in
+            host.cookieHeader(for: url, inTabWithID: tabID) { header in
+                let trimmed = header?.trimmingCharacters(in: .whitespacesAndNewlines)
+                continuation.resume(returning: (trimmed?.isEmpty == false) ? trimmed : nil)
+            }
+        }
+    }
+
+    private func syncBackgroundKeepAlive() {
+        let activeCount = downloads.reduce(into: 0) { count, item in
+            if item.isActive && item.state != .cancelled && item.state != .completed && item.state != .failed {
+                count += 1
+            }
+        }
+        backgroundKeepAlive.setActiveTaskCount(activeCount)
+    }
+
+    private func clearMediaCaches(for tabID: String) {
+        let existingEvents = mediaRadar.events(for: tabID)
+        for event in existingEvents {
+            cachedHLSInspections.removeValue(forKey: event.url)
+        }
+        if let cachedDOM = cachedDOMScanByTabID.removeValue(forKey: tabID) {
+            for entry in cachedDOM.entries {
+                if let url = entry.url {
+                    cachedHLSInspections.removeValue(forKey: url)
+                }
+            }
+        }
+        mediaRadar.clear(tabID: tabID)
+    }
+
+    private func meaningfulTabTitle(for tab: CuriumTabModel?) -> String? {
+        guard let tab, tab.url != nil else { return nil }
+        let trimmed = tab.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "New Tab" else { return nil }
+        return trimmed
+    }
+
+    private static func originString(for url: URL?) -> String? {
+        guard let url,
+              CuriumHLSParser.isAllowedHTTPURL(url),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased() else {
+            return nil
+        }
+        if let port = url.port {
+            let isDefault = (scheme == "http" && port == 80) || (scheme == "https" && port == 443)
+            return isDefault ? "\(scheme)://\(host)" : "\(scheme)://\(host):\(port)"
+        }
+        return "\(scheme)://\(host)"
     }
 
     func dismissDownloadBanner() {
@@ -1432,7 +1709,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             onDemandSnapshotTasks.removeValue(forKey: evictedID)?.cancel()
             onDemandSnapshotTokens.removeValue(forKey: evictedID)
             mediaPermissions.invalidate(tabID: evictedID)
-            mediaRadar.clear(tabID: evictedID)
+            clearMediaCaches(for: evictedID)
             evictedTab.invalidate()
             historyByTabID.removeValue(forKey: evictedID)
             committedHistoryByTabID.removeValue(forKey: evictedID)

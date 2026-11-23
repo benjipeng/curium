@@ -1,3 +1,4 @@
+import CommonCrypto
 import CoreMedia
 import CuriumEngineContract
 import Darwin
@@ -3472,5 +3473,773 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
             customHandlerCalled = true
         }
         #expect(customHandlerCalled)
+    }
+}
+
+@Suite("Media Radar, HLS Parser & Authenticated Media Downloads")
+struct CuriumMediaRadarAndDownloaderTests {
+    private func makeTempDir(_ prefix: String = "curium-mr") throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "\(prefix)-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func encryptAES128CBC(_ plaintext: Data, key: Data, iv: Data) throws -> Data {
+        let outCapacity = plaintext.count + kCCBlockSizeAES128
+        var outData = Data(count: outCapacity)
+        var outLength = 0
+        let status: CCCryptorStatus = outData.withUnsafeMutableBytes { outBuf in
+            plaintext.withUnsafeBytes { inBuf in
+                key.withUnsafeBytes { keyBuf in
+                    iv.withUnsafeBytes { ivBuf in
+                        CCCrypt(
+                            CCOperation(kCCEncrypt),
+                            CCAlgorithm(kCCAlgorithmAES),
+                            CCOptions(kCCOptionPKCS7Padding),
+                            keyBuf.baseAddress,
+                            kCCKeySizeAES128,
+                            ivBuf.baseAddress,
+                            inBuf.baseAddress,
+                            plaintext.count,
+                            outBuf.baseAddress,
+                            outCapacity,
+                            &outLength
+                        )
+                    }
+                }
+            }
+        }
+        #expect(status == kCCSuccess)
+        outData.count = outLength
+        return outData
+    }
+
+    @Test("HLS Master Playlist parses variants, sorts by resolution and bandwidth, binds DEFAULT audio renditions, and resolves relative URLs")
+    func hlsMasterPlaylistParsingSortingAudioBindingAndRelativeURLs() throws {
+        let baseURL = try #require(URL(string: "https://cdn.video.example/streams/v2/master.m3u8?token=xyz"))
+        let masterText = """
+        #EXTM3U
+        #EXT-X-VERSION:6
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud-hi",NAME="Commentary",DEFAULT=NO,AUTOSELECT=YES,URI="../audio/commentary.m3u8"
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud-hi",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="../audio/en/index.m3u8"
+        #EXT-X-STREAM-INF:BANDWIDTH=1800000,AVERAGE-BANDWIDTH=1500000,RESOLUTION=1280x720,FRAME-RATE=29.970,CODECS="avc1.4d401f,mp4a.40.2"
+        /hls/720p/prog.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=6200000,AVERAGE-BANDWIDTH=5400000,RESOLUTION=1920x1080,FRAME-RATE=59.940,CODECS="avc1.64002a,mp4a.40.2",AUDIO="aud-hi"
+        1080p/prog.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=14500000,RESOLUTION=3840x2160,FRAME-RATE=60.000,CODECS="hvc1.1.6.L150.90",AUDIO="aud-hi"
+        //edge.video.example/uhd/2160p.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=950000,RESOLUTION=1000x500
+        custom/prog.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=128000,CODECS="mp4a.40.2"
+        audio-only.m3u8
+        """
+
+        let inspection = try CuriumHLSParser.parseMasterOrMedia(text: masterText, baseURL: baseURL)
+        #expect(inspection.isMasterPlaylist)
+        #expect(inspection.isDownloadable)
+        #expect(inspection.unavailableReason == nil)
+        #expect(!inspection.isLiveStream)
+        #expect(inspection.variants.count == 5)
+
+        // Sorted highest resolution / bandwidth first: 2160p -> 1080p -> 720p -> 1000×500 -> 128 kbps.
+        let v4K = inspection.variants[0]
+        #expect(v4K.url.absoluteString == "https://edge.video.example/uhd/2160p.m3u8")
+        #expect(v4K.resolutionLabel == "2160p")
+        #expect(v4K.bitrateLabel == "14.5 Mbps")
+        #expect(v4K.displayTitle == "2160p · 14.5 Mbps")
+        #expect(v4K.audioGroupID == "aud-hi")
+        #expect(v4K.audioURI?.absoluteString == "https://cdn.video.example/streams/audio/en/index.m3u8")
+
+        let v1080 = inspection.variants[1]
+        #expect(v1080.url.absoluteString == "https://cdn.video.example/streams/v2/1080p/prog.m3u8")
+        #expect(v1080.resolutionLabel == "1080p")
+        #expect(v1080.bitrateLabel == "5.4 Mbps")
+        #expect(v1080.displayTitle == "1080p · 5.4 Mbps")
+        #expect(v1080.codecs == "avc1.64002a,mp4a.40.2")
+        #expect(v1080.audioURI?.absoluteString == "https://cdn.video.example/streams/audio/en/index.m3u8")
+
+        let v720 = inspection.variants[2]
+        #expect(v720.url.absoluteString == "https://cdn.video.example/hls/720p/prog.m3u8")
+        #expect(v720.resolutionLabel == "720p")
+        #expect(v720.audioURI == nil)
+
+        let vCustom = inspection.variants[3]
+        #expect(vCustom.resolutionLabel == "1000×500")
+        #expect(vCustom.bitrateLabel == "950 kbps")
+        #expect(vCustom.displayTitle == "1000×500 · 950 kbps")
+
+        let vAudioOnly = inspection.variants[4]
+        #expect(vAudioOnly.resolutionLabel == nil)
+        #expect(vAudioOnly.bitrateLabel == "128 kbps")
+        #expect(vAudioOnly.displayTitle == "128 kbps")
+
+        // Master-level FairPlay SESSION-KEY marks inspection non-downloadable with DRM reason.
+        let drmMaster = """
+        #EXTM3U
+        #EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI="skd://fps.example/asset-1",KEYFORMAT="com.apple.streamingkeydelivery"
+        #EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1920x1080
+        1080p.m3u8
+        """
+        let drmInspection = try CuriumHLSParser.parseMasterOrMedia(text: drmMaster, baseURL: baseURL)
+        #expect(!drmInspection.isDownloadable)
+        #expect(drmInspection.encryption == .unsupportedDRM(method: "SAMPLE-AES"))
+        #expect(drmInspection.unavailableReason?.contains("SAMPLE-AES") == true)
+    }
+
+    @Test("HLS Media Playlist handles TS vs fMP4 EXT-X-MAP, EXT-X-BYTERANGE, VOD vs Live, SAMPLE-AES DRM, and SSRF scheme/size/count bounds")
+    func hlsMediaPlaylistFormatsByteRangeLiveDRMAndSSRFRejection() throws {
+        let baseURL = try #require(URL(string: "https://cdn.video.example/vod/1080p/index.m3u8"))
+
+        // 1. MPEG-TS VOD playlist with contiguous EXT-X-BYTERANGE.
+        let tsPlaylistText = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:6
+        #EXT-X-MEDIA-SEQUENCE:42
+        #EXTINF:5.5,
+        #EXT-X-BYTERANGE:1000@200
+        main.ts
+        #EXTINF:4.5,
+        #EXT-X-BYTERANGE:1500
+        main.ts
+        #EXT-X-ENDLIST
+        """
+        let tsMedia = try CuriumHLSParser.parseMediaPlaylist(text: tsPlaylistText, baseURL: baseURL)
+        #expect(!tsMedia.isFMP4)
+        #expect(!tsMedia.isLiveStream)
+        #expect(tsMedia.isEndList)
+        #expect(tsMedia.mediaSequence == 42)
+        #expect(tsMedia.totalDurationSeconds == 10.0)
+        #expect(tsMedia.segments.count == 2)
+        #expect(tsMedia.segments[0].mediaSequence == 42)
+        #expect(tsMedia.segments[0].byteRange?.length == 1000)
+        #expect(tsMedia.segments[0].byteRange?.offset == 200)
+        #expect(tsMedia.segments[1].mediaSequence == 43)
+        #expect(tsMedia.segments[1].byteRange?.length == 1500)
+        #expect(tsMedia.segments[1].byteRange?.offset == 1200)
+
+        // 2. fMP4 playlist with EXT-X-MAP + BYTERANGE and PLAYLIST-TYPE:VOD (even without ENDLIST).
+        let fmp4Text = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-PLAYLIST-TYPE:VOD
+        #EXT-X-MAP:URI="../init/header.mp4",BYTERANGE="720@0"
+        #EXTINF:4.0,
+        seg0.m4s
+        #EXTINF:3.25,
+        seg1.m4s
+        """
+        let fmp4Inspection = try CuriumHLSParser.parseMasterOrMedia(text: fmp4Text, baseURL: baseURL)
+        #expect(!fmp4Inspection.isMasterPlaylist)
+        #expect(fmp4Inspection.isFMP4)
+        #expect(!fmp4Inspection.isLiveStream)
+        #expect(fmp4Inspection.isDownloadable)
+        #expect(fmp4Inspection.directSegmentCount == 2)
+        #expect(fmp4Inspection.estimatedDurationSeconds == 7.25)
+
+        let fmp4Media = try CuriumHLSParser.parseMediaPlaylist(text: fmp4Text, baseURL: baseURL)
+        #expect(fmp4Media.isFMP4)
+        #expect(fmp4Media.segments[0].mapURL?.absoluteString == "https://cdn.video.example/vod/init/header.mp4")
+        #expect(fmp4Media.segments[0].mapByteRange?.length == 720)
+        #expect(fmp4Media.segments[0].mapByteRange?.offset == 0)
+        #expect(fmp4Media.segments[0].mapEncryption == .none)
+
+        // RFC 8216 §4.3.2.5: #EXT-X-KEY preceding #EXT-X-MAP binds AES-128 encryption to the init section too.
+        let encryptedMapText = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-KEY:METHOD=AES-128,URI="keys/init.key",IV=0x0000000000000000000000000000000a
+        #EXT-X-MAP:URI="init.mp4"
+        #EXTINF:4.0,
+        seg0.m4s
+        #EXT-X-ENDLIST
+        """
+        let encryptedMapMedia = try CuriumHLSParser.parseMediaPlaylist(text: encryptedMapText, baseURL: baseURL)
+        if case .aes128(let mapKeyURL, let mapIV) = encryptedMapMedia.segments[0].mapEncryption {
+            #expect(mapKeyURL.absoluteString == "https://cdn.video.example/vod/1080p/keys/init.key")
+            #expect(mapIV?.last == 0x0A)
+        } else {
+            Issue.record("Expected AES-128 mapEncryption when #EXT-X-KEY precedes #EXT-X-MAP")
+        }
+
+        // 3. Live stream (missing #EXT-X-ENDLIST and not VOD) is marked non-downloadable.
+        let liveText = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-MEDIA-SEQUENCE:9001
+        #EXTINF:4.0,
+        live9001.ts
+        """
+        let liveInspection = try CuriumHLSParser.parseMasterOrMedia(text: liveText, baseURL: baseURL)
+        #expect(liveInspection.isLiveStream)
+        #expect(!liveInspection.isDownloadable)
+        #expect(liveInspection.unavailableReason?.localizedCaseInsensitiveContains("live") == true)
+
+        // 4. SAMPLE-AES FairPlay DRM in media playlist reports unsupportedDRM cleanly without throwing on skd://.
+        let sampleAESText = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:6
+        #EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://fairplay.example/key1"
+        #EXTINF:6.0,
+        drm0.ts
+        #EXT-X-ENDLIST
+        """
+        let drmMedia = try CuriumHLSParser.parseMasterOrMedia(text: sampleAESText, baseURL: baseURL)
+        #expect(!drmMedia.isDownloadable)
+        #expect(drmMedia.encryption == .unsupportedDRM(method: "SAMPLE-AES"))
+        #expect(drmMedia.unavailableReason?.contains("SAMPLE-AES") == true)
+
+        // 5. Strict SSRF & non-HTTP(S) scheme rejection on baseURL, variants, segments, keys, and init maps.
+        #expect(!CuriumHLSParser.isAllowedHTTPURL(URL(fileURLWithPath: "/etc/passwd")))
+        #expect(!CuriumHLSParser.isAllowedHTTPURL(URL(string: "data:application/vnd.apple.mpegurl;base64,I0VYVE0zVQ==")!))
+        #expect(!CuriumHLSParser.isAllowedHTTPURL(URL(string: "javascript:alert(1)")!))
+        #expect(!CuriumHLSParser.isAllowedHTTPURL(URL(string: "http:///etc/passwd")!))
+        #expect(CuriumHLSParser.isAllowedHTTPURL(baseURL))
+
+        #expect(throws: CuriumHLSParserError.disallowedURLScheme("file")) {
+            _ = try CuriumHLSParser.parseMasterOrMedia(
+                text: "#EXTM3U\n#EXTINF:4.0,\nseg.ts\n#EXT-X-ENDLIST",
+                baseURL: URL(fileURLWithPath: "/tmp/playlist.m3u8")
+            )
+        }
+        for maliciousPlaylist in [
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nfile:///etc/passwd",
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\ndata:text/plain,evil",
+            "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"en\",URI=\"file:///etc/passwd\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"a\"\nok.m3u8",
+            "#EXTM3U\n#EXTINF:4.0,\nfile:///private/var/mobile/Library/Cookies.binarycookies\n#EXT-X-ENDLIST",
+            "#EXTM3U\n#EXTINF:4.0,\njavascript:fetch('https://evil.example')\n#EXT-X-ENDLIST",
+            "#EXTM3U\n#EXT-X-MAP:URI=\"file:///etc/hosts\"\n#EXTINF:4.0,\nseg.m4s\n#EXT-X-ENDLIST",
+            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"file:///etc/master.key\"\n#EXTINF:4.0,\nseg.ts\n#EXT-X-ENDLIST",
+        ] {
+            #expect(throws: CuriumHLSParserError.self) {
+                _ = try CuriumHLSParser.parseMasterOrMedia(text: maliciousPlaylist, baseURL: baseURL)
+            }
+        }
+
+        // 6. Bounded playlist size (4 MiB) and max segment count (5,000).
+        let oversized = "#EXTM3U\n#" + String(repeating: "A", count: CuriumHLSParser.maxPlaylistBytes + 16)
+        #expect(throws: CuriumHLSParserError.self) {
+            _ = try CuriumHLSParser.parseMasterOrMedia(text: oversized, baseURL: baseURL)
+        }
+
+        var tooManyLines: [String] = ["#EXTM3U", "#EXT-X-TARGETDURATION:2"]
+        tooManyLines.reserveCapacity(CuriumHLSParser.maxSegments * 2 + 6)
+        for idx in 0...CuriumHLSParser.maxSegments {
+            tooManyLines.append("#EXTINF:2.0,")
+            tooManyLines.append("seg\(idx).ts")
+        }
+        tooManyLines.append("#EXT-X-ENDLIST")
+        #expect(throws: CuriumHLSParserError.tooManySegments(CuriumHLSParser.maxSegments + 1)) {
+            _ = try CuriumHLSParser.parseMediaPlaylist(text: tooManyLines.joined(separator: "\n"), baseURL: baseURL)
+        }
+    }
+
+    @Test("AES-128-CBC decryption round-trips with explicit hex IV and RFC 8216 §5.2 sequence-number fallback")
+    func aes128CBCRoundTripAndSequenceIVFallback() throws {
+        let baseURL = try #require(URL(string: "https://cdn.video.example/enc/index.m3u8"))
+        let key = Data((0..<16).map { UInt8(0xA0 + $0) })
+        let plaintext1 = Data("Curium MPEG-TS Packet #1 — authenticated AES-128-CBC round-trip payload!".utf8)
+        let plaintext2 = Data(repeating: 0x47, count: 188 * 3) // Three 188-byte MPEG-TS sync frames
+
+        // 1. Explicit IV parsed from #EXT-X-KEY (including short hex left-padding).
+        let encryptedPlaylistText = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:6
+        #EXT-X-MEDIA-SEQUENCE:0x01020304
+        #EXT-X-KEY:METHOD=AES-128,URI="keys/k1.bin",IV=0x000102030405060708090a0b0c0d0e0f
+        #EXTINF:6.0,
+        seg0.ts
+        #EXT-X-KEY:METHOD=AES-128,URI="keys/k1.bin"
+        #EXTINF:6.0,
+        seg1.ts
+        #EXT-X-ENDLIST
+        """
+        let media = try CuriumHLSParser.parseMediaPlaylist(
+            text: encryptedPlaylistText.replacingOccurrences(of: "0x01020304", with: "16909060"),
+            baseURL: baseURL
+        )
+        #expect(media.segments.count == 2)
+
+        guard case .aes128(let keyURL0, let explicitIV0) = media.segments[0].encryption else {
+            Issue.record("Expected AES-128 encryption on segment 0")
+            return
+        }
+        #expect(keyURL0.absoluteString == "https://cdn.video.example/enc/keys/k1.bin")
+        let expectedExplicitIV = Data((0..<16).map(UInt8.init))
+        #expect(explicitIV0 == expectedExplicitIV)
+        let resolvedIV0 = CuriumHLSParser.resolveIV(
+            explicitIV: explicitIV0,
+            mediaSequence: media.segments[0].mediaSequence
+        )
+        #expect(resolvedIV0 == expectedExplicitIV)
+
+        let ciphertext1 = try encryptAES128CBC(plaintext1, key: key, iv: resolvedIV0)
+        let decrypted1 = try CuriumHLSParser.decryptAES128CBC(ciphertext1, key: key, iv: resolvedIV0)
+        #expect(decrypted1 == plaintext1)
+
+        // 2. Sequence-number IV fallback on segment 1 (mediaSequence = 16909061 = 0x01020305).
+        guard case .aes128(_, let explicitIV1) = media.segments[1].encryption else {
+            Issue.record("Expected AES-128 encryption on segment 1")
+            return
+        }
+        #expect(explicitIV1 == nil)
+        #expect(media.segments[1].mediaSequence == 0x0102_0305)
+        let resolvedIV1 = CuriumHLSParser.resolveIV(
+            explicitIV: explicitIV1,
+            mediaSequence: media.segments[1].mediaSequence
+        )
+        let expectedSeqIV = Data([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x02, 0x03, 0x05])
+        #expect(resolvedIV1 == expectedSeqIV)
+
+        let ciphertext2 = try encryptAES128CBC(plaintext2, key: key, iv: resolvedIV1)
+        let decrypted2 = try CuriumHLSParser.decryptAES128CBC(ciphertext2, key: key, iv: resolvedIV1)
+        #expect(decrypted2 == plaintext2)
+
+        // 3. Key/IV/alignment validation fails closed.
+        #expect(throws: CuriumHLSParserError.invalidKeyLength(15)) {
+            _ = try CuriumHLSParser.decryptAES128CBC(ciphertext1, key: Data(repeating: 1, count: 15), iv: resolvedIV0)
+        }
+        #expect(throws: CuriumHLSParserError.invalidIVLength(12)) {
+            _ = try CuriumHLSParser.decryptAES128CBC(ciphertext1, key: key, iv: Data(repeating: 1, count: 12))
+        }
+        #expect(throws: CuriumHLSParserError.self) {
+            _ = try CuriumHLSParser.decryptAES128CBC(Data([0x01, 0x02, 0x03]), key: key, iv: resolvedIV0)
+        }
+    }
+
+    @Test("CuriumMediaDOMScanner parses isolated-world frames, deduplicates and enriches network events, sorts by stream priority, and sanitizes filenames")
+    @MainActor
+    func domScannerParseMergeEnrichmentPriorityAndFilenames() async throws {
+        let mainPageURL = try #require(URL(string: "https://cinema.example/watch?v=99"))
+        let embedURL = try #require(URL(string: "https://player.cinema.example/embed/99"))
+        let hlsURL = try #require(URL(string: "https://cdn.cinema.example/hls/master.m3u8?sig=secret"))
+        let mp4URL = try #require(URL(string: "https://cdn.cinema.example/files/a1b2c3d4e5f60718293a.mp4"))
+        let domOnlyAudioURL = try #require(URL(string: "https://cdn.cinema.example/audio/theme-song.mp3"))
+        let dashURL = try #require(URL(string: "https://cdn.cinema.example/dash/manifest.mpd"))
+
+        let frames: [CuriumIsolatedFrameEvalResult] = [
+            CuriumIsolatedFrameEvalResult(
+                isMainFrame: true,
+                frameURL: mainPageURL,
+                frameOrigin: "https://cinema.example",
+                result: .object([
+                    "pageTitle": .string("  Keynote: Future of Liquid Glass / iOS 27  "),
+                    "blobVideoCount": .number(2),
+                    "entries": .array([
+                        .object([
+                            "url": .null,
+                            "isBlob": .bool(true),
+                            "tag": .string("video"),
+                            "width": .number(1920),
+                            "height": .number(1080),
+                        ]),
+                        .object([
+                            "url": .string("file:///etc/passwd"),
+                            "isBlob": .bool(false),
+                            "tag": .string("video"),
+                        ]),
+                        .object([
+                            "url": .string(domOnlyAudioURL.absoluteString),
+                            "isBlob": .bool(false),
+                            "tag": .string("audio"),
+                            "title": .string("Opening Theme: Orchestra / Live"),
+                            "duration": .number(185.4),
+                            "mimeType": .string("audio/mpeg"),
+                        ]),
+                    ]),
+                ])
+            ),
+            CuriumIsolatedFrameEvalResult(
+                isMainFrame: false,
+                frameURL: embedURL,
+                frameOrigin: "https://player.cinema.example",
+                result: .object([
+                    "pageTitle": .string("Embedded Player"),
+                    "blobVideoCount": .number(1),
+                    "entries": .array([
+                        .object([
+                            "url": .string(mp4URL.absoluteString),
+                            "isBlob": .bool(false),
+                            "tag": .string("video"),
+                            "width": .number(1920),
+                            "height": .number(1080),
+                            "duration": .number(3723.0),
+                            "mimeType": .string("video/mp4; codecs=\"avc1\""),
+                        ]),
+                    ]),
+                ])
+            ),
+        ]
+
+        let parsed = CuriumMediaDOMScanner.parseProbeResults(frames)
+        #expect(parsed.pageTitle == "Keynote: Future of Liquid Glass / iOS 27")
+        #expect(parsed.blobVideoCount == 3)
+        // file:///etc/passwd entry was rejected; 1 blob video + 1 audio + 1 mp4 video remain.
+        #expect(parsed.entries.count == 3)
+        #expect(!parsed.entries.contains { $0.url?.scheme == "file" })
+
+        let t0 = Date(timeIntervalSince1970: 1_760_000_000)
+        let networkEvents: [CuriumMediaResourceEvent] = [
+            try #require(CuriumMediaResourceEvent.parse(
+                from: [
+                    "url": dashURL,
+                    "mimeType": "application/dash+xml",
+                    "httpMethod": "GET",
+                    "httpStatusCode": 200,
+                    "contentLength": 2048,
+                    "referrer": embedURL,
+                    "frameOrigin": "https://player.cinema.example",
+                ],
+                effectiveUserAgent: "CuriumUA/146",
+                now: t0.addingTimeInterval(30)
+            )),
+            try #require(CuriumMediaResourceEvent.parse(
+                from: [
+                    "url": mp4URL,
+                    "mimeType": "video/mp4",
+                    "httpMethod": "GET",
+                    "httpStatusCode": 206,
+                    "contentLength": 52_428_800,
+                    "requestDestination": "video",
+                    "referrer": embedURL,
+                ],
+                effectiveUserAgent: "CuriumUA/146",
+                now: t0.addingTimeInterval(10)
+            )),
+            try #require(CuriumMediaResourceEvent.parse(
+                from: [
+                    "url": hlsURL,
+                    "mimeType": "application/vnd.apple.mpegurl",
+                    "httpMethod": "GET",
+                    "httpStatusCode": 200,
+                    "contentLength": 4096,
+                    "referrer": mainPageURL,
+                    "frameOrigin": "https://cinema.example",
+                ],
+                effectiveUserAgent: "CuriumUA/146",
+                now: t0.addingTimeInterval(20)
+            )),
+        ]
+
+        let snapshot = CuriumMediaDOMScanner.merge(
+            tabID: "tab-1",
+            pageTitle: parsed.pageTitle,
+            networkEvents: networkEvents,
+            domEntries: parsed.entries,
+            blobVideoCount: parsed.blobVideoCount,
+            effectiveUserAgent: "FallbackUA/1.0",
+            now: t0.addingTimeInterval(40)
+        )
+
+        #expect(snapshot.tabID == "tab-1")
+        #expect(snapshot.detectedBlobVideoCount == 3)
+        // Deduped mp4 (network + DOM) + hls (network) + audio (DOM) + dash (network) == 4 candidates.
+        #expect(snapshot.candidates.count == 4)
+        #expect(snapshot.candidates.map(\.kind) == [.hls, .video, .audio, .dash])
+
+        let hlsCandidate = snapshot.candidates[0]
+        #expect(hlsCandidate.url == hlsURL)
+        #expect(hlsCandidate.formatBadge == "HLS")
+        #expect(hlsCandidate.fromNetwork && !hlsCandidate.fromDOM)
+        // Generic "master" stem replaced by pageTitle; ":" and "/" sanitized out of suggestedFilename.
+        #expect(hlsCandidate.title == "Keynote: Future of Liquid Glass / iOS 27")
+        #expect(hlsCandidate.suggestedFilename == "Keynote- Future of Liquid Glass - iOS 27.ts")
+
+        let videoCandidate = snapshot.candidates[1]
+        #expect(videoCandidate.url == mp4URL)
+        #expect(videoCandidate.fromDOM && videoCandidate.fromNetwork)
+        #expect(videoCandidate.resolutionLabel == "1080p")
+        #expect(videoCandidate.formattedDuration == "1:02:03")
+        #expect(videoCandidate.contentLength == 52_428_800)
+        #expect(videoCandidate.formattedByteSize != nil)
+        #expect(videoCandidate.frameOrigin == "https://player.cinema.example")
+        #expect(videoCandidate.effectiveUserAgent == "CuriumUA/146")
+        // Opaque hex stem replaced with pageTitle; extension resolved to .mp4.
+        #expect(videoCandidate.suggestedFilename == "Keynote- Future of Liquid Glass - iOS 27.mp4")
+
+        let audioCandidate = snapshot.candidates[2]
+        #expect(audioCandidate.url == domOnlyAudioURL)
+        #expect(audioCandidate.fromDOM && !audioCandidate.fromNetwork)
+        #expect(audioCandidate.title == "Opening Theme: Orchestra / Live")
+        #expect(audioCandidate.formattedDuration == "3:05")
+        #expect(audioCandidate.suggestedFilename == "Opening Theme- Orchestra - Live.mp3")
+
+        let dashCandidate = snapshot.candidates[3]
+        #expect(dashCandidate.formatBadge == "DASH")
+        #expect(dashCandidate.suggestedFilename.hasSuffix(".mpd"))
+
+        // Verify CuriumBrowserStore.scanActiveTabMedia() wires isolated-world eval + radar merge cleanly.
+        let host = MockBrowserHost()
+        let mockTab = MockTabHost(tabID: "t-scan", url: mainPageURL, title: "Fallback Title")
+        mockTab.isolatedEvalHandler = { script, allFrames in
+            #expect(script == CuriumMediaDOMScanner.probeScript)
+            #expect(allFrames == true)
+            return ([
+                [
+                    "isMainFrame": NSNumber(value: true),
+                    "frameURL": mainPageURL,
+                    "frameOrigin": "https://cinema.example",
+                    "result": [
+                        "pageTitle": "Live Concert",
+                        "blobVideoCount": 1,
+                        "entries": [
+                            [
+                                "url": domOnlyAudioURL.absoluteString,
+                                "isBlob": false,
+                                "tag": "audio",
+                                "duration": 90.0,
+                            ] as [String: Any],
+                        ],
+                    ] as [String: Any],
+                ],
+            ], nil)
+        }
+        host.tabs = [mockTab]
+        host.activeTab = mockTab
+        let store = CuriumBrowserStore(host: host)
+        _ = store.mediaRadar.ingest(
+            rawEvent: ["url": hlsURL, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200],
+            tabID: "t-scan",
+            effectiveUserAgent: "CuriumUA/146"
+        )
+        #expect(store.activeTabMediaCount == 1)
+
+        let liveScan = await store.scanActiveTabMedia()
+        #expect(liveScan.pageTitle == "Live Concert")
+        #expect(liveScan.detectedBlobVideoCount == 1)
+        #expect(liveScan.candidates.map(\.kind) == [.hls, .audio])
+    }
+
+    @Test("CuriumMediaNetworking maps system/direct/fixed proxies, configures cookie-isolated ephemeral sessions, and attaches auth headers")
+    @MainActor
+    func mediaNetworkingProxyDictionaryEphemeralSessionAndAuthHeaders() throws {
+        // 1. Proxy dictionary mapping (.system, .direct, .fixed for socks5://, http://, https://, IPv6, bypass).
+        #expect(CuriumMediaNetworking.proxyDictionary(for: .system) == nil)
+        let directDict = try #require(CuriumMediaNetworking.proxyDictionary(for: .direct))
+        #expect(directDict.isEmpty)
+
+        let socksDict = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "localhost,127.0.0.1;<local>")
+        ))
+        #expect((socksDict["SOCKSEnable"] as? Int) == 1)
+        #expect((socksDict["SOCKSProxy"] as? String) == "127.0.0.1")
+        #expect((socksDict["SOCKSPort"] as? Int) == 1080)
+        #expect((socksDict["ExceptionsList"] as? [String]) == ["localhost", "127.0.0.1"])
+        #expect((socksDict["ExcludeSimpleHostnames"] as? Int) == 1)
+
+        let httpDict = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "http://proxy.internal:8080", bypassRules: nil)
+        ))
+        #expect((httpDict["HTTPEnable"] as? Int) == 1)
+        #expect((httpDict["HTTPProxy"] as? String) == "proxy.internal")
+        #expect((httpDict["HTTPPort"] as? Int) == 8080)
+        #expect((httpDict["HTTPSEnable"] as? Int) == 1)
+        #expect((httpDict["HTTPSProxy"] as? String) == "proxy.internal")
+        #expect((httpDict["HTTPSPort"] as? Int) == 8080)
+
+        let httpsDict = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "https://tls-proxy.internal:8443", bypassRules: nil)
+        ))
+        #expect((httpsDict["HTTPEnable"] as? Int) == 1)
+        #expect((httpsDict["HTTPSEnable"] as? Int) == 1)
+        #expect((httpsDict["HTTPSProxy"] as? String) == "tls-proxy.internal")
+        #expect((httpsDict["HTTPSPort"] as? Int) == 8443)
+
+        let splitIPv6Dict = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "http=10.0.0.2:3128;https=socks5://[::1]:1085", bypassRules: nil)
+        ))
+        #expect((splitIPv6Dict["HTTPEnable"] as? Int) == 1)
+        #expect((splitIPv6Dict["HTTPProxy"] as? String) == "10.0.0.2")
+        #expect((splitIPv6Dict["HTTPPort"] as? Int) == 3128)
+        #expect((splitIPv6Dict["SOCKSEnable"] as? Int) == 1)
+        #expect((splitIPv6Dict["SOCKSProxy"] as? String) == "::1")
+        #expect((splitIPv6Dict["SOCKSPort"] as? Int) == 1085)
+
+        // Fixed proxy with unsupported-only scheme clause fails closed rather than degrading to direct [:] real IP.
+        let failClosedFixed = try #require(CuriumMediaNetworking.proxyDictionary(
+            for: .fixed(rules: "ftp=127.0.0.1:2121", bypassRules: nil)
+        ))
+        #expect((failClosedFixed["SOCKSEnable"] as? Int) == 1)
+        #expect((failClosedFixed["SOCKSProxy"] as? String) == "127.0.0.1")
+        #expect((failClosedFixed["SOCKSPort"] as? Int) == 1)
+
+        // 2. Ephemeral session enforces cookie & cache isolation on LiveContainer.
+        let session = CuriumMediaNetworking.makeEphemeralSession(
+            proxy: .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: nil)
+        )
+        defer { session.invalidateAndCancel() }
+        let cfg = session.configuration
+        #expect(cfg.httpShouldSetCookies == false)
+        #expect(cfg.httpCookieAcceptPolicy == .never)
+        #expect(cfg.urlCache == nil)
+        #expect((cfg.connectionProxyDictionary?["SOCKSProxy"] as? String) == "127.0.0.1")
+
+        // 3. makeRequest attaches Cookie, User-Agent, Referer, Origin, and Range while blocking file:// Referer & "null" Origin.
+        let targetURL = try #require(URL(string: "https://cdn.example/video/seg1.m4s"))
+        let context = CuriumMediaRequestContext(
+            cookieHeader: "  sid=abc123; theme=dark  ",
+            userAgent: "Mozilla/5.0 CuriumTest/146",
+            referrer: URL(string: "https://watch.example/player/42"),
+            origin: "https://watch.example",
+            proxy: .direct
+        )
+        let req = CuriumMediaNetworking.makeRequest(
+            url: targetURL,
+            context: context,
+            byteRange: (length: 1024, offset: 512)
+        )
+        #expect(req.httpMethod == "GET")
+        #expect(req.httpShouldHandleCookies == false)
+        #expect(req.value(forHTTPHeaderField: "Cookie") == "sid=abc123; theme=dark")
+        #expect(req.value(forHTTPHeaderField: "User-Agent") == "Mozilla/5.0 CuriumTest/146")
+        #expect(req.value(forHTTPHeaderField: "Referer") == "https://watch.example/player/42")
+        #expect(req.value(forHTTPHeaderField: "Origin") == "https://watch.example")
+        #expect(req.value(forHTTPHeaderField: "Range") == "bytes=512-1535")
+
+        let scrubbedContext = CuriumMediaRequestContext(
+            cookieHeader: "   ",
+            userAgent: nil,
+            referrer: URL(fileURLWithPath: "/private/var/mobile/secret.html"),
+            origin: "null",
+            proxy: .system
+        )
+        let scrubbedReq = CuriumMediaNetworking.makeRequest(
+            url: targetURL,
+            context: scrubbedContext,
+            byteRange: (length: 256, offset: nil)
+        )
+        #expect(scrubbedReq.value(forHTTPHeaderField: "Cookie") == nil)
+        #expect(scrubbedReq.value(forHTTPHeaderField: "Referer") == nil)
+        #expect(scrubbedReq.value(forHTTPHeaderField: "Origin") == nil)
+        #expect(scrubbedReq.value(forHTTPHeaderField: "Range") == "bytes=0-255")
+
+        // 4. Direct & HLS tasks deterministically reject non-http(s) URLs before touching the network.
+        let tempDir = try makeTempDir("curium-mr-scheme")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let destFile = tempDir.appending(path: "out.mp4", directoryHint: .notDirectory)
+
+        let directTask = CuriumDirectMediaDownloadTask(
+            url: URL(fileURLWithPath: "/etc/passwd"),
+            suggestedFilename: "passwd.mp4",
+            context: context
+        )
+        var directError: (any Error)?
+        directTask.start(withDestinationURL: destFile) { saved, err in
+            #expect(saved == nil)
+            directError = err
+        }
+        #expect(directTask.state == .failed)
+        #expect((directError as? CuriumMediaDownloadError) == .disallowedURLScheme("file"))
+        #expect(!FileManager.default.fileExists(atPath: destFile.path))
+
+        let hlsTask = CuriumHLSMediaDownloadTask(
+            playlistURL: URL(fileURLWithPath: "/etc/passwd"),
+            suggestedFilename: "passwd.ts",
+            context: context
+        )
+        var hlsError: (any Error)?
+        hlsTask.start(withDestinationURL: destFile) { saved, err in
+            #expect(saved == nil)
+            hlsError = err
+        }
+        #expect(hlsTask.state == .failed)
+        #expect((hlsError as? CuriumMediaDownloadError) == .disallowedURLScheme("file"))
+        #expect(!FileManager.default.fileExists(atPath: destFile.path))
+    }
+
+    @Test("CuriumDownloadStorage classifies PDF/video/audio symbols and CuriumBackgroundKeepAlive gates strictly on background && activeTaskCount > 0")
+    @MainActor
+    func mediaTypeClassificationAndBackgroundKeepAliveGate() throws {
+        // 1. CuriumDownloadStorage.isVideo / isAudio / symbolName classification.
+        #expect(CuriumDownloadStorage.symbolName(mimeType: "application/pdf", filename: "paper.pdf") == "doc.richtext")
+        #expect(!CuriumDownloadStorage.isVideo(mimeType: "application/pdf", filename: "paper.pdf"))
+        #expect(!CuriumDownloadStorage.isAudio(mimeType: "application/pdf", filename: "paper.pdf"))
+
+        for videoName in ["clip.mp4", "movie.m4v", "capture.mov", "vp9.webm", "anime.mkv", "segment.ts", "stream.m3u8"] {
+            #expect(CuriumDownloadStorage.isVideo(mimeType: nil, filename: videoName), "Expected video for \(videoName)")
+            #expect(!CuriumDownloadStorage.isAudio(mimeType: nil, filename: videoName))
+            #expect(CuriumDownloadStorage.symbolName(mimeType: nil, filename: videoName) == "film")
+        }
+        #expect(CuriumDownloadStorage.isVideo(mimeType: "audio/mpegurl", filename: "live", url: URL(string: "https://cdn.example/live")))
+        #expect(!CuriumDownloadStorage.isAudio(mimeType: "audio/mpegurl", filename: "live"))
+        #expect(CuriumDownloadStorage.symbolName(mimeType: "application/octet-stream", filename: "lecture.mp4") == "film")
+
+        for audioName in ["track.mp3", "podcast.m4a", "voice.aac", "vorbis.ogg", "speech.opus", "lossless.flac", "pcm.wav"] {
+            #expect(CuriumDownloadStorage.isAudio(mimeType: nil, filename: audioName), "Expected audio for \(audioName)")
+            #expect(!CuriumDownloadStorage.isVideo(mimeType: nil, filename: audioName))
+            #expect(CuriumDownloadStorage.symbolName(mimeType: nil, filename: audioName) == "waveform")
+        }
+        #expect(CuriumDownloadStorage.symbolName(mimeType: "application/octet-stream", filename: "episode.m4a") == "waveform")
+        #expect(CuriumDownloadStorage.symbolName(mimeType: "application/zip", filename: "archive.zip") == "doc")
+
+        // 2. CuriumSavedDownload and CuriumDownload propagate classification & symbolName.
+        let savedVideo = CuriumSavedDownload(
+            url: URL(fileURLWithPath: "/tmp/keynote.mp4"),
+            filename: "keynote.mp4",
+            byteCount: 1024,
+            modifiedAt: .now,
+            isPDF: false
+        )
+        #expect(savedVideo.isVideo)
+        #expect(!savedVideo.isAudio)
+        #expect(savedVideo.symbolName == "film")
+
+        let savedAudio = CuriumSavedDownload(
+            url: URL(fileURLWithPath: "/tmp/song.flac"),
+            filename: "song.flac",
+            byteCount: 2048,
+            modifiedAt: .now,
+            isPDF: false
+        )
+        #expect(savedAudio.isAudio)
+        #expect(!savedAudio.isVideo)
+        #expect(savedAudio.symbolName == "waveform")
+
+        let activeAudioDownload = CuriumDownload(
+            task: MockDownloadTask(
+                originalURL: URL(string: "https://cdn.example/mix.opus"),
+                suggestedFilename: "mix.opus",
+                mimeType: "audio/opus"
+            )
+        )
+        #expect(activeAudioDownload.isAudio)
+        #expect(!activeAudioDownload.isVideo)
+        #expect(activeAudioDownload.symbolName == "waveform")
+
+        // 3. CuriumBackgroundKeepAlive strictly requires BOTH isBackgrounded && activeTaskCount > 0.
+        let keepAlive = CuriumBackgroundKeepAlive()
+        defer { keepAlive.stopImmediately() }
+
+        #expect(!keepAlive.shouldBeActive)
+        #expect(!keepAlive.isEngineRunning)
+
+        // Foreground + active tasks -> NEVER activates audio session.
+        keepAlive.setActiveTaskCount(2)
+        #expect(keepAlive.activeTaskCount == 2)
+        #expect(!keepAlive.isBackgrounded)
+        #expect(!keepAlive.shouldBeActive)
+        #expect(!keepAlive.isEngineRunning)
+
+        // Background + 0 tasks -> NEVER activates audio session.
+        keepAlive.setActiveTaskCount(0)
+        keepAlive.setBackgrounded(true)
+        #expect(keepAlive.isBackgrounded)
+        #expect(!keepAlive.shouldBeActive)
+        #expect(!keepAlive.isEngineRunning)
+
+        // Background + active tasks -> eligible (on headless Simulator 0Hz routes it fails safe without throwing).
+        keepAlive.setActiveTaskCount(1)
+        #expect(keepAlive.shouldBeActive)
+
+        // Foreground return tears down immediately even while tasks remain active.
+        keepAlive.setBackgrounded(false)
+        #expect(!keepAlive.shouldBeActive)
+        #expect(!keepAlive.isEngineRunning)
+
+        // Task queue drain while backgrounded tears down immediately.
+        keepAlive.setBackgrounded(true)
+        keepAlive.setActiveTaskCount(0)
+        #expect(!keepAlive.shouldBeActive)
+        #expect(!keepAlive.isEngineRunning)
     }
 }

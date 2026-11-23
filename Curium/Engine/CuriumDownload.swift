@@ -8,7 +8,7 @@ final class CuriumDownload: Identifiable {
     let id: String
     let sourceTabID: String?
     let originalURL: URL?
-    let filename: String
+    private(set) var filename: String
     let mimeType: String?
     let isExplicitDownload: Bool
     let isMainFrame: Bool
@@ -21,6 +21,7 @@ final class CuriumDownload: Identifiable {
     private(set) var totalBytes: Int64 = -1
     private(set) var receivedBytes: Int64 = 0
     private(set) var isStarting = false
+    @ObservationIgnored var onActivityChange: (@MainActor () -> Void)?
 
     var isActive: Bool { isStarting || state == .inProgress }
 
@@ -41,6 +42,18 @@ final class CuriumDownload: Identifiable {
 
     var isPDF: Bool {
         CuriumDownloadStorage.isPDF(mimeType: mimeType, filename: filename, url: originalURL)
+    }
+
+    var isVideo: Bool {
+        CuriumDownloadStorage.isVideo(mimeType: mimeType, filename: filename, url: originalURL)
+    }
+
+    var isAudio: Bool {
+        CuriumDownloadStorage.isAudio(mimeType: mimeType, filename: filename, url: originalURL)
+    }
+
+    var symbolName: String {
+        CuriumDownloadStorage.symbolName(mimeType: mimeType, filename: filename, url: originalURL)
     }
 
     var formattedByteSize: String? {
@@ -66,7 +79,12 @@ final class CuriumDownload: Identifiable {
         guard state == .pending, !isStarting else { return savedURL }
         isStarting = true
         failure = nil
-        defer { isStarting = false; refresh() }
+        onActivityChange?()
+        defer {
+            isStarting = false
+            refresh()
+            onActivityChange?()
+        }
         let name = filename
 
         if downloadsRoot == nil && CuriumDownloadsFolderManager.isUsingCustomDownloadsFolder {
@@ -82,6 +100,7 @@ final class CuriumDownload: Identifiable {
                 }.value
                 stagingDirectory = staged.sessionDirectory
                 let downloadedURL = try await task.start(withDestinationURL: staged.fileURL)
+                let commitName = downloadedURL.lastPathComponent.isEmpty ? name : downloadedURL.lastPathComponent
                 let sessionToClean = staged.sessionDirectory
                 let committedURL = try await Task.detached(priority: .utility) {
                     defer {
@@ -91,12 +110,16 @@ final class CuriumDownload: Identifiable {
                     return try CuriumDownloadStorage.commitStagedFile(
                         from: downloadedURL,
                         toDirectory: destinationDirectory,
-                        preferredFilename: name,
+                        preferredFilename: commitName,
                         removeSource: true
                     )
                 }.value
                 stagingDirectory = nil
                 savedURL = committedURL
+                let finalName = committedURL.lastPathComponent
+                if !finalName.isEmpty && finalName != filename {
+                    filename = finalName
+                }
                 return savedURL
             } catch {
                 if task.state != .cancelled { failure = error.localizedDescription }
@@ -117,6 +140,10 @@ final class CuriumDownload: Identifiable {
             reservedURL = destination
             let resolved = try await task.start(withDestinationURL: destination)
             savedURL = resolved
+            let finalName = resolved.lastPathComponent
+            if !finalName.isEmpty && finalName != filename {
+                filename = finalName
+            }
             return savedURL
         } catch {
             if task.state != .cancelled { failure = error.localizedDescription }
@@ -127,5 +154,6 @@ final class CuriumDownload: Identifiable {
     func cancel() {
         task.cancel()
         refresh()
+        onActivityChange?()
     }
 }

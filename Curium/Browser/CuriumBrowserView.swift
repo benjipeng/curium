@@ -19,7 +19,7 @@ struct CuriumBrowserView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     fileprivate enum Destination: Hashable, Identifiable {
-        case tabs, extensions, downloads, bookmarks, history, settings, profiles
+        case tabs, extensions, mediaRadar, downloads, bookmarks, history, settings, profiles
 
         var id: Self { self }
     }
@@ -196,10 +196,19 @@ struct CuriumBrowserView: View {
         .onChange(of: store.activeMediaPermissionPrompt != nil) { _, presented in
             if presented { dismissAddressFocus() }
         }
-        .sheet(item: $sheet, onDismiss: { store.setSheetPresented(false) }) { item in
+        .sheet(item: $sheet, onDismiss: {
+            if sheet == nil {
+                store.setSheetPresented(false)
+            }
+        }) { item in
             switch item {
             case .tabs: CuriumTabsSheet(store: store)
             case .extensions: CuriumExtensionsSheet(browser: store)
+            case .mediaRadar:
+                CuriumMediaRadarSheet(store: store, onOpenDownloads: {
+                    store.dismissDownloadBanner()
+                    present(.downloads)
+                })
             case .downloads: CuriumDownloadsSheet(store: store)
             case .bookmarks:
                 CuriumLibrarySheet(
@@ -684,6 +693,16 @@ private struct CuriumOverflowToolbarMenu: View {
                 .accessibilityIdentifier("curium.menu.bookmarks")
             Button { present(.history) } label: { Label("History", systemImage: "clock") }
                 .accessibilityIdentifier("curium.menu.history")
+
+            Button { present(.mediaRadar) } label: {
+                let detected = store.activeTabMediaCount
+                Label(
+                    detected > 0 ? "Detected Media (\(detected))" : "Detected Media",
+                    systemImage: "film.stack"
+                )
+            }
+            .disabled(tab?.url == nil || tab?.isShowingPDF == true)
+            .accessibilityIdentifier("curium.menu.mediaRadar")
 
             Button { present(.downloads) } label: {
                 let pending = store.pendingOrActiveDownloadCount
