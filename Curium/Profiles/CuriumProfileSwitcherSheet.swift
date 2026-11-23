@@ -410,15 +410,15 @@ struct CuriumProfileSwitcherSheet: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(
                             isActiveEngineRestart
-                                ? "Restart Required: \(activeProfile.displayName)"
+                                ? "Restart to Apply Changes"
                                 : "Pending Switch: \(nextLaunchProfile.displayName)"
                         )
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
                         Text(
                             isActiveEngineRestart
-                                ? "Saved fingerprint or network edits for \(activeProfile.displayName) apply on next launch. Tabs and library will be saved before closing."
-                                : "Tabs and library for \(activeProfile.displayName) will be saved before closing so Curium opens cleanly into \(nextLaunchProfile.displayName)."
+                                ? "Reopen Curium to apply updated settings for \(activeProfile.displayName). Tabs and library are saved before closing."
+                                : "Tabs and library are saved before closing. Reopen Curium to switch into \(nextLaunchProfile.displayName)."
                         )
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -438,7 +438,7 @@ struct CuriumProfileSwitcherSheet: View {
                             }
                             Text(
                                 isActiveEngineRestart
-                                    ? "Save & Close to Apply"
+                                    ? CuriumProfileRelauncher.primaryApplyButtonTitle
                                     : CuriumProfileRelauncher.primaryRelaunchButtonTitle
                             )
                         }

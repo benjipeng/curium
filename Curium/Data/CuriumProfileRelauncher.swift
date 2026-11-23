@@ -16,6 +16,14 @@ enum CuriumProfileRelauncher {
         "Close & Switch"
     }
 
+    static var primaryApplyButtonTitle: String {
+        "Save & Close to Apply"
+    }
+
+    static var shortApplyButtonTitle: String {
+        "Close & Apply"
+    }
+
     static var recoveryCloseButtonTitle: String {
         "Close Curium"
     }

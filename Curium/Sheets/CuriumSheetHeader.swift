@@ -239,7 +239,7 @@ struct CuriumSettingsSheet: View {
                                 if let nextProfile {
                                     Text(
                                         hasPendingActiveRestart
-                                            ? "Restart required to apply changes"
+                                            ? "Restart to apply changes"
                                             : "Next launch: \(nextProfile.displayName)"
                                     )
                                     .font(.caption.weight(.medium))

@@ -772,7 +772,9 @@ private struct CuriumBottomOverlayStack: View {
         let storeID: String? = isShowingPDF ? nil : CuriumExtensionStore.storeExtensionID(from: tab?.url)
         let bannerDownload = store.activeDownloadBanner
         let showPendingSwitch = fingerprintStore.hasPendingProfileSwitch && !dismissedPendingSwitch
+        let isActiveEngineRestart = fingerprintStore.hasPendingActiveProfileEngineChanges
         let nextProfile = showPendingSwitch ? fingerprintStore.nextLaunchProfile : nil
+        let pendingPromptKey = "\(fingerprintStore.nextLaunchProfileID)|\(isActiveEngineRestart)|\(fingerprintStore.activeProfile.revision)"
 
         Group {
             if storeID != nil || nextProfile != nil || bannerDownload != nil {
@@ -795,6 +797,7 @@ private struct CuriumBottomOverlayStack: View {
                         CuriumPendingProfileSwitchPill(
                             store: store,
                             nextProfile: nextProfile,
+                            isActiveEngineRestart: isActiveEngineRestart,
                             maxWidth: min(440, pane.maxWidth),
                             onDismiss: { dismissedPendingSwitch = true }
                         )
@@ -824,37 +827,56 @@ private struct CuriumBottomOverlayStack: View {
                 .ignoresSafeArea(isShowingPDF ? SafeAreaRegions() : .keyboard, edges: .bottom)
             }
         }
-        .onChange(of: fingerprintStore.nextLaunchProfileID) { _, _ in
+        .onChange(of: pendingPromptKey) { _, _ in
             dismissedPendingSwitch = false
         }
     }
 }
 
 /// Calm floating Liquid Glass pill offering one-tap cold relaunch when the user has
-/// selected a different profile for the next launch.
+/// selected a different profile or saved engine-affecting edits to the active profile.
 private struct CuriumPendingProfileSwitchPill: View {
     let store: CuriumBrowserStore
     let nextProfile: CuriumFingerprintProfile
+    let isActiveEngineRestart: Bool
     let maxWidth: CGFloat
     let onDismiss: () -> Void
 
     @State private var isRelaunching = false
 
+    private var promptTitle: String {
+        isActiveEngineRestart
+            ? "Restart to apply changes"
+            : "Switch to \(nextProfile.displayName)"
+    }
+
     private var shortActionTitle: String {
-        CuriumProfileRelauncher.shortActionButtonTitle
+        isActiveEngineRestart
+            ? CuriumProfileRelauncher.shortApplyButtonTitle
+            : CuriumProfileRelauncher.shortActionButtonTitle
+    }
+
+    private var primaryActionAccessibilityLabel: String {
+        isActiveEngineRestart
+            ? CuriumProfileRelauncher.primaryApplyButtonTitle
+            : CuriumProfileRelauncher.primaryRelaunchButtonTitle
+    }
+
+    private var dismissAccessibilityLabel: String {
+        isActiveEngineRestart ? "Dismiss Restart Prompt" : "Dismiss Pending Switch"
     }
 
     var body: some View {
-        let nextPalette = nextProfile.resolvedPalette
+        let accentTint = isActiveEngineRestart ? Color.orange : nextProfile.resolvedPalette.tint
 
         HStack(spacing: 10) {
-            Image(systemName: nextProfile.resolvedSymbolName)
+            Image(systemName: isActiveEngineRestart ? "arrow.clockwise.circle.fill" : nextProfile.resolvedSymbolName)
                 .font(.body.weight(.semibold))
-                .foregroundStyle(nextPalette.tint)
+                .foregroundStyle(accentTint)
                 .frame(width: 24)
                 .accessibilityHidden(true)
 
-            Text("Next launch: \(nextProfile.displayName)")
+            Text(promptTitle)
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
@@ -882,14 +904,14 @@ private struct CuriumPendingProfileSwitchPill: View {
                 }
             }
             .buttonStyle(.borderedProminent)
-            .tint(nextPalette.tint)
+            .tint(accentTint)
             .controlSize(.small)
             .disabled(isRelaunching)
-            .accessibilityLabel(CuriumProfileRelauncher.primaryRelaunchButtonTitle)
+            .accessibilityLabel(primaryActionAccessibilityLabel)
             .accessibilityIdentifier("curium.pendingSwitch.relaunch")
 
             Button(action: onDismiss) {
-                Label("Dismiss Pending Switch", systemImage: "xmark")
+                Label(dismissAccessibilityLabel, systemImage: "xmark")
                     .labelStyle(.iconOnly)
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(.secondary)
