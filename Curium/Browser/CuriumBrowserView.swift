@@ -38,9 +38,17 @@ struct CuriumBrowserView: View {
                 layoutDirection: layoutDirection
             )
             let restingTopInset: CGFloat = isFullscreen ? 0 : clearance.bandFloor
+            let hasBottomOverlay = store.activeDownloadBanner != nil
+                || CuriumFingerprintStore.shared.hasPendingProfileSwitch
+            let safeBottom = max(proxy.safeAreaInsets.bottom, 34)
+            let startBottomClearance: CGFloat = (
+                placement == .none
+                    ? CuriumSpace.bottomToolbarClearance + safeBottom + 18
+                    : safeBottom + 24
+            ) + (hasBottomOverlay ? 64 : 0)
 
             ZStack(alignment: .top) {
-                CuriumPageCanvas(tab: tab)
+                CuriumPageCanvas(tab: tab, startPageCanvas: showsStartPage ? palette.canvas : nil)
                     .ignoresSafeArea(.all)
 
                 CuriumBlinkViewportHost(
@@ -54,6 +62,7 @@ struct CuriumBrowserView: View {
                 )
                 .ignoresSafeArea(.container, edges: [.top, .bottom])
                 .ignoresSafeArea(.keyboard)
+                .opacity(showsStartPage ? 0 : 1)
                 .allowsHitTesting(!showsStartPage && tab?.isShowingPDF != true && !addressFocused)
                 .accessibilityHidden(showsStartPage || tab?.isShowingPDF == true)
 
@@ -84,9 +93,11 @@ struct CuriumBrowserView: View {
                     CuriumStartPage(
                         store: store,
                         topInset: clearance.bandFloor,
-                        onOpenProfiles: { present(.profiles) }
+                        bottomClearance: startBottomClearance,
+                        onOpenProfiles: { present(.profiles) },
+                        onOpenHistory: { present(.history) }
                     )
-                    .ignoresSafeArea(.container, edges: .top)
+                    .ignoresSafeArea(.container, edges: [.top, .bottom])
                     .ignoresSafeArea(.keyboard)
                 }
 
@@ -160,6 +171,10 @@ struct CuriumBrowserView: View {
         }
         .ignoresSafeArea(.container, edges: .top)
         .background {
+            CuriumPageCanvas(tab: tab, startPageCanvas: showsStartPage ? palette.canvas : nil)
+                .ignoresSafeArea(.all)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
             CuriumVerticalBarReader { placement = $0 }
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
@@ -1117,9 +1132,14 @@ private struct CuriumExtensionsToolbarButton: View {
 
 private struct CuriumPageCanvas: View {
     let tab: CuriumTabModel?
+    var startPageCanvas: Color? = nil
 
     var body: some View {
-        Color(uiColor: tab?.pageCanvasColor ?? .systemBackground)
+        if let startPageCanvas {
+            startPageCanvas
+        } else {
+            Color(uiColor: tab?.pageCanvasColor ?? .systemBackground)
+        }
     }
 }
 
@@ -1948,40 +1968,47 @@ struct CuriumStandbyPage: View {
     let palette: CuriumPalette
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("96").font(.system(.caption, design: .monospaced).weight(.semibold))
-                    Text("Cm").font(.system(size: 40, weight: .medium, design: .serif))
-                        .tracking(-2.5)
-                }
-                .foregroundStyle(palette.tint)
-                .frame(width: 96, height: 96)
-                .background(palette.tile, in: .rect(cornerRadius: 22))
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Curium, element 96")
+        let hostTitle = tab?.url.map(CuriumSiteIdentity.cleanHost(for:))?.nilIfEmpty
 
-                VStack(alignment: .leading, spacing: 9) {
-                    Text(tab?.url?.host() ?? "Curium")
-                        .font(.system(.largeTitle, design: .serif).weight(.medium))
+        ZStack {
+            CuriumStartAtmosphere(palette: palette)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    Label("ENGINE STANDBY", systemImage: "circle.dotted")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .tracking(1.3)
+                        .foregroundStyle(palette.tint)
+
+                    Text(hostTitle ?? "Waiting for Blink")
+                        .font(.system(size: 32, weight: .medium, design: .serif))
+                        .tracking(-0.7)
+                        .foregroundStyle(.primary)
+
+                    Rectangle()
+                        .fill(CuriumSpace.editorialRule)
+                        .frame(height: 0.5)
+
                     Text(engineReady ? "Waiting for Blink to open a tab." :
                          "Tabs and address history are available for this session. Loading websites requires Blink.")
-                        .font(.callout)
+                        .font(.subheadline)
                         .foregroundStyle(CuriumSpace.secondaryInk)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-
-                Label("ENGINE STANDBY", systemImage: "circle.dotted")
-                    .font(.system(.caption2, design: .monospaced).weight(.semibold))
-                    .tracking(1)
-                    .foregroundStyle(palette.tint)
+                .frame(maxWidth: 400, alignment: .leading)
+                .padding(.horizontal, 32)
+                .padding(.top, topInset + 48)
+                .padding(.bottom, 28)
+                .frame(maxWidth: .infinity, alignment: .center)
             }
-            .frame(maxWidth: 380, alignment: .leading)
-            .padding(.horizontal, 32)
-            .padding(.top, topInset + 46)
-            .padding(.bottom, 28)
-            .frame(maxWidth: .infinity, alignment: .center)
+            .scrollBounceBehavior(.basedOnSize)
         }
-        .scrollBounceBehavior(.basedOnSize)
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }

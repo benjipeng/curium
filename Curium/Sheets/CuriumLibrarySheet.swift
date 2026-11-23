@@ -286,7 +286,7 @@ private struct CuriumLibraryRow: View {
 
 struct CuriumSiteMonogram: View {
     enum Size {
-        case row, shortcut
+        case compactSeal, seal, row, shortcut
     }
 
     let host: String
@@ -294,15 +294,49 @@ struct CuriumSiteMonogram: View {
     @Environment(\.curiumPalette) private var palette
 
     var body: some View {
-        let side: CGFloat = size == .row ? 36 : 64
-        Text(host.first.map { String($0).localizedUppercase } ?? "·")
-            .font(.system(size == .row ? .title3 : .largeTitle, design: .serif).weight(.medium))
+        let side: CGFloat
+        let cornerRadius: CGFloat
+        let font: Font
+        let showsHairline: Bool
+
+        switch size {
+        case .compactSeal:
+            side = 28
+            cornerRadius = 7
+            font = .system(size: 14, weight: .medium, design: .serif)
+            showsHairline = true
+        case .seal:
+            side = 32
+            cornerRadius = 8
+            font = .system(size: 16, weight: .medium, design: .serif)
+            showsHairline = true
+        case .row:
+            side = 36
+            cornerRadius = 9
+            font = .system(.title3, design: .serif).weight(.medium)
+            showsHairline = false
+        case .shortcut:
+            side = 64
+            cornerRadius = 16
+            font = .system(.largeTitle, design: .serif).weight(.medium)
+            showsHairline = false
+        }
+
+        let initial = CuriumSiteIdentity.monogramInitial(forHost: host)
+        return Text(initial)
+            .font(font)
             .lineLimit(1)
             .minimumScaleFactor(0.5)
-            .padding(4)
+            .padding(showsHairline ? 2 : 4)
             .frame(width: side, height: side)
-            .foregroundStyle(.tint)
-            .background(palette.tile, in: .rect(cornerRadius: size == .row ? 9 : 16))
+            .foregroundStyle(palette.tint)
+            .background(palette.tile, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay {
+                if showsHairline {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .strokeBorder(palette.tint.opacity(0.14), lineWidth: 0.5)
+                }
+            }
             .accessibilityHidden(true)
     }
 }

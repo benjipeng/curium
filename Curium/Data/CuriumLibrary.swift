@@ -64,6 +64,31 @@ struct CuriumHistoryDay: Identifiable, Sendable {
     var id: Date { day }
 }
 
+/// Frecency-ranked local site surfaced on the Start Page's Frequently Visited shelf.
+struct CuriumFrequentSite: Identifiable, Hashable, Sendable {
+    let siteID: Int64
+    let url: URL
+    let title: String
+    let visitCount: Int
+    let lastVisit: Date
+    let cleanHost: String
+
+    init(siteID: Int64, url: URL, title: String, visitCount: Int, lastVisit: Date) {
+        self.siteID = siteID
+        self.url = url
+        self.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.visitCount = visitCount
+        self.lastVisit = lastVisit
+        let cleaned = CuriumSiteIdentity.cleanHost(for: url)
+        self.cleanHost = cleaned.isEmpty ? (url.host() ?? url.absoluteString) : cleaned
+    }
+
+    var id: Int64 { siteID }
+    var displayTitle: String {
+        CuriumSiteIdentity.displayTitle(rawTitle: title, cleanHost: cleanHost)
+    }
+}
+
 struct CuriumAddressMatch: Identifiable, Hashable, Sendable {
     enum Kind: Sendable { case bookmark, history }
     let kind: Kind
@@ -110,6 +135,9 @@ final class CuriumLibrary {
     var favoriteBookmarks: [CuriumBookmark] { bookmarks.favorites }
     var favorites: [CuriumBookmark] { favoriteBookmarks }
     var bookmarkRevision: Int { state.bookmarkRevision }
+    /// Pre-warmed Frequently Visited snapshot available synchronously on Frame 0 of a New Tab.
+    var cachedFrequentSites: [CuriumFrequentSite] { state.cachedFrequentSites }
+    var hasLoadedFrequentSites: Bool { state.hasLoadedFrequentSites }
     /// Set once the database cannot be opened; every write after that is lost.
     var storageUnavailable: Bool { state.storageUnavailable }
 
@@ -148,6 +176,8 @@ final class CuriumLibrary {
         }
         private(set) var bookmarkRevision = 0
         var historyRevision = 0
+        var cachedFrequentSites: [CuriumFrequentSite] = []
+        var hasLoadedFrequentSites = false
         var storageUnavailable = false
 
         let profileID: String
@@ -190,8 +220,16 @@ final class CuriumLibrary {
         }
         guard state.pendingMutation == nil else { return }
         enqueue { library in
-            library.bookmarks = try await library.database.bookmarkTree()
+            let tree = try await library.database.bookmarkTree()
+            library.bookmarks = tree
             library.hasLoadedBookmarks = true
+            let rawFrequent = try await library.database.frequentSiteCandidates(limit: 8, now: .now)
+            library.cachedFrequentSites = CuriumLibrary.deduplicateFrequentSites(
+                rawFrequent,
+                excludingFavorites: tree.favorites,
+                limit: tree.favorites.isEmpty ? 8 : 6
+            )
+            library.hasLoadedFrequentSites = true
         }
     }
 
@@ -276,6 +314,71 @@ final class CuriumLibrary {
             try await library.database.delete(siteID: entry.siteID, url: entry.url, day: day)
             library.historyRevision += 1
         }.value
+    }
+
+    /// Removes a site and all of its visit rows from history.
+    func deleteSite(_ site: CuriumFrequentSite) async {
+        _ = await enqueue { library in
+            try await library.database.deleteSite(id: site.siteID, url: site.url)
+            library.historyRevision += 1
+        }.value
+    }
+
+    /// Frecency-ranked sites deduplicated by canonical host and URL against Favorites,
+    /// awaiting initial bookmark load so cold-launch Start Page never flashes Favorites in Recent.
+    func frequentSites(
+        excludingFavorites favorites: [CuriumBookmark]? = nil,
+        limit: Int,
+        now: Date = .now
+    ) async -> [CuriumFrequentSite] {
+        guard limit > 0, !Task.isCancelled else { return [] }
+        if !state.hasLoadedBookmarks {
+            _ = await state.pendingMutation?.value
+        }
+        guard !Task.isCancelled else { return [] }
+        let excludedFavorites = favorites ?? state.bookmarks.favorites
+        do {
+            let rawCandidates = try await state.database.frequentSiteCandidates(limit: limit, now: now)
+            guard !Task.isCancelled else { return [] }
+            let result = Self.deduplicateFrequentSites(
+                rawCandidates,
+                excludingFavorites: excludedFavorites,
+                limit: limit
+            )
+            if favorites == nil {
+                state.cachedFrequentSites = result
+                state.hasLoadedFrequentSites = true
+            }
+            return result
+        } catch is CancellationError {
+            return []
+        } catch {
+            record(error)
+            return []
+        }
+    }
+
+    private static func deduplicateFrequentSites(
+        _ rawCandidates: [CuriumFrequentSite],
+        excludingFavorites excludedFavorites: [CuriumBookmark],
+        limit: Int
+    ) -> [CuriumFrequentSite] {
+        let excludedURLs = Set(excludedFavorites.map { CuriumSiteIdentity.normalizedURLKey(for: $0.url) })
+        let excludedHosts = Set(excludedFavorites.compactMap { CuriumSiteIdentity.canonicalSiteKey(for: $0.url) })
+        var seenHosts = Set<String>()
+        var result: [CuriumFrequentSite] = []
+        result.reserveCapacity(limit)
+        for candidate in rawCandidates {
+            let urlKey = CuriumSiteIdentity.normalizedURLKey(for: candidate.url)
+            if excludedURLs.contains(urlKey) { continue }
+            guard let hostKey = CuriumSiteIdentity.canonicalSiteKey(for: candidate.url) else { continue }
+            if excludedHosts.contains(hostKey) || !seenHosts.insert(hostKey).inserted {
+                continue
+            }
+            result.append(candidate)
+            if result.count >= limit { break }
+        }
+        return result
     }
 
     func clearHistory(_ range: CuriumHistoryClearRange) async {

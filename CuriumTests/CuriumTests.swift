@@ -6352,4 +6352,170 @@ struct CuriumMediaRadarAndDownloaderTests {
             }
         ))
     }
+
+    @Test("Start Page: CuriumSiteIdentity strips noisy prefixes, fixes W monograms, and gates Favorite URLs")
+    func startPageSiteIdentityMonogramAndURLValidation() throws {
+        // Fixes the legacy "W" monogram bug across www./m./mobile. hosts while keeping meaningful subdomains.
+        #expect(CuriumSiteIdentity.cleanHost(from: "www.nytimes.com") == "nytimes.com")
+        #expect(CuriumSiteIdentity.cleanHost(from: "M.Wikipedia.org") == "Wikipedia.org")
+        #expect(CuriumSiteIdentity.cleanHost(from: "mobile.twitter.com") == "twitter.com")
+        #expect(CuriumSiteIdentity.cleanHost(from: "docs.google.com") == "docs.google.com")
+        #expect(CuriumSiteIdentity.monogramInitial(forHost: "www.nytimes.com") == "N")
+        #expect(CuriumSiteIdentity.monogramInitial(forHost: "www.apple.com") == "A")
+        #expect(CuriumSiteIdentity.monogramInitial(forHost: "docs.google.com") == "D")
+        #expect(CuriumSiteIdentity.monogramInitial(forHost: "news.ycombinator.com") == "N")
+
+        // Filters transient bot-challenge / redirect boilerplate titles back to cleanHost.
+        #expect(CuriumSiteIdentity.displayTitle(rawTitle: "Just a moment...", cleanHost: "vimeo.com") == "vimeo.com")
+        #expect(CuriumSiteIdentity.displayTitle(rawTitle: "Attention Required! | Cloudflare", cleanHost: "example.com") == "example.com")
+        #expect(CuriumSiteIdentity.displayTitle(rawTitle: "https://vimeo.com/123", cleanHost: "vimeo.com") == "vimeo.com")
+        #expect(CuriumSiteIdentity.displayTitle(rawTitle: "Shaka Player Demo", cleanHost: "shaka-project.github.io") == "Shaka Player Demo")
+
+        // Canonical host key preserves non-default ports and ignores default 80/443.
+        #expect(CuriumSiteIdentity.canonicalSiteKey(for: try #require(URL(string: "https://www.example.com:443/a"))) == "example.com")
+        #expect(CuriumSiteIdentity.canonicalSiteKey(for: try #require(URL(string: "http://m.example.com:80/b"))) == "example.com")
+        #expect(CuriumSiteIdentity.canonicalSiteKey(for: try #require(URL(string: "http://localhost:8080/app"))) == "localhost:8080")
+        #expect(CuriumSiteIdentity.canonicalSiteKey(for: try #require(URL(string: "file:///etc/hosts"))) == nil)
+
+        // Favorite URL normalization prepends https:// and rejects non-HTTP(S) schemes & junk input.
+        #expect(CuriumSiteIdentity.normalizedFavoriteURL(from: "news.ycombinator.com")?.absoluteString == "https://news.ycombinator.com")
+        #expect(CuriumSiteIdentity.normalizedFavoriteURL(from: "http://localhost:3000/dev")?.absoluteString == "http://localhost:3000/dev")
+        #expect(CuriumSiteIdentity.normalizedFavoriteURL(from: "localhost:8080")?.absoluteString == "https://localhost:8080")
+        #expect(CuriumSiteIdentity.normalizedFavoriteURL(from: "127.0.0.1:9000")?.absoluteString == "https://127.0.0.1:9000")
+        #expect(CuriumSiteIdentity.normalizedFavoriteURL(from: "javascript:alert(1)") == nil)
+        #expect(CuriumSiteIdentity.normalizedFavoriteURL(from: "data:text/html,hi") == nil)
+        #expect(CuriumSiteIdentity.normalizedFavoriteURL(from: "file:///tmp/a.html") == nil)
+        #expect(CuriumSiteIdentity.normalizedFavoriteURL(from: "not a url") == nil)
+        #expect(CuriumSiteIdentity.normalizedFavoriteURL(from: "singleword") == nil)
+    }
+
+    @Test("Start Page: conciseStartPostureSummary emits at most 3 editorial tokens")
+    func startPageConcisePostureSummary() throws {
+        let personal = CuriumFingerprintStore.makeDefaultPersonalProfile(preserveLegacyDefaults: false)
+        #expect(personal.conciseStartPostureSummary == "Authentic Chrome")
+
+        let macTemplate = try #require(CuriumProfileTemplate.template(for: "macos-desktop"))
+        let macProxied = macTemplate.instantiate(
+            id: "p-mac01",
+            displayName: "Work Mac",
+            enableFarbling: true,
+            proxy: .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: nil)
+        )
+        #expect(macProxied.conciseStartPostureSummary == "macOS 158 · Farbled · Proxy")
+
+        let androidTemplate = try #require(CuriumProfileTemplate.template(for: "default"))
+        let androidUnfarbledDirect = androidTemplate.instantiate(
+            id: "p-and01",
+            displayName: "Android Clean",
+            enableFarbling: false,
+            proxy: .direct
+        )
+        #expect(androidUnfarbledDirect.conciseStartPostureSummary == "Android 158 · Custom HW · Direct")
+    }
+
+    @Test("Start Page: CuriumLibrary.frequentSites ranks by frecency, deduplicates Favorites/hosts, and deletes cleanly")
+    @MainActor
+    func startPageFrequentSitesFrecencyDedupAndDelete() async throws {
+        let dir = try makeTempDir("curium-start-frequent")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appending(path: "curium.sqlite", directoryHint: .notDirectory)
+        let library = CuriumLibrary(profileID: "p-freq", database: CuriumDatabase(databaseURL: dbURL, profileID: "p-freq"))
+
+        let favURL = try #require(URL(string: "https://www.apple.com/"))
+        let dupFavMobile = try #require(URL(string: "https://m.apple.com/iphone"))
+        let topURL1 = try #require(URL(string: "https://www.nytimes.com/section/tech"))
+        let topURL2 = try #require(URL(string: "https://nytimes.com/"))
+        let secondURL = try #require(URL(string: "https://news.ycombinator.com/"))
+
+        #expect(await library.saveBookmark(url: favURL, title: "Apple", in: CuriumBookmarkFolder.favoritesID))
+        library.recordVisit(url: dupFavMobile, title: "Apple Mobile")
+        library.recordVisit(url: topURL1, title: "NYT Tech")
+        library.recordVisit(url: topURL1, title: "NYT Tech")
+        library.recordVisit(url: topURL1, title: "NYT Tech")
+        library.recordVisit(url: topURL2, title: "NYT Home")
+        library.recordVisit(url: secondURL, title: "Hacker News")
+
+        // Ensure all enqueued SQLite writes flush before querying.
+        await library.checkpointAsync()
+
+        let frequent = await library.frequentSites(limit: 6)
+        // Apple (including m.apple.com) is excluded because www.apple.com is in Favorites;
+        // www.nytimes.com & nytimes.com collapse to 1 canonical host entry ahead of HN.
+        #expect(frequent.count == 2)
+        #expect(frequent[0].cleanHost == "nytimes.com")
+        #expect(frequent[0].visitCount == 3)
+        #expect(frequent[1].cleanHost == "news.ycombinator.com")
+
+        // Removing the top URL removes only that site row (non-destructive to other pages on the host),
+        // promoting the remaining nytimes.com URL; removing that second URL clears the host completely.
+        await library.deleteSite(frequent[0])
+        let afterFirstDelete = await library.frequentSites(limit: 6)
+        #expect(afterFirstDelete.count == 2)
+        #expect(afterFirstDelete.contains(where: { $0.url == topURL2 }))
+        #expect(!afterFirstDelete.contains(where: { $0.url == topURL1 }))
+
+        let remainingNYT = try #require(afterFirstDelete.first(where: { $0.url == topURL2 }))
+        await library.deleteSite(remainingNYT)
+        let afterSecondDelete = await library.frequentSites(limit: 6)
+        #expect(afterSecondDelete.count == 1)
+        #expect(afterSecondDelete[0].cleanHost == "news.ycombinator.com")
+    }
+
+    @Test("Start Page: CuriumStartPageLayoutMetrics locks 161pt/334pt fold-invariant leaves across Flat and Book Pose")
+    func startPageLayoutMetricsFoldInvariance() {
+        // 1. Inner Landscape Flat (`867 pt` safe width inside 84 pt vertical bar): 680 pt spread -> 161 pt / 334 pt.
+        let flat = CuriumStartPageLayoutMetrics.resolve(
+            bounds: CGRect(x: 0, y: 0, width: 867, height: 669),
+            fold: nil
+        )
+        #expect(!flat.isDualLeafBookPose)
+        #expect(flat.spreadWidth == 680)
+        #expect(flat.favoriteColumns == 4)
+        #expect(flat.favoriteCardWidth == 161)
+        #expect(flat.recentColumns == 2)
+        #expect(flat.recentCardWidth == 334)
+
+        // 2. Inner Landscape Book Pose (`.division` at x=455.5..495.5): exact same 161 pt / 334 pt cards, 72 pt gutter.
+        let book = CuriumStartPageLayoutMetrics.resolve(
+            bounds: CGRect(x: 0, y: 0, width: 867, height: 669),
+            fold: .init(frame: CGRect(x: 455.5, y: 0, width: 40, height: 669), isVertical: true)
+        )
+        #expect(book.isDualLeafBookPose)
+        #expect(book.leafWidth == 334)
+        #expect(book.hingeGutter == 72)
+        #expect(book.favoriteColumns == 4)
+        #expect(book.favoriteCardWidth == flat.favoriteCardWidth)
+        #expect(book.recentColumns == 2)
+        #expect(book.recentCardWidth == flat.recentCardWidth)
+        #expect(book.leadingInset == 105.5)
+        #expect(book.trailingInset == 21.5)
+
+        // 3. Outer Portrait (`382 pt`): 2 Favorite cols, 1 Recent col, stacked header.
+        let outer = CuriumStartPageLayoutMetrics.resolve(
+            bounds: CGRect(x: 0, y: 0, width: 382, height: 678),
+            fold: nil
+        )
+        #expect(!outer.isWideHeader)
+        #expect(outer.favoriteColumns == 2)
+        #expect(outer.recentColumns == 1)
+        #expect(outer.spreadWidth == 342)
+
+        // 4. Inner Portrait Tabletop Pose (horizontal `.division` y=455.5..495.5): bounded to upper pane.
+        let tabletop = CuriumStartPageLayoutMetrics.resolve(
+            bounds: CGRect(x: 0, y: 0, width: 669, height: 951),
+            fold: .init(frame: CGRect(x: 0, y: 455.5, width: 669, height: 40), isVertical: false)
+        )
+        #expect(tabletop.viewport.height == 443.5)
+        #expect(tabletop.favoriteColumns == 4)
+        #expect(tabletop.recentColumns == 2)
+
+        // 5. Dynamic Type Accessibility sizes halve column counts cleanly.
+        let a11y = CuriumStartPageLayoutMetrics.resolve(
+            bounds: CGRect(x: 0, y: 0, width: 867, height: 669),
+            fold: nil,
+            isAccessibilitySize: true
+        )
+        #expect(a11y.favoriteColumns == 2)
+        #expect(a11y.recentColumns == 1)
+    }
 }

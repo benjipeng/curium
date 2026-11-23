@@ -506,6 +506,79 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
         return parts.joined(separator: " · ")
     }
 
+    /// Editorial Start Page posture line (at most 3 concise `" · "`-separated tokens,
+    /// e.g. `macOS 158 · Farbled · Proxy` or `Authentic Chrome`).
+    var conciseStartPostureSummary: String {
+        var parts: [String] = []
+        if matchesBuild39EngineDefaults {
+            parts.append("Authentic Chrome")
+        } else {
+            let slot = defaultSlot == .desktop ? desktop : mobile
+            let rawPlatform = (slot.platform ?? slot.navigatorPlatform ?? "").lowercased()
+            let osLabel: String
+            if rawPlatform.contains("mac") {
+                osLabel = "macOS"
+            } else if rawPlatform.contains("win") {
+                osLabel = "Windows"
+            } else if rawPlatform.contains("android") {
+                osLabel = "Android"
+            } else if rawPlatform.contains("linux") {
+                osLabel = "Linux"
+            } else if rawPlatform.contains("ios") || rawPlatform.contains("iphone") || rawPlatform.contains("ipad") {
+                osLabel = "iOS"
+            } else {
+                osLabel = defaultSlot == .desktop ? "Desktop" : "Authentic Chrome"
+            }
+
+            if let major = Self.extractChromeMajorVersion(from: slot) {
+                parts.append("\(osLabel) \(major)")
+            } else {
+                parts.append(osLabel)
+            }
+
+            if isFarblingActive {
+                parts.append("Farbled")
+            } else if !usesNativeHardwareAndGPU {
+                parts.append("Custom HW")
+            }
+        }
+
+        switch proxy {
+        case .system:
+            break
+        case .direct:
+            parts.append("Direct")
+        case .fixed:
+            parts.append("Proxy")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func extractChromeMajorVersion(from slot: CuriumIdentitySlot) -> String? {
+        if let major = slot.majorVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !major.isEmpty,
+           major.allSatisfy(\.isNumber) {
+            return major
+        }
+        if let full = slot.fullVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let first = full.split(separator: ".").first,
+           !first.isEmpty,
+           first.allSatisfy(\.isNumber) {
+            return String(first)
+        }
+        if let ua = slot.uaString {
+            for marker in ["Chrome/", "CriOS/"] {
+                if let range = ua.range(of: marker) {
+                    let digits = ua[range.upperBound...].prefix(while: \.isNumber)
+                    if !digits.isEmpty {
+                        return String(digits)
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
     /// Normalizes user-entered or imported string fields (trimming whitespace on IDs,
     /// metadata, slots, languages, proxy rules, timezone, and seed) while preserving
     /// explicit empty Client Hint strings (`""`).

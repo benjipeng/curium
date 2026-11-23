@@ -85,6 +85,48 @@ enum CuriumPalette: String, Codable, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// Architectural paper canvas for Start Page and Engine Standby, subtly tinted to
+    /// the active actinide palette without relying on `@Environment(\.colorScheme)`.
+    var canvas: Color {
+        switch self {
+        case .violet: Color(uiColor: Self.dynamic(light: 0xF8F7FB, dark: 0x0C0B10))
+        case .thorium: Color(uiColor: Self.dynamic(light: 0xF6FAF9, dark: 0x090E0D))
+        case .neptunium: Color(uiColor: Self.dynamic(light: 0xF6F8FC, dark: 0x090C11))
+        case .americium: Color(uiColor: Self.dynamic(light: 0xFBF9F5, dark: 0x0F0C09))
+        case .berkelium: Color(uiColor: Self.dynamic(light: 0xFBF7F9, dark: 0x100A0D))
+        case .californium: Color(uiColor: Self.dynamic(light: 0xF6F7FB, dark: 0x0A0B11))
+        }
+    }
+
+    /// Elevated neutral plinth surface for Start Page cards and dossier rows.
+    var cardSurface: Color {
+        switch self {
+        case .violet: Color(uiColor: Self.dynamic(light: 0xFFFFFF, dark: 0x16141E))
+        case .thorium: Color(uiColor: Self.dynamic(light: 0xFFFFFF, dark: 0x111918))
+        case .neptunium: Color(uiColor: Self.dynamic(light: 0xFFFFFF, dark: 0x111720))
+        case .americium: Color(uiColor: Self.dynamic(light: 0xFFFFFF, dark: 0x1A1612))
+        case .berkelium: Color(uiColor: Self.dynamic(light: 0xFFFFFF, dark: 0x1B1317))
+        case .californium: Color(uiColor: Self.dynamic(light: 0xFFFFFF, dark: 0x131520))
+        }
+    }
+
+    /// Static skylight atmospheric tint scoped strictly to Start Page / Standby backdrops.
+    /// Tuned to avoid 8-bit Mach banding in Dark Mode while preserving serene actinide warmth.
+    var atmosphereGlow: Color {
+        let lightAlpha: CGFloat = 0.065
+        let darkAlpha: CGFloat
+        switch self {
+        case .americium, .berkelium:
+            darkAlpha = 0.065
+        case .violet, .thorium, .neptunium, .californium:
+            darkAlpha = 0.07
+        }
+        return Color(uiColor: UIColor { traits in
+            let resolved = self.ink.resolvedColor(with: traits)
+            return resolved.withAlphaComponent(traits.userInterfaceStyle == .dark ? darkAlpha : lightAlpha)
+        })
+    }
+
     fileprivate static func dynamic(light: UInt32, dark: UInt32) -> UIColor {
         UIColor { traits in
             let rgb = traits.userInterfaceStyle == .dark ? dark : light
@@ -155,4 +197,175 @@ enum CuriumSpace {
         return UIFont.systemFont(ofSize: min(live, capped), weight: .medium)
     }
     static let secondaryInk = Color(uiColor: CuriumPalette.dynamic(light: 0x565260, dark: 0xB9B5C4))
+    static let cardBorder = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(white: 1, alpha: 0.09)
+            : UIColor(white: 0, alpha: 0.085)
+    })
+    static let cardShadow = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? .clear
+            : UIColor(white: 0, alpha: 0.04)
+    })
+    static let editorialRule = Color(uiColor: .separator).opacity(0.45)
+}
+
+/// Pure host, monogram, deduplication, and Favorite-URL normalization helpers shared by
+/// Start Page, Library, and Add Favorite sheets.
+enum CuriumSiteIdentity {
+    private static let posixLocale = Locale(identifier: "en_US_POSIX")
+    private static let noisyHostPrefixes = ["www.", "m.", "mobile."]
+    private static let boilerplateTitles: Set<String> = [
+        "just a moment...",
+        "just a moment…",
+        "attention required! | cloudflare",
+        "attention required!",
+        "redirecting...",
+        "redirecting…",
+        "access denied",
+    ]
+
+    /// Returns a clean Start Page title, replacing transient bot-challenge / redirect boilerplate
+    /// or raw URL strings with `cleanHost`.
+    static func displayTitle(rawTitle: String, cleanHost: String) -> String {
+        let trimmed = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return cleanHost }
+        let lowered = trimmed.folding(options: .caseInsensitive, locale: posixLocale)
+        if boilerplateTitles.contains(lowered)
+            || lowered.hasPrefix("http://")
+            || lowered.hasPrefix("https://") {
+            return cleanHost
+        }
+        return trimmed
+    }
+
+    /// Strips a single leading `www.`, `m.`, or `mobile.` prefix for clean display and monograms.
+    static func cleanHost(from rawHost: String) -> String {
+        let trimmed = rawHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let lowered = trimmed.folding(options: .caseInsensitive, locale: posixLocale)
+        for prefix in noisyHostPrefixes where lowered.hasPrefix(prefix) && trimmed.count > prefix.count {
+            let start = trimmed.index(trimmed.startIndex, offsetBy: prefix.count)
+            return String(trimmed[start...])
+        }
+        return trimmed
+    }
+
+    static func cleanHost(for url: URL) -> String {
+        let raw = url.host(percentEncoded: false) ?? url.host() ?? ""
+        return cleanHost(from: raw)
+    }
+
+    /// Extracts a single uppercase monogram initial from the meaningful host label
+    /// (`www.nytimes.com` -> `"N"`, `docs.google.com` -> `"D"`).
+    static func monogramInitial(forHost rawHost: String) -> String {
+        let cleaned = cleanHost(from: rawHost)
+        let candidate = cleaned.first(where: { $0.isLetter || $0.isNumber }) ?? cleaned.first
+        return candidate.map { String($0).localizedUppercase } ?? "·"
+    }
+
+    /// Canonical host key for Start Page deduplication (`http`/`https` only, lowercased POSIX,
+    /// one noisy prefix stripped, preserving non-default ports).
+    static func canonicalSiteKey(for url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let rawHost = url.host(percentEncoded: false),
+              !rawHost.isEmpty else {
+            return nil
+        }
+        let cleaned = cleanHost(from: rawHost).folding(options: .caseInsensitive, locale: posixLocale)
+        guard !cleaned.isEmpty else { return nil }
+        if let port = url.port, port != 80, port != 443 {
+            return "\(cleaned):\(port)"
+        }
+        return cleaned
+    }
+
+    /// Exact normalized URL string key used to avoid duplicating Favorites in Recent History.
+    static func normalizedURLKey(for url: URL) -> String {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.folding(options: .caseInsensitive, locale: posixLocale) else {
+            return url.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        components.scheme = scheme
+        components.host = cleanHost(from: host)
+        if (scheme == "http" && components.port == 80) || (scheme == "https" && components.port == 443) {
+            components.port = nil
+        }
+        if components.path == "/" {
+            components.path = ""
+        }
+        return components.string ?? url.absoluteString
+    }
+
+    /// Normalizes and validates a user-entered website address for saving into Favorites.
+    /// Prepends `https://` when no scheme is present; strictly permits only `http` / `https`
+    /// with no whitespace and a valid dotted domain, `localhost`, or IP literal.
+    static func normalizedFavoriteURL(from rawInput: String) -> URL? {
+        let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains(where: \.isWhitespace) else { return nil }
+
+        let withScheme: String
+        if trimmed.contains("://") {
+            withScheme = trimmed
+        } else if let colon = trimmed.firstIndex(of: ":"),
+                  colon > trimmed.startIndex,
+                  trimmed[..<colon].allSatisfy({ $0.isLetter || $0.isNumber || $0 == "+" || $0 == "-" || $0 == "." }),
+                  !trimmed[..<colon].allSatisfy(\.isNumber) {
+            // Distinguish `javascript:alert(1)` / `data:...` / `file:...` from `localhost:8080` or `example.com:8443`.
+            let afterColon = trimmed[trimmed.index(after: colon)...]
+            let portPrefix = afterColon.prefix { $0.isNumber }
+            let looksLikeHostPort = !portPrefix.isEmpty
+                && (portPrefix.endIndex == afterColon.endIndex
+                    || afterColon[portPrefix.endIndex] == "/"
+                    || afterColon[portPrefix.endIndex] == "?"
+                    || afterColon[portPrefix.endIndex] == "#")
+            if looksLikeHostPort {
+                withScheme = "https://\(trimmed)"
+            } else {
+                return nil
+            }
+        } else {
+            withScheme = "https://\(trimmed)"
+        }
+
+        guard let components = URLComponents(string: withScheme),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let rawHost = components.host,
+              !rawHost.isEmpty,
+              let url = components.url else {
+            return nil
+        }
+
+        let host = rawHost.folding(options: .caseInsensitive, locale: posixLocale)
+        if host == "localhost" {
+            return url
+        }
+        // IPv6 literal (`[::1]`) or IPv4 address.
+        if host.contains(":") {
+            return url
+        }
+        if isIPv4Literal(host) {
+            return url
+        }
+        // Standard domain must contain a dot and non-empty labels on both sides (non-empty TLD).
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count >= 2,
+              labels.allSatisfy({ !$0.isEmpty && !$0.hasPrefix("-") && !$0.hasSuffix("-") }),
+              let tld = labels.last, tld.count >= 2 else {
+            return nil
+        }
+        return url
+    }
+
+    private static func isIPv4Literal(_ host: String) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        return parts.allSatisfy { part in
+            guard let byte = Int(part), (0...255).contains(byte) else { return false }
+            return true
+        }
+    }
 }

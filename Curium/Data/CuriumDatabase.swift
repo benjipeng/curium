@@ -178,6 +178,58 @@ actor CuriumDatabase {
         }
     }
 
+    /// Removes a site and all of its visit rows across every day (used by Start Page's
+    /// Frequently Visited context menu).
+    func deleteSite(id siteID: Int64, url: URL) throws {
+        let db = try database()
+        let site = CuriumSQLite.Value.integer(siteID)
+        let address = CuriumSQLite.Value.text(url.absoluteString)
+        try db.write {
+            try db.run("DELETE FROM visits WHERE site_id = (SELECT id FROM sites WHERE id = ? AND url = ?)", [site, address])
+            try db.run("DELETE FROM sites WHERE id = ? AND url = ?", [site, address])
+        }
+    }
+
+    /// Bounded frecency query over `sites` (7-day half-life) for the Start Page's
+    /// Frequently Visited shelf. Deduplication against Favorites and canonical hosts runs in Swift.
+    func frequentSiteCandidates(limit: Int, now: Date) throws -> [CuriumFrequentSite] {
+        try Task.checkCancellation()
+        guard limit > 0 else { return [] }
+        let db = try database()
+        let fetchLimit = Int64(max(64, limit * 12))
+        let time = CuriumSQLite.Value.real(now.timeIntervalSince1970)
+        var results: [CuriumFrequentSite] = []
+        results.reserveCapacity(min(Int(fetchLimit), 96))
+        try db.cancellableRows("""
+            SELECT id, url, title, visit_count, last_visit
+            FROM sites
+            WHERE visit_count > 0
+              AND last_visit IS NOT NULL
+              AND (url LIKE 'https://%' COLLATE NOCASE OR url LIKE 'http://%' COLLATE NOCASE)
+            ORDER BY (CAST(visit_count AS REAL) / (1.0 + MAX(0.0, ?1 - last_visit) / 604800.0)) DESC,
+                     last_visit DESC,
+                     id DESC
+            LIMIT ?2
+            """, [time, .integer(fetchLimit)]) { row in
+            let id = sqlite3_column_int64(row, 0)
+            let rawURL = CuriumSQLite.text(row, 1)
+            let title = CuriumSQLite.text(row, 2)
+            let visitCount = Int(sqlite3_column_int64(row, 3))
+            let lastVisit = Date(timeIntervalSince1970: sqlite3_column_double(row, 4))
+            if let url = URL(string: rawURL) {
+                results.append(CuriumFrequentSite(
+                    siteID: id,
+                    url: url,
+                    title: title,
+                    visitCount: visitCount,
+                    lastVisit: lastVisit
+                ))
+            }
+            return true
+        }
+        return results
+    }
+
     func clearHistory(since start: Date?) throws {
         let db = try database()
         try db.write {
