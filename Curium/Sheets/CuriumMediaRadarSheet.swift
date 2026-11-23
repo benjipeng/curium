@@ -36,8 +36,30 @@ struct CuriumMediaRadarSheet: View {
         _snapshot = State(initialValue: store.currentMediaSnapshot())
     }
 
+    private var subsumedChildHLSIDs: Set<String> {
+        var subsumed: Set<String> = []
+        for (masterID, state) in hlsStates {
+            guard case .loaded(let inspection) = state, inspection.isMasterPlaylist else { continue }
+            for childURL in inspection.referencedPlaylistURLs {
+                let childID = childURL.absoluteString
+                guard childID != masterID else { continue }
+                if downloadsByTargetKey[childID] == nil {
+                    subsumed.insert(childID)
+                }
+            }
+        }
+        return subsumed
+    }
+
     private var streamCandidates: [CuriumMediaCandidate] {
-        snapshot.candidates.filter { $0.kind == .hls || $0.kind == .dash }
+        let hidden = subsumedChildHLSIDs
+        return snapshot.candidates.filter {
+            ($0.kind == .hls || $0.kind == .dash) && !hidden.contains($0.id)
+        }
+    }
+
+    private var hasMultipleVisibleStreams: Bool {
+        streamCandidates.count > 1
     }
 
     private var videoCandidates: [CuriumMediaCandidate] {
@@ -650,6 +672,11 @@ struct CuriumMediaRadarSheet: View {
 
     private func metadataLine(for candidate: CuriumMediaCandidate) -> String? {
         var parts: [String] = []
+        if hasMultipleVisibleStreams,
+           let pathHint = candidate.manifestPathHint,
+           !pathHint.isEmpty {
+            parts.append(pathHint)
+        }
         if let resolution = candidate.resolutionLabel, !resolution.isEmpty {
             parts.append(resolution)
         }

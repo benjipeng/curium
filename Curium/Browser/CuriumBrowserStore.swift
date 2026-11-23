@@ -550,7 +550,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     var downloadsRoot: URL? { downloadsRootOverride }
     var isEngineReady: Bool { host != nil }
-    var activeTabMediaCount: Int { mediaRadar.events(for: activeTab?.id).count }
+    var activeTabMediaCount: Int { currentMediaSnapshot().candidates.count }
     var pendingOrActiveDownloadCount: Int {
         downloads.reduce(into: 0) { count, item in
             if item.state == .pending || item.isActive { count += 1 }

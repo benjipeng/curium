@@ -164,6 +164,31 @@ struct CuriumHLSMasterInspection: Equatable, Sendable {
     let isLiveStream: Bool
     let isFMP4: Bool
     let encryption: CuriumHLSEncryptionKind
+    /// All child variant and `#EXT-X-MEDIA` rendition playlist URLs referenced by a master playlist,
+    /// allowing Media Radar UI to collapse redundant child `.m3u8` rows once the master is inspected.
+    let referencedPlaylistURLs: Set<URL>
+
+    init(
+        sourceURL: URL,
+        isMasterPlaylist: Bool,
+        variants: [CuriumHLSVariant],
+        directSegmentCount: Int,
+        estimatedDurationSeconds: Double?,
+        isLiveStream: Bool,
+        isFMP4: Bool,
+        encryption: CuriumHLSEncryptionKind,
+        referencedPlaylistURLs: Set<URL> = []
+    ) {
+        self.sourceURL = sourceURL
+        self.isMasterPlaylist = isMasterPlaylist
+        self.variants = variants
+        self.directSegmentCount = directSegmentCount
+        self.estimatedDurationSeconds = estimatedDurationSeconds
+        self.isLiveStream = isLiveStream
+        self.isFMP4 = isFMP4
+        self.encryption = encryption
+        self.referencedPlaylistURLs = referencedPlaylistURLs
+    }
 
     var isDownloadable: Bool {
         if case .unsupportedDRM = encryption {
@@ -317,15 +342,17 @@ enum CuriumHLSParser {
         baseURL: URL
     ) throws -> CuriumHLSMasterInspection {
         var audioGroups: [String: AudioRenditionCandidate] = [:]
+        var referencedPlaylistURLs: Set<URL> = []
         var masterEncryption: CuriumHLSEncryptionKind = .none
 
-        // Pass 1: Collect #EXT-X-MEDIA audio renditions and #EXT-X-SESSION-KEY declarations
+        // Pass 1: Collect #EXT-X-MEDIA renditions and #EXT-X-SESSION-KEY declarations
         // (tags may appear before or after #EXT-X-STREAM-INF in RFC 8216).
         for line in lines {
             if line.hasPrefix("#EXT-X-MEDIA:") {
                 let attrs = parseAttributeList(String(line.dropFirst("#EXT-X-MEDIA:".count)))
                 if let rawURI = attrs["URI"], !rawURI.isEmpty {
                     let resolvedURI = try resolveAllowedURL(rawURI, relativeTo: baseURL)
+                    referencedPlaylistURLs.insert(resolvedURI)
                     if attrs["TYPE"]?.uppercased() == "AUDIO",
                        let groupID = attrs["GROUP-ID"], !groupID.isEmpty {
                         let isDefault = attrs["DEFAULT"]?.uppercased() == "YES"
@@ -345,6 +372,12 @@ enum CuriumHLSParser {
                             audioGroups[groupID] = candidate
                         }
                     }
+                }
+            } else if line.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:") {
+                let attrs = parseAttributeList(String(line.dropFirst("#EXT-X-I-FRAME-STREAM-INF:".count)))
+                if let rawURI = attrs["URI"], !rawURI.isEmpty {
+                    let resolvedURI = try resolveAllowedURL(rawURI, relativeTo: baseURL)
+                    referencedPlaylistURLs.insert(resolvedURI)
                 }
             } else if line.hasPrefix("#EXT-X-SESSION-KEY:") {
                 let attrs = parseAttributeList(String(line.dropFirst("#EXT-X-SESSION-KEY:".count)))
@@ -370,6 +403,7 @@ enum CuriumHLSParser {
             pendingStreamAttrs = nil
 
             let resolvedURL = try resolveAllowedURL(line, relativeTo: baseURL)
+            referencedPlaylistURLs.insert(resolvedURL)
             let bandwidth = attrs["BANDWIDTH"].flatMap(Int.init)
             let averageBandwidth = attrs["AVERAGE-BANDWIDTH"].flatMap(Int.init)
             let (width, height) = parseResolution(attrs["RESOLUTION"])
@@ -394,9 +428,17 @@ enum CuriumHLSParser {
             if variantsByID[variant.id] == nil {
                 orderedIDs.append(variant.id)
                 variantsByID[variant.id] = variant
-            } else if let existing = variantsByID[variant.id],
-                      (variant.bandwidth ?? 0) > (existing.bandwidth ?? 0) {
-                variantsByID[variant.id] = variant
+            } else if let existing = variantsByID[variant.id] {
+                // When a master playlist lists multiple audio-codec groups for the exact same
+                // video playlist URL (e.g. AAC stereo vs Dolby AC-3 / EC-3), prefer universally
+                // playable AAC (`mp4a`) first, breaking ties by higher bandwidth.
+                let newCodecRank = audioCodecCompatibilityRank(variant.codecs)
+                let oldCodecRank = audioCodecCompatibilityRank(existing.codecs)
+                if newCodecRank > oldCodecRank
+                    || (newCodecRank == oldCodecRank && (variant.bandwidth ?? 0) > (existing.bandwidth ?? 0))
+                {
+                    variantsByID[variant.id] = variant
+                }
             }
         }
 
@@ -425,8 +467,23 @@ enum CuriumHLSParser {
             estimatedDurationSeconds: nil,
             isLiveStream: false,
             isFMP4: false,
-            encryption: masterEncryption
+            encryption: masterEncryption,
+            referencedPlaylistURLs: referencedPlaylistURLs
         )
+    }
+
+    private static func audioCodecCompatibilityRank(_ codecs: String?) -> Int {
+        guard let lowered = codecs?.lowercased(), !lowered.isEmpty else { return 0 }
+        let tokens = lowered
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if tokens.contains(where: { $0.hasPrefix("mp4a") }) {
+            return 2
+        }
+        if tokens.contains(where: { $0.hasPrefix("ac-3") || $0.hasPrefix("ec-3") }) {
+            return 1
+        }
+        return 0
     }
 
     // MARK: - Media Playlist Parsing

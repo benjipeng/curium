@@ -4299,4 +4299,225 @@ struct CuriumMediaRadarAndDownloaderTests {
         #expect(!keepAlive.shouldBeActive)
         #expect(!keepAlive.isEngineRunning)
     }
+
+    @Test("Real-site Media Radar regressions: audio/ogg typing, MSE 206 chunk filtering, master HLS prioritization, and AAC preference over AC-3")
+    @MainActor
+    func realSiteMediaRadarRegressions() throws {
+        let t0 = Date(timeIntervalSince1970: 1_760_000_000)
+
+        // 1. W3Schools Audio (`horse.ogg` served with `Content-Type: video/ogg` inside `<audio><source>`).
+        let horseURL = try #require(URL(string: "https://www.w3schools.com/html/horse.ogg"))
+        #expect(CuriumMediaResourceEvent.classify(url: horseURL, mimeType: "video/ogg", destination: "audio") == .audio)
+        #expect(CuriumMediaDOMScanner.probeScript.contains("{ src: srcNode.src, type: srcNode.type || null, tag }"))
+
+        // Even if the network callback arrived with ambiguous destination ("empty") and video/ogg,
+        // merging with a DOM `<audio>` entry upgrades the candidate to `.audio` with OGG badge & .ogg filename.
+        let horseNet = try #require(CuriumMediaResourceEvent.parse(
+            from: [
+                "url": horseURL,
+                "mimeType": "video/ogg",
+                "httpMethod": "GET",
+                "httpStatusCode": 200,
+                "contentLength": 13_889,
+                "requestDestination": "empty",
+            ],
+            now: t0
+        ))
+        #expect(horseNet.kind == .video)
+        let horseDOM = CuriumDOMMediaEntry(
+            url: horseURL,
+            isBlob: false,
+            tag: "audio",
+            title: nil,
+            width: nil,
+            height: nil,
+            durationSeconds: 1.8,
+            frameURL: URL(string: "https://www.w3schools.com/html/html5_audio.asp"),
+            frameOrigin: "https://www.w3schools.com",
+            mimeType: "audio/ogg"
+        )
+        let audioSnap = CuriumMediaDOMScanner.merge(
+            tabID: "t-audio",
+            pageTitle: "HTML Audio",
+            networkEvents: [horseNet],
+            domEntries: [horseDOM],
+            blobVideoCount: 0,
+            effectiveUserAgent: nil,
+            now: t0
+        )
+        #expect(audioSnap.candidates.count == 1)
+        let horseCandidate = try #require(audioSnap.candidates.first)
+        #expect(horseCandidate.kind == .audio)
+        #expect(horseCandidate.formatBadge == "OGG")
+        #expect(horseCandidate.suggestedFilename == "horse.ogg")
+
+        // Real OGG video retains `.video` with `OGG` badge and `.ogg` extension (not `.mp4`).
+        let videoOggURL = try #require(URL(string: "https://www.w3schools.com/html/mov_bbb.ogg"))
+        let videoOggNet = try #require(CuriumMediaResourceEvent.parse(
+            from: [
+                "url": videoOggURL,
+                "mimeType": "video/ogg",
+                "httpMethod": "GET",
+                "httpStatusCode": 206,
+                "contentLength": 600_000,
+                "requestDestination": "video",
+            ],
+            now: t0
+        ))
+        let videoOggSnap = CuriumMediaDOMScanner.merge(
+            tabID: "t-vogg",
+            pageTitle: "HTML Video",
+            networkEvents: [videoOggNet],
+            domEntries: [],
+            blobVideoCount: 0,
+            effectiveUserAgent: nil,
+            now: t0
+        )
+        #expect(videoOggSnap.candidates.first?.kind == .video)
+        #expect(videoOggSnap.candidates.first?.formatBadge == "OGG")
+        #expect(videoOggSnap.candidates.first?.suggestedFilename == "mov_bbb.ogg")
+
+        // 2. Shaka DASH / Apple fMP4 HTTP 206 & tiny init chunks are filtered when adaptive streaming is active,
+        // while real DOM/direct `<video>` elements remain visible and `activeTabMediaCount` stays in sync.
+        let dashURL = try #require(URL(string: "https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd"))
+        let chunk206Video = try #require(URL(string: "https://storage.googleapis.com/shaka-demo-assets/angel-one/v-0576p-1400k-vp9.webm"))
+        let chunk206Audio = try #require(URL(string: "https://storage.googleapis.com/shaka-demo-assets/angel-one/a-eng-0128k-aac.mp4"))
+        let chunkTinyInit = try #require(URL(string: "https://storage.googleapis.com/shaka-demo-assets/angel-one/init.webm"))
+        let standaloneMP4 = try #require(URL(string: "https://cdn.example/promo.mp4"))
+
+        let shakaEvents: [CuriumMediaResourceEvent] = [
+            try #require(CuriumMediaResourceEvent.parse(
+                from: ["url": dashURL, "mimeType": "video/vnd.mpeg.dash.mpd", "httpMethod": "GET", "httpStatusCode": 200, "requestDestination": "empty"],
+                now: t0
+            )),
+            try #require(CuriumMediaResourceEvent.parse(
+                from: ["url": chunk206Video, "mimeType": "video/webm", "httpMethod": "GET", "httpStatusCode": 206, "contentLength": 194_560, "requestDestination": "empty"],
+                now: t0.addingTimeInterval(1)
+            )),
+            try #require(CuriumMediaResourceEvent.parse(
+                from: ["url": chunk206Audio, "mimeType": "audio/mp4", "httpMethod": "GET", "httpStatusCode": 206, "contentLength": 66_560, "requestDestination": "empty"],
+                now: t0.addingTimeInterval(2)
+            )),
+            try #require(CuriumMediaResourceEvent.parse(
+                from: ["url": chunkTinyInit, "mimeType": "video/webm", "httpMethod": "GET", "httpStatusCode": 200, "contentLength": 314, "requestDestination": "empty"],
+                now: t0.addingTimeInterval(3)
+            )),
+            try #require(CuriumMediaResourceEvent.parse(
+                from: ["url": standaloneMP4, "mimeType": "video/mp4", "httpMethod": "GET", "httpStatusCode": 206, "contentLength": 788_493, "requestDestination": "video"],
+                now: t0.addingTimeInterval(4)
+            )),
+        ]
+        let shakaSnap = CuriumMediaDOMScanner.merge(
+            tabID: "t-shaka",
+            pageTitle: "Shaka Player",
+            networkEvents: shakaEvents,
+            domEntries: [],
+            blobVideoCount: 1,
+            effectiveUserAgent: nil,
+            now: t0.addingTimeInterval(5)
+        )
+        #expect(shakaSnap.candidates.map(\.url) == [standaloneMP4, dashURL])
+        #expect(shakaSnap.candidates.map(\.kind) == [.video, .dash])
+
+        let host = MockBrowserHost()
+        let tab = MockTabHost(tabID: "t-count", url: URL(string: "https://hlsjs.video-dev.org/demo/"), title: "hls.js demo")
+        host.tabs = [tab]
+        host.activeTab = tab
+        let store = CuriumBrowserStore(host: host)
+        let appleMaster = try #require(URL(string: "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8"))
+        let appleInitChunk = try #require(URL(string: "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/v5/main.mp4"))
+        _ = store.mediaRadar.ingest(
+            rawEvent: ["url": appleMaster, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200, "requestDestination": "empty"],
+            tabID: "t-count",
+            effectiveUserAgent: nil
+        )
+        _ = store.mediaRadar.ingest(
+            rawEvent: ["url": appleInitChunk, "mimeType": "video/mp4", "httpMethod": "GET", "httpStatusCode": 206, "contentLength": 719, "requestDestination": "empty"],
+            tabID: "t-count",
+            effectiveUserAgent: nil
+        )
+        #expect(store.mediaRadar.events(for: "t-count").count == 2)
+        #expect(store.activeTabMediaCount == 1)
+
+        // 3. HLS Master Playlist sorts ahead of child variant/audio playlists and exposes disambiguating path hints.
+        let appleVideoChild = try #require(URL(string: "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/v5/prog_index.m3u8"))
+        let appleAudioChild = try #require(URL(string: "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/a1/prog_index.m3u8"))
+        let hlsOrderSnap = CuriumMediaDOMScanner.merge(
+            tabID: "t-hls-order",
+            pageTitle: "hls.js demo",
+            networkEvents: [
+                try #require(CuriumMediaResourceEvent.parse(
+                    from: ["url": appleVideoChild, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200],
+                    now: t0
+                )),
+                try #require(CuriumMediaResourceEvent.parse(
+                    from: ["url": appleAudioChild, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200],
+                    now: t0.addingTimeInterval(1)
+                )),
+                try #require(CuriumMediaResourceEvent.parse(
+                    from: ["url": appleMaster, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200],
+                    now: t0.addingTimeInterval(5)
+                )),
+            ],
+            domEntries: [],
+            blobVideoCount: 1,
+            effectiveUserAgent: nil,
+            now: t0.addingTimeInterval(6)
+        )
+        #expect(hlsOrderSnap.candidates.map(\.url) == [appleMaster, appleVideoChild, appleAudioChild])
+        #expect(hlsOrderSnap.candidates.compactMap(\.manifestPathHint) == ["master.m3u8", "v5/prog_index.m3u8", "a1/prog_index.m3u8"])
+
+        // Shallower Mux-style master (`x36xhzz.m3u8`) also sorts ahead of nested child variant (`url_0/chunk.m3u8`).
+        let muxMaster = try #require(URL(string: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"))
+        let muxChild = try #require(URL(string: "https://test-streams.mux.dev/x36xhzz/url_0/193039199_mp4_h264_aac_hd_7.m3u8"))
+        let muxOrderSnap = CuriumMediaDOMScanner.merge(
+            tabID: "t-mux-order",
+            pageTitle: "hls.js demo",
+            networkEvents: [
+                try #require(CuriumMediaResourceEvent.parse(
+                    from: ["url": muxChild, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200],
+                    now: t0.addingTimeInterval(2)
+                )),
+                try #require(CuriumMediaResourceEvent.parse(
+                    from: ["url": muxMaster, "mimeType": "application/vnd.apple.mpegurl", "httpMethod": "GET", "httpStatusCode": 200],
+                    now: t0
+                )),
+            ],
+            domEntries: [],
+            blobVideoCount: 1,
+            effectiveUserAgent: nil,
+            now: t0.addingTimeInterval(3)
+        )
+        #expect(muxOrderSnap.candidates.map(\.url) == [muxMaster, muxChild])
+
+        // 4. Apple-style master playlist with duplicate video playlist URLs prefers universal AAC (`mp4a`)
+        // over higher-bandwidth Dolby AC-3 / EC-3 and populates `referencedPlaylistURLs` for UI collapsing.
+        let appleBipbopMaster = """
+        #EXTM3U
+        #EXT-X-VERSION:6
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud1",LANGUAGE="en",NAME="English",AUTOSELECT=YES,DEFAULT=YES,CHANNELS="2",URI="a1/prog_index.m3u8"
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud2",LANGUAGE="en",NAME="English AC3",AUTOSELECT=YES,DEFAULT=YES,CHANNELS="6",URI="a2/prog_index.m3u8"
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud3",LANGUAGE="en",NAME="English EC3",AUTOSELECT=YES,DEFAULT=YES,CHANNELS="6",URI="a3/prog_index.m3u8"
+        #EXT-X-I-FRAME-STREAM-INF:AVERAGE-BANDWIDTH=183689,BANDWIDTH=187492,CODECS="avc1.640020",RESOLUTION=960x540,URI="v5/iframe_index.m3u8"
+        #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=2448647,BANDWIDTH=2484135,CODECS="avc1.640020,ac-3",RESOLUTION=960x540,FRAME-RATE=60.000,AUDIO="aud2"
+        v5/prog_index.m3u8
+        #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=2190673,BANDWIDTH=2227464,CODECS="avc1.640020,mp4a.40.2",RESOLUTION=960x540,FRAME-RATE=60.000,AUDIO="aud1"
+        v5/prog_index.m3u8
+        #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=2320647,BANDWIDTH=2356135,CODECS="avc1.640020,ec-3",RESOLUTION=960x540,FRAME-RATE=60.000,AUDIO="aud3"
+        v5/prog_index.m3u8
+        """
+        let bipbopInspection = try CuriumHLSParser.parseMasterOrMedia(text: appleBipbopMaster, baseURL: appleMaster)
+        #expect(bipbopInspection.isMasterPlaylist)
+        #expect(bipbopInspection.variants.count == 1)
+        let preferredVariant = try #require(bipbopInspection.variants.first)
+        #expect(preferredVariant.url == appleVideoChild)
+        #expect(preferredVariant.codecs == "avc1.640020,mp4a.40.2")
+        #expect(preferredVariant.audioGroupID == "aud1")
+        #expect(preferredVariant.audioURI == appleAudioChild)
+        #expect(bipbopInspection.referencedPlaylistURLs.contains(appleVideoChild))
+        #expect(bipbopInspection.referencedPlaylistURLs.contains(appleAudioChild))
+        #expect(bipbopInspection.referencedPlaylistURLs.contains(
+            try #require(URL(string: "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/v5/iframe_index.m3u8"))
+        ))
+    }
 }

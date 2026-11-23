@@ -101,19 +101,25 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
         {
             return .hls
         }
-        if pathExt == "mpd" || mime == "application/dash+xml" {
+        if pathExt == "mpd" || mime == "application/dash+xml" || mime == "video/vnd.mpeg.dash.mpd" {
             return .dash
         }
-        if mime.hasPrefix("video/")
-            || ["mp4", "m4v", "webm", "mov", "mkv"].contains(pathExt)
-            || destination == "video"
-        {
+
+        let isStrictAudioExt = ["mp3", "m4a", "aac", "opus", "flac", "wav"].contains(pathExt)
+        let isVideoExt = ["mp4", "m4v", "webm", "mov", "mkv", "ogv"].contains(pathExt)
+
+        // Respect explicit <audio> element / kAudio request destination even when a server
+        // mislabels an audio container (e.g. W3Schools serving horse.ogg as video/ogg).
+        if destination == "audio" {
+            return .audio
+        }
+        if mime.hasPrefix("audio/") || isStrictAudioExt {
+            return .audio
+        }
+        if mime.hasPrefix("video/") || isVideoExt || destination == "video" {
             return .video
         }
-        if mime.hasPrefix("audio/")
-            || ["mp3", "m4a", "aac", "ogg", "opus", "flac", "wav"].contains(pathExt)
-            || destination == "audio"
-        {
+        if pathExt == "ogg" {
             return .audio
         }
         return nil
@@ -148,7 +154,28 @@ final class CuriumMediaRadar {
 
         var list = eventsByTabID[tabID] ?? []
         if let existingIndex = list.firstIndex(where: { $0.id == parsed.id }) {
-            list[existingIndex] = parsed
+            let existing = list[existingIndex]
+            let preservedDate = existing.kind == .hls
+                ? min(existing.capturedAt, parsed.capturedAt)
+                : parsed.capturedAt
+            list[existingIndex] = CuriumMediaResourceEvent(
+                id: parsed.id,
+                url: parsed.url,
+                originalURL: parsed.originalURL ?? existing.originalURL,
+                mimeType: parsed.mimeType ?? existing.mimeType,
+                httpMethod: parsed.httpMethod ?? existing.httpMethod,
+                httpStatusCode: (existing.httpStatusCode == 200 && parsed.httpStatusCode == 206)
+                    ? existing.httpStatusCode
+                    : parsed.httpStatusCode,
+                contentLength: max(existing.contentLength, parsed.contentLength),
+                requestDestination: parsed.requestDestination.isEmpty ? existing.requestDestination : parsed.requestDestination,
+                referrer: parsed.referrer ?? existing.referrer,
+                frameURL: parsed.frameURL ?? existing.frameURL,
+                frameOrigin: parsed.frameOrigin ?? existing.frameOrigin,
+                effectiveUserAgent: parsed.effectiveUserAgent ?? existing.effectiveUserAgent,
+                kind: parsed.kind,
+                capturedAt: preservedDate
+            )
         } else {
             list.insert(parsed, at: 0)
             if list.count > Self.maxEventsPerTab {
@@ -259,12 +286,13 @@ struct CuriumMediaCandidate: Identifiable, Equatable, Sendable {
         case .video:
             let ext = url.pathExtension.lowercased()
             switch ext {
-            case "mp4", "m4v", "webm", "mov", "mkv":
+            case "mp4", "m4v", "webm", "mov", "mkv", "ogv", "ogg":
                 return ext.uppercased()
             default:
                 if let mime = mimeType?.lowercased() {
                     if mime.contains("mp4") { return "MP4" }
                     if mime.contains("webm") { return "WEBM" }
+                    if mime.contains("ogg") { return "OGG" }
                     if mime.contains("quicktime") { return "MOV" }
                     if mime.contains("matroska") { return "MKV" }
                 }
@@ -338,6 +366,25 @@ struct CuriumMediaCandidate: Identifiable, Equatable, Sendable {
         }
     }
 
+    /// Short path cue for disambiguating multiple HLS/DASH playlists sharing the same page title
+    /// (e.g. `master.m3u8` vs `v5/prog_index.m3u8`).
+    var manifestPathHint: String? {
+        guard kind == .hls || kind == .dash else { return nil }
+        let components = url.pathComponents.filter { $0 != "/" && !$0.isEmpty }
+        guard let leaf = components.last, !leaf.isEmpty else { return nil }
+        let stem = (leaf as NSString).deletingPathExtension.lowercased()
+        let genericLeafStems: Set<String> = [
+            "prog_index", "index", "playlist", "chunklist", "stream", "manifest", "media",
+        ]
+        if genericLeafStems.contains(stem), components.count >= 2 {
+            let parent = components[components.count - 2]
+            if !parent.isEmpty {
+                return "\(parent)/\(leaf)"
+            }
+        }
+        return leaf
+    }
+
     private func preferredFileExtension() -> String {
         let urlExt = url.pathExtension.lowercased()
         let mime = mimeType?.lowercased() ?? ""
@@ -348,10 +395,11 @@ struct CuriumMediaCandidate: Identifiable, Equatable, Sendable {
         case .dash:
             return "mpd"
         case .video:
-            if ["mp4", "m4v", "webm", "mov", "mkv"].contains(urlExt) {
+            if ["mp4", "m4v", "webm", "mov", "mkv", "ogv", "ogg"].contains(urlExt) {
                 return urlExt
             }
             if mime.contains("webm") { return "webm" }
+            if mime.contains("ogg") { return "ogg" }
             if mime.contains("quicktime") { return "mov" }
             if mime.contains("matroska") { return "mkv" }
             return "mp4"
@@ -429,7 +477,7 @@ enum CuriumMediaDOMScanner {
           for (let j = 0; j < children.length; j++) {
             const srcNode = children[j];
             if (srcNode.src) {
-              rawSources.push({ src: srcNode.src, type: srcNode.type || null, tag: "source" });
+              rawSources.push({ src: srcNode.src, type: srcNode.type || null, tag });
             }
           }
           for (let k = 0; k < rawSources.length && entries.length < maxEntries; k++) {
@@ -630,6 +678,8 @@ enum CuriumMediaDOMScanner {
             var explicitTitle: String?
             var mimeType: String?
             var contentLength: Int64
+            var httpStatusCode: Int
+            var requestDestination: String
             var width: Int?
             var height: Int?
             var durationSeconds: Double?
@@ -659,12 +709,26 @@ enum CuriumMediaDOMScanner {
                 if event.contentLength > existing.contentLength {
                     existing.contentLength = event.contentLength
                 }
+                if existing.httpStatusCode == 0 || (existing.httpStatusCode == 206 && event.httpStatusCode == 200) {
+                    existing.httpStatusCode = event.httpStatusCode
+                }
+                if existing.requestDestination.isEmpty || existing.requestDestination == "empty" || existing.requestDestination == "other" {
+                    if !event.requestDestination.isEmpty {
+                        existing.requestDestination = event.requestDestination
+                    }
+                }
                 if existing.referrer == nil { existing.referrer = event.referrer ?? event.frameURL }
                 if existing.frameOrigin == nil { existing.frameOrigin = event.frameOrigin }
                 if existing.effectiveUserAgent == nil {
                     existing.effectiveUserAgent = event.effectiveUserAgent ?? trimmedFallbackUA
                 }
-                if event.capturedAt > existing.capturedAt {
+                // Preserve earliest capture timestamp for HLS manifests so Master Playlists
+                // fetched before child variant playlists stay prioritized at the top.
+                if existing.kind == .hls {
+                    if event.capturedAt < existing.capturedAt {
+                        existing.capturedAt = event.capturedAt
+                    }
+                } else if event.capturedAt > existing.capturedAt {
                     existing.capturedAt = event.capturedAt
                 }
                 buildersByID[key] = existing
@@ -675,6 +739,8 @@ enum CuriumMediaDOMScanner {
                     explicitTitle: nil,
                     mimeType: event.mimeType,
                     contentLength: event.contentLength,
+                    httpStatusCode: event.httpStatusCode,
+                    requestDestination: event.requestDestination,
                     width: nil,
                     height: nil,
                     durationSeconds: nil,
@@ -711,6 +777,12 @@ enum CuriumMediaDOMScanner {
 
             if var existing = buildersByID[key] {
                 existing.fromDOM = true
+                if entry.tag == "audio" && existing.kind == .video {
+                    existing.kind = .audio
+                    if let mime = entry.mimeType, mime.hasPrefix("audio/") {
+                        existing.mimeType = mime
+                    }
+                }
                 if existing.explicitTitle == nil, let entryTitle {
                     existing.explicitTitle = entryTitle
                 }
@@ -740,6 +812,8 @@ enum CuriumMediaDOMScanner {
                     explicitTitle: entryTitle,
                     mimeType: entry.mimeType,
                     contentLength: -1,
+                    httpStatusCode: 0,
+                    requestDestination: destination,
                     width: entry.width,
                     height: entry.height,
                     durationSeconds: entry.durationSeconds,
@@ -753,10 +827,48 @@ enum CuriumMediaDOMScanner {
             }
         }
 
-        let sortedBuilders = buildersByID.values.sorted { lhs, rhs in
+        let effectiveBlobCount = max(blobVideoCount, blobEntriesCount)
+        let hasAdaptiveStreaming = buildersByID.values.contains { $0.kind == .hls || $0.kind == .dash }
+            || effectiveBlobCount > 0
+
+        // Drop XHR/fetch fMP4 or DASH byte-range chunks / init headers (e.g. Apple fMP4 `main.mp4`
+        // 719-byte init boxes or Shaka DASH partial `.webm`/`.mp4` chunks) when an adaptive
+        // manifest or MSE blob player is active on the tab, while always preserving real DOM
+        // <video>/<audio> elements and direct media requests.
+        let filteredBuilders: [Builder] = buildersByID.values.filter { item in
+            guard hasAdaptiveStreaming,
+                  (item.kind == .video || item.kind == .audio),
+                  !item.fromDOM else {
+                return true
+            }
+            let isScriptFetch = item.requestDestination.isEmpty
+                || item.requestDestination == "empty"
+                || item.requestDestination == "other"
+            guard isScriptFetch else { return true }
+            let isPartialRangeChunk = item.httpStatusCode == 206
+            let isTinyInitSegment = item.contentLength > 0 && item.contentLength < 8_192
+            return !(isPartialRangeChunk || isTinyInitSegment)
+        }
+
+        let sortedBuilders = filteredBuilders.sorted { lhs, rhs in
             let lhsRank = streamKindSortRank(lhs.kind)
             let rhsRank = streamKindSortRank(rhs.kind)
             if lhsRank != rhsRank { return lhsRank < rhsRank }
+
+            if lhs.kind == .hls && rhs.kind == .hls {
+                let lhsMasterRank = hlsMasterPriorityRank(for: lhs.url)
+                let rhsMasterRank = hlsMasterPriorityRank(for: rhs.url)
+                if lhsMasterRank != rhsMasterRank { return lhsMasterRank < rhsMasterRank }
+
+                let lhsDepth = lhs.url.pathComponents.count
+                let rhsDepth = rhs.url.pathComponents.count
+                if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
+
+                if lhs.capturedAt != rhs.capturedAt {
+                    return lhs.capturedAt < rhs.capturedAt
+                }
+                return lhs.url.absoluteString < rhs.url.absoluteString
+            }
 
             if lhs.capturedAt != rhs.capturedAt {
                 return lhs.capturedAt > rhs.capturedAt
@@ -805,7 +917,7 @@ enum CuriumMediaDOMScanner {
             tabID: tabID,
             pageTitle: trimmedPageTitle,
             candidates: candidates,
-            detectedBlobVideoCount: max(blobVideoCount, blobEntriesCount),
+            detectedBlobVideoCount: effectiveBlobCount,
             scannedAt: now
         )
     }
@@ -817,6 +929,19 @@ enum CuriumMediaDOMScanner {
         case .audio: return 2
         case .dash: return 3
         }
+    }
+
+    /// Lower ranks sort first: explicitly named master playlists (`master*.m3u8`) take top priority
+    /// over generic variant/media playlists (`prog_index.m3u8`, `chunklist.m3u8`, etc.).
+    private static func hlsMasterPriorityRank(for url: URL) -> Int {
+        let stem = (url.lastPathComponent as NSString).deletingPathExtension.lowercased()
+        if stem == "master" || stem.hasPrefix("master_") || stem.hasPrefix("master-") || stem.hasSuffix("_master") || stem.hasSuffix("-master") {
+            return 0
+        }
+        if stem == "prog_index" || stem.hasPrefix("chunklist") || stem.contains("audio") || stem.contains("subtitle") {
+            return 2
+        }
+        return 1
     }
 
     private static func formatResolution(width: Int?, height: Int?) -> String? {
