@@ -49,7 +49,7 @@ struct CuriumBrowserView: View {
                 )
                 .ignoresSafeArea(.container, edges: [.top, .bottom])
                 .ignoresSafeArea(.keyboard)
-                .allowsHitTesting(!showsStartPage && tab?.isShowingPDF != true)
+                .allowsHitTesting(!showsStartPage && tab?.isShowingPDF != true && !addressFocused)
                 .accessibilityHidden(showsStartPage || tab?.isShowingPDF == true)
 
                 if let pdfSession = tab?.pdfSession {
@@ -78,6 +78,14 @@ struct CuriumBrowserView: View {
                     CuriumStartPage(store: store, topInset: clearance.bandFloor)
                         .ignoresSafeArea(.container, edges: .top)
                         .ignoresSafeArea(.keyboard)
+                }
+
+                if !isFullscreen && addressFocused {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                        .onTapGesture { addressFocused = false }
+                        .accessibilityHidden(true)
                 }
 
                 if !isFullscreen {
@@ -158,11 +166,11 @@ struct CuriumBrowserView: View {
             // Spans the whole window: UIKit reports only regions that overlap the view.
             // The first report snaps into place; later ones (a Live Activity widening
             // or releasing the island) move the bar in step with the island's own spring.
-            CuriumOcclusionReader { frames in
-                if occlusions == nil {
-                    occlusions = frames
-                } else {
+            CuriumOcclusionReader { frames, shouldAnimate in
+                if shouldAnimate {
                     withAnimation(.smooth(duration: 0.4)) { occlusions = frames }
+                } else {
+                    occlusions = frames
                 }
             }
                 .ignoresSafeArea()
@@ -234,7 +242,7 @@ struct CuriumBrowserView: View {
         sheet = destination
     }
 
-    private struct TopChromeClearance: Equatable {
+    struct TopChromeClearance: Equatable {
         let leading: CGFloat
         let trailing: CGFloat
         let top: CGFloat
@@ -252,16 +260,58 @@ struct CuriumBrowserView: View {
         let width = proxy.size.width
         let safeTop = proxy.safeAreaInsets.top
         let corner = proxy.containerCornerInsets
-
-        let baseSide: CGFloat = width < 420 ? 16 : 24
         let remLeading = max(0, corner.topLeading.width - proxy.safeAreaInsets.leading)
         let remTrailing = max(0, corner.topTrailing.width - proxy.safeAreaInsets.trailing)
 
+        guard #available(iOS 27.1, *) else {
+            return Self.resolveTopChromeClearance(
+                width: width,
+                safeTop: safeTop,
+                remLeading: remLeading,
+                remTrailing: remTrailing,
+                origin: proxy.frame(in: .global).origin,
+                occlusions: nil,
+                activeDivisions: [],
+                supportsReservedRegions: false,
+                layoutDirection: layoutDirection
+            )
+        }
+
+        let activeDivisions = proxy
+            .reservedRegions(kind: .division, options: [.includeInactive])
+            .filter(\.isActive)
+            .map(\.frame)
+
+        return Self.resolveTopChromeClearance(
+            width: width,
+            safeTop: safeTop,
+            remLeading: remLeading,
+            remTrailing: remTrailing,
+            origin: proxy.frame(in: .global).origin,
+            occlusions: occlusions,
+            activeDivisions: activeDivisions,
+            supportsReservedRegions: true,
+            layoutDirection: layoutDirection
+        )
+    }
+
+    static func resolveTopChromeClearance(
+        width: CGFloat,
+        safeTop: CGFloat,
+        remLeading: CGFloat,
+        remTrailing: CGFloat,
+        origin: CGPoint,
+        occlusions: [CGRect]?,
+        activeDivisions: [CGRect],
+        supportsReservedRegions: Bool = true,
+        layoutDirection: LayoutDirection = .leftToRight
+    ) -> TopChromeClearance {
+        let baseSide: CGFloat = width < 420 ? 16 : 24
+
         // A non-zero top inset is the system status band (inner portrait and other
         // horizontal-bar postures). The address bar lives inside that band, centered
-        // on the status cluster's line, and stops short of the cluster; web content
-        // starts at the band's floor. The reserve covers a cluster widened by a Live
-        // Activity; a wider reported occlusion region widens it further.
+        // on the status cluster's line, and stops short of the cluster with an
+        // interactive safety gap; web content starts at the band's floor.
         // Without a status band (vertical-bar postures), the bar rises into the top
         // edge and clears the 59 pt physical corners concentrically
         // (R_screen = 59, R_cap = 22; radialClearance = 37 - hypot(37 - side, 37 - top)):
@@ -285,7 +335,7 @@ struct CuriumBrowserView: View {
             bandFloor = top + CuriumSpace.tapTarget + 10
         }
 
-        guard #available(iOS 27.1, *) else {
+        guard supportsReservedRegions else {
             return TopChromeClearance(
                 leading: layoutDirection == .leftToRight ? left : right,
                 trailing: layoutDirection == .leftToRight ? right : left,
@@ -304,15 +354,10 @@ struct CuriumBrowserView: View {
 
         // 1. Top-edge hardware/status .occlusion inside our width.
         // Regions arrive in window coordinates; the band starts at the window's top edge.
-        // A region's frame already includes the margins UIKit wants kept clear of
-        // interactive content, so the bar meets it exactly, as Safari's toolbar does.
-        let origin = proxy.frame(in: .global).origin
+        // Keep an explicit interactive gap (`occlusionGap`) outside the reported cluster
+        // boundary so trailing controls stay well clear of system status/Control Center gates.
         let topBand = CGRect(x: 0, y: 0, width: width, height: 110)
         var obstacles: [CGRect] = []
-        if hasStatusBand, occlusions == nil {
-            let reserve = CuriumSpace.statusClusterReserve
-            obstacles.append(CGRect(x: width - reserve, y: 0, width: reserve, height: safeTop))
-        }
         for windowFrame in occlusions ?? [] {
             let frame = windowFrame.offsetBy(dx: -origin.x, dy: safeTop - origin.y)
             guard frame.height < 160,
@@ -326,9 +371,9 @@ struct CuriumBrowserView: View {
             let rightRoom = width - right - clampedMaxX
             if max(leftRoom, rightRoom) >= 160 {
                 if leftRoom >= rightRoom {
-                    right = max(right, width - clampedMinX)
+                    right = max(right, width - clampedMinX + CuriumSpace.occlusionGap)
                 } else {
-                    left = max(left, clampedMaxX)
+                    left = max(left, clampedMaxX + CuriumSpace.occlusionGap)
                 }
                 asymmetricHorizontalConstraint = true
                 bandFloor = max(bandFloor, min(110, frame.maxY))
@@ -338,9 +383,19 @@ struct CuriumBrowserView: View {
             }
         }
 
+        // Guard against empty occlusion arrays or one-frame stale post-rotation coordinates
+        // inside a horizontal status band so the bar never extends under the status cluster.
+        if hasStatusBand, obstacles.isEmpty {
+            let fallbackReserve = occlusions == nil
+                ? CuriumSpace.statusClusterReserve
+                : CuriumSpace.statusClusterIdleReserve
+            right = max(right, fallbackReserve)
+            let clampedReserve = min(width, fallbackReserve)
+            obstacles.append(CGRect(x: width - clampedReserve, y: 0, width: clampedReserve, height: safeTop))
+        }
+
         // 2. Keep the chrome within one pane when a fold is active.
-        for region in proxy.reservedRegions(kind: .division, options: [.includeInactive]) where region.isActive {
-            let frame = region.frame
+        for frame in activeDivisions {
             guard frame.minX < width - 2,
                   frame.maxX > 2 else { continue }
             if frame.width > frame.height {
@@ -804,24 +859,14 @@ private struct CuriumAddressBar: View {
     @State private var address = ""
     @State private var cachedSite = ""
     @State private var siteWidth: CGFloat = 0
-    @State private var fieldController = CuriumAddressFieldController()
 
     private var text: String { address.trimmingCharacters(in: .whitespacesAndNewlines) }
 
-    private var showsClearButton: Bool {
-        addressFocused && !address.isEmpty
-    }
-
-    private var showsReloadButton: Bool {
-        guard !addressFocused else { return false }
+    private var canReload: Bool {
         if let pdf = tab?.pdfSession {
             return pdf.originalURL != nil
         }
         return tab?.engine != nil && (tab?.url != nil || tab?.isLoading == true)
-    }
-
-    private var showsTrailingActionButton: Bool {
-        showsClearButton || showsReloadButton
     }
 
     private static func addressDisplayText(for tab: CuriumTabModel?) -> String {
@@ -867,17 +912,14 @@ private struct CuriumAddressBar: View {
         VStack(spacing: 6) {
             ZStack {
                 CuriumAddressInputField(
-                    controller: fieldController,
                     searchEngineTitle: store.library.searchEngine.title,
                     text: $address,
                     isFocused: $addressFocused,
-                    leadingInset: 14,
-                    trailingInset: showsClearButton
-                        ? CuriumSpace.tapTarget + 24
-                        : (showsReloadButton ? CuriumSpace.tapTarget + 6 : 14),
-                    leadingPassthroughWidth: 0,
-                    trailingPassthroughWidth: showsTrailingActionButton ? CuriumSpace.tapTarget + 6 : 0,
-                    onSubmit: submit
+                    canReload: canReload,
+                    isLoading: tab?.isLoading == true,
+                    isInteractive: !collapsed,
+                    onSubmit: submit,
+                    onReloadOrStop: { tab?.reloadOrStop() }
                 )
                 .frame(width: span, height: CuriumSpace.tapTarget)
                 .scaleEffect(fieldScale)
@@ -897,62 +939,29 @@ private struct CuriumAddressBar: View {
                     .accessibilityHidden(true)
             }
             .frame(width: width, height: height)
-            .background {
-                // The bar itself is the progress indicator: tint fills the glass
-                // from the leading edge, under the text, then fades when the page is done.
-                CuriumLoadingFill(tab: tab)
-                    .id(tab?.id)
-            }
             .clipShape(Capsule())
-            .glassEffect(addressFocused ? .regular : .regular.interactive(), in: Capsule())
-            // Keep trailing controls strictly outside UITextField and above the glass
-            // capsule in Z-order so neither UITextInteraction nor interactive Liquid Glass can
-            // cancel touches, while UITextField passes through hits across the trailing button zone.
-            .overlay(alignment: .trailing) {
-                if showsClearButton {
-                    Button {
-                        fieldController.clear()
-                        address = ""
-                        addressFocused = true
-                    } label: {
-                        Label("Clear Address", systemImage: "xmark.circle.fill")
-                            .labelStyle(.iconOnly)
-                            .font(.system(size: 18, weight: .regular))
-                            .foregroundStyle(.secondary)
-                            .frame(width: CuriumSpace.tapTarget + 4, height: CuriumSpace.tapTarget)
-                            .contentShape(Rectangle())
+            .background {
+                // Keep the Liquid Glass capsule and progress tint strictly behind the UIKit
+                // address container with hit-testing disabled so focus changes never mutate
+                // glass interactivity or intercept touches meant for Clear/Reload.
+                Color.clear
+                    .overlay {
+                        CuriumLoadingFill(tab: tab)
+                            .id(tab?.id)
                     }
-                    .buttonStyle(.plain)
-                    .padding(.trailing, 2)
-                    .accessibilitySortPriority(2)
-                    .accessibilityIdentifier("curium.address.clear")
-                } else if showsReloadButton, let tab {
-                    Button { tab.reloadOrStop() } label: {
-                        Label(tab.isLoading ? "Stop Loading" : "Reload",
-                              systemImage: tab.isLoading ? "xmark" : "arrow.clockwise")
-                            .labelStyle(.iconOnly)
-                            .frame(width: CuriumSpace.tapTarget, height: CuriumSpace.tapTarget)
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.trailing, 2)
-                    .scaleEffect(fieldScale)
-                    .opacity(fieldOpacity)
-                    .allowsHitTesting(!collapsed)
-                    .accessibilityHidden(collapsed)
-                    .accessibilitySortPriority(2)
-                    .accessibilityIdentifier("curium.address.reload")
-                }
+                    .clipShape(Capsule())
+                    .glassEffect(.regular, in: Capsule())
+                    .allowsHitTesting(false)
             }
             .overlay {
-                Button(action: expand) { Color.clear.contentShape(Capsule()) }
-                    .buttonStyle(.plain)
-                    .allowsHitTesting(collapsed)
-                    .accessibilityLabel("Address")
-                    .accessibilityValue(Text(verbatim: cachedSite))
-                    .accessibilityHint("Shows the full address bar.")
-                    .accessibilityIdentifier("curium.address.compact")
-                    .accessibilityHidden(!collapsed)
+                if collapsed {
+                    Button(action: expand) { Color.clear.contentShape(Capsule()) }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Address")
+                        .accessibilityValue(Text(verbatim: cachedSite))
+                        .accessibilityHint("Shows the full address bar.")
+                        .accessibilityIdentifier("curium.address.compact")
+                }
             }
             .offset(x: pillShift * collapse, y: (pillTop - restingTop) * collapse)
             .padding(.top, restingTop)
@@ -1000,45 +1009,44 @@ private struct CuriumAddressBar: View {
     }
 }
 
-@MainActor
-private final class CuriumAddressFieldController {
-    weak var field: CuriumAddressUITextField?
-
-    func clear() {
-        field?.clearAddressText()
-    }
-}
-
-/// Native UIKit address input paired with an imperative controller so the external
-/// overlay Clear button clears selected URLs and active IME compositions synchronously
-/// without ever living inside UITextField's gesture hierarchy or interactive Liquid Glass.
+/// Unified UIKit address-bar representable hosting `CuriumAddressUITextField` alongside
+/// dedicated sibling `UIButton`s for Clear and Reload so touches never fall through to
+/// Blink's `RenderWidgetUIView` and an edit-time Clear press can never mutate into Reload.
 private struct CuriumAddressInputField: UIViewRepresentable {
-    let controller: CuriumAddressFieldController
     let searchEngineTitle: String
     @Binding var text: String
     @Binding var isFocused: Bool
-    let leadingInset: CGFloat
-    let trailingInset: CGFloat
-    let leadingPassthroughWidth: CGFloat
-    let trailingPassthroughWidth: CGFloat
+    let canReload: Bool
+    let isLoading: Bool
+    let isInteractive: Bool
     let onSubmit: () -> Void
+    let onReloadOrStop: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
-    func makeUIView(context: Context) -> CuriumAddressUITextField {
-        let field = CuriumAddressUITextField()
-        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        field.delegate = context.coordinator
-        field.addTarget(context.coordinator, action: #selector(Coordinator.editingChanged(_:)), for: .editingChanged)
-        controller.field = field
-        applyConfiguration(to: field)
-        return field
+    func makeUIView(context: Context) -> CuriumAddressFieldContainerView {
+        let container = CuriumAddressFieldContainerView()
+        container.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        container.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        container.textField.delegate = context.coordinator
+        container.textField.addTarget(
+            context.coordinator,
+            action: #selector(Coordinator.editingChanged(_:)),
+            for: .editingChanged
+        )
+        container.onClear = { [weak coordinator = context.coordinator] in
+            coordinator?.handleClear()
+        }
+        container.onReloadOrStop = { [weak coordinator = context.coordinator] in
+            coordinator?.handleReloadOrStop()
+        }
+        applyConfiguration(to: container)
+        return container
     }
 
     func sizeThatFits(
         _ proposal: ProposedViewSize,
-        uiView: CuriumAddressUITextField,
+        uiView: CuriumAddressFieldContainerView,
         context: Context
     ) -> CGSize? {
         CGSize(
@@ -1047,11 +1055,11 @@ private struct CuriumAddressInputField: UIViewRepresentable {
         )
     }
 
-    func updateUIView(_ field: CuriumAddressUITextField, context: Context) {
+    func updateUIView(_ container: CuriumAddressFieldContainerView, context: Context) {
         context.coordinator.parent = self
-        controller.field = field
-        applyConfiguration(to: field)
+        applyConfiguration(to: container)
 
+        let field = container.textField
         if field.markedTextRange == nil, field.text != text {
             field.text = text
         }
@@ -1068,9 +1076,17 @@ private struct CuriumAddressInputField: UIViewRepresentable {
         } else if !isFocused, field.isFirstResponder {
             field.resignFirstResponder()
         }
+
+        container.updateTrailingState(
+            isFocused: isFocused,
+            canReload: canReload,
+            isLoading: isLoading,
+            isInteractive: isInteractive
+        )
     }
 
-    private func applyConfiguration(to field: CuriumAddressUITextField) {
+    private func applyConfiguration(to container: CuriumAddressFieldContainerView) {
+        let field = container.textField
         let promptText = "Search \(searchEngineTitle) or enter address"
         if field.placeholderText != promptText {
             field.placeholderText = promptText
@@ -1082,12 +1098,6 @@ private struct CuriumAddressInputField: UIViewRepresentable {
                 ]
             )
         }
-        field.updateInsets(
-            leading: leadingInset,
-            trailing: trailingInset,
-            leadingPassthrough: leadingPassthroughWidth,
-            trailingPassthrough: trailingPassthroughWidth
-        )
     }
 
     final class Coordinator: NSObject, UITextFieldDelegate {
@@ -1102,12 +1112,27 @@ private struct CuriumAddressInputField: UIViewRepresentable {
             if parent.text != next {
                 parent.text = next
             }
+            (textField.superview as? CuriumAddressFieldContainerView)?.refreshTrailingVisibility()
+        }
+
+        func handleClear() {
+            if parent.text != "" {
+                parent.text = ""
+            }
+            if !parent.isFocused {
+                parent.isFocused = true
+            }
+        }
+
+        func handleReloadOrStop() {
+            parent.onReloadOrStop()
         }
 
         func textFieldDidBeginEditing(_ textField: UITextField) {
             if !parent.isFocused {
                 parent.isFocused = true
             }
+            (textField.superview as? CuriumAddressFieldContainerView)?.markEditingBegan()
             guard let curiumField = textField as? CuriumAddressUITextField else { return }
             let session = curiumField.beginEditSession()
             if !(curiumField.text?.isEmpty ?? true) {
@@ -1122,6 +1147,7 @@ private struct CuriumAddressInputField: UIViewRepresentable {
         }
 
         func textFieldDidEndEditing(_ textField: UITextField) {
+            (textField.superview as? CuriumAddressFieldContainerView)?.recordEditingEnded()
             if parent.isFocused {
                 parent.isFocused = false
             }
@@ -1134,18 +1160,200 @@ private struct CuriumAddressInputField: UIViewRepresentable {
     }
 }
 
-private final class CuriumAddressUITextField: UITextField {
-    /// Generous clearance between the text editing rect and the trailing Clear overlay so
-    /// UIKit's trailing text-selection grabber never overlaps or pulls touches from Clear.
-    private static let clearEditingInset: CGFloat = CuriumSpace.tapTarget + 24
+/// Opaque UIKit container owning `textField` alongside distinct sibling `clearButton`
+/// and `reloadButton` controls so every point inside the capsule returns a UIKit view
+/// (never falling through to Blink), Clear preserves first responder & clears IME marked
+/// text synchronously, and Reload cannot fire from an edit-session press or focus-loss race.
+@MainActor
+final class CuriumAddressFieldContainerView: UIView {
+    static let trailingButtonWidth: CGFloat = CuriumSpace.tapTarget + 4
+    static let reloadCooldownAfterEditing: CFTimeInterval = 0.25
 
+    let textField = CuriumAddressUITextField()
+    let clearButton = UIButton(type: .system)
+    let reloadButton = UIButton(type: .system)
+
+    var onClear: (() -> Void)?
+    var onReloadOrStop: (() -> Void)?
+    var clock: () -> CFTimeInterval = CACurrentMediaTime
+
+    private var isFocusedState = false
+    private var canReloadState = false
+    private var isLoadingState = false
+    private var lastIsLoadingRendered: Bool?
+    private var lastEditingEndedAt: CFTimeInterval = -.greatestFiniteMagnitude
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+
+        configureClearButton()
+        configureReloadButton()
+
+        addSubview(textField)
+        addSubview(clearButton)
+        addSubview(reloadButton)
+
+        refreshTrailingVisibility()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("Use init(frame:).")
+    }
+
+    private func configureClearButton() {
+        var config = UIButton.Configuration.plain()
+        config.image = UIImage(
+            systemName: "xmark.circle.fill",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .regular)
+        )
+        config.baseForegroundColor = .secondaryLabel
+        config.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 2)
+        clearButton.configuration = config
+        clearButton.isPointerInteractionEnabled = true
+        clearButton.accessibilityLabel = "Clear Address"
+        clearButton.accessibilityIdentifier = "curium.address.clear"
+        clearButton.addTarget(self, action: #selector(clearTapped), for: .touchUpInside)
+    }
+
+    private func configureReloadButton() {
+        var config = UIButton.Configuration.plain()
+        config.baseForegroundColor = .label
+        config.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 2)
+        reloadButton.configuration = config
+        reloadButton.isPointerInteractionEnabled = true
+        reloadButton.accessibilityIdentifier = "curium.address.reload"
+        reloadButton.addTarget(self, action: #selector(reloadTapped), for: .touchUpInside)
+        syncReloadAppearance(isLoading: false)
+    }
+
+    private func syncReloadAppearance(isLoading: Bool) {
+        guard lastIsLoadingRendered != isLoading else { return }
+        lastIsLoadingRendered = isLoading
+        var config = reloadButton.configuration ?? .plain()
+        config.image = UIImage(
+            systemName: isLoading ? "xmark" : "arrow.clockwise",
+            withConfiguration: UIImage.SymbolConfiguration(textStyle: .body)
+        )
+        config.baseForegroundColor = .label
+        config.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 2)
+        reloadButton.configuration = config
+        reloadButton.accessibilityLabel = isLoading ? "Stop Loading" : "Reload"
+    }
+
+    func updateTrailingState(isFocused: Bool, canReload: Bool, isLoading: Bool, isInteractive: Bool) {
+        isFocusedState = isFocused
+        canReloadState = canReload
+        isLoadingState = isLoading
+        isUserInteractionEnabled = isInteractive
+        syncReloadAppearance(isLoading: isLoading)
+        refreshTrailingVisibility()
+    }
+
+    func markEditingBegan() {
+        isFocusedState = true
+        refreshTrailingVisibility()
+    }
+
+    func recordEditingEnded() {
+        lastEditingEndedAt = clock()
+        isFocusedState = false
+        refreshTrailingVisibility()
+    }
+
+    func refreshTrailingVisibility() {
+        let editing = isFocusedState || textField.isFirstResponder
+        let hasText = !(textField.text?.isEmpty ?? true)
+        let showClear = editing && hasText
+        let showReload = !editing && canReloadState
+        let visibilityChanged = (clearButton.isHidden == showClear) || (reloadButton.isHidden == showReload)
+
+        clearButton.isHidden = !showClear
+        clearButton.isEnabled = showClear
+        reloadButton.isHidden = !showReload
+        reloadButton.isEnabled = showReload
+
+        let hasButton = showClear || showReload
+        textField.updateInsets(leading: 14, trailing: hasButton ? 18 : 14)
+
+        if !isUserInteractionEnabled {
+            accessibilityElements = []
+        } else if showClear {
+            accessibilityElements = [textField, clearButton]
+        } else if showReload {
+            accessibilityElements = [textField, reloadButton]
+        } else {
+            accessibilityElements = [textField]
+        }
+
+        if visibilityChanged {
+            setNeedsLayout()
+        }
+    }
+
+    @objc func clearTapped() {
+        textField.clearAddressText()
+        refreshTrailingVisibility()
+        onClear?()
+    }
+
+    @objc func reloadTapped() {
+        guard !textField.isFirstResponder,
+              !isFocusedState,
+              canReloadState,
+              clock() - lastEditingEndedAt >= Self.reloadCooldownAfterEditing else { return }
+        onReloadOrStop?()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let slotWidth = min(bounds.width, Self.trailingButtonWidth)
+        let hasButton = !clearButton.isHidden || !reloadButton.isHidden
+        let isRTL = effectiveUserInterfaceLayoutDirection == .rightToLeft
+
+        let buttonFrame: CGRect
+        let fieldFrame: CGRect
+        if hasButton {
+            if isRTL {
+                buttonFrame = CGRect(x: 0, y: 0, width: slotWidth, height: bounds.height)
+                fieldFrame = CGRect(
+                    x: slotWidth,
+                    y: 0,
+                    width: max(0, bounds.width - slotWidth),
+                    height: bounds.height
+                )
+            } else {
+                buttonFrame = CGRect(x: bounds.width - slotWidth, y: 0, width: slotWidth, height: bounds.height)
+                fieldFrame = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: max(0, bounds.width - slotWidth),
+                    height: bounds.height
+                )
+            }
+        } else {
+            buttonFrame = CGRect(
+                x: isRTL ? 0 : bounds.width - slotWidth,
+                y: 0,
+                width: slotWidth,
+                height: bounds.height
+            )
+            fieldFrame = bounds
+        }
+
+        if textField.frame != fieldFrame { textField.frame = fieldFrame }
+        if clearButton.frame != buttonFrame { clearButton.frame = buttonFrame }
+        if reloadButton.frame != buttonFrame { reloadButton.frame = buttonFrame }
+    }
+}
+
+final class CuriumAddressUITextField: UITextField {
     var placeholderText = ""
     private(set) var editSessionID: UInt = 0
 
     private var leadingInset: CGFloat = 14
     private var trailingInset: CGFloat = 14
-    private var leadingPassthroughWidth: CGFloat = 0
-    private var trailingPassthroughWidth: CGFloat = 0
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1177,21 +1385,10 @@ private final class CuriumAddressUITextField: UITextField {
         return editSessionID
     }
 
-    func updateInsets(
-        leading: CGFloat,
-        trailing: CGFloat,
-        leadingPassthrough: CGFloat,
-        trailingPassthrough: CGFloat
-    ) {
-        let changed = leadingInset != leading
-            || trailingInset != trailing
-            || leadingPassthroughWidth != leadingPassthrough
-            || trailingPassthroughWidth != trailingPassthrough
-        guard changed else { return }
+    func updateInsets(leading: CGFloat, trailing: CGFloat) {
+        guard leadingInset != leading || trailingInset != trailing else { return }
         leadingInset = leading
         trailingInset = trailing
-        leadingPassthroughWidth = leadingPassthrough
-        trailingPassthroughWidth = trailingPassthrough
         setNeedsLayout()
     }
 
@@ -1205,32 +1402,26 @@ private final class CuriumAddressUITextField: UITextField {
         }
     }
 
+    private func directionalInsets() -> UIEdgeInsets {
+        let isRTL = effectiveUserInterfaceLayoutDirection == .rightToLeft
+        return UIEdgeInsets(
+            top: 0,
+            left: isRTL ? trailingInset : leadingInset,
+            bottom: 0,
+            right: isRTL ? leadingInset : trailingInset
+        )
+    }
+
     override func textRect(forBounds bounds: CGRect) -> CGRect {
-        let right = (isFirstResponder && !(text?.isEmpty ?? true))
-            ? max(trailingInset, Self.clearEditingInset)
-            : trailingInset
-        return bounds.inset(by: UIEdgeInsets(top: 0, left: leadingInset, bottom: 0, right: right))
+        bounds.inset(by: directionalInsets())
     }
 
     override func editingRect(forBounds bounds: CGRect) -> CGRect {
-        let right = !(text?.isEmpty ?? true)
-            ? max(trailingInset, Self.clearEditingInset)
-            : trailingInset
-        return bounds.inset(by: UIEdgeInsets(top: 0, left: leadingInset, bottom: 0, right: right))
+        bounds.inset(by: directionalInsets())
     }
 
     override func placeholderRect(forBounds bounds: CGRect) -> CGRect {
         textRect(forBounds: bounds)
-    }
-
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        if leadingPassthroughWidth > 0, point.x < leadingPassthroughWidth {
-            return nil
-        }
-        if trailingPassthroughWidth > 0, point.x > bounds.width - trailingPassthroughWidth {
-            return nil
-        }
-        return super.hitTest(point, with: event)
     }
 }
 

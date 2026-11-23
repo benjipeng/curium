@@ -99,6 +99,11 @@ enum CuriumSpace {
     /// the widest cluster measured on iPhone Duo inner portrait, with a Live Activity
     /// in the island (x 470-645 of 669 pt). Once the region is reported, it rules.
     static let statusClusterReserve: CGFloat = 210
+    /// Minimum trailing room for the idle status cluster (144 pt + 8 pt interactive gap)
+    /// when a horizontal status band is active but UIKit reports no matching occlusion yet.
+    static let statusClusterIdleReserve: CGFloat = 152
+    /// Horizontal breathing room between the address bar capsule and a top-band occlusion.
+    static let occlusionGap: CGFloat = 8
     /// Space a floating control needs to clear the horizontal bottom toolbar.
     static let bottomToolbarClearance: CGFloat = 58
     /// Compact address pill while reading: Safari's size, centered where the status bar was.

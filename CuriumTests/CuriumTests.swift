@@ -1915,3 +1915,146 @@ struct CuriumBuild41ContractTests {
         #expect(frames[1].result == .object(["videos": .number(2)]))
     }
 }
+
+@Suite("Address Bar Container & Inner-Portrait Clearance")
+@MainActor
+struct CuriumAddressBarAndClearanceTests {
+    @Test("Inner portrait clearance keeps an interactive gap before status cluster and guards empty/stale occlusions")
+    func innerPortraitClearanceAndFallbacks() {
+        // Idle inner portrait (669x951, safeTop = 82) with status cluster occlusion (525, 0, 144x82).
+        let idle = CuriumBrowserView.resolveTopChromeClearance(
+            width: 669,
+            safeTop: 82,
+            remLeading: 59,
+            remTrailing: 59,
+            origin: CGPoint(x: 0, y: 82),
+            occlusions: [CGRect(x: 525, y: 0, width: 144, height: 82)],
+            activeDivisions: []
+        )
+        #expect(idle.leading == 24)
+        #expect(idle.trailing == 152) // (669 - 525) + 8 pt safety gap
+        #expect(idle.top == 26)
+        #expect(idle.bandFloor == 82)
+
+        // Live Activity widened cluster (467, 0, 202x82).
+        let liveActivity = CuriumBrowserView.resolveTopChromeClearance(
+            width: 669,
+            safeTop: 82,
+            remLeading: 59,
+            remTrailing: 59,
+            origin: CGPoint(x: 0, y: 82),
+            occlusions: [CGRect(x: 467, y: 0, width: 202, height: 82)],
+            activeDivisions: []
+        )
+        #expect(liveActivity.trailing == 210) // (669 - 467) + 8 pt safety gap
+
+        // Before first UIKit report (nil) uses widest statusClusterReserve (210).
+        let initial = CuriumBrowserView.resolveTopChromeClearance(
+            width: 669,
+            safeTop: 82,
+            remLeading: 59,
+            remTrailing: 59,
+            origin: CGPoint(x: 0, y: 82),
+            occlusions: nil,
+            activeDivisions: []
+        )
+        #expect(initial.trailing == CuriumSpace.statusClusterReserve)
+
+        // Empty [] report or 1-frame stale landscape occlusion (x = 867 > width = 669) keeps idle cluster floor.
+        let emptyOcclusions = CuriumBrowserView.resolveTopChromeClearance(
+            width: 669,
+            safeTop: 82,
+            remLeading: 59,
+            remTrailing: 59,
+            origin: CGPoint(x: 0, y: 82),
+            occlusions: [],
+            activeDivisions: []
+        )
+        #expect(emptyOcclusions.trailing == CuriumSpace.statusClusterIdleReserve)
+
+        let staleLandscape = CuriumBrowserView.resolveTopChromeClearance(
+            width: 669,
+            safeTop: 82,
+            remLeading: 59,
+            remTrailing: 59,
+            origin: CGPoint(x: 0, y: 82),
+            occlusions: [CGRect(x: 867, y: 0, width: 84, height: 124)],
+            activeDivisions: []
+        )
+        #expect(staleLandscape.trailing == CuriumSpace.statusClusterIdleReserve)
+
+        // Inner landscape (951x669 -> 867 safe width, safeTop = 0, remLeading = 59) stays symmetric.
+        let innerLandscape = CuriumBrowserView.resolveTopChromeClearance(
+            width: 867,
+            safeTop: 0,
+            remLeading: 59,
+            remTrailing: 0,
+            origin: CGPoint(x: 0, y: 0),
+            occlusions: [CGRect(x: 867, y: 0, width: 84, height: 124)],
+            activeDivisions: []
+        )
+        #expect(innerLandscape.leading == 36)
+        #expect(innerLandscape.trailing == 36)
+        #expect(innerLandscape.top == 20)
+    }
+
+    @Test("Address container owns trailing hit-testing, clears synchronously, and blocks post-blur reload misfires")
+    func addressFieldContainerHitTestClearAndReloadGuard() {
+        var now: CFTimeInterval = 100.0
+        var clearCalls = 0
+        var reloadCalls = 0
+
+        let container = CuriumAddressFieldContainerView(frame: CGRect(x: 0, y: 0, width: 493, height: 44))
+        container.clock = { now }
+        container.onClear = { clearCalls += 1 }
+        container.onReloadOrStop = { reloadCalls += 1 }
+        container.textField.text = "https://www.youtube.com/watch?v=8_xmC3_UkyM"
+
+        // Unfocused with reloadable page: reload button covers trailing 48 pt flush to bounds.maxX.
+        container.updateTrailingState(isFocused: false, canReload: true, isLoading: false, isInteractive: true)
+        container.layoutIfNeeded()
+        #expect(container.clearButton.isHidden)
+        #expect(!container.reloadButton.isHidden)
+        #expect(container.reloadButton.frame == CGRect(x: 445, y: 0, width: 48, height: 44))
+        #expect(container.textField.frame == CGRect(x: 0, y: 0, width: 445, height: 44))
+        #expect(container.hitTest(CGPoint(x: 492, y: 22), with: nil) === container.reloadButton)
+
+        // Focused with URL: clear button owns trailing 48 pt (including 1 pt inside right edge), reload hidden.
+        container.updateTrailingState(isFocused: true, canReload: true, isLoading: false, isInteractive: true)
+        container.layoutIfNeeded()
+        #expect(!container.clearButton.isHidden)
+        #expect(container.reloadButton.isHidden)
+        #expect(container.hitTest(CGPoint(x: 446, y: 22), with: nil) === container.clearButton)
+        #expect(container.hitTest(CGPoint(x: 470, y: 22), with: nil) === container.clearButton)
+        #expect(container.hitTest(CGPoint(x: 492, y: 22), with: nil) === container.clearButton)
+        #expect(container.hitTest(CGPoint(x: 200, y: 22), with: nil) === container.textField)
+
+        // Tapping Clear empties text synchronously, bumps editSessionID, hides Clear, and never fires Reload.
+        let sessionBefore = container.textField.editSessionID
+        container.clearTapped()
+        #expect(container.textField.text == "")
+        #expect(container.textField.editSessionID != sessionBefore)
+        #expect(clearCalls == 1)
+        #expect(reloadCalls == 0)
+        #expect(container.clearButton.isHidden)
+        #expect(container.reloadButton.isHidden)
+
+        // Even if editing ends immediately before a stray reload tap, the post-blur cooldown suppresses it.
+        container.textField.text = "https://www.youtube.com/watch?v=8_xmC3_UkyM"
+        container.markEditingBegan()
+        container.recordEditingEnded()
+        now += 0.05
+        container.reloadTapped()
+        #expect(reloadCalls == 0)
+
+        // Once the cooldown elapses after editing ends, Reload works cleanly.
+        now += 0.30
+        container.reloadTapped()
+        #expect(reloadCalls == 1)
+
+        // Collapsed state disables interaction so the compact expand pill receives hits directly.
+        container.updateTrailingState(isFocused: false, canReload: true, isLoading: false, isInteractive: false)
+        #expect(!container.isUserInteractionEnabled)
+        #expect(container.hitTest(CGPoint(x: 200, y: 22), with: nil) == nil)
+    }
+}

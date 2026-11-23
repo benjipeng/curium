@@ -10,7 +10,7 @@ import UIKit
 /// widens the island. Reading them there, instead of from a SwiftUI geometry pass,
 /// keeps the bar in step with the island as it grows and shrinks.
 struct CuriumOcclusionReader: UIViewRepresentable {
-    let onChange: ([CGRect]) -> Void
+    let onChange: ([CGRect], Bool) -> Void
 
     func makeUIView(context: Context) -> Reader {
         let reader = Reader()
@@ -23,9 +23,10 @@ struct CuriumOcclusionReader: UIViewRepresentable {
     }
 
     final class Reader: UIView {
-        var onChange: (([CGRect]) -> Void)?
+        var onChange: (([CGRect], Bool) -> Void)?
         private var published: [CGRect]?
         private var lastBoundsSize: CGSize = .zero
+        private var pendingSizeSnap = false
 
         init() {
             super.init(frame: .zero)
@@ -40,6 +41,7 @@ struct CuriumOcclusionReader: UIViewRepresentable {
         override func didMoveToWindow() {
             super.didMoveToWindow()
             lastBoundsSize = bounds.size
+            pendingSizeSnap = true
             setNeedsUpdateConstraints()
         }
 
@@ -47,6 +49,7 @@ struct CuriumOcclusionReader: UIViewRepresentable {
             super.layoutSubviews()
             guard bounds.size != lastBoundsSize else { return }
             lastBoundsSize = bounds.size
+            pendingSizeSnap = true
             setNeedsUpdateConstraints() // Size or posture changed.
         }
 
@@ -61,6 +64,8 @@ struct CuriumOcclusionReader: UIViewRepresentable {
             #if DEBUG
             if let simulated = Self.simulatedFrames { frames = simulated }
             #endif
+            let shouldAnimate = published != nil && !pendingSizeSnap
+            pendingSizeSnap = false
             guard frames != published else { return }
             published = frames
             // The frame includes the margins; log them, since the Simulator reports zero.
@@ -72,7 +77,7 @@ struct CuriumOcclusionReader: UIViewRepresentable {
             CuriumDiagnostics.shared.record("layout", "occlusion: \(summary)")
             Task { @MainActor [weak self] in
                 guard let self, self.published == frames else { return }
-                self.onChange?(frames)
+                self.onChange?(frames, shouldAnimate)
             }
         }
 
