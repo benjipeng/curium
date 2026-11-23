@@ -19,7 +19,7 @@ struct CuriumBrowserView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     fileprivate enum Destination: Hashable, Identifiable {
-        case tabs, extensions, downloads, bookmarks, history, settings
+        case tabs, extensions, downloads, bookmarks, history, settings, profiles
 
         var id: Self { self }
     }
@@ -81,9 +81,13 @@ struct CuriumBrowserView: View {
                 }
 
                 if showsStartPage {
-                    CuriumStartPage(store: store, topInset: clearance.bandFloor)
-                        .ignoresSafeArea(.container, edges: .top)
-                        .ignoresSafeArea(.keyboard)
+                    CuriumStartPage(
+                        store: store,
+                        topInset: clearance.bandFloor,
+                        onOpenProfiles: { present(.profiles) }
+                    )
+                    .ignoresSafeArea(.container, edges: .top)
+                    .ignoresSafeArea(.keyboard)
                 }
 
                 if !isFullscreen && addressFocused {
@@ -207,9 +211,14 @@ struct CuriumBrowserView: View {
             case .history: CuriumLibrarySheet(store: store, section: .history)
             case .settings:
                 CuriumSettingsSheet(
-                    palette: $palette, siteMode: $siteMode,
-                    library: store.library, engineReady: store.isEngineReady
+                    palette: $palette,
+                    siteMode: $siteMode,
+                    library: store.library,
+                    engineReady: store.isEngineReady,
+                    browserStore: store
                 )
+            case .profiles:
+                CuriumProfileSwitcherSheet(browserStore: store)
             }
         }
         .alert("Curium", isPresented: Binding(
@@ -285,9 +294,20 @@ struct CuriumBrowserView: View {
             .map(\.frame)
     }
 
+    private static func currentWindowTopSafeAreaInset() -> CGFloat? {
+        let windowScenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let activeScene = windowScenes.first(where: { $0.activationState == .foregroundActive })
+            ?? windowScenes.first(where: { $0.activationState == .foregroundInactive })
+        guard let windowScene = activeScene,
+              let window = windowScene.windows.first(where: \.isKeyWindow) ?? windowScene.windows.first else {
+            return nil
+        }
+        return window.safeAreaInsets.top
+    }
+
     private func topChromeClearance(in proxy: GeometryProxy, activeDivisions: [CGRect]) -> TopChromeClearance {
         let width = proxy.size.width
-        let safeTop = windowSafeTop ?? proxy.safeAreaInsets.top
+        let safeTop = windowSafeTop ?? Self.currentWindowTopSafeAreaInset() ?? proxy.safeAreaInsets.top
         let corner = proxy.containerCornerInsets
         let remLeading = max(0, corner.topLeading.width - proxy.safeAreaInsets.leading)
         let remTrailing = max(0, corner.topTrailing.width - proxy.safeAreaInsets.trailing)
@@ -628,8 +648,16 @@ private struct CuriumOverflowToolbarMenu: View {
     }
 
     var body: some View {
+        let activeProfile = CuriumFingerprintStore.shared.activeProfile
+
         Menu {
             pageScaleControls
+            Divider()
+            Button { present(.profiles) } label: {
+                Label("Profile: \(activeProfile.displayName)", systemImage: activeProfile.resolvedSymbolName)
+            }
+            .accessibilityIdentifier("curium.menu.profiles")
+            Divider()
             Button {
                 beforeAction()
                 if let pdf = tab?.pdfSession {
@@ -704,9 +732,9 @@ private struct CuriumOverflowToolbarMenu: View {
 }
 
 /// Unified `.division`-aware bottom overlay container stacking the Chrome Web Store
-/// install pill above the non-PDF download banner so floating controls never collide
-/// or straddle the hinge, and keeping root `CuriumBrowserView` isolated from URL and
-/// download progress updates.
+/// install pill, calm pending profile switch pill, and non-PDF download banner so
+/// floating controls never collide or straddle the hinge, while keeping root
+/// `CuriumBrowserView` isolated from URL, profile-switch, and download progress updates.
 private struct CuriumBottomOverlayStack: View {
     let store: CuriumBrowserStore
     let pane: CuriumBrowserView.BottomOverlayPane
@@ -715,49 +743,146 @@ private struct CuriumBottomOverlayStack: View {
     let openExtensions: () -> Void
     let openDownloads: () -> Void
 
+    @State private var dismissedPendingSwitch = false
+
+    private var fingerprintStore: CuriumFingerprintStore { CuriumFingerprintStore.shared }
+
     var body: some View {
         let tab = store.activeTab
         let isShowingPDF = tab?.isShowingPDF == true
         let storeID: String? = isShowingPDF ? nil : CuriumExtensionStore.storeExtensionID(from: tab?.url)
         let bannerDownload = store.activeDownloadBanner
+        let showPendingSwitch = fingerprintStore.hasPendingProfileSwitch && !dismissedPendingSwitch
+        let nextProfile = showPendingSwitch ? fingerprintStore.nextLaunchProfile : nil
 
-        if storeID != nil || bannerDownload != nil {
-            let bottomPadding: CGFloat = {
-                guard let pdf = tab?.pdfSession, case .ready = pdf.phase else { return baseBottomPadding }
-                return (pdf.isSearching ? 10 : baseBottomPadding) + (pdf.isSearching ? 114 : 58)
-            }()
+        Group {
+            if storeID != nil || nextProfile != nil || bannerDownload != nil {
+                let bottomPadding: CGFloat = {
+                    guard let pdf = tab?.pdfSession, case .ready = pdf.phase else { return baseBottomPadding }
+                    return (pdf.isSearching ? 10 : baseBottomPadding) + (pdf.isSearching ? 114 : 58)
+                }()
 
-            VStack(spacing: 10) {
-                if let storeID {
-                    CuriumStoreInstallPill(
-                        extensions: store.extensions,
-                        storeID: storeID,
-                        palette: palette,
-                        openExtensions: openExtensions
-                    )
+                VStack(spacing: 10) {
+                    if let storeID {
+                        CuriumStoreInstallPill(
+                            extensions: store.extensions,
+                            storeID: storeID,
+                            palette: palette,
+                            openExtensions: openExtensions
+                        )
+                    }
+
+                    if let nextProfile {
+                        CuriumPendingProfileSwitchPill(
+                            store: store,
+                            nextProfile: nextProfile,
+                            maxWidth: min(440, pane.maxWidth),
+                            onDismiss: { dismissedPendingSwitch = true }
+                        )
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+
+                    if let bannerDownload {
+                        CuriumDownloadBannerCard(
+                            store: store,
+                            download: bannerDownload,
+                            palette: palette,
+                            maxWidth: min(480, pane.maxWidth),
+                            openDownloads: openDownloads
+                        )
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
                 }
+                .padding(.leading, pane.leading)
+                .padding(.trailing, pane.trailing)
+                .padding(.bottom, bottomPadding)
+                .frame(
+                    maxWidth: .infinity,
+                    maxHeight: .infinity,
+                    alignment: Alignment(horizontal: pane.alignment.horizontal, vertical: .bottom)
+                )
+                .ignoresSafeArea(isShowingPDF ? SafeAreaRegions() : .keyboard, edges: .bottom)
+            }
+        }
+        .onChange(of: fingerprintStore.nextLaunchProfileID) { _, _ in
+            dismissedPendingSwitch = false
+        }
+    }
+}
 
-                if let bannerDownload {
-                    CuriumDownloadBannerCard(
-                        store: store,
-                        download: bannerDownload,
-                        palette: palette,
-                        maxWidth: min(480, pane.maxWidth),
-                        openDownloads: openDownloads
-                    )
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+/// Calm floating Liquid Glass pill offering one-tap cold relaunch when the user has
+/// selected a different profile for the next launch.
+private struct CuriumPendingProfileSwitchPill: View {
+    let store: CuriumBrowserStore
+    let nextProfile: CuriumFingerprintProfile
+    let maxWidth: CGFloat
+    let onDismiss: () -> Void
+
+    @State private var isRelaunching = false
+
+    private var shortActionTitle: String {
+        CuriumProfileRelauncher.isRunningInLiveContainer ? "Relaunch" : "Switch"
+    }
+
+    var body: some View {
+        let nextPalette = nextProfile.resolvedPalette
+
+        HStack(spacing: 10) {
+            Image(systemName: nextProfile.resolvedSymbolName)
+                .font(.body.weight(.semibold))
+                .foregroundStyle(nextPalette.tint)
+                .frame(width: 24)
+                .accessibilityHidden(true)
+
+            Text("Next launch: \(nextProfile.displayName)")
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                guard !isRelaunching else { return }
+                isRelaunching = true
+                Task {
+                    let ok = await store.prepareForProfileSwitchAndRelaunch(to: nextProfile.id)
+                    if !ok {
+                        isRelaunching = false
+                    }
+                }
+            } label: {
+                if isRelaunching {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Text(shortActionTitle)
+                        .font(.footnote.weight(.semibold))
                 }
             }
-            .padding(.leading, pane.leading)
-            .padding(.trailing, pane.trailing)
-            .padding(.bottom, bottomPadding)
-            .frame(
-                maxWidth: .infinity,
-                maxHeight: .infinity,
-                alignment: Alignment(horizontal: pane.alignment.horizontal, vertical: .bottom)
-            )
-            .ignoresSafeArea(isShowingPDF ? SafeAreaRegions() : .keyboard, edges: .bottom)
+            .buttonStyle(.borderedProminent)
+            .tint(nextPalette.tint)
+            .controlSize(.small)
+            .disabled(isRelaunching)
+            .accessibilityLabel(CuriumProfileRelauncher.primaryRelaunchButtonTitle)
+            .accessibilityIdentifier("curium.pendingSwitch.relaunch")
+
+            Button(action: onDismiss) {
+                Label("Dismiss Pending Switch", systemImage: "xmark")
+                    .labelStyle(.iconOnly)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("curium.pendingSwitch.dismiss")
         }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: maxWidth, minHeight: CuriumSpace.tapTarget)
+        .glassEffect(.regular.interactive(), in: Capsule())
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("curium.pendingSwitch.pill")
     }
 }
 

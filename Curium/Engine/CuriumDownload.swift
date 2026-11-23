@@ -68,6 +68,42 @@ final class CuriumDownload: Identifiable {
         failure = nil
         defer { isStarting = false; refresh() }
         let name = filename
+
+        if downloadsRoot == nil && CuriumDownloadsFolderManager.isUsingCustomDownloadsFolder {
+            var stagingDirectory: URL?
+            defer {
+                if let stagingDirectory {
+                    CuriumDownloadStorage.removeDownloadStagingDirectory(stagingDirectory)
+                }
+            }
+            do {
+                let staged = try await Task.detached(priority: .utility) {
+                    try CuriumDownloadStorage.makeDownloadStagingDestination(filename: name)
+                }.value
+                stagingDirectory = staged.sessionDirectory
+                let downloadedURL = try await task.start(withDestinationURL: staged.fileURL)
+                let sessionToClean = staged.sessionDirectory
+                let committedURL = try await Task.detached(priority: .utility) {
+                    defer {
+                        CuriumDownloadStorage.removeDownloadStagingDirectory(sessionToClean)
+                    }
+                    let destinationDirectory = try CuriumDownloadStorage.downloadsRootDirectory()
+                    return try CuriumDownloadStorage.commitStagedFile(
+                        from: downloadedURL,
+                        toDirectory: destinationDirectory,
+                        preferredFilename: name,
+                        removeSource: true
+                    )
+                }.value
+                stagingDirectory = nil
+                savedURL = committedURL
+                return savedURL
+            } catch {
+                if task.state != .cancelled { failure = error.localizedDescription }
+                return nil
+            }
+        }
+
         var reservedURL: URL?
         defer {
             if let reservedURL {

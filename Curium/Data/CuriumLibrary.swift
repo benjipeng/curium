@@ -8,7 +8,7 @@ import Observation
 // file are the contract shared by the address bar, the Library sheet, and the
 // browser store. Change them only together with every caller.
 
-enum CuriumSearchEngine: String, CaseIterable, Identifiable, Sendable {
+enum CuriumSearchEngine: String, Codable, CaseIterable, Identifiable, Sendable {
     case google, duckDuckGo, brave, bing
 
     var id: Self { self }
@@ -100,26 +100,46 @@ enum CuriumHistoryClearRange: CaseIterable, Identifiable, Sendable {
 @MainActor
 @Observable
 final class CuriumLibrary {
-    var bookmarks: CuriumBookmarkTree { Self.state.bookmarks }
+    private static let legacySearchEngineKey = "curium.searchEngine"
+
+    let profileID: String
+    @ObservationIgnored private let state: State
+    @ObservationIgnored private let fingerprintStore: CuriumFingerprintStore
+
+    var bookmarks: CuriumBookmarkTree { state.bookmarks }
     var favoriteBookmarks: [CuriumBookmark] { bookmarks.favorites }
     var favorites: [CuriumBookmark] { favoriteBookmarks }
-    var bookmarkRevision: Int { Self.state.bookmarkRevision }
+    var bookmarkRevision: Int { state.bookmarkRevision }
     /// Set once the database cannot be opened; every write after that is lost.
-    var storageUnavailable: Bool { Self.state.storageUnavailable }
+    var storageUnavailable: Bool { state.storageUnavailable }
 
     /// Increments after every history mutation so views can re-query.
     private(set) var historyRevision: Int {
-        get { Self.state.historyRevision }
-        set { Self.state.historyRevision = newValue }
+        get { state.historyRevision }
+        set { state.historyRevision = newValue }
     }
 
     var searchEngine: CuriumSearchEngine {
-        get { Self.state.searchEngine }
-        set { Self.state.searchEngine = newValue }
+        get {
+            if let profile = fingerprintStore.profile(id: profileID) {
+                return profile.resolvedSearchEngine
+            }
+            if profileID == "default" {
+                let raw = UserDefaults.standard.string(forKey: Self.legacySearchEngineKey)
+                return raw.flatMap(CuriumSearchEngine.init(rawValue:)) ?? .google
+            }
+            return .google
+        }
+        set {
+            _ = fingerprintStore.updatePersonaMetadata(for: profileID, searchEngine: newValue)
+            if profileID == "default" {
+                UserDefaults.standard.set(newValue.rawValue, forKey: Self.legacySearchEngineKey)
+            }
+        }
     }
 
-    // Each window has a library facade. All windows observe the same snapshot
-    // and submit writes in order to the same connection.
+    // Each window in a profile has a library facade. All windows within the same
+    // profile observe the same snapshot and submit writes in order to that profile's DB.
     @MainActor
     @Observable
     fileprivate final class State {
@@ -129,25 +149,46 @@ final class CuriumLibrary {
         private(set) var bookmarkRevision = 0
         var historyRevision = 0
         var storageUnavailable = false
-        var searchEngine: CuriumSearchEngine {
-            didSet { UserDefaults.standard.set(searchEngine.rawValue, forKey: Self.searchEngineKey) }
-        }
 
-        private static let searchEngineKey = "curium.searchEngine"
-        let database = CuriumDatabase.shared
+        let profileID: String
+        let database: CuriumDatabase
         @ObservationIgnored var pendingMutation: Task<Bool, Never>?
         @ObservationIgnored var hasLoadedBookmarks = false
 
-        init() {
-            let raw = UserDefaults.standard.string(forKey: Self.searchEngineKey)
-            searchEngine = raw.flatMap(CuriumSearchEngine.init(rawValue:)) ?? .google
+        init(profileID: String, database: CuriumDatabase) {
+            self.profileID = profileID
+            self.database = database
         }
     }
 
-    private static let state = State()
+    @MainActor
+    private static var statesByProfileID: [String: State] = [:]
 
-    init() {
-        guard Self.state.pendingMutation == nil else { return }
+    private static func sharedState(for profileID: String) -> State {
+        let key = profileID.lowercased()
+        if let existing = statesByProfileID[key] {
+            return existing
+        }
+        let created = State(profileID: profileID, database: CuriumDatabase.shared(forProfile: profileID))
+        statesByProfileID[key] = created
+        return created
+    }
+
+    init(
+        profileID: String = "default",
+        database: CuriumDatabase? = nil,
+        fingerprintStore: CuriumFingerprintStore? = nil
+    ) {
+        let trimmed = profileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedID = trimmed.isEmpty ? "default" : trimmed
+        self.profileID = resolvedID
+        self.fingerprintStore = fingerprintStore ?? CuriumFingerprintStore.shared
+        if let database {
+            self.state = State(profileID: resolvedID, database: database)
+        } else {
+            self.state = Self.sharedState(for: resolvedID)
+        }
+        guard state.pendingMutation == nil else { return }
         enqueue { library in
             library.bookmarks = try await library.database.bookmarkTree()
             library.hasLoadedBookmarks = true
@@ -158,23 +199,29 @@ final class CuriumLibrary {
     /// checkpoint follows a write. SQLite itself never runs on the main actor.
     @discardableResult
     private func enqueue(_ operation: @escaping @MainActor (State) async throws -> Void) -> Task<Bool, Never> {
-        let previous = Self.state.pendingMutation
-        let task = Task {
+        let state = self.state
+        let previous = state.pendingMutation
+        let task = Task { @MainActor in
             _ = await previous?.value
             do {
-                try await operation(Self.state)
+                try await operation(state)
                 return true
             } catch {
-                Self.record(error)
+                if CuriumDatabase.isUnavailable(error), !state.storageUnavailable {
+                    state.storageUnavailable = true
+                }
+                CuriumDatabase.report(error)
                 return false
             }
         }
-        Self.state.pendingMutation = task
+        state.pendingMutation = task
         return task
     }
 
-    private static func record(_ error: any Error) {
-        if CuriumDatabase.isUnavailable(error), !state.storageUnavailable { state.storageUnavailable = true }
+    private func record(_ error: any Error) {
+        if CuriumDatabase.isUnavailable(error), !state.storageUnavailable {
+            state.storageUnavailable = true
+        }
         CuriumDatabase.report(error)
     }
 
@@ -209,15 +256,15 @@ final class CuriumLibrary {
 
     /// Days newest first; entries newest first within a day. An empty query returns everything up to `limit` entries.
     func historyDays(matching query: String, limit: Int = 600) async -> [CuriumHistoryDay] {
-        _ = await Self.state.pendingMutation?.value
+        _ = await state.pendingMutation?.value
         guard !Task.isCancelled else { return [] }
         do {
-            return try await Self.state.database.historyDays(matching: query.trimmingCharacters(in: .whitespacesAndNewlines),
-                                                             limit: limit, calendar: .current)
+            return try await state.database.historyDays(matching: query.trimmingCharacters(in: .whitespacesAndNewlines),
+                                                        limit: limit, calendar: .current)
         } catch is CancellationError {
             return []
         } catch {
-            Self.record(error)
+            record(error)
             return []
         }
     }
@@ -247,7 +294,7 @@ final class CuriumLibrary {
     }
 
     func bookmark(for url: URL) async -> CuriumBookmark? {
-        _ = await Self.state.pendingMutation?.value
+        _ = await state.pendingMutation?.value
         return bookmarks.bookmark(for: url)
     }
 
@@ -302,13 +349,13 @@ final class CuriumLibrary {
         let needle = Self.normalizedNeedle(for: text)
         guard !needle.isEmpty else { return [] }
 
-        if Self.state.hasLoadedBookmarks {
-            let bookmarkMatches = Self.matchingBookmarks(in: Self.state.bookmarks, needle: needle, limit: limit)
+        if state.hasLoadedBookmarks {
+            let bookmarkMatches = Self.matchingBookmarks(in: state.bookmarks, needle: needle, limit: limit)
             if bookmarkMatches.count >= limit { return bookmarkMatches }
             let excluded = Set(bookmarkMatches.map { $0.url.absoluteString })
             do {
                 // WAL allows concurrent reads without stalling behind queued write/checkpoint chains.
-                let history = try await Self.state.database.historyAddressMatches(
+                let history = try await state.database.historyAddressMatches(
                     for: text,
                     excludingURLs: excluded,
                     limit: limit - bookmarkMatches.count,
@@ -318,19 +365,19 @@ final class CuriumLibrary {
             } catch is CancellationError {
                 return []
             } catch {
-                Self.record(error)
+                record(error)
                 return bookmarkMatches
             }
         }
 
-        _ = await Self.state.pendingMutation?.value
+        _ = await state.pendingMutation?.value
         guard !Task.isCancelled else { return [] }
         do {
-            return try await Self.state.database.addressMatches(for: text, limit: limit, now: .now)
+            return try await state.database.addressMatches(for: text, limit: limit, now: .now)
         } catch is CancellationError {
             return []
         } catch {
-            Self.record(error)
+            record(error)
             return []
         }
     }

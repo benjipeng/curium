@@ -23,13 +23,64 @@ enum CuriumLibraryLocation {
         let legacy: [URL]
     }
 
-    static func resolve() throws -> Resolution {
+    /// Durable Curium support root directory (`<AppGroup>/Library/Application Support/Curium`,
+    /// `<Host>/Library/Application Support/Curium`, or `<Standalone AppSupport>/Curium`).
+    static func supportRootDirectory(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> URL {
+        let files = FileManager.default
+        let standalone = try files.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: false
+        )
+        guard let hostPath = environment["LC_HOME_PATH"], !hostPath.isEmpty else {
+            return standalone.appending(path: "Curium", directoryHint: .isDirectory)
+        }
+        if let group = sharedGroupContainer() {
+            return group
+                .appending(path: "Library/Application Support", directoryHint: .isDirectory)
+                .appending(path: "Curium", directoryHint: .isDirectory)
+        }
+        let host = URL(fileURLWithPath: hostPath, isDirectory: true).standardizedFileURL
+        return host
+            .appending(path: "Library/Application Support", directoryHint: .isDirectory)
+            .appending(path: "Curium", directoryHint: .isDirectory)
+    }
+
+    /// Profile-scoped Curium support directory (`<CuriumSupportRoot>/` for `"default"`,
+    /// `<CuriumSupportRoot>/Profiles/<slug>/` for isolated profiles).
+    static func profileSupportDirectory(
+        for profileID: String,
+        baseSupportRoot: URL? = nil
+    ) throws -> URL {
+        guard CuriumFingerprintValidator.isValidProfileID(profileID) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let root = try baseSupportRoot ?? supportRootDirectory()
+        if profileID == "default" {
+            return root
+        }
+        return root
+            .appending(path: "Profiles", directoryHint: .isDirectory)
+            .appending(path: profileID, directoryHint: .isDirectory)
+    }
+
+    static func resolve(profileID: String = "default") throws -> Resolution {
+        guard CuriumFingerprintValidator.isValidProfileID(profileID) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        if profileID != "default" {
+            let profileDir = try profileSupportDirectory(for: profileID)
+            let dbURL = profileDir.appending(path: fileName, directoryHint: .notDirectory)
+            return Resolution(database: dbURL, legacy: [])
+        }
+
         let files = FileManager.default
         let standalone = try files.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                        appropriateFor: nil, create: true)
         let ownLibrary = Self.library(in: standalone)
 
-        guard let hostPath = ProcessInfo.processInfo.environment["LC_HOME_PATH"] else {
+        guard let hostPath = ProcessInfo.processInfo.environment["LC_HOME_PATH"], !hostPath.isEmpty else {
             return Resolution(database: ownLibrary, legacy: [])
         }
         let host = URL(fileURLWithPath: hostPath, isDirectory: true).standardizedFileURL

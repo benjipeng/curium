@@ -2,25 +2,46 @@ import Darwin
 import Foundation
 import OSLog
 import SQLite3
+import os
 
-/// Lazily opens one connection for all scenes. Each operation runs to completion
+/// Lazily opens one connection per profile for all scenes. Each operation runs to completion
 /// on this actor, so a transaction never spans an actor suspension.
 actor CuriumDatabase {
     static let shared = CuriumDatabase()
+    private static let instancesLock = OSAllocatedUnfairLock<[String: CuriumDatabase]>(initialState: [:])
+
+    static func shared(forProfile profileID: String) -> CuriumDatabase {
+        let normalized = profileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = normalized.isEmpty ? "default" : normalized.lowercased()
+        if key == "default" {
+            return shared
+        }
+        return instancesLock.withLock { cache in
+            if let existing = cache[key] {
+                return existing
+            }
+            let created = CuriumDatabase(profileID: normalized)
+            cache[key] = created
+            return created
+        }
+    }
 
     private let databaseURL: URL?
+    private let profileID: String
     private var connection: CuriumSQLite?
     private var openFailure: (any Error)?
 
-    init(databaseURL: URL? = nil) {
+    init(databaseURL: URL? = nil, profileID: String = "default") {
         self.databaseURL = databaseURL
+        let trimmed = profileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.profileID = trimmed.isEmpty ? "default" : trimmed
     }
 
     private func database() throws -> CuriumSQLite {
         if let connection { return connection }
         if let openFailure { throw openFailure }
         do {
-            let db = try CuriumSQLite(url: databaseURL ?? Self.defaultURL())
+            let db = try CuriumSQLite(url: databaseURL ?? Self.defaultURL(forProfile: profileID))
             connection = db
             return db
         } catch {
@@ -43,12 +64,12 @@ actor CuriumDatabase {
         log.error("Library operation failed: \(String(describing: error), privacy: .private)")
     }
 
-    private static func defaultURL() throws -> URL {
-        let resolution = try CuriumLibraryLocation.resolve()
+    private static func defaultURL(forProfile profileID: String) throws -> URL {
+        let resolution = try CuriumLibraryLocation.resolve(profileID: profileID)
         guard CuriumLibraryLocation.adoptLegacyIfNeeded(resolution) else {
             throw AdoptionFailed()
         }
-        log.notice("library at \(resolution.database.path, privacy: .public)")
+        log.notice("library(\(profileID, privacy: .public)) at \(resolution.database.path, privacy: .public)")
         return resolution.database
     }
 

@@ -654,9 +654,16 @@ struct CuriumFingerprintTests {
 
         let store = CuriumFingerprintStore(fileURL: fileURL)
         #expect(store.selectedProfileID == nil)
+        #expect(store.profiles.map(\.id) == ["default"])
+        #expect(store.profiles.first?.displayName == "Personal")
         #expect(!store.deleteProfile(id: "default"))
 
-        let custom = try #require(store.duplicateProfile(from: "win11-workstation", newID: "office-win", displayName: "Office Win"))
+        let templateInstance = try #require(
+            store.createProfile(fromTemplate: "win11-workstation", displayName: "Windows Base")
+        )
+        let custom = try #require(
+            store.duplicateProfile(from: templateInstance.id, newID: "office-win", displayName: "Office Win")
+        )
         #expect(custom.id == "office-win")
         #expect(store.selectProfile(id: "office-win"))
 
@@ -676,9 +683,10 @@ struct CuriumFingerprintTests {
 
         #expect(reloaded.deleteProfile(id: "office-win"))
         #expect(reloaded.selectedProfileID == nil)
+        #expect(reloaded.retiredProfileIDs.contains("office-win"))
 
-        // Built-ins stay protected against direct overwrite and deletion (including case variants on APFS),
-        // and always sort before custom profiles.
+        // Reserved built-in template IDs stay protected against direct upsert as new profiles
+        // (including case variants on APFS); v2 exposes all 7 archetypes via `templates`.
         var builtInAttempt = CuriumFingerprintPresets.linuxDesktop
         builtInAttempt.displayName = "Tampered Linux"
         #expect(!reloaded.upsert(builtInAttempt).isValid)
@@ -686,7 +694,10 @@ struct CuriumFingerprintTests {
         builtInCaseAttempt.id = "IOS-Blink"
         #expect(!reloaded.upsert(builtInCaseAttempt).isValid)
         #expect(!reloaded.deleteProfile(id: "linux-desktop"))
-        #expect(reloaded.builtInProfiles.map(\.id) == CuriumFingerprintPresets.allBuiltIns.map(\.id))
+        #expect(reloaded.builtInProfiles.isEmpty)
+        #expect(reloaded.profiles.first?.id == "default")
+        #expect(reloaded.templates.count == CuriumFingerprintPresets.allBuiltIns.count)
+        #expect(Set(reloaded.templates.map(\.id)) == CuriumFingerprintPresets.builtInIDs)
 
         // Engine wire JSON import creates a valid custom profile, and case-insensitive APFS collisions are rejected.
         let wireJSON = Data("""
@@ -845,7 +856,7 @@ struct CuriumFingerprintTests {
 
     @Test("Bootstrap fails closed when an explicit profile is selected without a Build 40+ engine")
     @MainActor
-    func bootstrapFailsClosedWithoutEngineSupport() {
+    func bootstrapFailsClosedWithoutEngineSupport() throws {
         let dir = FileManager.default.temporaryDirectory
             .appending(path: "curium-fp-boot-\(UUID().uuidString)", directoryHint: .isDirectory)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -854,10 +865,13 @@ struct CuriumFingerprintTests {
         let store = CuriumFingerprintStore(fileURL: fileURL)
         #expect(CuriumFingerprintBootstrap.prepareEngineLaunch(store: store) == .defaultBuild39)
 
-        #expect(store.selectProfile(id: "macos-desktop"))
+        let macProfile = try #require(
+            store.createProfile(fromTemplate: "macos-desktop", displayName: "macOS Desktop")
+        )
+        #expect(store.selectProfile(id: macProfile.id))
         let outcome = CuriumFingerprintBootstrap.prepareEngineLaunch(store: store)
         if case .rejected(let profileID, _) = outcome {
-            #expect(profileID == "macos-desktop")
+            #expect(profileID == macProfile.id)
         } else {
             Issue.record("Expected fail-closed rejection when engine lacks Build 40 fingerprint contract, got \(outcome)")
         }
@@ -1663,7 +1677,7 @@ struct CuriumBuild41ContractTests {
         #expect(desktopV1["webglProfile"] == nil)
         #expect(desktopV1["pdfViewerEnabled"] == nil)
 
-        // Static template ships without a hardcoded public seed; store materializes a unique 64-hex seed per install.
+        // Static template ships without a hardcoded public seed; creating from template materializes a unique 64-hex seed.
         let privacyTemplate = CuriumFingerprintPresets.privacyHardened
         #expect(privacyTemplate.fingerprintSeed == nil)
         #expect(privacyTemplate.farbling == .allEnabled)
@@ -1671,7 +1685,9 @@ struct CuriumBuild41ContractTests {
             .appending(path: "curium-privacy-seed-\(UUID().uuidString)", directoryHint: .isDirectory)
         defer { try? FileManager.default.removeItem(at: privacyDir) }
         let privacyStore = CuriumFingerprintStore(fileURL: privacyDir.appending(path: "profiles.json"))
-        let privacy = try #require(privacyStore.profiles.first { $0.id == "privacy-hardened" })
+        let privacy = try #require(
+            privacyStore.createProfile(fromTemplate: "privacy-hardened", displayName: "Privacy Hardened")
+        )
         #expect(privacy.isFarblingActive)
         let privData = try privacy.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US"], schemaVersion: 2)
         let privObj = try #require(JSONSerialization.jsonObject(with: privData) as? [String: Any])
@@ -2126,8 +2142,12 @@ struct CuriumWave1HardeningTests {
             cachesRoot: cachesRoot
         )
 
-        let priv1 = try #require(store1.profiles.first { $0.id == "privacy-hardened" })
-        let priv2 = try #require(store2.profiles.first { $0.id == "privacy-hardened" })
+        let priv1 = try #require(
+            store1.createProfile(fromTemplate: "privacy-hardened", displayName: "Privacy One")
+        )
+        let priv2 = try #require(
+            store2.createProfile(fromTemplate: "privacy-hardened", displayName: "Privacy Two")
+        )
         let seed1 = try #require(priv1.fingerprintSeed)
         let seed2 = try #require(priv2.fingerprintSeed)
         #expect(CuriumFingerprintSchema.isValidSeedHex(seed1))
@@ -2135,7 +2155,7 @@ struct CuriumWave1HardeningTests {
         #expect(seed1 != seed2)
 
         let cloned = try #require(
-            store1.duplicateProfile(from: "privacy-hardened", newID: "work-private", displayName: "Work Private")
+            store1.duplicateProfile(from: priv1.id, newID: "work-private", displayName: "Work Private")
         )
         let clonedSeed = try #require(cloned.fingerprintSeed)
         #expect(CuriumFingerprintSchema.isValidSeedHex(clonedSeed))
@@ -2148,7 +2168,7 @@ struct CuriumWave1HardeningTests {
         )
         #expect(orphans == ["orphan-2", "orphan-b"])
         #expect(store1.nextAvailableID(base: "orphan") == "orphan-3")
-        #expect(store1.duplicateProfile(from: "privacy-hardened", newID: "orphan-2", displayName: "Collide") == nil)
+        #expect(store1.duplicateProfile(from: priv1.id, newID: "orphan-2", displayName: "Collide") == nil)
     }
 
     @Test("RTL top clearance keeps physical pillShift and unedited Row 0 direct-open is suppressed")
@@ -2266,5 +2286,700 @@ struct CuriumWave1HardeningTests {
         store.select(model2)
         try await Task.sleep(for: .milliseconds(150))
         #expect(model1.thumbnail != nil)
+    }
+}
+
+@Suite("Wave 2 Multi-Profile & LiveContainer Downloads")
+struct CuriumWave2MultiProfileAndDownloadsTests {
+    private func makeTempDir(_ prefix: String = "curium-w2") throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "\(prefix)-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private struct V1PersistedFixture: Encodable {
+        let version: Int
+        let selectedProfileID: String?
+        let profiles: [CuriumFingerprintProfile]
+    }
+
+    @Test("v1 store automatically migrates to v2 retaining default, custom, selected, and on-disk profiles")
+    func v1ToV2AutomaticMigration() throws {
+        let root = try makeTempDir("curium-w2-migrate")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let supportRoot = root.appending(path: "Application Support", directoryHint: .isDirectory)
+        let cachesRoot = root.appending(path: "Caches", directoryHint: .isDirectory)
+        let onDiskPrivacyDir = supportRoot.appending(path: "ChromiumProfiles/privacy-hardened", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: onDiskPrivacyDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: cachesRoot, withIntermediateDirectories: true)
+
+        let retiredSeed = try #require(CuriumFingerprintSchema.retiredStaticSeeds.first)
+        var v1Profiles = CuriumFingerprintPresets.allBuiltIns
+        if let privacyIdx = v1Profiles.firstIndex(where: { $0.id == "privacy-hardened" }) {
+            v1Profiles[privacyIdx].fingerprintSeed = retiredSeed
+        }
+
+        var workEU = CuriumFingerprintPresets.defaultAuthenticChrome
+        workEU.id = "work-eu"
+        workEU.displayName = "Work EU"
+        workEU.isBuiltIn = false
+        workEU.hardware.timezone = "Europe/Berlin"
+        v1Profiles.append(workEU)
+
+        let fileURL = root.appending(path: CuriumFingerprintStore.fileName, directoryHint: .notDirectory)
+        let fixture = V1PersistedFixture(
+            version: 1,
+            selectedProfileID: "macos-desktop",
+            profiles: v1Profiles
+        )
+        let encodedFixture = try JSONEncoder().encode(fixture)
+        try encodedFixture.write(to: fileURL, options: .atomic)
+
+        let store = CuriumFingerprintStore(
+            fileURL: fileURL,
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot
+        )
+        #expect(store.loadError == nil)
+        #expect(store.selectedProfileID == "macos-desktop")
+        #expect(store.nextLaunchProfileID == "macos-desktop")
+
+        let retainedIDs = Set(store.profiles.map(\.id))
+        #expect(retainedIDs == Set(["default", "macos-desktop", "privacy-hardened", "work-eu"]))
+        #expect(store.profiles.count == 4)
+
+        let defaultProfile = try #require(store.profiles.first)
+        #expect(defaultProfile.id == "default")
+        #expect(defaultProfile.displayName == "Personal")
+        #expect(!defaultProfile.isBuiltIn)
+        #expect(defaultProfile.templateID == "default")
+        #expect(defaultProfile.symbolName == "person.crop.circle")
+        #expect(defaultProfile.palette != nil)
+        #expect(defaultProfile.siteMode != nil)
+        #expect(defaultProfile.searchEngine != nil)
+
+        let migratedWork = try #require(store.profile(id: "work-eu"))
+        #expect(migratedWork.displayName == "Work EU")
+        #expect(migratedWork.hardware.timezone == "Europe/Berlin")
+        #expect(!migratedWork.isBuiltIn)
+
+        let migratedMac = try #require(store.profile(id: "macos-desktop"))
+        #expect(migratedMac.id == "macos-desktop")
+        #expect(!migratedMac.isBuiltIn)
+        #expect(migratedMac.templateID == "macos-desktop")
+
+        let migratedPrivacy = try #require(store.profile(id: "privacy-hardened"))
+        #expect(migratedPrivacy.id == "privacy-hardened")
+        #expect(!migratedPrivacy.isBuiltIn)
+        #expect(migratedPrivacy.templateID == "privacy-hardened")
+        let upgradedSeed = try #require(migratedPrivacy.fingerprintSeed)
+        #expect(CuriumFingerprintSchema.isValidSeedHex(upgradedSeed))
+        #expect(!CuriumFingerprintSchema.isRetiredStaticSeed(upgradedSeed))
+        #expect(upgradedSeed != retiredSeed)
+
+        for unusedID in ["linux-desktop", "win11-workstation", "ios-blink", "pixel-android"] {
+            #expect(store.profile(id: unusedID) == nil)
+        }
+
+        // Persisted file upgrades immediately to schema v2 and survives reload identically.
+        let persistedData = try Data(contentsOf: fileURL)
+        let persistedState = try JSONDecoder().decode(CuriumFingerprintStore.PersistedState.self, from: persistedData)
+        #expect(persistedState.version == 2)
+        #expect(persistedState.selectedProfileID == "macos-desktop")
+        #expect(Set(persistedState.profiles.map(\.id)) == retainedIDs)
+
+        let reloaded = CuriumFingerprintStore(
+            fileURL: fileURL,
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot
+        )
+        #expect(reloaded.loadError == nil)
+        #expect(reloaded.selectedProfileID == "macos-desktop")
+        #expect(reloaded.profile(id: "privacy-hardened")?.fingerprintSeed == upgradedSeed)
+    }
+
+    @Test("Immutable p-<8hex> creation, tombstone ledger, persona metadata, delete guards, and actinide palettes")
+    func immutableSlugCreationTombstonesPersonaMetadataAndDeleteGuards() throws {
+        let root = try makeTempDir("curium-w2-slugs")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let supportRoot = root.appending(path: "Application Support", directoryHint: .isDirectory)
+        let cachesRoot = root.appending(path: "Caches", directoryHint: .isDirectory)
+        let fileURL = root.appending(path: CuriumFingerprintStore.fileName, directoryHint: .notDirectory)
+
+        let store = CuriumFingerprintStore(
+            fileURL: fileURL,
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot
+        )
+        #expect(store.profiles.count == 1)
+        #expect(store.profiles.first?.id == "default")
+        #expect(store.templates.count == 7)
+
+        let created = try #require(
+            store.createProfile(
+                fromTemplate: "privacy-hardened",
+                displayName: "Shopping",
+                symbolName: "bag",
+                palette: .americium
+            )
+        )
+        #expect(created.id.hasPrefix("p-"))
+        let hexSuffix = String(created.id.dropFirst(2))
+        #expect(hexSuffix.count == 8)
+        #expect(hexSuffix.unicodeScalars.allSatisfy { scalar in
+            let v = scalar.value
+            return (v >= 48 && v <= 57) || (v >= 97 && v <= 102)
+        })
+        #expect(CuriumFingerprintValidator.isValidProfileID(created.id))
+        #expect(created.displayName == "Shopping")
+        #expect(created.symbolName == "bag")
+        #expect(created.palette == .americium)
+        #expect(created.templateID == "privacy-hardened")
+
+        let seed = try #require(created.fingerprintSeed)
+        #expect(CuriumFingerprintSchema.isValidSeedHex(seed))
+        #expect(!CuriumFingerprintSchema.isRetiredStaticSeed(seed))
+        #expect(created.isFarblingActive)
+
+        #expect(store.updatePersonaMetadata(
+            for: created.id,
+            displayName: "Shopping EU",
+            symbolName: "sparkles",
+            palette: .berkelium,
+            siteMode: .desktop,
+            searchEngine: .brave
+        ))
+        #expect(store.selectProfile(id: created.id))
+
+        let reloaded = CuriumFingerprintStore(
+            fileURL: fileURL,
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot
+        )
+        #expect(reloaded.selectedProfileID == created.id)
+        let loaded = try #require(reloaded.profile(id: created.id))
+        #expect(loaded.displayName == "Shopping EU")
+        #expect(loaded.symbolName == "sparkles")
+        #expect(loaded.palette == .berkelium)
+        #expect(loaded.siteMode == .desktop)
+        #expect(loaded.searchEngine == .brave)
+        #expect(loaded.templateID == "privacy-hardened")
+        #expect(loaded.fingerprintSeed == seed)
+
+        // Engine wire payload must strictly exclude all v2 UI persona & lifecycle metadata.
+        let wireData = try loaded.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US"])
+        let wireObj = try #require(JSONSerialization.jsonObject(with: wireData) as? [String: Any])
+        #expect((wireObj["profileId"] as? String) == created.id)
+        #expect((wireObj["fingerprintSeed"] as? String) == seed)
+        for forbiddenKey in [
+            "symbolName", "palette", "siteMode", "searchEngine", "templateID",
+            "createdAt", "lastUsedAt", "displayName", "notes", "isBuiltIn",
+        ] {
+            #expect(wireObj[forbiddenKey] == nil, "Engine wire JSON leaked UI key \(forbiddenKey)")
+        }
+
+        // Default cannot be deleted; deleting an isolated profile records its slug in `retiredProfileIDs`,
+        // redirects selection back to default, and blocks reusing the retired slug.
+        #expect(!reloaded.deleteProfile(id: "default"))
+        #expect(reloaded.profile(id: "default") != nil)
+
+        #expect(reloaded.deleteProfile(id: created.id))
+        #expect(reloaded.profile(id: created.id) == nil)
+        #expect(reloaded.retiredProfileIDs.contains(created.id.lowercased()))
+        #expect(reloaded.selectedProfileID == nil)
+        #expect(reloaded.nextLaunchProfileID == "default")
+
+        let reuseReport = reloaded.upsert(loaded)
+        #expect(!reuseReport.isValid)
+        #expect(reuseReport.errors.contains { $0.contains("retired") })
+
+        var upperReuse = loaded
+        upperReuse.id = created.id.uppercased()
+        #expect(!reloaded.upsert(upperReuse).isValid)
+        #expect(reloaded.duplicateProfile(from: "default", newID: created.id, displayName: "Reuse") == nil)
+
+        let afterDelete = CuriumFingerprintStore(
+            fileURL: fileURL,
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot
+        )
+        #expect(afterDelete.retiredProfileIDs.contains(created.id.lowercased()))
+        #expect(afterDelete.selectedProfileID == nil)
+        #expect(!afterDelete.upsert(loaded).isValid)
+
+        // All 6 actinide palettes and per-profile enums encode/decode cleanly; curated SF Symbols are populated.
+        let expectedPalettes: [CuriumPalette] = [
+            .violet, .thorium, .neptunium, .americium, .berkelium, .californium,
+        ]
+        #expect(CuriumPalette.allCases == expectedPalettes)
+        for accent in expectedPalettes {
+            let encoded = try JSONEncoder().encode(accent)
+            let decoded = try JSONDecoder().decode(CuriumPalette.self, from: encoded)
+            #expect(decoded == accent)
+            #expect(!accent.title.isEmpty)
+            #expect(!accent.notation.isEmpty)
+        }
+        for mode in CuriumSiteMode.allCases {
+            let decoded = try JSONDecoder().decode(CuriumSiteMode.self, from: try JSONEncoder().encode(mode))
+            #expect(decoded == mode)
+        }
+        for engine in CuriumSearchEngine.allCases {
+            let decoded = try JSONDecoder().decode(CuriumSearchEngine.self, from: try JSONEncoder().encode(engine))
+            #expect(decoded == engine)
+        }
+        #expect(!CuriumProfileSymbols.curated.isEmpty)
+        #expect(CuriumProfileSymbols.curated.contains("person.crop.circle"))
+        #expect(CuriumProfileSymbols.curated.contains("bag"))
+    }
+
+    @Test("Per-profile SQLite resolution skips legacy adoption and isolates bookmarks and history")
+    func perProfileSQLiteIsolation() async throws {
+        let isolatedResolution = try CuriumLibraryLocation.resolve(profileID: "p-a1b2c3d4")
+        #expect(isolatedResolution.database.path.hasSuffix("Curium/Profiles/p-a1b2c3d4/curium.sqlite"))
+        #expect(isolatedResolution.legacy.isEmpty)
+        #expect(throws: Error.self) {
+            _ = try CuriumLibraryLocation.resolve(profileID: "../escape")
+        }
+
+        let root = try makeTempDir("curium-w2-sqlite")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let baseSupportRoot = root.appending(path: "Curium", directoryHint: .isDirectory)
+
+        let defaultDir = try CuriumLibraryLocation.profileSupportDirectory(
+            for: "default",
+            baseSupportRoot: baseSupportRoot
+        )
+        let isolatedDir = try CuriumLibraryLocation.profileSupportDirectory(
+            for: "p-a1b2c3d4",
+            baseSupportRoot: baseSupportRoot
+        )
+        #expect(defaultDir.standardizedFileURL == baseSupportRoot.standardizedFileURL)
+        #expect(isolatedDir.path.hasSuffix("Curium/Profiles/p-a1b2c3d4"))
+
+        let defaultDB = CuriumDatabase(
+            databaseURL: defaultDir.appending(path: CuriumLibraryLocation.fileName, directoryHint: .notDirectory),
+            profileID: "default"
+        )
+        let isolatedDB = CuriumDatabase(
+            databaseURL: isolatedDir.appending(path: CuriumLibraryLocation.fileName, directoryHint: .notDirectory),
+            profileID: "p-a1b2c3d4"
+        )
+
+        let personalBookmark = try #require(URL(string: "https://personal.example/home"))
+        let personalVisit = try #require(URL(string: "https://personal-news.example/article"))
+        let workBookmark = try #require(URL(string: "https://work-portal.example/dashboard"))
+        let workVisit = try #require(URL(string: "https://work-docs.example/spec"))
+        let timestamp = Date(timeIntervalSince1970: 1_750_000_000)
+
+        _ = try await defaultDB.saveBookmark(
+            url: personalBookmark,
+            title: "Personal Home",
+            in: CuriumBookmarkFolder.favoritesID,
+            at: timestamp
+        )
+        try await defaultDB.recordVisit(url: personalVisit, title: "Personal News", at: timestamp)
+
+        _ = try await isolatedDB.saveBookmark(
+            url: workBookmark,
+            title: "Work Portal",
+            in: CuriumBookmarkFolder.favoritesID,
+            at: timestamp
+        )
+        try await isolatedDB.recordVisit(url: workVisit, title: "Work Spec", at: timestamp)
+
+        let defaultTree = try await defaultDB.bookmarkTree()
+        let isolatedTree = try await isolatedDB.bookmarkTree()
+        #expect(defaultTree.isBookmarked(personalBookmark))
+        #expect(!defaultTree.isBookmarked(workBookmark))
+        #expect(isolatedTree.isBookmarked(workBookmark))
+        #expect(!isolatedTree.isBookmarked(personalBookmark))
+
+        let defaultHistoryURLs = try await defaultDB
+            .historyDays(matching: "", limit: 20, calendar: .current)
+            .flatMap(\.entries)
+            .map(\.url)
+        let isolatedHistoryURLs = try await isolatedDB
+            .historyDays(matching: "", limit: 20, calendar: .current)
+            .flatMap(\.entries)
+            .map(\.url)
+        #expect(defaultHistoryURLs == [personalVisit])
+        #expect(isolatedHistoryURLs == [workVisit])
+
+        let defaultWorkMatches = try await defaultDB.addressMatches(for: "work", limit: 6, now: timestamp)
+        let isolatedPersonalMatches = try await isolatedDB.addressMatches(for: "personal", limit: 6, now: timestamp)
+        #expect(defaultWorkMatches.isEmpty)
+        #expect(isolatedPersonalMatches.isEmpty)
+    }
+
+    @Test("Per-profile CuriumSessionStorage filters non-web schemes, clamps activeIndex, caps at 24 tabs, and clears on empty")
+    func perProfileSessionStorageSaveRestoreAndCap() throws {
+        let root = try makeTempDir("curium-w2-session")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let profileDir = root.appending(path: "p-a1b2c3d4", directoryHint: .isDirectory)
+        let siblingDir = root.appending(path: "default", directoryHint: .isDirectory)
+
+        let mixedURLs: [URL] = try [
+            #require(URL(string: "https://example.com")),
+            #require(URL(string: "chrome://settings")),
+            #require(URL(string: "https://webkit.org")),
+            #require(URL(string: "file:///etc/passwd")),
+        ]
+        CuriumSessionStorage.save(urls: mixedURLs, activeIndex: 2, forProfile: "p-a1b2c3d4", directory: profileDir)
+        CuriumSessionStorage.save(
+            urls: [try #require(URL(string: "http://personal.local/page"))],
+            activeIndex: 0,
+            forProfile: "default",
+            directory: siblingDir
+        )
+
+        let loaded = try #require(CuriumSessionStorage.load(forProfile: "p-a1b2c3d4", directory: profileDir))
+        #expect(loaded.openTabURLs == ["https://example.com", "https://webkit.org"])
+        #expect(loaded.activeTabIndex == 1)
+
+        // Sibling profile session stays isolated.
+        let siblingLoaded = try #require(CuriumSessionStorage.load(forProfile: "default", directory: siblingDir))
+        #expect(siblingLoaded.openTabURLs == ["http://personal.local/page"])
+        #expect(siblingLoaded.activeTabIndex == 0)
+
+        // Out-of-range activeIndex clamps cleanly.
+        CuriumSessionStorage.save(urls: mixedURLs, activeIndex: 99, forProfile: "p-a1b2c3d4", directory: profileDir)
+        #expect(CuriumSessionStorage.load(forProfile: "p-a1b2c3d4", directory: profileDir)?.activeTabIndex == 1)
+
+        CuriumSessionStorage.save(urls: mixedURLs, activeIndex: -4, forProfile: "p-a1b2c3d4", directory: profileDir)
+        #expect(CuriumSessionStorage.load(forProfile: "p-a1b2c3d4", directory: profileDir)?.activeTabIndex == 0)
+
+        // 24-tab cap is enforced deterministically.
+        let thirtyURLs = try (0..<30).map { idx in
+            try #require(URL(string: "https://tab-\(idx).example/"))
+        }
+        CuriumSessionStorage.save(urls: thirtyURLs, activeIndex: 28, forProfile: "p-a1b2c3d4", directory: profileDir)
+        let capped = try #require(CuriumSessionStorage.load(forProfile: "p-a1b2c3d4", directory: profileDir))
+        #expect(capped.openTabURLs.count == CuriumSessionStorage.maxSavedTabs)
+        #expect(capped.openTabURLs.first == "https://tab-0.example/")
+        #expect(capped.openTabURLs.last == "https://tab-23.example/")
+        #expect(capped.activeTabIndex == CuriumSessionStorage.maxSavedTabs - 1)
+
+        // Saving [] deletes session.json on disk.
+        let sessionFile = try CuriumSessionStorage.sessionFileURL(forProfile: "p-a1b2c3d4", directory: profileDir)
+        #expect(FileManager.default.fileExists(atPath: sessionFile.path))
+        CuriumSessionStorage.save(urls: [], activeIndex: 0, forProfile: "p-a1b2c3d4", directory: profileDir)
+        #expect(!FileManager.default.fileExists(atPath: sessionFile.path))
+        #expect(CuriumSessionStorage.load(forProfile: "p-a1b2c3d4", directory: profileDir) == nil)
+    }
+
+    @Test("Profile switch handoff builds LiveContainer 1/2 relaunch URLs and flushes tabs, SQLite, and selection safely")
+    @MainActor
+    func profileSwitchHandoffAndLiveContainerRelaunchURLs() async throws {
+        let bundlePath = "/var/containers/Bundle/Application/12345678/com.appautomaton.curium.app"
+        let lc1URL = try #require(
+            CuriumProfileRelauncher.liveContainerRelaunchURL(bundlePath: bundlePath, scheme: "livecontainer")
+        )
+        #expect(lc1URL.absoluteString == "livecontainer://livecontainer-launch?bundle-name=com.appautomaton.curium.app")
+
+        let lc2URL = try #require(
+            CuriumProfileRelauncher.liveContainerRelaunchURL(bundlePath: bundlePath, scheme: "livecontainer2")
+        )
+        #expect(lc2URL.absoluteString == "livecontainer2://livecontainer-launch?bundle-name=com.appautomaton.curium.app")
+
+        let fallbackBundleURL = try #require(
+            CuriumProfileRelauncher.liveContainerRelaunchURL(bundlePath: "/tmp/not-a-bundle", scheme: "livecontainer")
+        )
+        #expect(fallbackBundleURL.absoluteString == "livecontainer://livecontainer-launch?bundle-name=com.appautomaton.curium.app")
+        #expect(CuriumProfileRelauncher.liveContainerRelaunchURL(bundlePath: bundlePath, scheme: "   ") == nil)
+
+        let root = try makeTempDir("curium-w2-handoff")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let fpFileURL = root.appending(path: CuriumFingerprintStore.fileName, directoryHint: .notDirectory)
+        let dbURL = root.appending(path: CuriumLibraryLocation.fileName, directoryHint: .notDirectory)
+        let sessionDir = root.appending(path: "Session", directoryHint: .isDirectory)
+        let downloadsDir = root.appending(path: "Downloads", directoryHint: .isDirectory)
+        let previewDir = root.appending(path: "PDFPreview", directoryHint: .isDirectory)
+
+        let fpStore = CuriumFingerprintStore(
+            fileURL: fpFileURL,
+            applicationSupportRoot: root.appending(path: "Support", directoryHint: .isDirectory),
+            cachesRoot: root.appending(path: "Caches", directoryHint: .isDirectory)
+        )
+        let targetProfile = try #require(
+            fpStore.createProfile(fromTemplate: "macos-desktop", displayName: "Work Mac")
+        )
+
+        let db = CuriumDatabase(databaseURL: dbURL, profileID: "default")
+        let library = CuriumLibrary(profileID: "default", database: db, fingerprintStore: fpStore)
+        let checkpointURL = try #require(URL(string: "https://checkpoint.example/handoff"))
+        library.recordVisit(url: checkpointURL, title: "Handoff Check")
+
+        let host = MockBrowserHost()
+        let tab1URL = try #require(URL(string: "https://example.com"))
+        let tab2URL = try #require(URL(string: "chrome://settings"))
+        let tab3URL = try #require(URL(string: "https://webkit.org"))
+        let tab1 = MockTabHost(tabID: "t1", extensionTabID: 1, url: tab1URL)
+        let tab2 = MockTabHost(tabID: "t2", extensionTabID: 2, url: tab2URL)
+        let tab3 = MockTabHost(tabID: "t3", extensionTabID: 3, url: tab3URL)
+        host.tabs = [tab1, tab2, tab3]
+        host.activeTab = tab3
+
+        let browserStore = CuriumBrowserStore(
+            host: host,
+            extensionManager: MockExtensionManager(),
+            downloadsRoot: downloadsDir,
+            pdfPreviewCacheRoot: previewDir,
+            activeProfileID: "default",
+            library: library,
+            fingerprintStore: fpStore,
+            sessionDirectoryOverride: sessionDir,
+            restoreSession: false
+        )
+
+        var relaunchCalls = 0
+        // Unknown target fails closed without triggering relaunch.
+        let invalidSwitch = await browserStore.prepareForProfileSwitchAndRelaunch(to: "p-00000000") {
+            relaunchCalls += 1
+        }
+        #expect(!invalidSwitch)
+        #expect(relaunchCalls == 0)
+
+        let switched = await browserStore.prepareForProfileSwitchAndRelaunch(to: targetProfile.id) {
+            relaunchCalls += 1
+        }
+        #expect(switched)
+        #expect(relaunchCalls == 1)
+        #expect(fpStore.selectedProfileID == targetProfile.id)
+
+        let reloadedFPStore = CuriumFingerprintStore(fileURL: fpFileURL)
+        #expect(reloadedFPStore.selectedProfileID == targetProfile.id)
+
+        // Open web tabs persisted to session.json with non-web tabs stripped and active tab mapped cleanly.
+        let savedSession = try #require(CuriumSessionStorage.load(forProfile: "default", directory: sessionDir))
+        #expect(savedSession.openTabURLs == ["https://example.com", "https://webkit.org"])
+        #expect(savedSession.activeTabIndex == 1)
+
+        // Library write was flushed & checkpointed cleanly before relaunch.
+        let flushedVisits = try await db
+            .historyDays(matching: "checkpoint.example", limit: 10, calendar: .current)
+            .flatMap(\.entries)
+            .map(\.url)
+        #expect(flushedVisits == [checkpointURL])
+        let walPath = dbURL.path + "-wal"
+        if FileManager.default.fileExists(atPath: walPath) {
+            let walAttrs = try FileManager.default.attributesOfItem(atPath: walPath)
+            #expect(((walAttrs[.size] as? NSNumber)?.int64Value ?? 0) == 0)
+        }
+
+        // Fresh store restores the saved session into standby tabs cleanly.
+        let restoredStore = CuriumBrowserStore(
+            host: nil,
+            downloadsRoot: downloadsDir,
+            pdfPreviewCacheRoot: previewDir,
+            activeProfileID: "default",
+            library: library,
+            fingerprintStore: fpStore,
+            sessionDirectoryOverride: sessionDir,
+            restoreSession: true
+        )
+        #expect(restoredStore.tabs.compactMap(\.url).map(\.absoluteString) == ["https://example.com", "https://webkit.org"])
+        #expect(restoredStore.activeTab?.url?.absoluteString == "https://webkit.org")
+    }
+
+    @Test("LiveContainer Tier A 3-parent walk, Tier B bookmark record, per-profile PDF cache, and staged commit")
+    func liveContainerTierATierBPDFCacheAndStagedCommit() throws {
+        // 1. Tier A Private LiveContainer 3-parent walk -> <HostContainer>/Documents/Curium/Downloads.
+        let privateLCPath = "/var/mobile/Containers/Data/Application/HOST-1/Documents/Data/Application/GUEST-1"
+        let privateRoot = try CuriumDownloadStorage.defaultDownloadsRootDirectory(
+            environment: ["LC_HOME_PATH": privateLCPath],
+            homeDirectory: privateLCPath,
+            sharedAppGroupURL: nil
+        )
+        #expect(privateRoot.path == "/var/mobile/Containers/Data/Application/HOST-1/Documents/Curium/Downloads")
+        #expect(CuriumDownloadStorage.isPrivateHostDocumentsLayout(fromCandidatePaths: [privateLCPath]))
+
+        // Even when an App Group URL is present, Private host Documents layout keeps Files.app visibility.
+        let sharedGroupURL = URL(fileURLWithPath: "/var/mobile/Containers/Shared/AppGroup/GRP-1", isDirectory: true)
+        let privateWithGroup = try CuriumDownloadStorage.defaultDownloadsRootDirectory(
+            environment: ["LC_HOME_PATH": privateLCPath],
+            homeDirectory: privateLCPath,
+            sharedAppGroupURL: sharedGroupURL
+        )
+        #expect(privateWithGroup.path == "/var/mobile/Containers/Data/Application/HOST-1/Documents/Curium/Downloads")
+
+        // 2. Tier A Shared LiveContainer App Group layout -> <SharedAppGroup>/Documents/Curium/Downloads.
+        let sharedLCPath = "/var/mobile/Containers/Shared/AppGroup/GRP-1/LiveContainer/Data/Application/GUEST-1"
+        let sharedRoot = try CuriumDownloadStorage.defaultDownloadsRootDirectory(
+            environment: ["LC_HOME_PATH": sharedLCPath],
+            homeDirectory: sharedLCPath,
+            sharedAppGroupURL: sharedGroupURL
+        )
+        #expect(sharedRoot.path == "/var/mobile/Containers/Shared/AppGroup/GRP-1/Documents/Curium/Downloads")
+        #expect(!CuriumDownloadStorage.isPrivateHostDocumentsLayout(fromCandidatePaths: [sharedLCPath]))
+
+        let sharedFallbackRoot = try CuriumDownloadStorage.defaultDownloadsRootDirectory(
+            environment: ["LC_HOME_PATH": sharedLCPath],
+            homeDirectory: sharedLCPath,
+            sharedAppGroupURL: nil
+        )
+        #expect(sharedFallbackRoot.path == "/var/mobile/Containers/Shared/AppGroup/GRP-1/Documents/Curium/Downloads")
+
+        // 3. Per-profile PDF preview cache isolation and sibling-safe stale cleanup.
+        let defaultPDFRoot = try CuriumDownloadStorage.pdfPreviewCacheRoot(profileID: "default")
+        let profilePDFRoot = try CuriumDownloadStorage.pdfPreviewCacheRoot(profileID: "p-12345678")
+        #expect(defaultPDFRoot.lastPathComponent == CuriumDownloadStorage.previewCacheDirectoryName)
+        #expect(profilePDFRoot.path.hasSuffix("/\(CuriumDownloadStorage.previewCacheDirectoryName)/p-12345678"))
+        #expect(profilePDFRoot.deletingLastPathComponent().standardizedFileURL == defaultPDFRoot.standardizedFileURL)
+
+        let sandbox = try makeTempDir("curium-w2-downloads")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let tempPreviewBase = sandbox.appending(path: CuriumDownloadStorage.previewCacheDirectoryName, directoryHint: .isDirectory)
+        let staleDefaultSession = tempPreviewBase.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let isolatedProfileDir = tempPreviewBase.appending(path: "p-12345678", directoryHint: .isDirectory)
+        let isolatedSessionDir = isolatedProfileDir.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let isolatedPDF = isolatedSessionDir.appending(path: "spec.pdf", directoryHint: .notDirectory)
+        try FileManager.default.createDirectory(at: staleDefaultSession, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: isolatedSessionDir, withIntermediateDirectories: true)
+        try Data("%PDF-1.4\nisolated".utf8).write(to: isolatedPDF)
+
+        CuriumDownloadStorage.cleanupStalePDFPreviews(cacheRoot: tempPreviewBase)
+        #expect(!FileManager.default.fileExists(atPath: staleDefaultSession.path))
+        #expect(FileManager.default.fileExists(atPath: isolatedProfileDir.path))
+        #expect(FileManager.default.fileExists(atPath: isolatedPDF.path))
+
+        CuriumDownloadStorage.cleanupStalePDFPreviews(cacheRoot: isolatedProfileDir)
+        #expect(!FileManager.default.fileExists(atPath: isolatedSessionDir.path))
+
+        // 4. Staged download commit with collision-free naming and source cleanup.
+        let stagingRoot = sandbox.appending(path: "Staging", directoryHint: .isDirectory)
+        let destDir = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+
+        let staged1 = try CuriumDownloadStorage.makeDownloadStagingDestination(
+            filename: "report.bin",
+            stagingRoot: stagingRoot
+        )
+        defer { CuriumDownloadStorage.removeDownloadStagingDirectory(staged1.sessionDirectory, stagingRoot: stagingRoot) }
+        let payload1 = Data("payload-one".utf8)
+        try payload1.write(to: staged1.fileURL)
+
+        let committed1 = try CuriumDownloadStorage.commitStagedFile(
+            from: staged1.fileURL,
+            toDirectory: destDir,
+            preferredFilename: "report.bin",
+            removeSource: true
+        )
+        #expect(committed1.deletingLastPathComponent().standardizedFileURL == destDir.standardizedFileURL)
+        #expect(committed1.lastPathComponent == "report.bin")
+        #expect(try Data(contentsOf: committed1) == payload1)
+        #expect(!FileManager.default.fileExists(atPath: staged1.fileURL.path))
+
+        let staged2 = try CuriumDownloadStorage.makeDownloadStagingDestination(
+            filename: "report.bin",
+            stagingRoot: stagingRoot
+        )
+        defer { CuriumDownloadStorage.removeDownloadStagingDirectory(staged2.sessionDirectory, stagingRoot: stagingRoot) }
+        let payload2 = Data("payload-two".utf8)
+        try payload2.write(to: staged2.fileURL)
+
+        let committed2 = try CuriumDownloadStorage.commitStagedFile(
+            from: staged2.fileURL,
+            toDirectory: destDir,
+            preferredFilename: "report.bin",
+            removeSource: true
+        )
+        #expect(committed2.lastPathComponent == "report (2).bin")
+        #expect(try Data(contentsOf: committed2) == payload2)
+        #expect(!FileManager.default.fileExists(atPath: staged2.fileURL.path))
+
+        let staged3 = try CuriumDownloadStorage.makeDownloadStagingDestination(
+            filename: "report.bin",
+            stagingRoot: stagingRoot
+        )
+        defer { CuriumDownloadStorage.removeDownloadStagingDirectory(staged3.sessionDirectory, stagingRoot: stagingRoot) }
+        let payload3 = Data("payload-three".utf8)
+        try payload3.write(to: staged3.fileURL)
+
+        let committed3 = try CuriumDownloadStorage.commitStagedFile(
+            from: staged3.fileURL,
+            toDirectory: destDir,
+            preferredFilename: "report.bin",
+            removeSource: false
+        )
+        #expect(committed3.lastPathComponent == "report (3).bin")
+        #expect(try Data(contentsOf: committed3) == payload3)
+        #expect(FileManager.default.fileExists(atPath: staged3.fileURL.path))
+
+        // 5. Tier B Inbox/tmp rejection and multi-host SharedFolderRecord round-trip in isolated UserDefaults.
+        #expect(CuriumDownloadsFolderManager.isRejectedInboxOrTemporaryURL(
+            URL(fileURLWithPath: "/var/mobile/Containers/Data/Application/A1/tmp/com.appautomaton.curium-Inbox")
+        ))
+        #expect(CuriumDownloadsFolderManager.isRejectedInboxOrTemporaryURL(
+            URL(fileURLWithPath: "/var/mobile/Documents/com.kdt.livecontainer-Inbox/Downloads")
+        ))
+        #expect(CuriumDownloadsFolderManager.isRejectedInboxOrTemporaryURL(
+            URL(fileURLWithPath: "/private/var/mobile/Containers/Data/Application/A1/tmp/PickedFolder")
+        ))
+        #expect(CuriumDownloadsFolderManager.isRejectedInboxOrTemporaryURL(
+            FileManager.default.temporaryDirectory.appending(path: "EphemeralFolder", directoryHint: .isDirectory)
+        ))
+        #expect(!CuriumDownloadsFolderManager.isRejectedInboxOrTemporaryURL(
+            URL(fileURLWithPath: "/var/mobile/Containers/Shared/AppGroup/FP-1/File Provider Storage/Curium Downloads")
+        ))
+        #expect(!CuriumDownloadsFolderManager.isRejectedInboxOrTemporaryURL(
+            URL(fileURLWithPath: "/var/mobile/Library/Mobile Documents/com~apple~CloudDocs/Curium Downloads")
+        ))
+
+        let suiteName = "com.appautomaton.curium.tests.downloads-folder.\(UUID().uuidString)"
+        let isolatedDefaults = try #require(UserDefaults(suiteName: suiteName))
+        defer {
+            CuriumDownloadsFolderManager.clearRecord(defaults: isolatedDefaults)
+            isolatedDefaults.removePersistentDomain(forName: suiteName)
+        }
+
+        #expect(CuriumDownloadsFolderManager.loadRecord(defaults: isolatedDefaults) == nil)
+        let record = CuriumDownloadsFolderManager.SharedFolderRecord(
+            folderName: "Curium Downloads",
+            breadcrumb: "iCloud Drive › Curium Downloads",
+            canonicalPathHint: "/var/mobile/Library/Mobile Documents/com~apple~CloudDocs/Curium Downloads",
+            bookmarksByHost: [
+                "com.kdt.livecontainer.host1": Data([0x01, 0x02, 0x03, 0x04]),
+                "com.kdt.LiveContainer2.host2": Data([0xAA, 0xBB, 0xCC, 0xDD]),
+            ]
+        )
+        CuriumDownloadsFolderManager.saveRecord(record, defaults: isolatedDefaults)
+
+        let reloadedRecord = try #require(CuriumDownloadsFolderManager.loadRecord(defaults: isolatedDefaults))
+        #expect(reloadedRecord == record)
+        #expect(reloadedRecord.bookmarksByHost["com.kdt.livecontainer.host1"] == Data([0x01, 0x02, 0x03, 0x04]))
+        #expect(reloadedRecord.bookmarksByHost["com.kdt.LiveContainer2.host2"] == Data([0xAA, 0xBB, 0xCC, 0xDD]))
+        #expect(reloadedRecord.bookmarksByHost["com.kdt.LiveContainer3.host3"] == nil)
+
+        CuriumDownloadsFolderManager.clearRecord(defaults: isolatedDefaults)
+        #expect(CuriumDownloadsFolderManager.loadRecord(defaults: isolatedDefaults) == nil)
+
+        // 6. Legacy pre-Wave-2 guest Downloads adoption (symlink-safe, moves regular files into host Documents/Curium/Downloads).
+        let hostRoot = sandbox.appending(path: "LCHost", directoryHint: .isDirectory)
+        let guestHome = hostRoot.appending(path: "Documents/Data/Application/GUEST-UUID", directoryHint: .isDirectory)
+        let legacyGuestDownloads = guestHome.appending(path: "Documents/Curium/Downloads", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: legacyGuestDownloads, withIntermediateDirectories: true)
+        let oldDownload = legacyGuestDownloads.appending(path: "legacy-paper.pdf", directoryHint: .notDirectory)
+        try Data("legacy-pdf-bytes".utf8).write(to: oldDownload)
+        let outsideFile = sandbox.appending(path: "outside.txt", directoryHint: .notDirectory)
+        try Data("do-not-move".utf8).write(to: outsideFile)
+        let symlinkEntry = legacyGuestDownloads.appending(path: "escape-link.txt", directoryHint: .notDirectory)
+        try FileManager.default.createSymbolicLink(at: symlinkEntry, withDestinationURL: outsideFile)
+
+        let adopted = CuriumDownloadStorage.adoptLegacyGuestDownloadsIfNeeded(
+            environment: ["LC_HOME_PATH": guestHome.path],
+            homeDirectory: guestHome.path,
+            sharedAppGroupURL: nil
+        )
+        #expect(adopted == 1)
+        let promotedFile = hostRoot.appending(path: "Documents/Curium/Downloads/legacy-paper.pdf", directoryHint: .notDirectory)
+        #expect(try Data(contentsOf: promotedFile) == Data("legacy-pdf-bytes".utf8))
+        #expect(!FileManager.default.fileExists(atPath: oldDownload.path))
+        #expect(FileManager.default.fileExists(atPath: outsideFile.path))
+        #expect(!FileManager.default.fileExists(atPath: hostRoot.appending(path: "Documents/Curium/Downloads/escape-link.txt").path))
     }
 }

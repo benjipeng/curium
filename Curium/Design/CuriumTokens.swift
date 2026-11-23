@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-enum CuriumSiteMode: String, CaseIterable, Identifiable, Sendable {
+enum CuriumSiteMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case adaptive
     case desktop
     case mobile
@@ -33,8 +33,8 @@ enum CuriumSiteMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-enum CuriumPalette: String, CaseIterable, Identifiable, Sendable {
-    case violet, thorium, neptunium
+enum CuriumPalette: String, Codable, CaseIterable, Identifiable, Sendable {
+    case violet, thorium, neptunium, americium, berkelium, californium
 
     var id: Self { self }
 
@@ -43,6 +43,9 @@ enum CuriumPalette: String, CaseIterable, Identifiable, Sendable {
         case .violet: "Curium Violet"
         case .thorium: "Thorium Teal"
         case .neptunium: "Neptunium Blue"
+        case .americium: "Americium Amber"
+        case .berkelium: "Berkelium Rose"
+        case .californium: "Californium Indigo"
         }
     }
 
@@ -51,6 +54,9 @@ enum CuriumPalette: String, CaseIterable, Identifiable, Sendable {
         case .violet: "96 Cm"
         case .thorium: "90 Th"
         case .neptunium: "93 Np"
+        case .americium: "95 Am"
+        case .berkelium: "97 Bk"
+        case .californium: "98 Cf"
         }
     }
 
@@ -62,6 +68,9 @@ enum CuriumPalette: String, CaseIterable, Identifiable, Sendable {
         case .violet: Self.dynamic(light: 0x57349C, dark: 0xC5AEFF)
         case .thorium: Self.dynamic(light: 0x006255, dark: 0x80DDCC)
         case .neptunium: Self.dynamic(light: 0x225494, dark: 0xA6CAFF)
+        case .americium: Self.dynamic(light: 0x8C4A00, dark: 0xF5BA62)
+        case .berkelium: Self.dynamic(light: 0x992652, dark: 0xFF9BBF)
+        case .californium: Self.dynamic(light: 0x3942A3, dark: 0xA9B4FF)
         }
     }
 
@@ -70,6 +79,9 @@ enum CuriumPalette: String, CaseIterable, Identifiable, Sendable {
         case .violet: Color(uiColor: Self.dynamic(light: 0xEEE6FA, dark: 0x262035))
         case .thorium: Color(uiColor: Self.dynamic(light: 0xDFF3EE, dark: 0x162F2B))
         case .neptunium: Color(uiColor: Self.dynamic(light: 0xE4EFFD, dark: 0x172B44))
+        case .americium: Color(uiColor: Self.dynamic(light: 0xFBEEDB, dark: 0x332514))
+        case .berkelium: Color(uiColor: Self.dynamic(light: 0xFCE7EF, dark: 0x361B26))
+        case .californium: Color(uiColor: Self.dynamic(light: 0xE8EAFC, dark: 0x1E213D))
         }
     }
 
@@ -83,6 +95,27 @@ enum CuriumPalette: String, CaseIterable, Identifiable, Sendable {
             )
         }
     }
+}
+
+enum CuriumProfileSymbols {
+    static let curated: [String] = [
+        "person.crop.circle",
+        "briefcase",
+        "bag",
+        "globe",
+        "shield.lefthalf.filled",
+        "desktopcomputer",
+        "laptopcomputer",
+        "iphone",
+        "terminal",
+        "gamecontroller",
+        "graduationcap",
+        "airplane",
+        "building.2",
+        "lock.shield",
+        "sparkles",
+        "flask",
+    ]
 }
 
 extension EnvironmentValues {

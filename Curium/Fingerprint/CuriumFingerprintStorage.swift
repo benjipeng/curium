@@ -13,6 +13,7 @@ enum CuriumFingerprintProfileStorage {
         let profileID: String
         let supportDirectory: URL
         let cacheDirectory: URL
+        let curiumProfileDirectory: URL?
         let lockFile: URL?
         let isDefault: Bool
     }
@@ -51,12 +52,14 @@ enum CuriumFingerprintProfileStorage {
         }
     }
 
-    /// Resolves the exact `<Application Support>` and `<Caches>` roots used by
-    /// Chromium's `base::DIR_APP_DATA` and `base::DIR_CACHE` without creating directories.
+    /// Resolves the exact `<Application Support>`, `<Caches>`, and durable Curium profile
+    /// roots used by Build 42 (`paths.mm`) and Curium's per-profile SQLite/session storage
+    /// without creating directories.
     static func locations(
         for profileID: String,
         applicationSupportRoot: URL? = nil,
-        cachesRoot: URL? = nil
+        cachesRoot: URL? = nil,
+        curiumSupportRoot: URL? = nil
     ) -> Locations? {
         guard CuriumFingerprintValidator.isValidProfileID(profileID) else { return nil }
         let fm = FileManager.default
@@ -73,10 +76,19 @@ enum CuriumFingerprintProfileStorage {
                 profileID: profileID,
                 supportDirectory: supportBase.appending(path: "Chromium", directoryHint: .isDirectory),
                 cacheDirectory: cachesBase.appending(path: "Chromium", directoryHint: .isDirectory),
+                curiumProfileDirectory: nil,
                 lockFile: nil,
                 isDefault: true
             )
         }
+
+        let resolvedCuriumRoot = resolveCuriumSupportRoot(
+            curiumSupportRoot: curiumSupportRoot,
+            applicationSupportRoot: applicationSupportRoot
+        )
+        let curiumProfileDir = resolvedCuriumRoot?
+            .appending(path: "Profiles", directoryHint: .isDirectory)
+            .appending(path: profileID, directoryHint: .isDirectory)
 
         let supportDir = supportBase
             .appending(path: "ChromiumProfiles", directoryHint: .isDirectory)
@@ -90,17 +102,20 @@ enum CuriumFingerprintProfileStorage {
             profileID: profileID,
             supportDirectory: supportDir,
             cacheDirectory: cacheDir,
+            curiumProfileDirectory: curiumProfileDir,
             lockFile: lockFile,
             isDefault: false
         )
     }
 
-    /// Scans `<Application Support>/ChromiumProfiles/` and `<Caches>/ChromiumProfiles/`
-    /// with symlink-safe `lstat` checks and returns all valid non-default directory slugs
-    /// currently present on disk (case-insensitively deduplicated, sorted).
+    /// Scans `<Application Support>/ChromiumProfiles/`, `<Caches>/ChromiumProfiles/`, and
+    /// `<CuriumSupportRoot>/Profiles/` with symlink-safe `lstat` checks and returns all
+    /// valid non-default directory slugs currently present on disk (case-insensitively
+    /// deduplicated, sorted).
     static func existingIsolatedProfileSlugs(
         applicationSupportRoot: URL? = nil,
-        cachesRoot: URL? = nil
+        cachesRoot: URL? = nil,
+        curiumSupportRoot: URL? = nil
     ) -> [String] {
         let fm = FileManager.default
         let supportBase = applicationSupportRoot ?? (try? fm.url(
@@ -109,10 +124,19 @@ enum CuriumFingerprintProfileStorage {
         let cachesBase = cachesRoot ?? (try? fm.url(
             for: .cachesDirectory, in: .userDomainMask,
             appropriateFor: nil, create: false))
+        let resolvedCuriumRoot = resolveCuriumSupportRoot(
+            curiumSupportRoot: curiumSupportRoot,
+            applicationSupportRoot: applicationSupportRoot
+        )
+
+        var containers: [URL] = [supportBase, cachesBase]
+            .compactMap { $0?.appending(path: "ChromiumProfiles", directoryHint: .isDirectory) }
+        if let resolvedCuriumRoot {
+            containers.append(resolvedCuriumRoot.appending(path: "Profiles", directoryHint: .isDirectory))
+        }
 
         var discoveredByLowered: [String: String] = [:]
-        for base in [supportBase, cachesBase].compactMap({ $0 }) {
-            let profilesDir = base.appending(path: "ChromiumProfiles", directoryHint: .isDirectory)
+        for profilesDir in containers {
             guard inspectPathWithLstat(profilesDir.path) == .directory else { continue }
             guard let entries = try? fm.contentsOfDirectory(atPath: profilesDir.path) else { continue }
             for entry in entries {
@@ -133,18 +157,20 @@ enum CuriumFingerprintProfileStorage {
         }
     }
 
-    /// Discovers isolated `ChromiumProfiles/<slug>` directories on disk under
-    /// Application Support and Caches that are not present in `knownIDs`
-    /// (compared case-insensitively for APFS safety), skipping symlinks via `lstat`.
+    /// Discovers isolated `ChromiumProfiles/<slug>` and `Curium/Profiles/<slug>` directories
+    /// on disk that are not present in `knownIDs` (compared case-insensitively for APFS safety),
+    /// skipping symlinks via `lstat`.
     static func discoverOrphanedProfiles(
         knownIDs: Set<String>,
         applicationSupportRoot: URL? = nil,
-        cachesRoot: URL? = nil
+        cachesRoot: URL? = nil,
+        curiumSupportRoot: URL? = nil
     ) -> [String] {
         let knownLowered = Set(knownIDs.map { $0.lowercased() })
         return existingIsolatedProfileSlugs(
             applicationSupportRoot: applicationSupportRoot,
-            cachesRoot: cachesRoot
+            cachesRoot: cachesRoot,
+            curiumSupportRoot: curiumSupportRoot
         ).filter { slug in
             !knownLowered.contains(slug.lowercased())
         }
@@ -152,7 +178,6 @@ enum CuriumFingerprintProfileStorage {
 
     /// Returns true if the given profile ID matches the currently open engine session
     /// or the outcome chosen for this process launch.
-    @MainActor
     static func isProfileActiveInCurrentProcess(_ profileID: String) -> Bool {
         let needle = profileID.lowercased()
         if let status = CuriumFingerprintBootstrap.activeEngineStatus() {
@@ -178,32 +203,47 @@ enum CuriumFingerprintProfileStorage {
     static func measureUsage(
         for profileID: String,
         applicationSupportRoot: URL? = nil,
-        cachesRoot: URL? = nil
+        cachesRoot: URL? = nil,
+        curiumSupportRoot: URL? = nil
     ) -> UsageSnapshot {
         guard let loc = locations(
             for: profileID,
             applicationSupportRoot: applicationSupportRoot,
-            cachesRoot: cachesRoot
+            cachesRoot: cachesRoot,
+            curiumSupportRoot: curiumSupportRoot
         ) else {
             return UsageSnapshot(supportBytes: 0, cacheBytes: 0, exists: false)
         }
         let support = measureDirectorySafely(loc.supportDirectory, verifyParentChainDepth: loc.isDefault ? 1 : 2)
         let cache = measureDirectorySafely(loc.cacheDirectory, verifyParentChainDepth: loc.isDefault ? 1 : 2)
+        let curiumProfile = loc.curiumProfileDirectory.map {
+            measureDirectorySafely($0, verifyParentChainDepth: 2)
+        } ?? (bytes: 0, exists: false)
+
+        let pdfPreview: (bytes: Int64, exists: Bool)
+        if !loc.isDefault, let pdfPreviewDir = isolatedPDFPreviewDirectory(for: profileID, cachesRoot: cachesRoot) {
+            pdfPreview = measureDirectorySafely(pdfPreviewDir, verifyParentChainDepth: 2)
+        } else {
+            pdfPreview = (0, false)
+        }
+
         return UsageSnapshot(
-            supportBytes: support.bytes,
-            cacheBytes: cache.bytes,
-            exists: support.exists || cache.exists
+            supportBytes: support.bytes + curiumProfile.bytes,
+            cacheBytes: cache.bytes + pdfPreview.bytes,
+            exists: support.exists || curiumProfile.exists || cache.exists || pdfPreview.exists
         )
     }
 
-    /// Safely deletes an inactive, unlocked isolated profile's `Application Support`
-    /// and `Caches` directories. Refuses `"default"`, active profiles, symlink escapes,
-    /// and profiles locked via `flock(LOCK_EX | LOCK_NB)`.
+    /// Safely deletes an inactive, unlocked isolated profile's `Application Support`,
+    /// `Caches`, `Curium/Profiles/<slug>/`, and `Caches/CuriumPDFPreview/<slug>/`
+    /// directories. Refuses `"default"`, active profiles, symlink escapes, and profiles
+    /// locked via `flock(LOCK_EX | LOCK_NB)`.
     static func wipeIsolatedProfile(
         _ profileID: String,
         isActiveInCurrentProcess: Bool,
         applicationSupportRoot: URL? = nil,
-        cachesRoot: URL? = nil
+        cachesRoot: URL? = nil,
+        curiumSupportRoot: URL? = nil
     ) throws {
         guard CuriumFingerprintValidator.isValidProfileID(profileID) else {
             throw WipeError.invalidProfileID
@@ -217,15 +257,40 @@ enum CuriumFingerprintProfileStorage {
         guard let loc = locations(
             for: profileID,
             applicationSupportRoot: applicationSupportRoot,
-            cachesRoot: cachesRoot
+            cachesRoot: cachesRoot,
+            curiumSupportRoot: curiumSupportRoot
         ) else {
             throw WipeError.invalidProfileID
         }
 
-        // Verify parent chain (`ChromiumProfiles` and `<slug>`) contains no symlinks.
+        // Verify parent chains (`ChromiumProfiles`, `Profiles`, `CuriumPDFPreview`, and `<slug>`)
+        // contain no symlinks or unexpected non-directory entries.
         let supportParent = loc.supportDirectory.deletingLastPathComponent()
         let cacheParent = loc.cacheDirectory.deletingLastPathComponent()
-        for dir in [supportParent, loc.supportDirectory, cacheParent, loc.cacheDirectory] {
+        var pathsToVerify: [URL] = [supportParent, loc.supportDirectory, cacheParent, loc.cacheDirectory]
+
+        var curiumDeleteTarget: URL?
+        if let curiumProfileDir = loc.curiumProfileDirectory {
+            let profilesParent = curiumProfileDir.deletingLastPathComponent()
+            let curiumRoot = profilesParent.deletingLastPathComponent()
+            if profilesParent.lastPathComponent == "Profiles",
+               curiumProfileDir.lastPathComponent == profileID {
+                pathsToVerify.append(contentsOf: [curiumRoot, profilesParent, curiumProfileDir])
+                curiumDeleteTarget = curiumProfileDir
+            }
+        }
+
+        var pdfPreviewDeleteTarget: URL?
+        if let pdfPreviewDir = isolatedPDFPreviewDirectory(for: profileID, cachesRoot: cachesRoot) {
+            let previewParent = pdfPreviewDir.deletingLastPathComponent()
+            if previewParent.lastPathComponent == CuriumDownloadStorage.previewCacheDirectoryName,
+               pdfPreviewDir.lastPathComponent == profileID {
+                pathsToVerify.append(contentsOf: [previewParent, pdfPreviewDir])
+                pdfPreviewDeleteTarget = pdfPreviewDir
+            }
+        }
+
+        for dir in pathsToVerify {
             let state = inspectPathWithLstat(dir.path)
             if state == .symlink || state == .otherNonDirectory {
                 throw WipeError.unsafeSymlinkDetected
@@ -259,7 +324,14 @@ enum CuriumFingerprintProfileStorage {
         }
 
         let fm = FileManager.default
-        for dir in [loc.supportDirectory, loc.cacheDirectory] {
+        let deleteTargets = [
+            loc.supportDirectory,
+            loc.cacheDirectory,
+            curiumDeleteTarget,
+            pdfPreviewDeleteTarget,
+        ].compactMap { $0 }
+
+        for dir in deleteTargets {
             let state = inspectPathWithLstat(dir.path)
             guard state == .directory else { continue }
             do {
@@ -271,6 +343,28 @@ enum CuriumFingerprintProfileStorage {
     }
 
     // MARK: - Private
+
+    private static func resolveCuriumSupportRoot(
+        curiumSupportRoot: URL?,
+        applicationSupportRoot: URL?
+    ) -> URL? {
+        if let curiumSupportRoot {
+            return curiumSupportRoot
+        }
+        if let applicationSupportRoot {
+            return applicationSupportRoot.appending(path: "Curium", directoryHint: .isDirectory)
+        }
+        return try? CuriumLibraryLocation.supportRootDirectory()
+    }
+
+    private static func isolatedPDFPreviewDirectory(for profileID: String, cachesRoot: URL?) -> URL? {
+        let cachesBase = cachesRoot ?? (try? FileManager.default.url(
+            for: .cachesDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: false))
+        return cachesBase?
+            .appending(path: CuriumDownloadStorage.previewCacheDirectoryName, directoryHint: .isDirectory)
+            .appending(path: profileID, directoryHint: .isDirectory)
+    }
 
     private enum PathKind {
         case missing

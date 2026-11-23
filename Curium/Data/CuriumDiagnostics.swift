@@ -90,8 +90,9 @@ final class CuriumDiagnostics: @unchecked Sendable {
         }
     }
 
-    static func defaultDirectory() -> URL? {
-        try? CuriumLibraryLocation.resolve().database.deletingLastPathComponent()
+    static func defaultDirectory(profileID: String? = nil) -> URL? {
+        let resolvedID = profileID ?? CuriumFingerprintBootstrap.activeProfileID
+        return try? CuriumLibraryLocation.profileSupportDirectory(for: resolvedID)
     }
 
     func recordStartupIfNeeded(scheduleFlush: Bool = true) {
@@ -107,13 +108,14 @@ final class CuriumDiagnostics: @unchecked Sendable {
         let build = info["CFBundleVersion"] as? String ?? "?"
         let isLiveContainer = ProcessInfo.processInfo.environment["LC_HOME_PATH"] != nil
         let envName = isLiveContainer ? "LiveContainer" : "Standalone/Sim"
+        let activeProfile = CuriumFingerprintBootstrap.activeProfileID
         let jit = Self.jitModeLabel(CuriumActiveV8JitMode())
         let avail = ByteCountFormatter.string(
             fromByteCount: Int64(CuriumAvailableMemoryBytes()),
             countStyle: .memory
         )
 
-        appendLine(category: "boot", message: "Curium \(version) (\(build)) env=\(envName) v8=\(jit) avail=\(avail)")
+        appendLine(category: "boot", message: "Curium \(version) (\(build)) env=\(envName) profile=\(activeProfile) v8=\(jit) avail=\(avail)")
         for hook in hookStatuses() {
             let suffix = hook.detail.isEmpty ? "" : " (\(hook.detail))"
             appendLine(category: "hooks", message: "\(hook.name): \(hook.status)\(suffix)")
@@ -183,9 +185,11 @@ final class CuriumDiagnostics: @unchecked Sendable {
             countStyle: .memory
         )
 
+        let activeProfile = fingerprintStatus?.appliedProfileId ?? CuriumFingerprintBootstrap.activeProfileID
         var out: [String] = [
             "Curium \(version) (\(build)) Diagnostics",
             "Environment: \(envName)",
+            "Active Profile: \(activeProfile)",
             "V8 Runtime: \(jit)",
             "Available Memory: \(avail)",
             "Engine Hooks: \(Self.summarizeHooks(resolvedHooks).summary)",

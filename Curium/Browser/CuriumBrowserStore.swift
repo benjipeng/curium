@@ -347,7 +347,14 @@ final class CuriumTabModel: Identifiable {
     fileprivate func captureSnapshotAsync() async -> Bool {
         if let pdfSession {
             guard case .ready = pdfSession.phase, thumbnail == nil else { return false }
-            if let rendered = pdfSession.makeTabThumbnail(maxPixels: Self.maxSnapshotPixels) {
+            let revision = snapshotRevision
+            if let rendered = await pdfSession.makeTabThumbnailAsync(maxPixels: Self.maxSnapshotPixels) {
+                guard !Task.isCancelled,
+                      revision == snapshotRevision,
+                      self.pdfSession === pdfSession,
+                      thumbnail == nil else {
+                    return false
+                }
                 thumbnail = rendered
                 return true
             }
@@ -458,6 +465,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     private static let minTabAdmissionHeadroomBytes: UInt64 = 192 * 1024 * 1024
     private static let repeatVisitInterval: Duration = .seconds(2)
     private static let idleSnapshotDelay: Duration = .milliseconds(1500)
+    private static let sessionSaveDebounceDelay: Duration = .milliseconds(400)
 
     private struct ObservedVisit {
         let url: URL
@@ -474,8 +482,9 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     private let host: (any CrIOSBrowserHostV1)?
     private let reportsNavigationCommits: Bool
+    let activeProfileID: String
     let extensions: CuriumExtensionStore
-    let library = CuriumLibrary()
+    let library: CuriumLibrary
     let mediaRadar = CuriumMediaRadar()
     private(set) var tabs: [CuriumTabModel] = []
     private(set) var activeTab: CuriumTabModel?
@@ -512,16 +521,29 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     @ObservationIgnored private var isSceneBackgrounded = false
     @ObservationIgnored private var isSheetPresented = false
     @ObservationIgnored private var isRecoveringEmptyTabs = false
+    @ObservationIgnored private var isRestoringSession = false
     @ObservationIgnored private var hasSyncedInitialViewportWidth = false
     @ObservationIgnored private var idleSnapshotTask: Task<Void, Never>?
     @ObservationIgnored private var idleSnapshotToken: UUID?
+    @ObservationIgnored private var sessionSaveTask: Task<Void, Never>?
     @ObservationIgnored private var onDemandSnapshotTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var onDemandSnapshotTokens: [String: UUID] = [:]
     @ObservationIgnored private var savedDownloadsGeneration = 0
     @ObservationIgnored private var mediaPermissions: CuriumMediaPermissionCoordinator!
+    @ObservationIgnored private let fingerprintStore: CuriumFingerprintStore
     @ObservationIgnored private let downloadsRootOverride: URL?
     @ObservationIgnored private let pdfPreviewCacheRootOverride: URL?
+    @ObservationIgnored private let sessionDirectoryOverride: URL?
     @ObservationIgnored private(set) var viewportWidth: CGFloat = 669
+
+    private static var isRunningTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+    }
+
+    private var shouldPersistSession: Bool {
+        sessionDirectoryOverride != nil || !Self.isRunningTests
+    }
 
     var downloadsRoot: URL? { downloadsRootOverride }
     var isEngineReady: Bool { host != nil }
@@ -537,11 +559,25 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         captureAuthorizer: @escaping CuriumMediaPermissionCoordinator.CaptureAuthorizer =
             CuriumMediaPermissionCoordinator.liveCaptureAuthorizer,
         downloadsRoot: URL? = nil,
-        pdfPreviewCacheRoot: URL? = nil
+        pdfPreviewCacheRoot: URL? = nil,
+        activeProfileID: String = "default",
+        library: CuriumLibrary? = nil,
+        fingerprintStore: CuriumFingerprintStore? = nil,
+        sessionDirectoryOverride: URL? = nil,
+        restoreSession: Bool = true
     ) {
+        let trimmedProfileID = activeProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedProfileID = trimmedProfileID.isEmpty ? "default" : trimmedProfileID
+        let resolvedFingerprintStore = fingerprintStore ?? CuriumFingerprintStore.shared
+
         self.host = host
+        self.activeProfileID = resolvedProfileID
+        self.fingerprintStore = resolvedFingerprintStore
+        self.library = library ?? CuriumLibrary(profileID: resolvedProfileID, fingerprintStore: resolvedFingerprintStore)
         self.downloadsRootOverride = downloadsRoot
         self.pdfPreviewCacheRootOverride = pdfPreviewCacheRoot
+            ?? (try? CuriumDownloadStorage.pdfPreviewCacheRoot(profileID: resolvedProfileID))
+        self.sessionDirectoryOverride = sessionDirectoryOverride
         // The optional delegate method is ours, so probing it cannot tell us
         // whether Blink sends it. Patch 0097 adds this forwarder to the host.
         reportsNavigationCommits = host?.responds(to: NSSelectorFromString(
@@ -561,13 +597,27 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         if let host {
             host.delegate = self
             updateTabs(from: host)
+            let canRestoreIntoHost = tabs.isEmpty || (tabs.count == 1 && tabs[0].url == nil && !tabs[0].isLoading)
+            if restoreSession, canRestoreIntoHost {
+                _ = restoreSavedSessionIfAvailable()
+            }
             if tabs.isEmpty { newTab() }
         } else {
-            newTab()
+            let restored = restoreSession ? restoreSavedSessionIfAvailable() : false
+            if !restored && tabs.isEmpty {
+                newTab()
+            }
         }
         let previewRoot = pdfPreviewCacheRootOverride
-        Task.detached(priority: .utility) {
+        let shouldAdoptLegacyDownloads = downloadsRootOverride == nil
+        Task.detached(priority: .utility) { [weak self] in
             CuriumDownloadStorage.cleanupStalePDFPreviews(cacheRoot: previewRoot)
+            CuriumDownloadStorage.cleanupStaleDownloadStaging()
+            if shouldAdoptLegacyDownloads, CuriumDownloadStorage.adoptLegacyGuestDownloadsIfNeeded() > 0 {
+                await MainActor.run {
+                    self?.refreshSavedDownloads()
+                }
+            }
         }
         refreshSavedDownloads()
     }
@@ -589,8 +639,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     }
 
     private func prefersDesktopByDefault() -> Bool {
-        let raw = UserDefaults.standard.string(forKey: "curium.siteMode") ?? CuriumSiteMode.adaptive.rawValue
-        let mode = CuriumSiteMode(rawValue: raw) ?? .adaptive
+        let mode = fingerprintStore.profile(id: activeProfileID)?.resolvedSiteMode
+            ?? fingerprintStore.activeProfile.resolvedSiteMode
         return mode.prefersDesktop(forViewportWidth: viewportWidth)
     }
 
@@ -605,12 +655,14 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     func handleSceneWillDeactivate() {
         cancelAllSnapshotCaptures()
+        saveOpenTabsSession()
     }
 
     func handleSceneDidEnterBackground() {
         isSceneBackgrounded = true
         syncMediaPermissionPresentationGate()
         cancelAllSnapshotCaptures()
+        saveOpenTabsSession()
         backgroundEpoch += 1
         // Retain at most the active tab's thumbnail in background to minimize idle footprint.
         let keepID = activeTab?.id
@@ -618,6 +670,141 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         for tab in tabs where tab.id != keepID {
             tab.clearSnapshot()
         }
+    }
+
+    // MARK: - Per-Profile Session & Profile Switching
+
+    func saveOpenTabsSession() {
+        sessionSaveTask?.cancel()
+        sessionSaveTask = nil
+        guard shouldPersistSession, !isRestoringSession else { return }
+        let activeID = activeTab?.id
+        var urls: [URL] = []
+        urls.reserveCapacity(tabs.count)
+        var mappedActiveIndex = 0
+        for tab in tabs {
+            guard let candidate = tab.bookmarkableURL ?? tab.url,
+                  let scheme = candidate.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  candidate.host()?.isEmpty == false else {
+                continue
+            }
+            if tab.id == activeID {
+                mappedActiveIndex = urls.count
+            }
+            urls.append(candidate)
+        }
+        CuriumSessionStorage.save(
+            urls: urls,
+            activeIndex: mappedActiveIndex,
+            forProfile: activeProfileID,
+            directory: sessionDirectoryOverride
+        )
+    }
+
+    private func scheduleSessionSave() {
+        guard shouldPersistSession, !isRestoringSession else { return }
+        sessionSaveTask?.cancel()
+        sessionSaveTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: Self.sessionSaveDebounceDelay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.sessionSaveTask = nil
+            self.saveOpenTabsSession()
+        }
+    }
+
+    @discardableResult
+    private func restoreSavedSessionIfAvailable() -> Bool {
+        guard shouldPersistSession,
+              let saved = CuriumSessionStorage.load(
+                  forProfile: activeProfileID,
+                  directory: sessionDirectoryOverride
+              ) else {
+            return false
+        }
+        let validURLs = Array(saved.openTabURLs.compactMap(URL.init(string:)).prefix(Self.maxLiveTabs))
+        guard !validURLs.isEmpty else { return false }
+
+        isRestoringSession = true
+        defer { isRestoringSession = false }
+
+        let preferDesktop = prefersDesktopByDefault()
+        let targetActiveIndex = min(max(0, saved.activeTabIndex), validURLs.count - 1)
+
+        if let host {
+            var restoredTabIDs: [String] = []
+            restoredTabIDs.reserveCapacity(validURLs.count)
+            for (index, url) in validURLs.enumerated() {
+                if index == 0, tabs.count == 1, let existingBlank = tabs.first, existingBlank.url == nil {
+                    existingBlank.load(url, preferDesktop: preferDesktop)
+                    restoredTabIDs.append(existingBlank.id)
+                    continue
+                }
+                guard let createdEngine = host.createTab(with: nil, activate: index == targetActiveIndex) else {
+                    break
+                }
+                let createdID = createdEngine.tabID
+                if tabsByID[createdID] == nil {
+                    updateTabs(from: host)
+                }
+                if let model = tabsByID[createdID] {
+                    if preferDesktop {
+                        CuriumSetDesktopSite(createdEngine, true)
+                        refresh(model, from: createdEngine)
+                    }
+                    model.load(url, preferDesktop: preferDesktop)
+                    restoredTabIDs.append(createdID)
+                }
+            }
+            updateTabs(from: host)
+            if restoredTabIDs.indices.contains(targetActiveIndex) {
+                let targetID = restoredTabIDs[targetActiveIndex]
+                if activeTab?.id != targetID {
+                    _ = host.activateTab(withID: targetID)
+                    updateTabs(from: host)
+                }
+            }
+            return !restoredTabIDs.isEmpty
+        }
+
+        for url in validURLs {
+            let tab = CuriumTabModel()
+            tab.load(url, preferDesktop: preferDesktop)
+            tabs.append(tab)
+            tabsByID[tab.id] = tab
+        }
+        setActiveTab(tabs.indices.contains(targetActiveIndex) ? tabs[targetActiveIndex] : tabs.first)
+        return !tabs.isEmpty
+    }
+
+    @discardableResult
+    func switchProfileForNextLaunch(to profileID: String) -> Bool {
+        let trimmed = profileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard fingerprintStore.selectProfile(id: trimmed) else {
+            errorMessage = fingerprintStore.lastPersistError ?? "Unable to select profile \"\(trimmed)\"."
+            return false
+        }
+        return true
+    }
+
+    @discardableResult
+    func prepareForProfileSwitchAndRelaunch(
+        to profileID: String,
+        relaunchHandler: (@MainActor () -> Void)? = nil
+    ) async -> Bool {
+        guard switchProfileForNextLaunch(to: profileID) else {
+            return false
+        }
+        saveOpenTabsSession()
+        await library.checkpointAsync()
+        CuriumDiagnostics.shared.flushSync()
+        CuriumProfileRelauncher.relaunchAfterFlush(customHandler: relaunchHandler)
+        return true
     }
 
     func handleSceneWillEnterForeground() {
@@ -783,6 +970,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         }
         cancelIdleSnapshotCapture()
         activeTab = tab
+        scheduleSessionSave()
     }
 
     func submitAddress(_ input: String) {
@@ -804,6 +992,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         let preferDesktop = prefersDesktopByDefault()
         if let activeTab {
             activeTab.load(url, preferDesktop: preferDesktop)
+            scheduleSessionSave()
         } else {
             newTab(url: url)
         }
@@ -862,6 +1051,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             tabsByID[tab.id] = tab
             setActiveTab(tab)
         }
+        scheduleSessionSave()
         return true
     }
 
@@ -894,6 +1084,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             if activeTab?.id == tab.id { setActiveTab(tabs.isEmpty ? nil : tabs[min(index, tabs.count - 1)]) }
         }
         if tabs.isEmpty { newTab() }
+        scheduleSessionSave()
     }
 
     /// Clears cookies, cache, and site storage written since `start` (all of it when nil).
@@ -916,7 +1107,9 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         let oldExtID = model.extensionTabID
         refresh(model, from: tab)
         mediaPermissions.invalidateIfOriginChanged(tabID: tab.tabID, currentURL: model.url)
-        let contextChanged = model.url != oldURL || model.extensionTabID != oldExtID
+        let urlChanged = model.url != oldURL
+        let contextChanged = urlChanged || model.extensionTabID != oldExtID
+        if urlChanged { scheduleSessionSave() }
         if activeTab === model && contextChanged { updateExtensionContext(force: true) }
     }
 
@@ -948,7 +1141,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         ) {
             CuriumDiagnostics.shared.record(
                 "media-radar",
-                "[\(captured.kind.rawValue)] \(captured.url.host() ?? "")\(captured.url.path) method=\(captured.httpMethod ?? "-") mime=\(captured.mimeType ?? "-") status=\(captured.httpStatusCode) len=\(captured.contentLength)"
+                "[\(captured.kind.rawValue)] method=\(captured.httpMethod ?? "-") mime=\(captured.mimeType ?? "-") status=\(captured.httpStatusCode) len=\(captured.contentLength)"
             )
         }
     }
@@ -961,6 +1154,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             mediaPermissions.invalidate(tabID: tab.tabID)
             mediaRadar.clear(tabID: tab.tabID)
             tabsByID[tab.tabID]?.dismissPDFSession()
+            scheduleSessionSave()
         }
         guard reportsNavigationCommits else { return }
         let tabID = tab.tabID
@@ -1252,6 +1446,9 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
         setActiveTab(activeID.flatMap { nextIndex[$0] })
         updateExtensionContext(force: !activeMatches || !activeViewportMatches)
+        if !orderMatches || evictedAny {
+            scheduleSessionSave()
+        }
 
         if hostTabs.isEmpty && !isRecoveringEmptyTabs {
             isRecoveringEmptyTabs = true

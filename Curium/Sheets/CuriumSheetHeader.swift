@@ -157,16 +157,26 @@ struct CuriumSettingsSheet: View {
     @AppStorage("curium.uaBrand") private var uaBrandPreference: CuriumUABrandPreference = .chrome
     @AppStorage("curium.mobileUA") private var mobileUAPreference: CuriumMobileUAPreference = .android
     let engineReady: Bool
+    var browserStore: CuriumBrowserStore? = nil
 
-    @State private var showingDiagnostics = false
-    @State private var showingFingerprintStudio = false
+    @Environment(\.dismiss) private var dismiss
+    @State private var presentedSheet: PresentedSheet?
+    @State private var saveFolderFlow = CuriumSaveFolderFlowState()
     @State private var availableMemoryText = ""
     @State private var hooksSummary = ""
     @State private var hasHookFailure = false
     @State private var diagnosticLineCount = 0
     @State private var engineFingerprintStatus: CuriumEngineFingerprintStatus?
 
+    private enum PresentedSheet: Identifiable {
+        case profiles
+        case diagnostics
+
+        var id: Self { self }
+    }
+
     private var fingerprintStore: CuriumFingerprintStore { CuriumFingerprintStore.shared }
+    private var folderManager: CuriumDownloadsFolderManager { CuriumDownloadsFolderManager.shared }
 
     private var activeV8RuntimeLabel: String {
         guard engineReady else { return "Standby" }
@@ -174,121 +184,58 @@ struct CuriumSettingsSheet: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            CuriumSheetHeader(title: "Settings")
+        let activeProfile = fingerprintStore.activeProfile
+        let activeProfilePalette = activeProfile.resolvedPalette
+        let hasPendingSwitch = fingerprintStore.hasPendingProfileSwitch
+        let nextProfile = hasPendingSwitch ? fingerprintStore.nextLaunchProfile : nil
+        let _ = folderManager.status
+        let _ = folderManager.revision
+        let downloadsDisplayPath = CuriumDownloadsFolderManager.displayDownloadsPath
+
+        NavigationStack {
             List {
-                Section("Search Engine") {
-                    ForEach(CuriumSearchEngine.allCases) { engine in
-                        Button {
-                            library.searchEngine = engine
-                        } label: {
-                            HStack {
-                                Text(engine.title).foregroundStyle(.primary)
-                                Spacer()
-                                if library.searchEngine == engine {
-                                    Image(systemName: "checkmark")
-                                        .foregroundStyle(.tint)
-                                        .accessibilityHidden(true)
-                                }
-                            }
-                        }
-                        .accessibilityAddTraits(library.searchEngine == engine ? .isSelected : [])
-                    }
-                }
-
-                Section {
-                    ForEach(CuriumSiteMode.allCases) { mode in
-                        Button {
-                            siteMode = mode
-                        } label: {
-                            HStack {
-                                Text(mode.title).foregroundStyle(.primary)
-                                Spacer()
-                                if siteMode == mode {
-                                    Image(systemName: "checkmark").foregroundStyle(.tint)
-                                }
-                            }
-                        }
-                        .accessibilityAddTraits(siteMode == mode ? .isSelected : [])
-                    }
-                } header: {
-                    Text("Default Site Layout")
-                } footer: {
-                    Text("Duo Adaptive loads full Desktop layouts on the 7.6-inch unfolded display and Mobile layouts on the outer cover display.")
-                }
-
-                Section("Appearance") {
-                    ForEach(CuriumPalette.allCases) { option in
-                        Button {
-                            palette = option
-                        } label: {
-                            HStack {
-                                Circle()
-                                    .fill(option.tint)
-                                    .frame(width: 14, height: 14)
-                                    .accessibilityHidden(true)
-                                Text(option.title).foregroundStyle(.primary)
-                                Spacer()
-                                Text(option.notation)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                if palette == option {
-                                    Image(systemName: "checkmark").foregroundStyle(.tint)
-                                }
-                            }
-                        }
-                        .accessibilityAddTraits(palette == option ? .isSelected : [])
-                    }
-                }
-                Section {
-                    ForEach(CuriumJitPreference.allCases) { option in
-                        Button {
-                            jitPreference = option
-                        } label: {
-                            HStack {
-                                Text(option.title).foregroundStyle(.primary)
-                                Spacer()
-                                if jitPreference == option {
-                                    Image(systemName: "checkmark").foregroundStyle(.tint)
-                                }
-                            }
-                        }
-                        .accessibilityAddTraits(jitPreference == option ? .isSelected : [])
-                    }
-                } header: {
-                    Text("JavaScript Engine (V8)")
-                } footer: {
-                    Text("Applies on next launch. Under LiveContainer on iOS 26/27, enable Launch with JIT with StikDebug's universal.js script; otherwise Curium runs safely in Jitless mode.")
-                }
-
                 Section {
                     Button {
-                        showingFingerprintStudio = true
+                        presentedSheet = .profiles
                     } label: {
-                        LabeledContent {
-                            HStack(spacing: 6) {
-                                Text(fingerprintStore.selectedProfile?.displayName ?? "Default (Build 39)")
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.tertiary)
-                                    .accessibilityHidden(true)
-                            }
-                        } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: activeProfile.resolvedSymbolName)
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(activeProfilePalette.tint)
+                                .frame(width: 36, height: 36)
+                                .background(activeProfilePalette.tile, in: RoundedRectangle(cornerRadius: 10))
+                                .accessibilityHidden(true)
+
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Manage Profiles & Fingerprints")
+                                Text(activeProfile.displayName)
+                                    .font(.body.weight(.medium))
                                     .foregroundStyle(.primary)
-                                Text(selectedProfileSummarySubtitle)
+                                    .lineLimit(1)
+                                Text(activeProfile.shortArchetypeSummary)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                if let nextProfile {
+                                    Text("Next launch: \(nextProfile.displayName)")
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(nextProfile.resolvedPalette.tint)
+                                        .lineLimit(1)
+                                }
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                                .accessibilityHidden(true)
                         }
+                        .padding(.vertical, 2)
+                        .contentShape(Rectangle())
                     }
                     .foregroundStyle(.primary)
                     .accessibilityIdentifier("curium.settings.fingerprintStudio")
 
-                    if fingerprintStore.selectedProfileID == nil {
+                    if activeProfile.isPrimaryDefault && activeProfile.matchesBuild39EngineDefaults {
                         Picker("Browser Brand", selection: $uaBrandPreference) {
                             ForEach(CuriumUABrandPreference.allCases) { option in
                                 Text(option.title).tag(option)
@@ -304,10 +251,120 @@ struct CuriumSettingsSheet: View {
                     Text("Browser Identity & Profile")
                 } footer: {
                     if let status = engineFingerprintStatus {
-                        Text("Active engine profile: \(status.appliedProfileId) (\(status.state), rev \(status.appliedConfigRevision), \(status.hardwareOverridesActive ? "hardware override" : "native Apple hardware")). Profile switches apply on next cold launch.")
+                        Text("Active engine profile: \(activeProfile.displayName) (\(status.appliedProfileId), \(status.state), rev \(status.appliedConfigRevision), \(status.hardwareOverridesActive ? "hardware override" : "native Apple hardware")). Profile switches apply on next cold launch.")
                     } else {
-                        Text("Profile switches apply on next cold launch with isolated cookies, storage, and preferences.")
+                        Text("Profile switches apply on next cold launch with isolated cookies, storage, bookmarks, and tabs.")
                     }
+                }
+
+                Section {
+                    ForEach(CuriumSearchEngine.allCases) { engine in
+                        Button {
+                            library.searchEngine = engine
+                        } label: {
+                            HStack {
+                                Text(engine.title).foregroundStyle(Color.primary)
+                                Spacer()
+                                if library.searchEngine == engine {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(.tint)
+                                        .accessibilityHidden(true)
+                                }
+                            }
+                        }
+                        .foregroundStyle(Color.primary)
+                        .accessibilityAddTraits(library.searchEngine == engine ? .isSelected : [])
+                    }
+                } header: {
+                    Text("Search Engine")
+                } footer: {
+                    Text("Saved per profile (\(activeProfile.displayName)).")
+                }
+
+                Section {
+                    ForEach(CuriumSiteMode.allCases) { mode in
+                        Button {
+                            siteMode = mode
+                        } label: {
+                            HStack {
+                                Text(mode.title).foregroundStyle(Color.primary)
+                                Spacer()
+                                if siteMode == mode {
+                                    Image(systemName: "checkmark").foregroundStyle(.tint)
+                                }
+                            }
+                        }
+                        .foregroundStyle(Color.primary)
+                        .accessibilityAddTraits(siteMode == mode ? .isSelected : [])
+                    }
+                } header: {
+                    Text("Default Site Layout")
+                } footer: {
+                    Text("Duo Adaptive loads full Desktop layouts on the 7.6-inch unfolded display and Mobile layouts on the outer cover display. Saved per profile (\(activeProfile.displayName)).")
+                }
+
+                Section {
+                    ForEach(CuriumPalette.allCases) { option in
+                        Button {
+                            palette = option
+                        } label: {
+                            HStack {
+                                Circle()
+                                    .fill(option.tint)
+                                    .frame(width: 14, height: 14)
+                                    .accessibilityHidden(true)
+                                Text(option.title).foregroundStyle(Color.primary)
+                                Spacer()
+                                Text(option.notation)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                if palette == option {
+                                    Image(systemName: "checkmark").foregroundStyle(.tint)
+                                }
+                            }
+                        }
+                        .foregroundStyle(Color.primary)
+                        .accessibilityAddTraits(palette == option ? .isSelected : [])
+                    }
+                } header: {
+                    Text("Appearance")
+                } footer: {
+                    Text("Applies to the active profile (\(activeProfile.displayName)).")
+                }
+
+                Section {
+                    CuriumSaveLocationRow(
+                        flow: $saveFolderFlow,
+                        accessibilityID: "curium.settings.saveLocation"
+                    ) {
+                        browserStore?.refreshSavedDownloads()
+                    }
+                } header: {
+                    Text("Downloads")
+                } footer: {
+                    Text("Saved to \(downloadsDisplayPath). Downloads are shared across all profiles.")
+                }
+
+                Section {
+                    ForEach(CuriumJitPreference.allCases) { option in
+                        Button {
+                            jitPreference = option
+                        } label: {
+                            HStack {
+                                Text(option.title).foregroundStyle(Color.primary)
+                                Spacer()
+                                if jitPreference == option {
+                                    Image(systemName: "checkmark").foregroundStyle(.tint)
+                                }
+                            }
+                        }
+                        .foregroundStyle(Color.primary)
+                        .accessibilityAddTraits(jitPreference == option ? .isSelected : [])
+                    }
+                } header: {
+                    Text("JavaScript Engine (V8)")
+                } footer: {
+                    Text("Applies on next launch. Under LiveContainer on iOS 26/27, enable Launch with JIT with StikDebug's universal.js script; otherwise Curium runs safely in Jitless mode.")
                 }
 
                 Section("Browser") {
@@ -319,7 +376,7 @@ struct CuriumSettingsSheet: View {
                             .foregroundStyle(hasHookFailure ? .red : .secondary)
                     }
                     Button {
-                        showingDiagnostics = true
+                        presentedSheet = .diagnostics
                     } label: {
                         LabeledContent("Diagnostics Log") {
                             HStack(spacing: 6) {
@@ -339,25 +396,36 @@ struct CuriumSettingsSheet: View {
                 }
             }
             .listStyle(.insetGrouped)
-        }
-        .background(Color(uiColor: .systemGroupedBackground))
-        .onAppear { refreshDiagnosticsSummary() }
-        .sheet(isPresented: $showingFingerprintStudio, onDismiss: { refreshDiagnosticsSummary() }) {
-            CuriumFingerprintStudioSheet(store: fingerprintStore) {
-                refreshDiagnosticsSummary()
+            .curiumSaveFolderPickerFlow($saveFolderFlow) {
+                browserStore?.refreshSavedDownloads()
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button { dismiss() } label: {
+                        Label("Done", systemImage: "checkmark")
+                    }
+                }
             }
         }
-        .sheet(isPresented: $showingDiagnostics, onDismiss: { refreshDiagnosticsSummary() }) {
-            CuriumDiagnosticsSheet(engineReady: engineReady)
+        .onAppear {
+            folderManager.resolveInBackgroundIfNeeded()
+            refreshDiagnosticsSummary()
         }
-    }
-
-    private var selectedProfileSummarySubtitle: String {
-        if let profile = fingerprintStore.selectedProfile {
-            let hw = profile.usesNativeHardwareAndGPU ? "Native Apple HW/GPU" : "Custom HW/GPU"
-            return "\(profile.id) · \(hw) · \(profile.proxy.summary)"
+        .sheet(item: $presentedSheet, onDismiss: { refreshDiagnosticsSummary() }) { item in
+            switch item {
+            case .profiles:
+                CuriumProfileSwitcherSheet(
+                    browserStore: browserStore,
+                    fingerprintStore: fingerprintStore
+                ) {
+                    refreshDiagnosticsSummary()
+                }
+            case .diagnostics:
+                CuriumDiagnosticsSheet(engineReady: engineReady)
+            }
         }
-        return "Legacy Chromium profile · Native Apple HW/GPU"
     }
 
     private func refreshDiagnosticsSummary() {
@@ -377,6 +445,7 @@ struct CuriumSettingsSheet: View {
 private struct CuriumDiagnosticsSheet: View {
     let engineReady: Bool
 
+    @Environment(\.dismiss) private var dismiss
     @State private var hookStatuses: [CuriumDiagnostics.HookStatus] = []
     @State private var lines: [String] = []
     @State private var reportText = ""
@@ -385,7 +454,9 @@ private struct CuriumDiagnosticsSheet: View {
     @State private var copied = false
     @State private var fingerprintStatus: CuriumEngineFingerprintStatus?
     @State private var fingerprintCapabilities: CuriumEngineFingerprintCapabilities?
-    @State private var nextLaunchProfileLabel = "Default (Build 39)"
+    @State private var activeProfileLabel = "Personal (default)"
+    @State private var nextLaunchProfileLabel = "Personal (default)"
+    @State private var hasPendingProfileSwitch = false
     @State private var reloadTask: Task<Void, Never>?
 
     private var environmentLabel: String {
@@ -395,8 +466,7 @@ private struct CuriumDiagnosticsSheet: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            CuriumSheetHeader(title: "Diagnostics")
+        NavigationStack {
             List {
                 Section("Actions") {
                     Button {
@@ -424,6 +494,19 @@ private struct CuriumDiagnosticsSheet: View {
                 }
 
                 Section("Fingerprint & Profile Contract") {
+                    LabeledContent("Active Profile") {
+                        Text(activeProfileLabel)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    LabeledContent("Next Launch Profile") {
+                        Text(nextLaunchProfileLabel)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(hasPendingProfileSwitch ? .orange : .secondary)
+                            .multilineTextAlignment(.trailing)
+                    }
+
                     if let status = fingerprintStatus {
                         LabeledContent("Contract Version", value: "v\(status.contractVersion)")
                         LabeledContent("Engine State") {
@@ -453,8 +536,6 @@ private struct CuriumDiagnosticsSheet: View {
                     } else {
                         LabeledContent("Engine Contract", value: "Not linked / Pre-Build 40")
                     }
-
-                    LabeledContent("Next Launch Selection", value: nextLaunchProfileLabel)
 
                     if let caps = fingerprintCapabilities, caps.supportsLaunchFingerprintConfig {
                         DisclosureGroup("Engine Capabilities (\(caps.features.count) features)") {
@@ -511,8 +592,16 @@ private struct CuriumDiagnosticsSheet: View {
                 }
             }
             .listStyle(.insetGrouped)
+            .navigationTitle("Diagnostics")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button { dismiss() } label: {
+                        Label("Done", systemImage: "checkmark")
+                    }
+                }
+            }
         }
-        .background(Color(uiColor: .systemGroupedBackground))
         .onAppear { reload(flushFirst: true) }
         .onDisappear {
             reloadTask?.cancel()
@@ -526,13 +615,19 @@ private struct CuriumDiagnosticsSheet: View {
         let current = diag.currentLines()
         let status = CuriumFingerprintBootstrap.activeEngineStatus()
         let caps = CuriumFingerprintBootstrap.engineCapabilities()
-        let nextLabel = CuriumFingerprintStore.shared.selectedProfileID ?? "default (Build 39)"
+        let store = CuriumFingerprintStore.shared
+        let activeProfile = store.activeProfile
+        let nextProfile = store.nextLaunchProfile
+        let activeLabel = "\(activeProfile.displayName) (\(activeProfile.id))"
+        let nextLabel = "\(nextProfile.displayName) (\(nextProfile.id))"
 
         hookStatuses = hooks
         lines = current
         fingerprintStatus = status
         fingerprintCapabilities = caps
+        activeProfileLabel = activeLabel
         nextLaunchProfileLabel = nextLabel
+        hasPendingProfileSwitch = store.hasPendingProfileSwitch
         reportText = diag.formattedReport(
             hooks: hooks,
             lines: current,

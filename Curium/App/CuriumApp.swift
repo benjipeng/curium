@@ -22,7 +22,8 @@ enum CuriumApp {
             )
             return
         case .defaultBuild39, .configured:
-            if CuriumRegisterShell(CuriumShellBootstrap()) {
+            let activeProfileID = CuriumFingerprintBootstrap.activeProfileID
+            if CuriumRegisterShell(CuriumShellBootstrap(activeProfileID: activeProfileID)) {
                 exit(ChromeMain(CommandLine.argc, CommandLine.unsafeArgv))
             }
         }
@@ -37,7 +38,7 @@ private struct CuriumStandbyApp: App {
             if case .rejected(let profileID, let reason) = CuriumFingerprintBootstrap.lastOutcome {
                 CuriumProfileLaunchRecoveryView(profileID: profileID, reason: reason)
             } else {
-                CuriumStandbyWindow()
+                CuriumStandbyWindow(activeProfileID: CuriumFingerprintBootstrap.activeProfileID)
             }
         }
     }
@@ -91,6 +92,7 @@ private struct CuriumProfileLaunchRecoveryView: View {
     @State private var store = CuriumFingerprintStore.shared
     @State private var statusMessage: String?
     @State private var persistFailed = false
+    @State private var readyToRelaunch = false
     @State private var copiedDetails = false
     @State private var blockedProfileUsage: CuriumFingerprintProfileStorage.UsageSnapshot?
     @State private var confirmingWipe = false
@@ -119,8 +121,11 @@ private struct CuriumProfileLaunchRecoveryView: View {
 
     private var alternativeProfiles: [CuriumFingerprintProfile] {
         guard !isStoreCorrupt, engineSupportsProfiles else { return [] }
+        let blockedLowered = profileID.lowercased()
         return store.profiles.filter {
-            $0.id != profileID && CuriumFingerprintValidator.validate($0).isValid
+            !$0.isPrimaryDefault
+                && $0.id.lowercased() != blockedLowered
+                && CuriumFingerprintValidator.validate($0).isValid
         }
     }
 
@@ -208,7 +213,7 @@ private struct CuriumProfileLaunchRecoveryView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Permanently clears isolated cookies, site data, and HTTP cache in ChromiumProfiles/\(profileID). Your profile settings remain in the store.")
+            Text("Permanently clears isolated cookies, site data, cache, bookmarks, history, and saved tabs for profile \"\(profileID)\". Your profile settings remain in the store.")
         }
     }
 
@@ -253,7 +258,8 @@ private struct CuriumProfileLaunchRecoveryView: View {
                     Button {
                         if store.backupCorruptStoreAndReset() {
                             persistFailed = false
-                            statusMessage = "Corrupt store backed up to a .bak file and reset to Default (Build 39). Close and relaunch Curium."
+                            readyToRelaunch = true
+                            statusMessage = "Corrupt store backed up to a .bak file and reset to Personal (Default). Relaunch Curium to continue."
                         } else {
                             persistFailed = true
                             statusMessage = store.lastPersistError ?? "Could not back up corrupt store."
@@ -263,10 +269,11 @@ private struct CuriumProfileLaunchRecoveryView: View {
                     }
                     .buttonStyle(.borderedProminent)
                 } else {
-                    Button("Reset to Default Profile for Next Launch") {
+                    Button("Switch to Personal (Default) for Next Launch") {
                         if store.resetToBuild39Default() {
                             persistFailed = false
-                            statusMessage = "Reset to Default (Build 39) saved. Close and relaunch Curium."
+                            readyToRelaunch = true
+                            statusMessage = "Switched next launch to Personal (Default). Relaunch Curium to continue."
                         } else {
                             persistFailed = true
                             statusMessage = store.lastPersistError ?? "Could not write profile store to disk."
@@ -277,14 +284,17 @@ private struct CuriumProfileLaunchRecoveryView: View {
                     if !alternativeProfiles.isEmpty {
                         Menu {
                             ForEach(alternativeProfiles) { profile in
-                                Button("\(profile.displayName) (\(profile.id))") {
+                                Button {
                                     if store.selectProfile(id: profile.id) {
                                         persistFailed = false
-                                        statusMessage = "Switched next launch to \"\(profile.displayName)\". Close and relaunch Curium."
+                                        readyToRelaunch = true
+                                        statusMessage = "Switched next launch to \"\(profile.displayName)\". Relaunch Curium to continue."
                                     } else {
                                         persistFailed = true
                                         statusMessage = store.lastPersistError ?? "Could not write profile store to disk."
                                     }
+                                } label: {
+                                    Label(profile.displayName, systemImage: profile.resolvedSymbolName)
                                 }
                             }
                         } label: {
@@ -306,6 +316,18 @@ private struct CuriumProfileLaunchRecoveryView: View {
                         .buttonStyle(.bordered)
                         .disabled(isWiping)
                     }
+                }
+
+                if readyToRelaunch {
+                    Button {
+                        CuriumProfileRelauncher.relaunchAfterFlush()
+                    } label: {
+                        Label(
+                            CuriumProfileRelauncher.isRunningInLiveContainer ? "Relaunch Curium" : "Close Curium",
+                            systemImage: "arrow.clockwise.circle"
+                        )
+                    }
+                    .buttonStyle(.bordered)
                 }
 
                 Button {
@@ -390,11 +412,18 @@ private struct CuriumProfileLaunchRecoveryView: View {
 }
 
 private struct CuriumStandbyWindow: View {
-    @State private var store = CuriumBrowserStore()
+    @State private var store: CuriumBrowserStore
     @Environment(\.scenePhase) private var scenePhase
+
+    init(activeProfileID: String = "default") {
+        _store = State(initialValue: CuriumBrowserStore(activeProfileID: activeProfileID))
+    }
 
     var body: some View {
         CuriumScene(store: store)
+            .task {
+                CuriumDownloadsFolderManager.shared.resolveInBackgroundIfNeeded()
+            }
             .onChange(of: scenePhase) { _, phase in
                 switch phase {
                 case .inactive:
@@ -404,6 +433,7 @@ private struct CuriumStandbyWindow: View {
                     store.handleSceneDidEnterBackground()
                     CuriumCheckpointRunner.run(library: store.library, reason: "StandbyBackground")
                 case .active:
+                    CuriumDownloadsFolderManager.shared.resolveInBackgroundIfNeeded()
                     store.handleSceneWillEnterForeground()
                 @unknown default:
                     break
@@ -487,28 +517,75 @@ private enum CuriumCheckpointRunner {
 
 struct CuriumScene: View {
     let store: CuriumBrowserStore
-    @AppStorage("curium.palette") private var palette = CuriumPalette.violet
-    @AppStorage("curium.siteMode") private var siteMode = CuriumSiteMode.adaptive
+
+    private var fingerprintStore: CuriumFingerprintStore { CuriumFingerprintStore.shared }
+
+    private var activeProfile: CuriumFingerprintProfile? {
+        fingerprintStore.profile(id: store.activeProfileID)
+    }
+
+    private var activePalette: CuriumPalette {
+        activeProfile?.resolvedPalette ?? .violet
+    }
+
+    private var activeSiteMode: CuriumSiteMode {
+        activeProfile?.resolvedSiteMode ?? .adaptive
+    }
+
+    private var paletteBinding: Binding<CuriumPalette> {
+        Binding(
+            get: { activePalette },
+            set: { newValue in
+                _ = fingerprintStore.updatePersonaMetadata(for: store.activeProfileID, palette: newValue)
+                if store.activeProfileID == "default" {
+                    UserDefaults.standard.set(newValue.rawValue, forKey: "curium.palette")
+                }
+            }
+        )
+    }
+
+    private var siteModeBinding: Binding<CuriumSiteMode> {
+        Binding(
+            get: { activeSiteMode },
+            set: { newValue in
+                _ = fingerprintStore.updatePersonaMetadata(for: store.activeProfileID, siteMode: newValue)
+                if store.activeProfileID == "default" {
+                    UserDefaults.standard.set(newValue.rawValue, forKey: "curium.siteMode")
+                }
+            }
+        )
+    }
 
     var body: some View {
         NavigationStack {
-            CuriumBrowserView(store: store, palette: $palette, siteMode: $siteMode)
+            CuriumBrowserView(store: store, palette: paletteBinding, siteMode: siteModeBinding)
         }
-        .tint(palette.tint)
-        .environment(\.curiumPalette, palette)
-        .onChange(of: siteMode, initial: true) { _, _ in
+        .tint(activePalette.tint)
+        .environment(\.curiumPalette, activePalette)
+        .onChange(of: activeSiteMode, initial: true) { _, _ in
             store.syncDefaultSiteModeForBlankTabs()
         }
     }
 }
 
 private final class CuriumShellBootstrap: NSObject, CrIOSShellBootstrapDelegate {
+    private let activeProfileID: String
+
+    init(activeProfileID: String = "default") {
+        self.activeProfileID = activeProfileID
+        super.init()
+    }
+
     func makeRootViewController(
         for windowScene: UIWindowScene,
         browserHost: any CrIOSBrowserHostV1,
         extensionManager: (any CrIOSExtensionManagingV1)?
     ) -> UIViewController {
-        let store = CuriumBrowserStore(host: browserHost, extensionManager: extensionManager)
+        let store = CuriumBrowserStore(
+            host: browserHost,
+            extensionManager: extensionManager,
+            activeProfileID: activeProfileID
+        )
         return CuriumSceneHostingController(windowScene: windowScene, store: store)
     }
 }
@@ -522,6 +599,7 @@ private final class CuriumSceneHostingController: UIHostingController<CuriumScen
         self.store = store
         self.observedScene = windowScene
         super.init(rootView: CuriumScene(store: store))
+        CuriumDownloadsFolderManager.shared.resolveInBackgroundIfNeeded()
         installLifecycleObservers(for: windowScene)
     }
 
@@ -577,6 +655,7 @@ private final class CuriumSceneHostingController: UIHostingController<CuriumScen
     }
 
     @objc private func onSceneWillEnterForeground(_ notification: Notification) {
+        CuriumDownloadsFolderManager.shared.resolveInBackgroundIfNeeded()
         store.handleSceneWillEnterForeground()
     }
 }

@@ -397,6 +397,40 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
     var farbling: CuriumFarblingSettings? = nil
     var fontProfile: CuriumFontProfile? = nil
     var hideSpeechVoices: Bool? = nil
+    // Store v2 UI persona & lifecycle metadata (NEVER serialized into EngineWirePayload).
+    var symbolName: String? = nil
+    var palette: CuriumPalette? = nil
+    var siteMode: CuriumSiteMode? = nil
+    var searchEngine: CuriumSearchEngine? = nil
+    var templateID: String? = nil
+    var createdAt: Date? = nil
+    var lastUsedAt: Date? = nil
+
+    var isPrimaryDefault: Bool {
+        id == "default"
+    }
+
+    var resolvedSymbolName: String {
+        if let symbolName {
+            let trimmed = symbolName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return CuriumProfileTemplate.template(for: templateID ?? id)?.defaultSymbolName ?? "person.crop.circle"
+    }
+
+    var resolvedPalette: CuriumPalette {
+        palette ?? CuriumProfileTemplate.template(for: templateID ?? id)?.defaultPalette ?? .violet
+    }
+
+    var resolvedSiteMode: CuriumSiteMode {
+        siteMode ?? .adaptive
+    }
+
+    var resolvedSearchEngine: CuriumSearchEngine {
+        searchEngine ?? .google
+    }
 
     var usesNativeHardwareAndGPU: Bool {
         hardware.isNative && !mobile.hasWebGLOverride && !desktop.hasWebGLOverride
@@ -414,6 +448,62 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
             return farbling.enabledCount > 0
         }
         return fingerprintSeed != nil
+    }
+
+    /// True iff this is the `"default"` profile AND every engine-affecting field matches
+    /// Build 39's authentic Chrome baseline with no farbling, font, or speech overrides.
+    var matchesBuild39EngineDefaults: Bool {
+        guard id == "default" else { return false }
+        let baseline = CuriumFingerprintPresets.defaultAuthenticChrome
+        return defaultSlot == baseline.defaultSlot
+            && mobile == baseline.mobile
+            && desktop == baseline.desktop
+            && languages == baseline.languages
+            && proxy == baseline.proxy
+            && webrtcIpHandlingPolicy == baseline.webrtcIpHandlingPolicy
+            && enableDoNotTrack == baseline.enableDoNotTrack
+            && enableGlobalPrivacyControl == baseline.enableGlobalPrivacyControl
+            && hardware == baseline.hardware
+            && fingerprintSeed == nil
+            && !hasFarblingEnabled
+            && (fontProfile == nil || fontProfile == .native)
+            && (hideSpeechVoices == nil || hideSpeechVoices == false)
+    }
+
+    var shortArchetypeSummary: String {
+        if matchesBuild39EngineDefaults {
+            return "Authentic Chrome · Native HW"
+        }
+        let primarySlot = defaultSlot == .desktop ? desktop : mobile
+        let platformLabel: String
+        if let model = primarySlot.model, !model.isEmpty, let platform = primarySlot.platform, !platform.isEmpty {
+            platformLabel = "\(model) (\(platform))"
+        } else if let platform = primarySlot.platform, !platform.isEmpty {
+            if defaultSlot == .desktop {
+                platformLabel = "\(platform) Desktop"
+            } else if let desktopPlatform = desktop.platform, !desktopPlatform.isEmpty, desktopPlatform != platform {
+                platformLabel = "\(platform) + \(desktopPlatform)"
+            } else {
+                platformLabel = platform
+            }
+        } else {
+            platformLabel = defaultSlot == .desktop ? "Desktop" : "Authentic Chrome"
+        }
+
+        var parts = [platformLabel]
+        if isFarblingActive {
+            parts.append("Farbled")
+        }
+        parts.append(usesNativeHardwareAndGPU ? "Native HW" : "Custom HW")
+        switch proxy {
+        case .system:
+            break
+        case .direct:
+            parts.append("Direct")
+        case .fixed:
+            parts.append("Proxy")
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// Normalizes user-entered or imported string fields (trimming whitespace on IDs,
@@ -449,6 +539,14 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
         if let seed = fingerprintSeed {
             let trimmedSeed = seed.trimmingCharacters(in: .whitespacesAndNewlines)
             copy.fingerprintSeed = trimmedSeed.isEmpty ? nil : trimmedSeed
+        }
+        if let symbolName {
+            let trimmedSymbol = symbolName.trimmingCharacters(in: .whitespacesAndNewlines)
+            copy.symbolName = trimmedSymbol.isEmpty ? nil : trimmedSymbol
+        }
+        if let templateID {
+            let trimmedTemplate = templateID.trimmingCharacters(in: .whitespacesAndNewlines)
+            copy.templateID = trimmedTemplate.isEmpty ? nil : trimmedTemplate
         }
         return copy
     }

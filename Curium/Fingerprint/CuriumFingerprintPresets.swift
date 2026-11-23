@@ -331,3 +331,118 @@ enum CuriumFingerprintPresets {
         farbling: .allEnabled
     )
 }
+
+/// Curated creation template wrapping one of the 7 built-in fingerprint archetypes.
+/// Templates are never persisted as live profiles until instantiated by the user.
+struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let badge: String
+    let defaultSymbolName: String
+    let defaultPalette: CuriumPalette
+    let baseProfile: CuriumFingerprintProfile
+
+    static let allTemplates: [CuriumProfileTemplate] = [
+        CuriumProfileTemplate(
+            id: CuriumFingerprintPresets.defaultAuthenticChrome.id,
+            title: "Authentic Chrome",
+            subtitle: "Android 15 Mobile + macOS Desktop with native Apple hardware.",
+            badge: "Standard",
+            defaultSymbolName: "person.crop.circle",
+            defaultPalette: .violet,
+            baseProfile: CuriumFingerprintPresets.defaultAuthenticChrome
+        ),
+        CuriumProfileTemplate(
+            id: CuriumFingerprintPresets.privacyHardened.id,
+            title: "Privacy Hardened",
+            subtitle: "Per-site Canvas/Audio/WebGL farbling, GPC, and non-proxied WebRTC UDP off.",
+            badge: "Private",
+            defaultSymbolName: "shield.lefthalf.filled",
+            defaultPalette: .thorium,
+            baseProfile: CuriumFingerprintPresets.privacyHardened
+        ),
+        CuriumProfileTemplate(
+            id: CuriumFingerprintPresets.macosDesktopFirst.id,
+            title: "macOS Desktop",
+            subtitle: "macOS arm64 Chrome across all tabs and workers with native Apple Silicon.",
+            badge: "Desktop",
+            defaultSymbolName: "laptopcomputer",
+            defaultPalette: .neptunium,
+            baseProfile: CuriumFingerprintPresets.macosDesktopFirst
+        ),
+        CuriumProfileTemplate(
+            id: CuriumFingerprintPresets.iosBlinkAuthentic.id,
+            title: "iOS Mobile + macOS",
+            subtitle: "iOS 18.7 mobile UA with macOS desktop slot and native Apple hardware.",
+            badge: "Mobile",
+            defaultSymbolName: "iphone",
+            defaultPalette: .californium,
+            baseProfile: CuriumFingerprintPresets.iosBlinkAuthentic
+        ),
+        CuriumProfileTemplate(
+            id: CuriumFingerprintPresets.windowsWorkstation.id,
+            title: "Windows 11 Workstation",
+            subtitle: "Windows x64 desktop with 1080p screen, font filtering, and Intel ANGLE GPU.",
+            badge: "Work",
+            defaultSymbolName: "desktopcomputer",
+            defaultPalette: .americium,
+            baseProfile: CuriumFingerprintPresets.windowsWorkstation
+        ),
+        CuriumProfileTemplate(
+            id: CuriumFingerprintPresets.linuxDesktop.id,
+            title: "Linux Desktop",
+            subtitle: "Linux x86_64 workstation with Linux font filtering and Mesa Intel WebGL.",
+            badge: "Dev",
+            defaultSymbolName: "terminal",
+            defaultPalette: .thorium,
+            baseProfile: CuriumFingerprintPresets.linuxDesktop
+        ),
+        CuriumProfileTemplate(
+            id: CuriumFingerprintPresets.pixelAndroid.id,
+            title: "Pixel 9 Android",
+            subtitle: "Pixel 9 Android 15 Reduced UA with Android font filtering and native hardware.",
+            badge: "Android",
+            defaultSymbolName: "globe",
+            defaultPalette: .berkelium,
+            baseProfile: CuriumFingerprintPresets.pixelAndroid
+        ),
+    ]
+
+    static func template(for id: String?) -> CuriumProfileTemplate? {
+        guard let lowered = id?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !lowered.isEmpty else {
+            return nil
+        }
+        return allTemplates.first { $0.id.lowercased() == lowered }
+    }
+
+    func instantiate(
+        id: String,
+        displayName: String,
+        symbolName: String? = nil,
+        palette: CuriumPalette? = nil,
+        siteMode: CuriumSiteMode? = nil,
+        searchEngine: CuriumSearchEngine? = nil,
+        now: Date = .now
+    ) -> CuriumFingerprintProfile {
+        var profile = baseProfile
+        profile.id = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        profile.displayName = trimmedName.isEmpty ? title : trimmedName
+        profile.isBuiltIn = false
+        profile.revision = 1
+        profile.templateID = self.id
+        let trimmedSymbol = symbolName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        profile.symbolName = (trimmedSymbol?.isEmpty == false) ? trimmedSymbol : defaultSymbolName
+        profile.palette = palette ?? defaultPalette
+        profile.siteMode = siteMode ?? .adaptive
+        profile.searchEngine = searchEngine ?? .google
+        profile.createdAt = now
+        profile.lastUsedAt = nil
+        if baseProfile.hasFarblingEnabled {
+            profile.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
+        }
+        return profile.normalizedForPersistence()
+    }
+}

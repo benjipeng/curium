@@ -4,6 +4,9 @@ struct CuriumTabsSheet: View {
     let store: CuriumBrowserStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.layoutDirection) private var layoutDirection
+    @State private var showingProfiles = false
+
+    private var fingerprintStore: CuriumFingerprintStore { CuriumFingerprintStore.shared }
 
     private struct RowGeometry {
         let count: Int
@@ -19,56 +22,82 @@ struct CuriumTabsSheet: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            CuriumSheetHeader(title: "Tabs")
-            GeometryReader { proxy in
-                let width = proxy.size.width
-                let count = width < 680 ? 2 : 4
-                let division = activeDivision(in: proxy)
-                let vertical = division.flatMap { $0.height > $0.width ? $0 : nil }
-                let horizontal = division.flatMap { $0.width > $0.height ? $0 : nil }
-                let above = horizontal.map { max(0, min(proxy.size.height, $0.minY - 8)) }
-                let below = horizontal.map { max(0, proxy.size.height - $0.maxY - 8) }
-                let contentHeight = max(above ?? proxy.size.height, below ?? 0)
-                let top = (below ?? 0) > (above ?? proxy.size.height) ? proxy.size.height - contentHeight : 0
-                let rowGeo = computeRowGeometry(width: width, count: count, fold: vertical)
-                let rows = makeRows(from: store.tabs, columns: count)
+        let activeProfile = fingerprintStore.activeProfile
 
-                ScrollView {
-                    LazyVStack(spacing: 14) {
-                        ForEach(rows) { row in
-                            tabRow(row.tabs, geo: rowGeo)
+        NavigationStack {
+            VStack(spacing: 0) {
+                GeometryReader { proxy in
+                    let width = proxy.size.width
+                    let count = width < 680 ? 2 : 4
+                    let division = activeDivision(in: proxy)
+                    let vertical = division.flatMap { $0.height > $0.width ? $0 : nil }
+                    let horizontal = division.flatMap { $0.width > $0.height ? $0 : nil }
+                    let above = horizontal.map { max(0, min(proxy.size.height, $0.minY - 8)) }
+                    let below = horizontal.map { max(0, proxy.size.height - $0.maxY - 8) }
+                    let contentHeight = max(above ?? proxy.size.height, below ?? 0)
+                    let top = (below ?? 0) > (above ?? proxy.size.height) ? proxy.size.height - contentHeight : 0
+                    let rowGeo = computeRowGeometry(width: width, count: count, fold: vertical)
+                    let rows = makeRows(from: store.tabs, columns: count)
+
+                    ScrollView {
+                        LazyVStack(spacing: 14) {
+                            ForEach(rows) { row in
+                                tabRow(row.tabs, geo: rowGeo)
+                            }
                         }
+                        .padding(.vertical, 8)
                     }
-                    .padding(.vertical, 8)
+                    .frame(height: contentHeight)
+                    .offset(y: top)
+                    .scrollBounceBehavior(.basedOnSize)
                 }
-                .frame(height: contentHeight)
-                .offset(y: top)
-                .scrollBounceBehavior(.basedOnSize)
-            }
-            HStack {
-                Text("\(store.tabs.count) \(store.tabs.count == 1 ? "tab" : "tabs")")
-                    .font(.footnote.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    if store.newTab() { dismiss() }
-                } label: {
-                    Label("New Tab", systemImage: "plus")
-                        .font(.callout.weight(.semibold))
-                        .padding(.horizontal, 18)
-                        .frame(minHeight: CuriumSpace.tapTarget)
-                        .contentShape(Capsule())
+                HStack {
+                    Text("\(store.tabs.count) \(store.tabs.count == 1 ? "tab" : "tabs")")
+                        .font(.footnote.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        if store.newTab() { dismiss() }
+                    } label: {
+                        Label("New Tab", systemImage: "plus")
+                            .font(.callout.weight(.semibold))
+                            .padding(.horizontal, 18)
+                            .frame(minHeight: CuriumSpace.tapTarget)
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: Capsule())
                 }
-                .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: Capsule())
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 12)
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("Tabs")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        showingProfiles = true
+                    } label: {
+                        Label(activeProfile.displayName, systemImage: activeProfile.resolvedSymbolName)
+                    }
+                    .tint(activeProfile.resolvedPalette.tint)
+                    .accessibilityLabel("Profile: \(activeProfile.displayName)")
+                    .accessibilityHint("Opens Profile Switcher")
+                    .accessibilityIdentifier("curium.tabs.profileSwitcher")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button { dismiss() } label: {
+                        Label("Done", systemImage: "checkmark")
+                    }
+                }
+            }
         }
-        .background(Color(uiColor: .systemGroupedBackground))
         .presentationDetents([.large])
         .curiumSheetErrorAlert(store: store)
+        .sheet(isPresented: $showingProfiles) {
+            CuriumProfileSwitcherSheet(browserStore: store)
+        }
     }
 
     private func activeDivision(in proxy: GeometryProxy) -> CGRect? {

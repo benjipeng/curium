@@ -4,9 +4,12 @@ import SwiftUI
 struct CuriumStartPage: View {
     let store: CuriumBrowserStore
     let topInset: CGFloat
+    var onOpenProfiles: (() -> Void)? = nil
 
     @Environment(\.curiumPalette) private var palette
     @Environment(\.layoutDirection) private var layoutDirection
+
+    private var fingerprintStore: CuriumFingerprintStore { CuriumFingerprintStore.shared }
 
     private let columnSpacing: CGFloat = 16
     private let edgeMargin: CGFloat = 24
@@ -40,8 +43,64 @@ struct CuriumStartPage: View {
         .padding(.top, topInset)
     }
 
+    private var profilePersonaChip: some View {
+        let activeProfile = fingerprintStore.activeProfile
+        let hasPendingSwitch = fingerprintStore.hasPendingProfileSwitch
+        let nextProfile = hasPendingSwitch ? fingerprintStore.nextLaunchProfile : nil
+
+        return Button {
+            onOpenProfiles?()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: activeProfile.resolvedSymbolName)
+                    .font(.footnote.weight(.semibold))
+                    .accessibilityHidden(true)
+
+                Text(activeProfile.displayName)
+                    .font(.footnote.weight(.semibold))
+                    .lineLimit(1)
+
+                if let nextProfile {
+                    Circle()
+                        .fill(nextProfile.resolvedPalette.tint)
+                        .frame(width: 6, height: 6)
+                        .accessibilityHidden(true)
+                    Text("→ \(nextProfile.displayName)")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                if onOpenProfiles != nil {
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .opacity(0.75)
+                        .accessibilityHidden(true)
+                }
+            }
+            .foregroundStyle(palette.tint)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .background(palette.tile, in: Capsule())
+            .frame(minHeight: CuriumSpace.tapTarget)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(onOpenProfiles == nil)
+        .accessibilityLabel(
+            nextProfile.map {
+                "Profile \(activeProfile.displayName), next launch \($0.displayName)"
+            } ?? "Profile \(activeProfile.displayName)"
+        )
+        .accessibilityHint(onOpenProfiles == nil ? "" : "Opens Profile Switcher")
+        .accessibilityIdentifier("curium.start.profileChip")
+    }
+
     private var emptyPage: some View {
         VStack(spacing: 16) {
+            profilePersonaChip
+                .padding(.bottom, 4)
+
             VStack(alignment: .leading, spacing: 7) {
                 Text("96")
                     .font(.system(.caption, design: .monospaced).weight(.semibold))
@@ -86,14 +145,39 @@ struct CuriumStartPage: View {
             return GridItem(.fixed(width), spacing: spacing, alignment: .top)
         }
 
-        return LazyVGrid(columns: columns, spacing: 22) {
-            ForEach(favorites) { favorite in
-                shortcut(favorite)
+        return VStack(spacing: 16) {
+            if let innerFold {
+                let leftSpan = max(0, innerFold.minX - viewport.minX - foldMargin)
+                let rightSpan = max(0, viewport.maxX - innerFold.maxX - foldMargin)
+                let usePhysicalLeft = leftSpan > rightSpan
+                    || (leftSpan == rightSpan && layoutDirection == .leftToRight)
+                let physicalLeftPad: CGFloat = usePhysicalLeft
+                    ? edgeMargin
+                    : (innerFold.maxX - viewport.minX + foldMargin)
+                let physicalRightPad: CGFloat = usePhysicalLeft
+                    ? (viewport.maxX - innerFold.minX + foldMargin)
+                    : edgeMargin
+
+                profilePersonaChip
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, layoutDirection == .leftToRight ? physicalLeftPad : physicalRightPad)
+                    .padding(.trailing, layoutDirection == .leftToRight ? physicalRightPad : physicalLeftPad)
+            } else {
+                profilePersonaChip
+                    .padding(.horizontal, edgeMargin)
+                    .frame(maxWidth: .infinity, alignment: .center)
             }
+
+            LazyVGrid(columns: columns, spacing: 22) {
+                ForEach(favorites) { favorite in
+                    shortcut(favorite)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .offset(x: innerFold.map { $0.midX - viewport.midX } ?? 0)
         }
-        .padding(.vertical, edgeMargin)
-        .frame(maxWidth: .infinity)
-        .offset(x: innerFold.map { $0.midX - viewport.midX } ?? 0)
+        .padding(.top, 16)
+        .padding(.bottom, edgeMargin)
     }
 
     private func shortcut(_ favorite: CuriumBookmark) -> some View {

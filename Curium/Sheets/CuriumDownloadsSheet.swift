@@ -8,6 +8,9 @@ struct CuriumDownloadsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @State private var quickLookURL: URL?
+    @State private var saveFolderFlow = CuriumSaveFolderFlowState()
+
+    private var folderManager: CuriumDownloadsFolderManager { CuriumDownloadsFolderManager.shared }
 
     private struct QuickLookItem: Identifiable {
         let url: URL
@@ -27,46 +30,79 @@ struct CuriumDownloadsSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if store.downloads.isEmpty && store.savedDownloads.isEmpty {
-                    ContentUnavailableView {
-                        Label("No Downloads", systemImage: "arrow.down.to.line")
-                    } description: {
-                        Text(
-                            store.isEngineReady
-                                ? "Saved files and active downloads appear here. PDFs open directly in your tab and only save here when you choose Save."
-                                : "Downloads will be available when Blink is ready."
-                        )
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color(uiColor: .systemGroupedBackground))
-                } else {
-                    List {
-                        if hasSessionTasks {
-                            Section {
-                                ForEach(store.downloads) { item in
-                                    activeDownloadRow(item)
-                                }
-                            } header: {
-                                Text("This Session")
-                            }
-                        }
+        let folderStatus = folderManager.status
+        let _ = folderManager.revision
+        let displayPath = CuriumDownloadsFolderManager.displayDownloadsPath
 
-                        if !store.savedDownloads.isEmpty {
-                            Section {
-                                ForEach(store.savedDownloads) { file in
-                                    savedDownloadRow(file)
-                                }
-                            } header: {
-                                Text("Saved Files")
-                            } footer: {
-                                Text("Saved files are stored in Curium’s Downloads folder and remain accessible in Files.")
+        NavigationStack {
+            List {
+                Section {
+                    CuriumSaveLocationRow(
+                        flow: $saveFolderFlow,
+                        accessibilityID: "curium.downloads.saveLocation"
+                    ) {
+                        store.refreshSavedDownloads()
+                    }
+
+                    if case .needsHostGrant(let folderName, _, _) = folderStatus {
+                        Button {
+                            saveFolderFlow.isShowingPicker = true
+                        } label: {
+                            Label(
+                                "Link “\(folderName)” on \(CuriumDownloadsFolderManager.currentHostDisplayName())",
+                                systemImage: "folder.badge.person.crop"
+                            )
+                            .font(.subheadline.weight(.medium))
+                        }
+                        .tint(.orange)
+                        .accessibilityIdentifier("curium.downloads.linkFolder")
+                    }
+                } footer: {
+                    saveLocationFooter(for: folderStatus, displayPath: displayPath)
+                }
+
+                if store.downloads.isEmpty && store.savedDownloads.isEmpty {
+                    Section {
+                        ContentUnavailableView {
+                            Label("No Downloads", systemImage: "arrow.down.to.line")
+                        } description: {
+                            Text(
+                                store.isEngineReady
+                                    ? "Saved files and active downloads appear here. PDFs open directly in your tab and only save here when you choose Save."
+                                    : "Downloads will be available when Blink is ready."
+                            )
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 24)
+                        .listRowBackground(Color.clear)
+                    }
+                } else {
+                    if hasSessionTasks {
+                        Section {
+                            ForEach(store.downloads) { item in
+                                activeDownloadRow(item)
                             }
+                        } header: {
+                            Text("This Session")
                         }
                     }
-                    .listStyle(.insetGrouped)
+
+                    if !store.savedDownloads.isEmpty {
+                        Section {
+                            ForEach(store.savedDownloads) { file in
+                                savedDownloadRow(file)
+                            }
+                        } header: {
+                            Text("Saved Files")
+                        } footer: {
+                            Text("Saved to \(displayPath).")
+                        }
+                    }
                 }
+            }
+            .listStyle(.insetGrouped)
+            .curiumSaveFolderPickerFlow($saveFolderFlow) {
+                store.refreshSavedDownloads()
             }
             .navigationTitle("Downloads")
             .navigationBarTitleDisplayMode(.inline)
@@ -88,12 +124,17 @@ struct CuriumDownloadsSheet: View {
             }
         }
         .onAppear {
+            folderManager.resolveInBackgroundIfNeeded()
             store.refreshSavedDownloads()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
+                folderManager.resolveInBackgroundIfNeeded()
                 store.refreshSavedDownloads()
             }
+        }
+        .onChange(of: folderManager.revision) { _, _ in
+            store.refreshSavedDownloads()
         }
         .task(id: scenePhase == .active && hasActiveDownloads) {
             guard scenePhase == .active, hasActiveDownloads else { return }
@@ -121,6 +162,21 @@ struct CuriumDownloadsSheet: View {
                         }
                     }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func saveLocationFooter(
+        for status: CuriumDownloadsFolderManager.Status,
+        displayPath: String
+    ) -> some View {
+        switch status {
+        case .needsHostGrant(let folderName, _, _):
+            Text("Another LiveContainer instance saves downloads to “\(folderName)”. Grant folder access once to share the same Files library here.")
+        case .customActive:
+            Text("Saved to \(displayPath). Shared across all profiles and accessible in Files.")
+        case .defaultInternal:
+            Text("Saved to \(displayPath). Choose a folder in Files or iCloud Drive to browse downloads directly in Files. Shared across all profiles.")
         }
     }
 
