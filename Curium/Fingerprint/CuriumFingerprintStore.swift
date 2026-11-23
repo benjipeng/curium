@@ -160,11 +160,6 @@ final class CuriumFingerprintStore {
             }
             return false
         }
-        let nextLaunchWillRunBuild39 = selectedProfileID == nil
-            || (candidate.isPrimaryDefault && candidate.matchesBuild39EngineDefaults)
-        if nextLaunchWillRunBuild39 {
-            return true
-        }
         return !snapshot.matchesEngineFields(of: candidate)
     }
 
@@ -349,13 +344,14 @@ final class CuriumFingerprintStore {
         defaults: UserDefaults = .standard,
         now: Date = .now
     ) -> CuriumFingerprintProfile {
-        var profile = CuriumFingerprintPresets.build39NativeBaseline
+        var profile = CuriumFingerprintPresets.macosDesktopFirst
+        profile.id = "default"
         profile.displayName = "Personal"
-        profile.notes = "Primary profile using Chromium's default storage and Build 39 native baseline."
+        profile.notes = ""
         profile.isBuiltIn = false
         profile.revision = 1
         profile.symbolName = "person.crop.circle"
-        profile.templateID = "default"
+        profile.templateID = CuriumFingerprintPresets.macosDesktopFirst.id
         profile.createdAt = now
         if preserveLegacyDefaults {
             let rawPalette = defaults.string(forKey: "curium.palette")
@@ -364,7 +360,6 @@ final class CuriumFingerprintStore {
             profile.palette = rawPalette.flatMap(CuriumPalette.init(rawValue:)) ?? .violet
             profile.siteMode = rawSiteMode.flatMap(CuriumSiteMode.init(rawValue:)) ?? .adaptive
             profile.searchEngine = rawSearchEngine.flatMap(CuriumSearchEngine.init(rawValue:)) ?? .google
-            applyLegacyIdentityDefaults(from: defaults, to: &profile)
         } else {
             profile.palette = .violet
             profile.siteMode = .adaptive
@@ -373,146 +368,71 @@ final class CuriumFingerprintStore {
         return profile
     }
 
-    /// Folds legacy Build 39 (`patches/0105`) `UserDefaults` overrides (`curium.uaBrand`,
-    /// `curium.mobileUA`, `curium.acceptLang`, `curium.mobileModel`) into the `"default"`
-    /// (`Personal`) profile so Settings and Profile Editor stay synchronized and editing
-    /// an unrelated toggle never clobbers legacy choices.
-    nonisolated static func applyLegacyIdentityDefaults(
-        from defaults: UserDefaults,
-        to profile: inout CuriumFingerprintProfile
-    ) {
-        if let rawBrand = defaults.string(forKey: "curium.uaBrand")?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !rawBrand.isEmpty
-        {
-            let lowered = rawBrand.lowercased()
-            if lowered == "chromium" || lowered == "none" {
-                profile.mobile.primaryBrand = ""
-                profile.desktop.primaryBrand = ""
-            } else if lowered == "chrome" || lowered == "google chrome" {
-                profile.mobile.primaryBrand = "Google Chrome"
-                profile.desktop.primaryBrand = "Google Chrome"
-            } else if CuriumFingerprintValidator.isValidClientHintToken(rawBrand) {
-                profile.mobile.primaryBrand = rawBrand
-                profile.desktop.primaryBrand = rawBrand
-            }
-        }
-
-        let rawMobileUA = defaults.string(forKey: "curium.mobileUA")?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        if rawMobileUA == "ios" {
-            let preservedBrand = profile.mobile.primaryBrand
-            profile.mobile = CuriumFingerprintProfile.build39IOSMobileSlot
-            profile.mobile.primaryBrand = preservedBrand
-        } else if let rawModel = defaults.string(forKey: "curium.mobileModel")?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !rawModel.isEmpty,
-                  CuriumFingerprintValidator.isValidClientHintToken(rawModel)
-        {
-            profile.mobile.model = rawModel
-        }
-
-        if let rawAcceptLang = defaults.string(forKey: "curium.acceptLang")?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !rawAcceptLang.isEmpty
-        {
-            var parsedTags: [String] = []
-            var seenLowered: Set<String> = []
-            for rawPart in rawAcceptLang.split(separator: ",") {
-                let segments = rawPart.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
-                let cleaned: String
-                if segments.count == 2 {
-                    let param = segments[1].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                    // Only strip valid HTTP Accept-Language quality weights (`;q=...`); keep
-                    // malformed `;...` garbage intact so it is rejected below.
-                    if param.hasPrefix("q=") {
-                        cleaned = String(segments[0]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    } else {
-                        cleaned = String(rawPart).trimmingCharacters(in: .whitespacesAndNewlines)
-                    }
-                } else {
-                    cleaned = String(rawPart).trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-                guard !cleaned.isEmpty, !cleaned.contains(",") else { continue }
-                let canonical = CuriumNormalizedAcceptLanguages([cleaned])
-                guard canonical != "en-US,en" else { continue }
-                if seenLowered.insert(canonical.lowercased()).inserted {
-                    parsedTags.append(canonical)
-                    if parsedTags.count == 8 { break }
-                }
-            }
-            if !parsedTags.isEmpty {
-                profile.languages = parsedTags
-            }
-        }
-    }
-
-    /// Synchronizes Settings' Browser Brand (`"chrome"` / `"chromium"`) and Mobile Profile
-    /// (`"android"` / `"ios"`) pickers directly into `"default"` (`Personal`) and mirrors
-    /// them to `UserDefaults` so Settings and Profile Studio never desynchronize.
+    /// Upgrades untouched legacy Build 39 (`defaultSlot == .mobile`, Android/iOS mobile slot)
+    /// and untouched earlier pure-macOS (`screen == nil`, `webglRenderer == nil`, native hardware)
+    /// `"default"` (`Personal`) profiles in place to coherent Apple Silicon M3 macOS Chrome 158
+    /// while preserving all user persona metadata, proxy, locale, timezone, and farbling settings.
     @discardableResult
-    func applyLegacyIdentityPreferencesToPersonal(
-        uaBrand: String? = nil,
-        mobileUA: String? = nil,
-        defaults: UserDefaults = .standard
+    private nonisolated static func upgradeLegacyDefaultIdentityIfNeeded(
+        _ profile: inout CuriumFingerprintProfile
     ) -> Bool {
-        guard loadError == nil else {
-            lastPersistError = "Cannot update profile while \(Self.fileName) is unreadable."
-            return false
-        }
-        guard let idx = profiles.firstIndex(where: \.isPrimaryDefault) else {
-            return false
-        }
-        let previousProfiles = profiles
-        let previousSelection = selectedProfileID
-        var updated = profiles[idx]
-
-        if let uaBrand {
-            let normalized = uaBrand.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let brandValue = (normalized == "chromium" || normalized == "none") ? "" : "Google Chrome"
-            updated.mobile.primaryBrand = brandValue
-            updated.desktop.primaryBrand = brandValue
-        }
-
-        if let mobileUA {
-            let normalized = mobileUA.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let preservedBrand = updated.mobile.primaryBrand
-            if normalized == "ios" {
-                updated.mobile = CuriumFingerprintProfile.build39IOSMobileSlot
-                updated.mobile.primaryBrand = preservedBrand
-            } else {
-                let preservedModel = updated.mobile.platform == "Android" ? updated.mobile.model : ""
-                updated.mobile = CuriumFingerprintPresets.build39NativeBaseline.mobile
-                updated.mobile.primaryBrand = preservedBrand
-                if let preservedModel, !preservedModel.isEmpty {
-                    updated.mobile.model = preservedModel
-                }
+        let target = CuriumFingerprintPresets.macosDesktopFirst
+        if profile.hasUntouchedLegacyBuild39Identity {
+            let preservedTimezone = profile.hardware.timezone
+            profile.defaultSlot = target.defaultSlot
+            profile.mobile = target.mobile
+            profile.desktop = target.desktop
+            if (profile.hardware.hardwareConcurrency == nil && profile.hardware.deviceMemoryGB == nil)
+                || (profile.hardware.hardwareConcurrency == 8 && profile.hardware.deviceMemoryGB == 8)
+            {
+                profile.hardware = target.hardware
+                profile.hardware.timezone = preservedTimezone
             }
+            profile.fontProfile = target.fontProfile
+            profile.hideSpeechVoices = target.hideSpeechVoices
+            profile.templateID = target.id
+            if profile.notes == "Primary profile using Chromium's default storage and Build 39 native baseline."
+                || profile.notes == CuriumFingerprintPresets.build39NativeBaseline.notes
+                || profile.notes == CuriumFingerprintPresets.defaultAuthenticChrome.notes
+            {
+                profile.notes = ""
+            }
+            return true
         }
 
-        if updated != profiles[idx] {
-            let bumped = profiles[idx].revision < CuriumFingerprintValidator.maxSafeJSONRevision
-                ? profiles[idx].revision + 1
-                : CuriumFingerprintValidator.maxSafeJSONRevision
-            updated.revision = bumped
-            profiles[idx] = updated
+        if profile.isPrimaryDefault,
+           profile.defaultSlot == .desktop,
+           profile.desktop.platform == "macOS",
+           profile.desktop.screen == nil,
+           profile.desktop.webglVendor == nil,
+           profile.desktop.webglRenderer == nil,
+           profile.hardware.hardwareConcurrency == nil,
+           profile.hardware.deviceMemoryGB == nil
+        {
+            profile.desktop.webglVendor = target.desktop.webglVendor
+            profile.desktop.webglRenderer = target.desktop.webglRenderer
+            profile.desktop.webglProfile = profile.desktop.webglProfile ?? target.desktop.webglProfile
+            profile.desktop.screen = target.desktop.screen
+            if profile.mobile.platform == "macOS",
+               profile.mobile.mobile != true,
+               profile.mobile.screen == nil,
+               profile.mobile.webglVendor == nil,
+               profile.mobile.webglRenderer == nil
+            {
+                profile.mobile.webglVendor = target.mobile.webglVendor
+                profile.mobile.webglRenderer = target.mobile.webglRenderer
+                profile.mobile.webglProfile = profile.mobile.webglProfile ?? target.mobile.webglProfile
+                profile.mobile.screen = target.mobile.screen
+            }
+            profile.hardware.hardwareConcurrency = target.hardware.hardwareConcurrency
+            profile.hardware.deviceMemoryGB = target.hardware.deviceMemoryGB
+            profile.fontProfile = profile.fontProfile ?? target.fontProfile
+            profile.hideSpeechVoices = profile.hideSpeechVoices ?? target.hideSpeechVoices
+            profile.templateID = profile.templateID ?? target.id
+            return true
         }
 
-        if !updated.matchesBuild39EngineDefaults && selectedProfileID == nil {
-            selectedProfileID = "default"
-        }
-
-        if !persist() {
-            profiles = previousProfiles
-            selectedProfileID = previousSelection
-            return false
-        }
-
-        if let uaBrand {
-            defaults.set(uaBrand, forKey: "curium.uaBrand")
-        }
-        if let mobileUA {
-            defaults.set(mobileUA, forKey: "curium.mobileUA")
-        }
-        return true
+        return false
     }
 
     /// Moves an unreadable/corrupt `fingerprint-profiles.json` aside to
@@ -825,11 +745,6 @@ final class CuriumFingerprintStore {
                 max(normalized.revision, bumped)
             )
             profiles[idx] = updated
-            // If the user customized Personal's engine fields while on unconfigured `nil`,
-            // opt into `"default"` so the engine applies the customized settings on next launch.
-            if updated.isPrimaryDefault && !updated.matchesBuild39EngineDefaults && selectedProfileID == nil {
-                selectedProfileID = "default"
-            }
         } else {
             updated.revision = min(
                 CuriumFingerprintValidator.maxSafeJSONRevision,
@@ -1398,8 +1313,9 @@ final class CuriumFingerprintStore {
             if defaultProfile.palette == nil { defaultProfile.palette = legacyPalette }
             if defaultProfile.siteMode == nil { defaultProfile.siteMode = legacySiteMode }
             if defaultProfile.searchEngine == nil { defaultProfile.searchEngine = legacySearchEngine }
-            if defaultProfile.templateID == nil { defaultProfile.templateID = "default" }
+            if defaultProfile.templateID == nil { defaultProfile.templateID = CuriumFingerprintPresets.macosDesktopFirst.id }
             if defaultProfile.createdAt == nil { defaultProfile.createdAt = now }
+            _ = upgradeLegacyDefaultIdentityIfNeeded(&defaultProfile)
         } else {
             defaultProfile = makeDefaultPersonalProfile(preserveLegacyDefaults: true, now: now)
         }
@@ -1498,15 +1414,8 @@ final class CuriumFingerprintStore {
                 defaultProfile.isBuiltIn = false
                 needsPersist = true
             }
-            if preserveLegacyDefaults,
-               decoded.selectedProfileID == nil,
-               defaultProfile.matchesBuild39EngineDefaults
-            {
-                let before = defaultProfile
-                applyLegacyIdentityDefaults(from: .standard, to: &defaultProfile)
-                if defaultProfile != before {
-                    needsPersist = true
-                }
+            if upgradeLegacyDefaultIdentityIfNeeded(&defaultProfile) {
+                needsPersist = true
             }
             if ensureValidFarblingSeed(&defaultProfile) {
                 migratedSeeds.insert("default")
@@ -1782,17 +1691,33 @@ enum CuriumFingerprintBootstrap {
             return .defaultBuild39
         }
 
-        guard let selectedID = store.selectedProfileID else {
-            let launchedDefault = CuriumFingerprintStore.makeDefaultPersonalProfile(
-                preserveLegacyDefaults: store.isProductionDefaultFile
-            )
-            return launchDefaultBuild39(launchedDefault)
+        let requestedID = store.selectedProfileID
+        let profile: CuriumFingerprintProfile
+        if let selectedID = requestedID {
+            guard let stored = store.profile(id: selectedID) else {
+                let outcome = LaunchOutcome.rejected(
+                    profileID: selectedID,
+                    reason: "Selected profile \"\(selectedID)\" was not found in the profile store."
+                )
+                recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
+                return outcome
+            }
+            profile = stored
+        } else {
+            profile = store.profile(id: "default")
+                ?? CuriumFingerprintStore.makeDefaultPersonalProfile(
+                    preserveLegacyDefaults: store.isProductionDefaultFile
+                )
         }
 
-        guard let profile = store.profile(id: selectedID) else {
+        let caps = (capabilitiesProvider ?? engineCapabilities)()
+        guard caps.supportsLaunchFingerprintConfig else {
+            if profile.isPrimaryDefault && requestedID == nil {
+                return launchDefaultBuild39(profile)
+            }
             let outcome = LaunchOutcome.rejected(
-                profileID: selectedID,
-                reason: "Selected profile \"\(selectedID)\" was not found in the profile store."
+                profileID: profile.id,
+                reason: "The embedded Blink engine does not support launch fingerprint profiles (requires Build 40+)."
             )
             recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
             return outcome
@@ -1802,6 +1727,7 @@ enum CuriumFingerprintBootstrap {
             return launchDefaultBuild39(profile)
         }
 
+        let selectedID = profile.id
         guard store.ensureMaterializedSeedPersisted(for: profile.id) else {
             let reason = store.lastPersistError
                 ?? "Failed to persist materialized farbling seed for profile \"\(profile.id)\"."
@@ -1809,30 +1735,13 @@ enum CuriumFingerprintBootstrap {
             recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
             return outcome
         }
-        guard let materialized = store.profile(id: profile.id) else {
-            let outcome = LaunchOutcome.rejected(
-                profileID: selectedID,
-                reason: "Selected profile \"\(selectedID)\" was not found in the profile store."
-            )
-            recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
-            return outcome
-        }
+        let materialized = store.profile(id: profile.id) ?? profile
 
         let validation = CuriumFingerprintValidator.validate(materialized)
         guard validation.isValid else {
             let outcome = LaunchOutcome.rejected(
                 profileID: selectedID,
                 reason: validation.errors.joined(separator: " ")
-            )
-            recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
-            return outcome
-        }
-
-        let caps = (capabilitiesProvider ?? engineCapabilities)()
-        guard caps.supportsLaunchFingerprintConfig else {
-            let outcome = LaunchOutcome.rejected(
-                profileID: selectedID,
-                reason: "The embedded Blink engine does not support launch fingerprint profiles (requires Build 40+)."
             )
             recordLaunchState(outcome: outcome, proxy: .system, snapshot: nil, profile: nil, sharedLockFD: -1)
             return outcome
@@ -1898,8 +1807,9 @@ enum CuriumFingerprintBootstrap {
 }
 
 extension CuriumFingerprintProfile {
-    /// Exact Build 39 (`patches/0105`) iOS Blink mobile slot (`--curium-mobile-ua=ios`).
-    nonisolated static let build39IOSMobileSlot = CuriumIdentitySlot(
+    /// Exact Build 39 (`patches/0105`) iOS Blink mobile slot (`--curium-mobile-ua=ios`),
+    /// retained solely to detect and migrate untouched legacy `"default"` profiles.
+    private nonisolated static let build39IOSMobileSlot = CuriumIdentitySlot(
         osCpu: "iPhone; CPU iPhone OS 18_7 like Mac OS X",
         appendMobileToken: true,
         primaryBrand: "Google Chrome",
@@ -1914,39 +1824,11 @@ extension CuriumFingerprintProfile {
         navigatorPlatform: "iPhone"
     )
 
-    nonisolated var legacyUABrandRawValue: String {
-        if mobile.primaryBrand == "" && desktop.primaryBrand == "" {
-            return "chromium"
-        }
-        return "chrome"
-    }
-
-    nonisolated var legacyMobileUARawValue: String {
-        if mobile.platform == "iOS" {
-            return "ios"
-        }
-        return "android"
-    }
-
-    /// True iff this is `"default"` (`Personal`) and every engine-affecting field matches
-    /// the Build 39 baseline modulo legacy Settings choices (`curium.uaBrand`,
-    /// `curium.mobileUA`, `curium.mobileModel`, `curium.acceptLang`).
-    nonisolated var supportsLegacyIdentityPickers: Bool {
-        guard isPrimaryDefault else { return false }
+    /// True when `"default"` (`Personal`) still carries untouched legacy Build 39 mobile/desktop
+    /// identity slots (Android 15 or iOS Blink) that should migrate cleanly to Apple Silicon macOS.
+    nonisolated var hasUntouchedLegacyBuild39Identity: Bool {
+        guard isPrimaryDefault, defaultSlot == .mobile else { return false }
         let baseline = CuriumFingerprintPresets.build39NativeBaseline
-        guard defaultSlot == baseline.defaultSlot,
-              proxy == baseline.proxy,
-              webrtcIpHandlingPolicy == baseline.webrtcIpHandlingPolicy,
-              enableDoNotTrack == baseline.enableDoNotTrack,
-              enableGlobalPrivacyControl == baseline.enableGlobalPrivacyControl,
-              hardware == baseline.hardware,
-              fingerprintSeed == nil,
-              !hasFarblingEnabled,
-              (fontProfile == nil || fontProfile == .native),
-              (hideSpeechVoices == nil || hideSpeechVoices == false)
-        else {
-            return false
-        }
 
         let allowedBrands: Set<String> = ["Google Chrome", ""]
         let mobileBrand = mobile.primaryBrand ?? "Google Chrome"

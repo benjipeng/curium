@@ -101,6 +101,10 @@ private final class MainThreadObservationBox: @unchecked Sendable {
 @MainActor
 @Observable
 final class CuriumExtensionStore {
+    static let hiddenBuiltInExtensionIDs: Set<String> =
+        CuriumVideoPiPExtension.hiddenExtensionIDs
+            .union(CuriumDesktopParityExtension.hiddenExtensionIDs)
+
     private static let windows = NSHashTable<CuriumExtensionStore>.weakObjects()
     private static let actionRefreshDebounce: Duration = .milliseconds(120)
 
@@ -138,6 +142,11 @@ final class CuriumExtensionStore {
             observationBox = MainThreadObservationBox(token)
             Task { @MainActor in
                 await CuriumVideoPiPExtension.ensureInstalled(using: manager)
+                let desktopParityEnabled = CuriumFingerprintStore.shared.activeProfile.defaultSlot == .desktop
+                await CuriumDesktopParityExtension.ensureInstalled(
+                    using: manager,
+                    enabled: desktopParityEnabled
+                )
             }
         }
     }
@@ -160,7 +169,7 @@ final class CuriumExtensionStore {
     }
 
     private func handleActionPresentationChange(extensionID: String?) {
-        if let extensionID, CuriumVideoPiPExtension.hiddenExtensionIDs.contains(extensionID) {
+        if let extensionID, Self.hiddenBuiltInExtensionIDs.contains(extensionID) {
             return
         }
         if let extensionID, !extensionID.isEmpty, hasLoadedInstalled,
@@ -260,7 +269,7 @@ final class CuriumExtensionStore {
         do {
             let next: [CuriumExtension] = try manager.extensions().compactMap { entry in
                 guard let id = entry["id"] as? String,
-                      !CuriumVideoPiPExtension.hiddenExtensionIDs.contains(id) else {
+                      !Self.hiddenBuiltInExtensionIDs.contains(id) else {
                     return nil
                 }
                 let enabled = entry["enabled"] as? Bool ?? false
@@ -338,7 +347,7 @@ final class CuriumExtensionStore {
     }
 
     func isInstalled(_ id: String) -> Bool {
-        guard !CuriumVideoPiPExtension.hiddenExtensionIDs.contains(id) else { return false }
+        guard !Self.hiddenBuiltInExtensionIDs.contains(id) else { return false }
         return installed.contains { $0.id == id }
     }
 

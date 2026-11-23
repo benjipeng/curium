@@ -21,10 +21,21 @@ previous = set(manifest.read_text(encoding="utf-8").splitlines()) if manifest.is
 if enabled and not all((source / name).is_file() for name in ("icudtl.dat", "resources.pak")):
     sys.exit(f"error: Missing Curium engine resources in {source}")
 
+# Exclude unused ios/web injected scripts that otherwise leak window.__gCrWeb
+# and window.__proto__.webkit.messageHandlers into every page and iframe.
+EXCLUDED_FILES = {
+    "gcrweb.js",
+    "send_webkit_message.js",
+    "language_detection.js",
+    "translate_ios.js",
+}
+
 files = {
     p.relative_to(source).as_posix()
     for p in source.rglob("*")
-    if p.is_file() and not p.relative_to(source).as_posix().startswith("bundled_extensions/ios_probe/")
+    if p.is_file()
+    and not p.relative_to(source).as_posix().startswith("bundled_extensions/ios_probe/")
+    and p.relative_to(source).as_posix() not in EXCLUDED_FILES
 } if enabled else set()
 
 for name in sorted(previous - files):

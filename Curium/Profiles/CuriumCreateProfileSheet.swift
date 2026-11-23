@@ -318,8 +318,8 @@ struct CuriumCreateProfileSheet: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Text("\(selectedPalette.title) · \(selectedPalette.notation)")
-                        .font(.caption.monospaced())
+                    Text(selectedPalette.title)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
@@ -419,10 +419,10 @@ struct CuriumCreateProfileSheet: View {
                 .accessibilityIdentifier("curium.createProfile.template.\(template.id)")
             }
         } header: {
-            Text("Fingerprint Archetype")
+            Text("Profile Template")
         } footer: {
             Text(
-                "Choose a platform archetype for UA, Client Hints, and font filtering. Every setting can be customized after creation."
+                "Both templates run Apple Silicon macOS Chrome 158 with isolated cookies, storage, and extensions."
             )
         }
     }
@@ -431,33 +431,27 @@ struct CuriumCreateProfileSheet: View {
         let poolVariants = CuriumFingerprintDevicePools.variants(forTemplateID: selectedTemplate.id)
 
         return Section {
-            Toggle("Unique Per-Site Farbling Seed", isOn: $enableFarbling)
+            Toggle("Anti-Fingerprinting Protection", isOn: $enableFarbling)
                 .accessibilityIdentifier("curium.createProfile.farbling")
 
             if !poolVariants.isEmpty {
-                Picker("Hardware & Chip", selection: $selectedHardwareChoice) {
-                    Text("Auto (Distinct Variant)").tag(Self.autoDistinctVariantTag)
+                Picker("Mac Hardware", selection: $selectedHardwareChoice) {
+                    Text("Auto (Distinct Mac)").tag(Self.autoDistinctVariantTag)
                     ForEach(poolVariants) { variant in
                         Text(variant.label).tag(variant.id)
                     }
                     if selectedTemplate.supportsNativeHardwareBaseline {
-                        Text("Native Device Hardware").tag(Self.nativeHardwareTag)
+                        Text("Native Apple Silicon").tag(Self.nativeHardwareTag)
                     }
                 }
                 .accessibilityIdentifier("curium.createProfile.hardwareVariant")
             }
         } header: {
-            Text("Fingerprint Protection")
+            Text("Device & Protection")
         } footer: {
-            if !poolVariants.isEmpty {
-                Text(
-                    "Choose Auto to assign a distinct chip, RAM tier, and display automatically, or pick an exact configuration (such as Apple M1–M5 Max with 8–32 GB RAM). Every new profile also gets its own 256-bit deterministic farbling seed."
-                )
-            } else {
-                Text(
-                    "Every new profile gets its own 256-bit deterministic farbling seed in Blink C++ so Canvas, Audio, WebGL, and TextMetrics hashes stay separated across profiles."
-                )
-            }
+            Text(
+                "Auto assigns a distinct Apple Silicon chip, RAM tier, and display. Anti-fingerprinting adds a unique per-site seed for Canvas, Audio, WebGL, and TextMetrics."
+            )
         }
     }
 
@@ -576,7 +570,7 @@ struct CuriumCreateProfileSheet: View {
             Text("Defaults")
         } footer: {
             Text(
-                "Stored locally on this device with isolated cookies, site storage, extensions, SQLite bookmarks/history, and open tabs."
+                "Duo Adaptive adjusts viewport width on the outer cover display while keeping your macOS browser identity unchanged."
             )
         }
     }

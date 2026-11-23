@@ -555,35 +555,36 @@ struct CuriumFingerprintTests {
             #expect(obj["notes"] == nil)
             #expect(obj["isBuiltIn"] == nil)
         }
-        #expect(CuriumFingerprintPresets.allBuiltIns.count == 3)
-        #expect(CuriumProfileTemplate.allTemplates.map(\.id) == ["macos-desktop", "default", "privacy-hardened"])
-        // All verified built-in presets anchor on Chrome 158 Stable and avoid `.mobileAndroid` VM extension stripping.
+        #expect(CuriumFingerprintPresets.allBuiltIns.count == 2)
+        #expect(CuriumProfileTemplate.allTemplates.map(\.id) == ["macos-desktop", "privacy-hardened"])
+        // All verified built-in presets anchor on Apple Silicon macOS Chrome 158 Stable.
         for preset in CuriumFingerprintPresets.allBuiltIns {
-            let primarySlot = preset.defaultSlot == .desktop ? preset.desktop : preset.mobile
-            #expect(primarySlot.majorVersion == CuriumChromeStableBaseline.majorVersion)
-            #expect(primarySlot.fullVersion == CuriumChromeStableBaseline.fullVersion)
-            #expect(primarySlot.productVersion == CuriumChromeStableBaseline.productVersion)
-            #expect(primarySlot.webglProfile == .native)
+            #expect(preset.defaultSlot == .desktop)
+            #expect(preset.mobile == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+            #expect(preset.desktop == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+            #expect(preset.desktop.majorVersion == CuriumChromeStableBaseline.majorVersion)
+            #expect(preset.desktop.fullVersion == CuriumChromeStableBaseline.fullVersion)
+            #expect(preset.desktop.productVersion == CuriumChromeStableBaseline.productVersion)
             #expect(preset.desktop.webglProfile == .native)
+            #expect(preset.fontProfile == .apple)
+            #expect(preset.hideSpeechVoices == false)
         }
-        // Apple-platform presets preserve native Apple Silicon & Metal GPU by default.
-        #expect(CuriumFingerprintPresets.macosDesktopFirst.usesNativeHardwareAndGPU)
-        #expect(CuriumFingerprintPresets.privacyHardened.usesNativeHardwareAndGPU)
+        // Apple-platform presets anchor on a coherent Apple M3 14" (8c / 16 GB / 1512×982 30-bit) baseline by default.
+        for preset in [CuriumFingerprintPresets.macosDesktopFirst, CuriumFingerprintPresets.privacyHardened] {
+            #expect(!preset.usesNativeHardwareAndGPU)
+            #expect(preset.desktop.webglVendor == "Google Inc. (Apple)")
+            #expect(preset.desktop.webglRenderer == "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)")
+            #expect(
+                preset.desktop.screen
+                    == CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 944, colorDepth: 30)
+            )
+            #expect(preset.hardware.hardwareConcurrency == 8)
+            #expect(preset.hardware.deviceMemoryGB == 16)
+            #expect(preset.shortArchetypeSummary.contains("Apple M3"))
+        }
         #expect(CuriumFingerprintPresets.macosDesktopFirst.desktop.platformVersion == CuriumChromeStableBaseline.macOSPlatformVersion)
         #expect(CuriumFingerprintPresets.privacyHardened.webrtcIpHandlingPolicy == .disableNonProxiedUdp)
         #expect(CuriumFingerprintPresets.privacyHardened.enableGlobalPrivacyControl == true)
-        // Mobile Chrome Android preset masks non-Apple GPU strings, screen, fonts, speech voices, and 8c/8GB
-        // while explicitly keeping `webglProfile: .native` (zero +11 VM stripping penalty) and macOS Desktop native.
-        let androidDual = CuriumFingerprintPresets.defaultAuthenticChrome
-        #expect(!androidDual.usesNativeHardwareAndGPU)
-        #expect(androidDual.mobile.hasWebGLOverride)
-        #expect(androidDual.mobile.webglProfile == .native)
-        #expect(androidDual.mobile.screen != nil)
-        #expect(!androidDual.desktop.hasWebGLOverride)
-        #expect(androidDual.fontProfile == .android)
-        #expect(androidDual.hideSpeechVoices == true)
-        #expect(androidDual.hardware.hardwareConcurrency == 8)
-        #expect(androidDual.hardware.deviceMemoryGB == 8)
     }
 
     @Test("Validator rejects unsafe profile IDs, bad W3C deviceMemory buckets, invalid proxies, and bad timezones")
@@ -738,7 +739,7 @@ struct CuriumFingerprintTests {
         #expect(reloaded.builtInProfiles.isEmpty)
         #expect(reloaded.profiles.first?.id == "default")
         #expect(reloaded.templates.count == CuriumFingerprintPresets.allBuiltIns.count)
-        #expect(Set(reloaded.templates.map(\.id)) == CuriumFingerprintPresets.builtInIDs)
+        #expect(Set(reloaded.templates.map(\.id)) == Set(CuriumFingerprintPresets.allBuiltIns.map(\.id)))
 
         // Engine wire JSON import creates a valid custom profile, and case-insensitive APFS collisions are rejected.
         let wireJSON = Data("""
@@ -935,7 +936,7 @@ struct CuriumFingerprintTests {
 
         // P1-3: Instantiating with a fixed proxy defaults WebRTC to `.disableNonProxiedUdp` (zero warnings),
         // and pairing `.fixed` with any weaker policy emits a STUN/UDP coherence warning.
-        for templateID in ["macos-desktop", "default", "privacy-hardened"] {
+        for templateID in ["macos-desktop", "privacy-hardened"] {
             let template = try #require(CuriumProfileTemplate.template(for: templateID))
             let instantiated = template.instantiate(
                 id: "p-a1b2c3d4",
@@ -2444,6 +2445,9 @@ struct CuriumWave1HardeningTests {
         let suiteName = "curium.reset.legacy.\(UUID().uuidString)"
         let suite = try #require(UserDefaults(suiteName: suiteName))
         defer { suite.removePersistentDomain(forName: suiteName) }
+        suite.set(CuriumPalette.americium.rawValue, forKey: "curium.palette")
+        suite.set(CuriumSiteMode.desktop.rawValue, forKey: "curium.siteMode")
+        suite.set(CuriumSearchEngine.brave.rawValue, forKey: "curium.searchEngine")
         suite.set("chromium", forKey: "curium.uaBrand")
         suite.set("ios", forKey: "curium.mobileUA")
 
@@ -2457,9 +2461,12 @@ struct CuriumWave1HardeningTests {
         #expect(!failedStore.upsert(retiredReuse).isValid)
 
         let personal = try #require(failedStore.profile(id: "default"))
-        #expect(personal.mobile.platform == "iOS")
-        #expect(personal.mobile.primaryBrand == "")
-        #expect(personal.desktop.primaryBrand == "")
+        #expect(personal.defaultSlot == .desktop)
+        #expect(personal.mobile == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+        #expect(personal.desktop == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+        #expect(personal.palette == .americium)
+        #expect(personal.siteMode == .desktop)
+        #expect(personal.searchEngine == .brave)
     }
 
     @Test("Duplicating a farbled profile rotates fingerprintSeed and blocks orphaned slug reuse")
@@ -2705,7 +2712,10 @@ struct CuriumWave2MultiProfileAndDownloadsTests {
         #expect(defaultProfile.id == "default")
         #expect(defaultProfile.displayName == "Personal")
         #expect(!defaultProfile.isBuiltIn)
-        #expect(defaultProfile.templateID == "default")
+        #expect(defaultProfile.templateID == "macos-desktop")
+        #expect(defaultProfile.defaultSlot == .desktop)
+        #expect(defaultProfile.mobile == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+        #expect(defaultProfile.desktop == CuriumFingerprintPresets.stableMacOSDesktopSlot)
         #expect(defaultProfile.symbolName == "person.crop.circle")
         #expect(defaultProfile.palette != nil)
         #expect(defaultProfile.siteMode != nil)
@@ -2768,7 +2778,7 @@ struct CuriumWave2MultiProfileAndDownloadsTests {
         )
         #expect(store.profiles.count == 1)
         #expect(store.profiles.first?.id == "default")
-        #expect(store.templates.count == 3)
+        #expect(store.templates.count == 2)
 
         let created = try #require(
             store.createProfile(
@@ -3222,7 +3232,7 @@ struct CuriumWave2MultiProfileAndDownloadsTests {
         #expect(!FileManager.default.fileExists(atPath: try #require(loc.curiumProfileDirectory).path))
     }
 
-    @Test("Legacy UserDefaults identity settings fold into Personal and stay synced across Settings and Profile Editor")
+    @Test("Legacy Build 39 Android/iOS Personal profiles auto-upgrade to Apple Silicon macOS while preserving user preferences")
     @MainActor
     func legacyIdentityDefaultsSyncWithPersonal() throws {
         let suiteName = "curium.legacy.sync.\(UUID().uuidString)"
@@ -3231,57 +3241,118 @@ struct CuriumWave2MultiProfileAndDownloadsTests {
 
         suite.set("chromium", forKey: "curium.uaBrand")
         suite.set("ios", forKey: "curium.mobileUA")
-        suite.set("ja-JP;q=0.9, en-US, bad;tag", forKey: "curium.acceptLang")
-        suite.set("Pixel 9", forKey: "curium.mobileModel")
         suite.set(CuriumPalette.americium.rawValue, forKey: "curium.palette")
         suite.set(CuriumSiteMode.desktop.rawValue, forKey: "curium.siteMode")
         suite.set(CuriumSearchEngine.brave.rawValue, forKey: "curium.searchEngine")
 
-        let iosPersonal = CuriumFingerprintStore.makeDefaultPersonalProfile(
+        // Fresh default Personal ignores deprecated Android/iOS/Chromium UA keys and uses pure macOS Chrome 158,
+        // while preserving palette, layout, and search engine preferences.
+        let freshPersonal = CuriumFingerprintStore.makeDefaultPersonalProfile(
             preserveLegacyDefaults: true,
             defaults: suite
         )
-        #expect(iosPersonal.mobile.platform == "iOS")
-        #expect(iosPersonal.mobile.navigatorPlatform == "iPhone")
-        #expect(iosPersonal.mobile.osCpu == "iPhone; CPU iPhone OS 18_7 like Mac OS X")
-        #expect(iosPersonal.mobile.primaryBrand == "")
-        #expect(iosPersonal.desktop.primaryBrand == "")
-        #expect(iosPersonal.mobile.model == "")
-        #expect(iosPersonal.languages == ["ja-JP", "en-US"])
-        #expect(iosPersonal.palette == .americium)
-        #expect(iosPersonal.siteMode == .desktop)
-        #expect(iosPersonal.searchEngine == .brave)
-        #expect(iosPersonal.supportsLegacyIdentityPickers)
+        #expect(freshPersonal.defaultSlot == .desktop)
+        #expect(freshPersonal.mobile == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+        #expect(freshPersonal.desktop == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+        #expect(freshPersonal.fontProfile == .apple)
+        #expect(freshPersonal.hideSpeechVoices == false)
+        #expect(freshPersonal.palette == .americium)
+        #expect(freshPersonal.siteMode == .desktop)
+        #expect(freshPersonal.searchEngine == .brave)
 
-        suite.set("android", forKey: "curium.mobileUA")
-        let androidPersonal = CuriumFingerprintStore.makeDefaultPersonalProfile(
-            preserveLegacyDefaults: true,
-            defaults: suite
-        )
-        #expect(androidPersonal.mobile.platform == "Android")
-        #expect(androidPersonal.mobile.model == "Pixel 9")
-        #expect(androidPersonal.supportsLegacyIdentityPickers)
-
-        // Applying Settings pickers to Personal and later toggling an unrelated flag (DNT) preserves them.
-        let root = try makeTempDir("curium-w2-legacy-sync")
+        // Existing v2 store on disk carrying an untouched Build 39 Android 15 Personal profile
+        // automatically upgrades its identity slots and hardware to coherent M3 macOS while keeping proxy/timezone/palette/notes.
+        let root = try makeTempDir("curium-w2-legacy-upgrade")
         defer { try? FileManager.default.removeItem(at: root) }
-        let store = CuriumFingerprintStore(fileURL: root.appending(path: CuriumFingerprintStore.fileName))
-        #expect(store.applyLegacyIdentityPreferencesToPersonal(uaBrand: "chromium", mobileUA: "ios", defaults: suite))
-        #expect(store.selectedProfileID == "default")
-        #expect(suite.string(forKey: "curium.uaBrand") == "chromium")
-        #expect(suite.string(forKey: "curium.mobileUA") == "ios")
+        let fileURL = root.appending(path: CuriumFingerprintStore.fileName)
+        var legacyAndroid = CuriumFingerprintPresets.build39NativeBaseline
+        legacyAndroid.displayName = "Personal"
+        legacyAndroid.isBuiltIn = false
+        legacyAndroid.palette = .thorium
+        legacyAndroid.siteMode = .adaptive
+        legacyAndroid.searchEngine = .duckDuckGo
+        legacyAndroid.hardware.timezone = "Europe/London"
+        legacyAndroid.proxy = .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: nil)
+        legacyAndroid.notes = "Keep my note"
+        let persisted = CuriumFingerprintStore.PersistedState(
+            version: 2,
+            selectedProfileID: nil,
+            profiles: [legacyAndroid],
+            retiredProfileIDs: []
+        )
+        try JSONEncoder().encode(persisted).write(to: fileURL)
 
-        var edited = try #require(store.profile(id: "default"))
-        #expect(edited.supportsLegacyIdentityPickers)
-        edited.enableDoNotTrack = true
-        #expect(store.upsert(edited).isValid)
+        let upgradedStore = CuriumFingerprintStore(fileURL: fileURL)
+        let upgraded = try #require(upgradedStore.profile(id: "default"))
+        #expect(upgraded.defaultSlot == .desktop)
+        #expect(upgraded.mobile == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+        #expect(upgraded.desktop == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+        #expect(upgraded.hardware.hardwareConcurrency == 8)
+        #expect(upgraded.hardware.deviceMemoryGB == 16)
+        #expect(upgraded.hardware.timezone == "Europe/London")
+        #expect(upgraded.fontProfile == .apple)
+        #expect(upgraded.hideSpeechVoices == false)
+        #expect(upgraded.palette == .thorium)
+        #expect(upgraded.searchEngine == .duckDuckGo)
+        #expect(upgraded.proxy == .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: nil))
+        #expect(upgraded.notes == "Keep my note")
 
-        let saved = try #require(store.profile(id: "default"))
-        #expect(saved.enableDoNotTrack)
-        #expect(saved.mobile.platform == "iOS")
-        #expect(saved.mobile.primaryBrand == "")
-        #expect(saved.desktop.primaryBrand == "")
-        #expect(!saved.supportsLegacyIdentityPickers)
+        // Untouched earlier pure-macOS Personal profile (`screen == nil`, `webglRenderer == nil`, native hardware)
+        // auto-upgrades in place to coherent M3 1512×982 30-bit / 8c / 16 GB while preserving timezone/proxy/notes.
+        let unrolledMacFileURL = root.appending(path: "unrolled-mac-\(CuriumFingerprintStore.fileName)")
+        var unrolledMacSlot = CuriumFingerprintPresets.stableMacOSDesktopSlot
+        unrolledMacSlot.webglVendor = nil
+        unrolledMacSlot.webglRenderer = nil
+        unrolledMacSlot.screen = nil
+        var unrolledMacDefault = CuriumFingerprintStore.makeDefaultPersonalProfile()
+        unrolledMacDefault.mobile = unrolledMacSlot
+        unrolledMacDefault.desktop = unrolledMacSlot
+        unrolledMacDefault.hardware = CuriumHardwareOverrides(
+            hardwareConcurrency: nil,
+            deviceMemoryGB: nil,
+            timezone: "Asia/Tokyo"
+        )
+        unrolledMacDefault.proxy = .fixed(rules: "socks5://127.0.0.1:1088", bypassRules: "localhost")
+        unrolledMacDefault.notes = "Preserve user note"
+        unrolledMacDefault.palette = .californium
+        let unrolledState = CuriumFingerprintStore.PersistedState(
+            version: 2,
+            selectedProfileID: nil,
+            profiles: [unrolledMacDefault],
+            retiredProfileIDs: []
+        )
+        try JSONEncoder().encode(unrolledState).write(to: unrolledMacFileURL)
+
+        let upgradedMacStore = CuriumFingerprintStore(fileURL: unrolledMacFileURL)
+        let upgradedMac = try #require(upgradedMacStore.profile(id: "default"))
+        #expect(upgradedMac.desktop == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+        #expect(upgradedMac.mobile == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+        #expect(upgradedMac.desktop.screen?.width == 1512)
+        #expect(upgradedMac.desktop.screen?.height == 982)
+        #expect(upgradedMac.desktop.screen?.availHeight == 944)
+        #expect(upgradedMac.desktop.screen?.colorDepth == 30)
+        #expect(upgradedMac.hardware.hardwareConcurrency == 8)
+        #expect(upgradedMac.hardware.deviceMemoryGB == 16)
+        #expect(upgradedMac.hardware.timezone == "Asia/Tokyo")
+        #expect(upgradedMac.proxy == .fixed(rules: "socks5://127.0.0.1:1088", bypassRules: "localhost"))
+        #expect(upgradedMac.notes == "Preserve user note")
+        #expect(upgradedMac.palette == .californium)
+
+        // Reloading confirms the upgraded M3 defaults were persisted and an explicit custom variant on Personal stays untouched.
+        let m4ProVariant = try #require(
+            CuriumFingerprintDevicePools.variant(
+                forTemplateID: "macos-desktop",
+                variantID: "macos-desktop-m4pro-14c-32g-1728x1117"
+            )
+        )
+        let explicitPersonal = m4ProVariant.apply(to: upgradedMac)
+        #expect(upgradedMacStore.upsert(explicitPersonal).isValid)
+        let reloadedCustomStore = CuriumFingerprintStore(fileURL: unrolledMacFileURL)
+        let reloadedCustomPersonal = try #require(reloadedCustomStore.profile(id: "default"))
+        #expect(reloadedCustomPersonal.desktop.webglRenderer?.contains("Apple M4 Pro") == true)
+        #expect(reloadedCustomPersonal.hardware.hardwareConcurrency == 14)
+        #expect(reloadedCustomPersonal.hardware.deviceMemoryGB == 32)
+        #expect(reloadedCustomPersonal.hardware.timezone == "Asia/Tokyo")
     }
 
     @Test("Store resolves profile IDs case-insensitively across export, duplicate, delete, and deleteAndWipe")
@@ -3583,24 +3654,21 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
     func allHardwareVariantPoolsValidateAndSerializeSchemaV2() throws {
         let expectedMultiVariantMinimums: [String: Int] = [
             "macos-desktop": 8,
-            "default": 6,
             "privacy-hardened": 8,
         ]
         #expect(Set(CuriumFingerprintDevicePools.allPools.keys) == Set(expectedMultiVariantMinimums.keys))
 
-        // Retired unverified templates (`ios-blink`, x86_64 Windows/Linux, duplicate Pixel) are no longer offered.
-        for retiredID in CuriumFingerprintPresets.retiredLegacyBuiltInIDs {
+        // Retired unverified templates (`ios-blink`, x86_64 Windows/Linux, Android) are no longer offered.
+        for retiredID in CuriumFingerprintPresets.retiredLegacyBuiltInIDs.union(["default"]) {
             #expect(CuriumProfileTemplate.template(for: retiredID) == nil)
             #expect(CuriumFingerprintDevicePools.variants(forTemplateID: retiredID).isEmpty)
         }
 
-        // Apple Silicon pool covers M1–M5 Max chips and 8 / 16 / 32 GB RAM tiers with 24-bit displays.
+        // Apple Silicon pool covers M1–M5 Max chips and 8 / 16 / 32 GB RAM tiers with 30-bit wide-gamut P3 displays.
         let macPool = CuriumFingerprintDevicePools.macosDesktop
         #expect(Set(macPool.map(\.deviceMemoryGB)) == Set([8.0, 16.0, 32.0]))
         #expect(macPool.contains { $0.webglRenderer.contains("Apple M5 Max") && $0.hardwareConcurrency == 18 && $0.deviceMemoryGB == 32 })
-        #expect(macPool.allSatisfy { $0.webglProfile == .native && $0.screen.colorDepth == 24 })
-        // Android pool explicitly enforces `webglProfile: .native` (never `.mobileAndroid`).
-        #expect(CuriumFingerprintDevicePools.androidAuthenticChrome.allSatisfy { $0.webglProfile == .native })
+        #expect(macPool.allSatisfy { $0.webglProfile == .native && $0.screen.colorDepth == 30 })
 
         // Exact Build 42 C++ schema v2 key allowlists from patches/0106 & patches/0110.
         let allowedTopKeys: Set<String> = [
@@ -3705,16 +3773,39 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
             }
         }
 
-        // Default Personal baseline remains 100% untouched Build 39 native behavior.
+        // Default Personal baseline launches as pure Apple Silicon macOS Chrome 158 on Build 40+/42 engines
+        // (and falls back gracefully to Build 39 only when engine contractVersion == 0).
         defer { CuriumFingerprintBootstrap.resetStateForTesting() }
         let rootDir = try makeTempDir("curium-pa-default")
         defer { try? FileManager.default.removeItem(at: rootDir) }
         let store = CuriumFingerprintStore(fileURL: rootDir.appending(path: CuriumFingerprintStore.fileName))
         let personal = try #require(store.profile(id: "default"))
-        #expect(personal.matchesBuild39EngineDefaults)
+        #expect(personal.defaultSlot == .desktop)
+        #expect(personal.mobile == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+        #expect(personal.desktop == CuriumFingerprintPresets.stableMacOSDesktopSlot)
         #expect(personal.fingerprintSeed == nil)
         #expect(!personal.isFarblingActive)
-        #expect(CuriumFingerprintBootstrap.prepareEngineLaunch(store: store) == .defaultBuild39)
+        let v2Caps = CuriumEngineFingerprintCapabilities(dictionary: [
+            "contractVersion": 2,
+            "supportedSchemaVersions": [1, 2],
+            "maxConfigBytes": 65536,
+        ])
+        var sentPayload: Data?
+        let configuredOutcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: store,
+            capabilitiesProvider: { v2Caps },
+            configureEngine: { data, _ in
+                sentPayload = data
+                return true
+            }
+        )
+        #expect(configuredOutcome == .configured(profileID: "default", revision: 1, nativeHardware: false))
+        let payloadObj = try #require(
+            sentPayload.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        )
+        #expect((payloadObj["defaultSlot"] as? String) == "desktop")
+        #expect(((payloadObj["desktop"] as? [String: Any])?["platform"] as? String) == "macOS")
+        #expect(((payloadObj["mobile"] as? [String: Any])?["platform"] as? String) == "macOS")
     }
 
     @Test("Default createProfile across all verified templates enables farbling with unique 256-bit seeds, supports explicit chip/RAM selection, and honors enableFarbling: false")
@@ -3723,7 +3814,7 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
         let rootDir = try makeTempDir("curium-pa-seeds")
         defer { try? FileManager.default.removeItem(at: rootDir) }
         let store = CuriumFingerprintStore(fileURL: rootDir.appending(path: CuriumFingerprintStore.fileName))
-        #expect(CuriumProfileTemplate.allTemplates.count == 3)
+        #expect(CuriumProfileTemplate.allTemplates.count == 2)
         #expect(CuriumProfileTemplate.allTemplates.first?.id == "macos-desktop")
 
         // Explicit Apple Silicon chip & RAM variant selection works deterministically.
@@ -3801,7 +3892,6 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
     func consecutiveCreateProfileCollisionFreeDifferentiation() throws {
         let multiVariantIDs = [
             "macos-desktop",
-            "default",
             "privacy-hardened",
         ]
 
@@ -3812,10 +3902,15 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
 
             let template = try #require(CuriumProfileTemplate.template(for: templateID))
             let poolSize = template.hardwareVariantCount
-            #expect(poolSize >= 6)
+            #expect(poolSize >= 8)
+            let personal = try #require(store.profile(id: "default"))
+            let personalSignature = HardwareSignature(profile: personal)
 
+            // Personal ("default") already occupies 1 of the 8 Apple Silicon pool variants (M3 1512×982),
+            // so the next `poolSize - 1` created profiles exhaust the remaining 7 distinct variants with
+            // zero collisions against Personal or each other (`store.profiles` reaches all `poolSize` variants).
             var createdProfiles: [CuriumFingerprintProfile] = []
-            for idx in 0..<poolSize {
+            for idx in 0..<(poolSize - 1) {
                 let profile = try #require(
                     store.createProfile(fromTemplate: templateID, displayName: "\(templateID)-\(idx)")
                 )
@@ -3826,12 +3921,15 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
             }
 
             let signatures = createdProfiles.map(HardwareSignature.init(profile:))
+            let allStoreSignatures = store.profiles.map(HardwareSignature.init(profile:))
             let seeds = try createdProfiles.map { try #require($0.fingerprintSeed) }
+            #expect(!signatures.contains(personalSignature))
+            #expect(Set(signatures).count == poolSize - 1)
             #expect(
-                Set(signatures).count == poolSize,
-                "Expected \(poolSize) unique hardware variants before wrap for \(templateID), got \(Set(signatures).count)"
+                Set(allStoreSignatures).count == poolSize,
+                "Expected \(poolSize) unique hardware variants across Personal + created profiles for \(templateID), got \(Set(allStoreSignatures).count)"
             )
-            #expect(Set(seeds).count == poolSize)
+            #expect(Set(seeds).count == poolSize - 1)
 
             // Wrapping past poolSize still mints a unique seed and avoids repeating the immediately preceding variant.
             let wrapped = try #require(
@@ -3843,10 +3941,22 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
             let wrappedReport = CuriumFingerprintValidator.validate(wrapped)
             #expect(wrappedReport.errors.isEmpty)
             #expect(wrappedReport.warnings.isEmpty)
+
+            // Direct pool exhaustion from an empty existing set deals all `poolSize` unique variants before wrap.
+            var standalone: [CuriumFingerprintProfile] = []
+            for idx in 0..<poolSize {
+                let next = template.instantiate(
+                    id: String(format: "p-%08x", idx + 1),
+                    displayName: "Standalone \(idx)",
+                    avoidingExisting: standalone
+                )
+                standalone.append(next)
+            }
+            #expect(Set(standalone.map(HardwareSignature.init(profile:))).count == poolSize)
         }
 
-        // Explicit randomizeHardwareVariant: false preserves native Apple hardware on Apple-native templates,
-        // while Mobile Chrome (Android 15) still masks non-Apple GPU/fonts/hardware cleanly with native WebGL profile.
+        // Explicit randomizeHardwareVariant: false preserves the coherent Apple M3 14" template baseline,
+        // and the retired Android ("default") template cannot be instantiated.
         let optOutDir = try makeTempDir("curium-pa-hw-optout")
         defer { try? FileManager.default.removeItem(at: optOutDir) }
         let optOutStore = CuriumFingerprintStore(fileURL: optOutDir.appending(path: CuriumFingerprintStore.fileName))
@@ -3854,29 +3964,22 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
             let plainMac = try #require(
                 optOutStore.createProfile(
                     fromTemplate: appleID,
-                    displayName: "Native \(appleID)",
+                    displayName: "Baseline \(appleID)",
                     randomizeHardwareVariant: false
                 )
             )
-            #expect(plainMac.usesNativeHardwareAndGPU)
+            #expect(!plainMac.usesNativeHardwareAndGPU)
+            #expect(plainMac.desktop == CuriumFingerprintPresets.stableMacOSDesktopSlot)
+            #expect(plainMac.hardware.hardwareConcurrency == 8)
+            #expect(plainMac.hardware.deviceMemoryGB == 16)
         }
-
-        let maskedBase = try #require(
+        #expect(
             optOutStore.createProfile(
                 fromTemplate: "default",
-                displayName: "Base Mobile",
+                displayName: "Retired Android",
                 randomizeHardwareVariant: false
-            )
+            ) == nil
         )
-        #expect(!maskedBase.usesNativeHardwareAndGPU)
-        #expect(maskedBase.mobile.hasWebGLOverride)
-        #expect(maskedBase.mobile.webglProfile == .native)
-        #expect(!maskedBase.desktop.hasWebGLOverride)
-        #expect(maskedBase.fontProfile == .android)
-        #expect(maskedBase.hideSpeechVoices == true)
-        let report = CuriumFingerprintValidator.validate(maskedBase)
-        #expect(report.errors.isEmpty)
-        #expect(report.warnings.isEmpty)
     }
 
     @Test("createProfile persists custom Fixed Proxy, timezone, and languages and fails closed on invalid inputs")
@@ -3994,24 +4097,22 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
         customLegacy.mobile.platform = "Windows"
         #expect(CuriumFingerprintPresets.rollCoherentHardwareVariant(for: customLegacy) == nil)
 
-        // Rolling the unconfigured Build 39 Personal (`default`) profile upgrades it onto a zero-warning
-        // Chrome 158 Android mobile hardware variant with explicit `webglProfile: .native` while keeping its macOS desktop slot intact.
+        // Rolling Personal (`default`) assigns a coherent Apple Silicon macOS Chrome 158 variant across both slots.
         let personal = try #require(store.profile(id: "default"))
         let rolledPersonal = try #require(CuriumFingerprintPresets.rollCoherentHardwareVariant(for: personal))
         #expect(rolledPersonal.id == "default")
         #expect(!rolledPersonal.usesNativeHardwareAndGPU)
-        #expect(rolledPersonal.mobile.hasWebGLOverride)
-        #expect(rolledPersonal.mobile.webglProfile == .native)
-        #expect(rolledPersonal.mobile.majorVersion == CuriumChromeStableBaseline.majorVersion)
+        #expect(rolledPersonal.desktop.hasWebGLOverride)
+        #expect(rolledPersonal.mobile == rolledPersonal.desktop)
+        #expect(rolledPersonal.desktop.webglProfile == .native)
         #expect(rolledPersonal.desktop.majorVersion == CuriumChromeStableBaseline.majorVersion)
-        #expect(!rolledPersonal.desktop.hasWebGLOverride)
-        #expect(rolledPersonal.fontProfile == .android)
-        #expect(rolledPersonal.hideSpeechVoices == true)
+        #expect(rolledPersonal.fontProfile == .apple)
+        #expect(rolledPersonal.hideSpeechVoices == false)
         #expect(CuriumFingerprintValidator.validate(rolledPersonal).errors.isEmpty)
         #expect(CuriumFingerprintValidator.validate(rolledPersonal).warnings.isEmpty)
 
         let fixedProxy = CuriumProxyConfig.fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "localhost")
-        for templateID in ["macos-desktop", "default", "privacy-hardened"] {
+        for templateID in ["macos-desktop", "privacy-hardened"] {
             let original = try #require(
                 store.createProfile(
                     fromTemplate: templateID,
@@ -6281,76 +6382,39 @@ struct CuriumMediaRadarAndDownloaderTests {
             curiumSupportRoot: curiumRoot
         )
 
-        // 1. Unmodified Personal booted with selectedProfileID == nil has no pending restart.
+        // 1. Unmodified Personal booted on a Build 42 engine with selectedProfileID == nil has no pending restart.
+        let v2Caps = CuriumEngineFingerprintCapabilities(dictionary: [
+            "contractVersion": 2,
+            "supportedSchemaVersions": [1, 2],
+            "maxConfigBytes": 65536,
+        ])
         let cleanOutcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
             store: store,
+            capabilitiesProvider: { v2Caps },
             configureEngine: { _, _ in true }
         )
-        #expect(cleanOutcome == .defaultBuild39)
+        #expect(cleanOutcome == .configured(profileID: "default", revision: 1, nativeHardware: false))
         #expect(!store.hasPendingActiveProfileEngineChanges)
         #expect(!store.hasPendingProfileSwitch)
 
-        // 2. Customize Personal with a Fixed Proxy, then simulate Recovery UI resetting selectedProfileID to nil.
+        // 2. Customize Personal with a Fixed Proxy mid-session -> immediately flags pending engine restart.
         var personal = try #require(store.profile(id: "default"))
         let customProxy = CuriumProxyConfig.fixed(rules: "socks5://127.0.0.1:1080", bypassRules: nil)
         personal.proxy = customProxy
         #expect(store.upsert(personal).isValid)
-        #expect(store.resetToBuild39Default())
-        #expect(store.selectedProfileID == nil)
-
-        // Boot into unconfigured Build 39 (.system proxy) while stored Personal carries Fixed Proxy.
-        let recoveryOutcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
-            store: store,
-            configureEngine: { _, _ in true }
-        )
-        #expect(recoveryOutcome == .defaultBuild39)
-        #expect(CuriumFingerprintBootstrap.activeLaunchProxy == .system)
-        #expect(store.activeProfile.proxy == customProxy)
         #expect(store.hasPendingActiveProfileEngineChanges)
         #expect(store.hasPendingProfileSwitch)
 
-        // 3. Clean Build 39 launch with legacy iOS Blink / Chromium UserDefaults (selectedProfileID == nil)
-        //    must NOT show a spurious RESTART badge while Blink is already running those exact 0105 defaults,
-        //    but MUST show RESTART if legacy UserDefaults change mid-session.
-        let suiteName = "curium.test.legacy.\(UUID().uuidString)"
-        let isolatedDefaults = try #require(UserDefaults(suiteName: suiteName))
-        defer { isolatedDefaults.removePersistentDomain(forName: suiteName) }
-        isolatedDefaults.set("ios", forKey: "curium.mobileUA")
-        isolatedDefaults.set("chromium", forKey: "curium.uaBrand")
-
-        let legacyPersonal = CuriumFingerprintStore.makeDefaultPersonalProfile(
-            preserveLegacyDefaults: true,
-            defaults: isolatedDefaults
+        // 3. After relaunching with the updated Personal profile, pending restart clears and activeLaunchProxy updates.
+        let relaunchedOutcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: store,
+            capabilitiesProvider: { v2Caps },
+            configureEngine: { _, _ in true }
         )
-        #expect(!legacyPersonal.matchesBuild39EngineDefaults)
-        let legacySnapshot = CuriumFingerprintBootstrap.EngineLaunchSnapshot(
-            from: legacyPersonal,
-            wasUnconfiguredBuild39: true
-        )
-        #expect(!CuriumFingerprintStore.hasPendingActiveProfileEngineChanges(
-            snapshot: legacySnapshot,
-            selectedProfileID: nil,
-            candidate: legacyPersonal,
-            effectiveBuild39Default: {
-                CuriumFingerprintStore.makeDefaultPersonalProfile(
-                    preserveLegacyDefaults: true,
-                    defaults: isolatedDefaults
-                )
-            }
-        ))
-
-        isolatedDefaults.set("android", forKey: "curium.mobileUA")
-        #expect(CuriumFingerprintStore.hasPendingActiveProfileEngineChanges(
-            snapshot: legacySnapshot,
-            selectedProfileID: nil,
-            candidate: legacyPersonal,
-            effectiveBuild39Default: {
-                CuriumFingerprintStore.makeDefaultPersonalProfile(
-                    preserveLegacyDefaults: true,
-                    defaults: isolatedDefaults
-                )
-            }
-        ))
+        #expect(relaunchedOutcome == .configured(profileID: "default", revision: 2, nativeHardware: false))
+        #expect(CuriumFingerprintBootstrap.activeLaunchProxy == customProxy)
+        #expect(!store.hasPendingActiveProfileEngineChanges)
+        #expect(!store.hasPendingProfileSwitch)
     }
 
     @Test("Start Page: CuriumSiteIdentity strips noisy prefixes, fixes W monograms, and gates Favorite URLs")
@@ -6392,7 +6456,15 @@ struct CuriumMediaRadarAndDownloaderTests {
     @Test("Start Page: conciseStartPostureSummary emits at most 3 editorial tokens")
     func startPageConcisePostureSummary() throws {
         let personal = CuriumFingerprintStore.makeDefaultPersonalProfile(preserveLegacyDefaults: false)
-        #expect(personal.conciseStartPostureSummary == "Authentic Chrome")
+        #expect(personal.conciseStartPostureSummary == "macOS 158 · Custom HW")
+
+        var nativeOverrideOff = personal
+        nativeOverrideOff.desktop.webglVendor = nil
+        nativeOverrideOff.desktop.webglRenderer = nil
+        nativeOverrideOff.mobile.webglVendor = nil
+        nativeOverrideOff.mobile.webglRenderer = nil
+        nativeOverrideOff.hardware = .native
+        #expect(nativeOverrideOff.conciseStartPostureSummary == "macOS 158")
 
         let macTemplate = try #require(CuriumProfileTemplate.template(for: "macos-desktop"))
         let macProxied = macTemplate.instantiate(
@@ -6403,14 +6475,14 @@ struct CuriumMediaRadarAndDownloaderTests {
         )
         #expect(macProxied.conciseStartPostureSummary == "macOS 158 · Farbled · Proxy")
 
-        let androidTemplate = try #require(CuriumProfileTemplate.template(for: "default"))
-        let androidUnfarbledDirect = androidTemplate.instantiate(
-            id: "p-and01",
-            displayName: "Android Clean",
+        let macCustomDirect = macTemplate.instantiate(
+            id: "p-mac02",
+            displayName: "Mac Clean",
             enableFarbling: false,
+            hardwareVariantID: "macos-desktop-m3-8c-16g-1512x982",
             proxy: .direct
         )
-        #expect(androidUnfarbledDirect.conciseStartPostureSummary == "Android 158 · Custom HW · Direct")
+        #expect(macCustomDirect.conciseStartPostureSummary == "macOS 158 · Custom HW · Direct")
     }
 
     @Test("Start Page: CuriumLibrary.frequentSites ranks by frecency, deduplicates Favorites/hosts, and deletes cleanly")

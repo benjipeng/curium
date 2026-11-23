@@ -80,6 +80,8 @@ static void CuriumNoOpLogLaunchMetrics(id self, SEL _cmd, id startupInfo, NSArra
 static NSArray<NSString *> *gCuriumAugmentedArguments = nil;
 static BOOL gCuriumExplicitFingerprintConfigured = NO;
 static BOOL gCuriumEnableGlobalPrivacyControl = NO;
+static BOOL gCuriumDisableWebTouchDetection = NO;
+static BOOL gCuriumEnableDesktopKeyboardAPI = NO;
 
 // Adds a bare switch once.
 static BOOL CuriumAddSwitch(NSMutableArray<NSString *> *args, NSString *flag) {
@@ -215,6 +217,27 @@ static BOOL CuriumMergeListSwitch(NSMutableArray<NSString *> *args, NSString *na
     return YES;
 }
 
+// Checks whether the effective (last) `--name=...` switch already contains |needle|.
+static BOOL CuriumHasSwitchValueToken(NSArray<NSString *> *args,
+                                      NSString *name,
+                                      NSString *needle) {
+    NSString *prefix = [name stringByAppendingString:@"="];
+    for (NSUInteger i = args.count; i-- > 0;) {
+        NSString *arg = args[i];
+        if ([arg hasPrefix:prefix]) {
+            NSString *value = [arg substringFromIndex:prefix.length];
+            return [value rangeOfString:needle].location != NSNotFound;
+        }
+        if ([arg isEqualToString:name]) {
+            if (i + 1 < args.count) {
+                return [args[i + 1] rangeOfString:needle].location != NSNotFound;
+            }
+            return NO;
+        }
+    }
+    return NO;
+}
+
 // Builds the engine's command line once. Inputs from NSBundle and NSUserDefaults
 // are read BEFORE swizzling -[NSProcessInfo arguments] so initializing Foundation's
 // NSArgumentDomain can never re-enter a dispatch_once lock on the main thread.
@@ -222,6 +245,8 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
                                                  BOOL supportsDisableSync,
                                                  BOOL hasExplicitFingerprintConfig,
                                                  BOOL enableGlobalPrivacyControl,
+                                                 BOOL disableWebTouchDetection,
+                                                 BOOL enableDesktopKeyboardAPI,
                                                  NSString *_Nullable jitPref,
                                                  NSString *_Nullable uaBrandPref,
                                                  NSString *_Nullable mobileUAPref,
@@ -263,6 +288,27 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
         changed |= CuriumMergeListSwitch(args, @"--enable-features", @",", @"GlobalPrivacyControlApi");
     }
 
+    if (disableWebTouchDetection) {
+        // Align WebIDL TouchEvent / ontouchstart exposure with maxTouchPoints == 0 on
+        // desktop macOS profiles while keeping native UIKit touch scrolling intact.
+        changed |= CuriumSetDefaultSwitchValue(args, @"--touch-events", @"disabled");
+        changed |= CuriumMergeListSwitch(args, @"--disable-blink-features", @",",
+                                         @"TouchEventFeatureDetection");
+        changed |= CuriumSetDefaultSwitchValue(args, @"--force-effective-connection-type", @"4G");
+        // Set native Display-P3 / extended-sRGB gamut, dynamic-range: high, and 30-bit colorDepth in C++.
+        changed |= CuriumSetDefaultSwitchValue(args, @"--force-color-profile", @"extended-srgb");
+        // Raise V8 old-space limit to ~2.2 GiB desktop Chrome bucket unless already specified.
+        if (!CuriumHasSwitchValueToken(args, @"--js-flags", @"--max-old-space-size=")) {
+            changed |= CuriumMergeListSwitch(args, @"--js-flags", @" ", @"--max-old-space-size=2048");
+        }
+    }
+
+    if (enableDesktopKeyboardAPI) {
+        // Expose desktop Chrome's navigator.keyboard API on desktop macOS profiles.
+        changed |= CuriumMergeListSwitch(args, @"--enable-blink-features", @",",
+                                         @"KeyboardLock");
+    }
+
     // Never merge legacy 0105 switches field-by-field into an explicit
     // CuriumFingerprintConfigV1 profile; only synthesize them when running in
     // unconfigured Build 39 default mode.
@@ -302,8 +348,11 @@ static void CuriumInstallCommandLineGuard(void) {
         NSString *mobileModelPref = [[defaults stringForKey:@"curium.mobileModel"] copy];
         BOOL hasExplicitConfig = gCuriumExplicitFingerprintConfigured;
         BOOL enableGPC = gCuriumEnableGlobalPrivacyControl;
+        BOOL disableTouchDetection = gCuriumDisableWebTouchDetection;
+        BOOL enableDesktopKeyboard = gCuriumEnableDesktopKeyboardAPI;
         gCuriumAugmentedArguments = CuriumBuildArguments(
-            base, supportsDisableSync, hasExplicitConfig, enableGPC, jitPref,
+            base, supportsDisableSync, hasExplicitConfig, enableGPC,
+            disableTouchDetection, enableDesktopKeyboard, jitPref,
             uaBrandPref, mobileUAPref, acceptLangPref, mobileModelPref);
 
         Class cls = object_getClass(processInfo);
@@ -319,10 +368,12 @@ static void CuriumInstallCommandLineGuard(void) {
             method_setImplementation(method, (IMP)CuriumAugmentedProcessArguments);
         }
         NSString *detail = hasExplicitConfig
-            ? [NSString stringWithFormat:@"%lu args (disable-sync=%d, jit=%@, fingerprint=profile-json)",
+            ? [NSString stringWithFormat:@"%lu args (disable-sync=%d, jit=%@, fingerprint=profile-json, touchDetect=%d, desktopKbd=%d)",
                (unsigned long)gCuriumAugmentedArguments.count,
                supportsDisableSync ? 1 : 0,
-               jitPref.length > 0 ? jitPref : @"automatic"]
+               jitPref.length > 0 ? jitPref : @"automatic",
+               disableTouchDetection ? 0 : 1,
+               enableDesktopKeyboard ? 1 : 0]
             : [NSString stringWithFormat:
                @"%lu args (disable-sync=%d, jit=%@, brand=%@, mobile=%@, lang=%@)",
                (unsigned long)gCuriumAugmentedArguments.count,
@@ -550,9 +601,23 @@ BOOL CuriumConfigureLaunchFingerprint(NSData *_Nullable jsonData, NSError *_Null
     if (jsonData.length > 0) {
         gCuriumExplicitFingerprintConfigured = YES;
         id parsed = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil];
-        gCuriumEnableGlobalPrivacyControl = [parsed isKindOfClass:[NSDictionary class]]
-            && [parsed[@"enableGlobalPrivacyControl"] isKindOfClass:[NSNumber class]]
-            && [parsed[@"enableGlobalPrivacyControl"] boolValue];
+        if ([parsed isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *dict = (NSDictionary *)parsed;
+            gCuriumEnableGlobalPrivacyControl = [dict[@"enableGlobalPrivacyControl"] isKindOfClass:[NSNumber class]]
+                && [dict[@"enableGlobalPrivacyControl"] boolValue];
+            NSString *defaultSlot = [dict[@"defaultSlot"] isKindOfClass:[NSString class]] ? dict[@"defaultSlot"] : nil;
+            NSDictionary *desktop = [dict[@"desktop"] isKindOfClass:[NSDictionary class]] ? dict[@"desktop"] : nil;
+            NSNumber *maxTouchPoints = [desktop[@"maxTouchPoints"] isKindOfClass:[NSNumber class]] ? desktop[@"maxTouchPoints"] : nil;
+            BOOL desktopZeroTouch = [defaultSlot isEqualToString:@"desktop"]
+                && maxTouchPoints != nil
+                && [maxTouchPoints integerValue] == 0;
+            gCuriumDisableWebTouchDetection = desktopZeroTouch;
+            gCuriumEnableDesktopKeyboardAPI = desktopZeroTouch;
+        } else {
+            gCuriumEnableGlobalPrivacyControl = NO;
+            gCuriumDisableWebTouchDetection = NO;
+            gCuriumEnableDesktopKeyboardAPI = NO;
+        }
         NSDictionary<NSString *, id> *status = CuriumEngineActiveFingerprintStatusDict();
         NSString *profileId = [status[@"appliedProfileId"] isKindOfClass:[NSString class]]
             ? status[@"appliedProfileId"] : @"unknown";
@@ -566,6 +631,8 @@ BOOL CuriumConfigureLaunchFingerprint(NSData *_Nullable jsonData, NSError *_Null
     } else {
         gCuriumExplicitFingerprintConfigured = NO;
         gCuriumEnableGlobalPrivacyControl = NO;
+        gCuriumDisableWebTouchDetection = NO;
+        gCuriumEnableDesktopKeyboardAPI = NO;
         CuriumRecordHookStatus(@"Fingerprint Profile", @"active", @"default (Build 39 0105)");
     }
     return YES;

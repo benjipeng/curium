@@ -10,9 +10,9 @@ enum CuriumSiteMode: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .adaptive: "Duo Adaptive (Inner Desktop · Outer Mobile)"
-        case .desktop: "Desktop Site"
-        case .mobile: "Mobile Site"
+        case .adaptive: "Duo Adaptive (Responsive)"
+        case .desktop: "Always Desktop Layout"
+        case .mobile: "Always Mobile Layout"
         }
     }
 

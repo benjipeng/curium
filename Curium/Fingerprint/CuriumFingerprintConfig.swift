@@ -471,30 +471,35 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
     }
 
     var shortArchetypeSummary: String {
-        if matchesBuild39EngineDefaults {
-            return "Authentic Chrome · Native HW"
-        }
         let primarySlot = defaultSlot == .desktop ? desktop : mobile
         let platformLabel: String
         if let model = primarySlot.model, !model.isEmpty, let platform = primarySlot.platform, !platform.isEmpty {
             platformLabel = "\(model) (\(platform))"
         } else if let platform = primarySlot.platform, !platform.isEmpty {
-            if defaultSlot == .desktop {
+            if let major = Self.extractChromeMajorVersion(from: primarySlot) {
+                platformLabel = "\(platform) \(major)"
+            } else if defaultSlot == .desktop {
                 platformLabel = "\(platform) Desktop"
-            } else if let desktopPlatform = desktop.platform, !desktopPlatform.isEmpty, desktopPlatform != platform {
-                platformLabel = "\(platform) + \(desktopPlatform)"
             } else {
                 platformLabel = platform
             }
         } else {
-            platformLabel = defaultSlot == .desktop ? "Desktop" : "Authentic Chrome"
+            platformLabel = defaultSlot == .desktop ? "macOS Desktop" : "Browser Profile"
         }
 
         var parts = [platformLabel]
-        if isFarblingActive {
-            parts.append("Farbled")
+        if let matchedVariant = CuriumFingerprintDevicePools.variants(forProfile: self).first(where: { $0.matches(self) }),
+           let chipLabel = matchedVariant.label.split(separator: "·").first?.trimmingCharacters(in: .whitespaces),
+           !chipLabel.isEmpty {
+            parts.append(chipLabel)
+        } else if usesNativeHardwareAndGPU {
+            parts.append("Native Apple")
+        } else {
+            parts.append("Custom HW")
         }
-        parts.append(usesNativeHardwareAndGPU ? "Native HW" : "Custom HW")
+        if isFarblingActive {
+            parts.append("Protected")
+        }
         switch proxy {
         case .system:
             break
@@ -507,40 +512,36 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
     }
 
     /// Editorial Start Page posture line (at most 3 concise `" · "`-separated tokens,
-    /// e.g. `macOS 158 · Farbled · Proxy` or `Authentic Chrome`).
+    /// e.g. `macOS 158`, `macOS 158 · Protected`, or `macOS 158 · Proxy`).
     var conciseStartPostureSummary: String {
         var parts: [String] = []
-        if matchesBuild39EngineDefaults {
-            parts.append("Authentic Chrome")
+        let slot = defaultSlot == .desktop ? desktop : mobile
+        let rawPlatform = (slot.platform ?? slot.navigatorPlatform ?? "").lowercased()
+        let osLabel: String
+        if rawPlatform.contains("mac") {
+            osLabel = "macOS"
+        } else if rawPlatform.contains("win") {
+            osLabel = "Windows"
+        } else if rawPlatform.contains("android") {
+            osLabel = "Android"
+        } else if rawPlatform.contains("linux") {
+            osLabel = "Linux"
+        } else if rawPlatform.contains("ios") || rawPlatform.contains("iphone") || rawPlatform.contains("ipad") {
+            osLabel = "iOS"
         } else {
-            let slot = defaultSlot == .desktop ? desktop : mobile
-            let rawPlatform = (slot.platform ?? slot.navigatorPlatform ?? "").lowercased()
-            let osLabel: String
-            if rawPlatform.contains("mac") {
-                osLabel = "macOS"
-            } else if rawPlatform.contains("win") {
-                osLabel = "Windows"
-            } else if rawPlatform.contains("android") {
-                osLabel = "Android"
-            } else if rawPlatform.contains("linux") {
-                osLabel = "Linux"
-            } else if rawPlatform.contains("ios") || rawPlatform.contains("iphone") || rawPlatform.contains("ipad") {
-                osLabel = "iOS"
-            } else {
-                osLabel = defaultSlot == .desktop ? "Desktop" : "Authentic Chrome"
-            }
+            osLabel = "macOS"
+        }
 
-            if let major = Self.extractChromeMajorVersion(from: slot) {
-                parts.append("\(osLabel) \(major)")
-            } else {
-                parts.append(osLabel)
-            }
+        if let major = Self.extractChromeMajorVersion(from: slot) {
+            parts.append("\(osLabel) \(major)")
+        } else {
+            parts.append(osLabel)
+        }
 
-            if isFarblingActive {
-                parts.append("Farbled")
-            } else if !usesNativeHardwareAndGPU {
-                parts.append("Custom HW")
-            }
+        if isFarblingActive {
+            parts.append("Farbled")
+        } else if !usesNativeHardwareAndGPU {
+            parts.append("Custom HW")
         }
 
         switch proxy {

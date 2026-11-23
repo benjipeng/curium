@@ -520,17 +520,10 @@ struct CuriumProfileSwitcherSheet: View {
 
     private var engineSummarySection: some View {
         Section {
-            LabeledContent("Active Process Profile") {
+            LabeledContent("Active Profile") {
                 Text(activeProfile.displayName)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-            }
-
-            LabeledContent("Isolation Mode") {
-                Text("Isolated Cookies, Bookmarks & Tabs")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.trailing)
             }
 
             if let status = engineStatus {
@@ -546,11 +539,9 @@ struct CuriumProfileSwitcherSheet: View {
                         .foregroundStyle(.secondary)
                 }
             }
-        } header: {
-            Text("Runtime")
         } footer: {
             Text(
-                "Everything runs locally on this device with isolated Blink cookies, site storage, extensions, SQLite bookmarks/history, and open tabs."
+                "Each profile runs locally with isolated cookies, site storage, extensions, bookmarks, history, and tabs."
             )
         }
     }
@@ -747,7 +738,7 @@ struct CuriumProfileSwitcherSheet: View {
         for profile: CuriumFingerprintProfile,
         usage: CuriumFingerprintProfileStorage.UsageSnapshot?
     ) -> String {
-        let archetype = profile.shortArchetypeSummary
+        let archetype = profile.conciseStartPostureSummary
         guard let usage else { return archetype }
         let usageText = usage.exists ? formatBytes(usage.totalBytes) : "Fresh"
         return "\(archetype) · \(usageText)"
@@ -809,9 +800,7 @@ struct CuriumProfileSwitcherSheet: View {
 
     private func selectForNextLaunch(_ profile: CuriumFingerprintProfile) {
         guard !isWiping, !isRelaunching else { return }
-        let targetID: String? = (profile.isPrimaryDefault && profile.matchesBuild39EngineDefaults)
-            ? nil
-            : profile.id
+        let targetID: String? = profile.isPrimaryDefault ? nil : profile.id
         if fingerprintStore.selectProfile(id: targetID) {
             onSelectionChanged?()
         } else {
@@ -822,9 +811,7 @@ struct CuriumProfileSwitcherSheet: View {
 
     private func cancelPendingSwitch() {
         guard !isWiping, !isRelaunching else { return }
-        let revertID: String? = (activeProfile.isPrimaryDefault && activeProfile.matchesBuild39EngineDefaults)
-            ? nil
-            : activeProfile.id
+        let revertID: String? = activeProfile.isPrimaryDefault ? nil : activeProfile.id
         if fingerprintStore.selectProfile(id: revertID) {
             onSelectionChanged?()
         } else {
@@ -845,9 +832,7 @@ struct CuriumProfileSwitcherSheet: View {
             }
         } else {
             let targetProfile = fingerprintStore.profile(id: profileID)
-            let resolvedSelectionID: String? = (targetProfile?.isPrimaryDefault == true && targetProfile?.matchesBuild39EngineDefaults == true)
-                ? nil
-                : profileID
+            let resolvedSelectionID: String? = targetProfile?.isPrimaryDefault == true ? nil : profileID
             if fingerprintStore.selectProfile(id: resolvedSelectionID) {
                 onSelectionChanged?()
                 await CuriumLibrary(profileID: activeProfileID, fingerprintStore: fingerprintStore).checkpointAsync()

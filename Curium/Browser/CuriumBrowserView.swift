@@ -3,8 +3,7 @@ import UIKit
 
 struct CuriumBrowserView: View {
     @Bindable var store: CuriumBrowserStore
-    @Binding var palette: CuriumPalette
-    @Binding var siteMode: CuriumSiteMode
+    let palette: CuriumPalette
     @Environment(\.layoutDirection) private var layoutDirection
 
     @State private var placement = CuriumVerticalBarPlacement.none
@@ -235,9 +234,6 @@ struct CuriumBrowserView: View {
             case .history: CuriumLibrarySheet(store: store, section: .history)
             case .settings:
                 CuriumSettingsSheet(
-                    palette: $palette,
-                    siteMode: $siteMode,
-                    library: store.library,
                     engineReady: store.isEngineReady,
                     browserStore: store
                 )

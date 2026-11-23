@@ -104,6 +104,36 @@ the pinned engine first, translate to `patches/` once proven.
   and added `CuriumMediaRadar.swift` consuming `didLoadResourceEvent:` +
   `effectiveUserAgent`. Verified live with real Blink on `iphone_duo_27_2`
   Simulator (`sdk 27.2`, `38/38` `CuriumTests` passing).
+- [x] **Pure Apple Silicon macOS Settings/Profile overhaul & downstream desktop anti-tampering parity (on Build 42).**
+  Consolidated global Settings (`CuriumSheetHeader.swift`) to single-owner global
+  controls (Profile, global Downloads, JavaScript Engine, Runtime & Diagnostics),
+  retired Android emulation and dead Build 38 UA pickers, streamlined the profile
+  editor (`CuriumFingerprintEditorView.swift`) into 4 consumer sections + Advanced,
+  and aligned default `Personal` and all 8 Apple Silicon presets to coherent 30-bit
+  M1–M5 macOS Chrome 158 configs (default Apple M3 `1512×982`, `8c`, `16 GB`,
+  `colorDepth: 30`) with automatic legacy profile upgrade. Landed three-layer
+  downstream desktop parity without rebuilding Chromium: (1) `embed-frameworks.sh`
+  excludes unused `gcrweb.js`, `send_webkit_message.js`, `language_detection.js`,
+  and `translate_ios.js` (removing `window.__gCrWeb` and
+  `window.__proto__.webkit.messageHandlers`); (2) `CuriumRuntime.m` injects native
+  desktop Blink/V8 switches (`--touch-events=disabled`,
+  `--disable-blink-features=TouchEventFeatureDetection`,
+  `--enable-blink-features=KeyboardLock`, `--force-color-profile=extended-srgb`,
+  `--js-flags=--max-old-space-size=2048`, `--force-effective-connection-type=4G`);
+  (3) hidden built-in MV3 extension `CuriumDesktopParityExtension.swift`
+  (deterministic ID `igckbhkefpgcfcijbdhbkalaofkagpom`, zero Widevine/DRM spoofing,
+  zero `getComputedStyle`/`matchMedia`/`performance.memory` proxies, pass-through-first,
+  `MacIntel`-guarded) closes `PresentationRequest.prototype.reconnect`
+  (`"Route not found"`), dynamic `Screen.prototype.availTop`, `@2x` DPR,
+  `KeyboardLayoutMap`, macOS/Google TTS voice metadata, `MediaCapabilities`,
+  `PublicKeyCredential.getClientCapabilities()`, `window.chrome`, and Chrome 138+
+  `LanguageDetector`/`Summarizer` availability. Verified on fresh `Curium.app`
+  install on `iphone_duo_27_2` Simulator (`sdk 27.2`, `95/95` `CuriumTests` passing
+  under `-warnings-as-errors`; live `demo.fingerprint.com/playground`:
+  `bot: not_detected`, `tampering: false` (`high` confidence, `anomaly_score: 0`,
+  `anti_detect_browser: false`), `virtual_machine: false`, `suspect_score: 11`;
+  both built-in extensions hidden in Extensions sheet).
+- [ ] **Optional Build 43+ upstream polish (non-urgent):** Move `RenderWidgetHostViewIOS::GetKeyboardLayoutMap()`, `Screen::availTop` macOS menu bar offset, and a `ContentJavaScriptFeatureManager` guard (`0008`) into C++ when the next engine wave is naturally cut so `CuriumDesktopParityExtension` shrinks further.
 - [ ] **Dysprosium-inspired media stream sniffer & multi-lane downloader (on Build 41).**
   Backed by `0108` `CuriumMediaRadar` (`didLoadResourceEvent:` +
   `effectiveUserAgent`); next UI/downloader milestone after Build 41 checkpoint.
@@ -117,7 +147,7 @@ permission element disable flag → `0107`) workarounds are retired.
 | Hook | Effect | Exit |
 | --- | --- | --- |
 | `CrIOSEngineBootstrap` launch fingerprint bridge (`CuriumRuntime.m`) | Probes engine capabilities (`v1` / `v2`, 17 features on Build 41), sends bounded `schemaVersion: 1|2` JSON before `ChromeMain`, fails closed on rejection, and queries live `activeFingerprintStatus`. | Permanent: shell ↔ engine launch contract. |
-| `-[NSProcessInfo arguments]` (`CuriumRuntime.m`) | Adds launch switches: Google features off, `--disable-sync`, JIT mode, Skia Graphite off on Simulator, `--enable-features=GlobalPrivacyControlApi` strictly when the active profile opts into GPC, and legacy `0105` switches only in unconfigured Build 39 default mode. | Permanent channel. |
+| `-[NSProcessInfo arguments]` (`CuriumRuntime.m`) | Adds launch switches: Google features off, `--disable-sync`, JIT mode, Skia Graphite off on Simulator, `--enable-features=GlobalPrivacyControlApi` when the active profile opts into GPC, desktop zero-touch macOS switches (`--touch-events=disabled`, `--disable-blink-features=TouchEventFeatureDetection`, `--enable-blink-features=KeyboardLock`, `--force-color-profile=extended-srgb`, `--js-flags=--max-old-space-size=2048`, `--force-effective-connection-type=4G`), and legacy `0105` switches only in unconfigured Build 39 default mode. | Permanent channel. |
 | `V8IOSJitPrepareForProcess` pre-`ChromeMain` probe (`CuriumRuntime.m`) | Prepares V8's iOS TXM / Simulator JIT pool before Crashpad installs exception handlers. | Permanent: shell-controlled JIT preference. |
 | `+[MetricsMediator logLaunchMetricsWithStartupInformation:connectedScenes:]` (`CuriumRuntime.m`) | No-op. Launch metrics walk Chrome's tab model for uploads Curium never makes. | None planned. |
 

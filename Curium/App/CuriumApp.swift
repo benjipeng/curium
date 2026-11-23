@@ -532,33 +532,9 @@ struct CuriumScene: View {
         activeProfile?.resolvedSiteMode ?? .adaptive
     }
 
-    private var paletteBinding: Binding<CuriumPalette> {
-        Binding(
-            get: { activePalette },
-            set: { newValue in
-                _ = fingerprintStore.updatePersonaMetadata(for: store.activeProfileID, palette: newValue)
-                if store.activeProfileID == "default" {
-                    UserDefaults.standard.set(newValue.rawValue, forKey: "curium.palette")
-                }
-            }
-        )
-    }
-
-    private var siteModeBinding: Binding<CuriumSiteMode> {
-        Binding(
-            get: { activeSiteMode },
-            set: { newValue in
-                _ = fingerprintStore.updatePersonaMetadata(for: store.activeProfileID, siteMode: newValue)
-                if store.activeProfileID == "default" {
-                    UserDefaults.standard.set(newValue.rawValue, forKey: "curium.siteMode")
-                }
-            }
-        )
-    }
-
     var body: some View {
         NavigationStack {
-            CuriumBrowserView(store: store, palette: paletteBinding, siteMode: siteModeBinding)
+            CuriumBrowserView(store: store, palette: activePalette)
         }
         .tint(activePalette.tint)
         .environment(\.curiumPalette, activePalette)

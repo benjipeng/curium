@@ -16,9 +16,10 @@ struct CuriumActivityShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
-/// Full local persona and Blink fingerprint editor supporting every retained profile
-/// (including `"default"` Personal) with 180 ms debounced validation, narrow-width
-/// 382 pt stacked monospace inputs, lazy JSON export, and isolated storage controls.
+/// Clean local profile and privacy editor for every retained profile (including `"default"`
+/// Personal). Daily preferences and high-level hardware/network/privacy controls stay calm
+/// at the top level, while wire-level identity slots, manual GPU overrides, seeds, and JSON
+/// export live inside a single secondary `Advanced` screen.
 struct CuriumFingerprintEditorView: View {
     private enum EditorDialog: Identifiable {
         case wipeStorage
@@ -93,7 +94,7 @@ struct CuriumFingerprintEditorView: View {
     private let iconColumns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 4)
     private let paletteColumns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 6)
 
-    private static let commonTimezones: [String] = [
+    static let commonTimezones: [String] = [
         "UTC",
         "America/New_York",
         "America/Chicago",
@@ -113,10 +114,6 @@ struct CuriumFingerprintEditorView: View {
 
     private var hasUnsavedChanges: Bool {
         effectiveDraft != savedBaseline
-    }
-
-    private var hasPendingEngineFingerprintChanges: Bool {
-        Self.hasEngineFingerprintDifferences(from: savedBaseline, to: effectiveDraft)
     }
 
     private var validationTrigger: ValidationTrigger {
@@ -207,46 +204,45 @@ struct CuriumFingerprintEditorView: View {
         return report
     }
 
-    private static func hasEngineFingerprintDifferences(
-        from baseline: CuriumFingerprintProfile,
-        to candidate: CuriumFingerprintProfile
-    ) -> Bool {
-        baseline.defaultSlot != candidate.defaultSlot
-            || baseline.mobile != candidate.mobile
-            || baseline.desktop != candidate.desktop
-            || baseline.languages != candidate.languages
-            || baseline.proxy != candidate.proxy
-            || baseline.webrtcIpHandlingPolicy != candidate.webrtcIpHandlingPolicy
-            || baseline.enableDoNotTrack != candidate.enableDoNotTrack
-            || baseline.enableGlobalPrivacyControl != candidate.enableGlobalPrivacyControl
-            || baseline.hardware != candidate.hardware
-            || baseline.fingerprintSeed != candidate.fingerprintSeed
-            || baseline.farbling != candidate.farbling
-            || baseline.fontProfile != candidate.fontProfile
-            || baseline.hideSpeechVoices != candidate.hideSpeechVoices
-    }
-
     private var storageFolderDisplayName: String? {
         let trimmed = draft.id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard CuriumFingerprintValidator.isValidProfileID(trimmed) else { return nil }
         return trimmed == "default" ? "Chromium/" : "ChromiumProfiles/\(trimmed)"
     }
 
+    private var hardwareProfileSummary: String {
+        if draft.usesNativeHardwareAndGPU {
+            return "Native Apple Silicon"
+        }
+        let poolVariants = CuriumFingerprintDevicePools.variants(forProfile: draft)
+        if let matched = poolVariants.first(where: { $0.matches(draft) }) {
+            return matched.label
+        }
+        var parts: [String] = []
+        if let cores = draft.hardware.hardwareConcurrency {
+            parts.append("\(cores)c")
+        }
+        if let mem = draft.hardware.deviceMemoryGB {
+            parts.append(mem < 1 ? "\(mem) GB" : "\(Int(mem)) GB")
+        }
+        if let screen = (draft.defaultSlot == .desktop ? draft.desktop.screen : draft.mobile.screen) {
+            parts.append("\(screen.width)×\(screen.height)")
+        }
+        return parts.isEmpty ? "Custom Hardware" : parts.joined(separator: " · ")
+    }
+
     var body: some View {
         Form {
-            personaAndPreferencesSection
-            statusAndQuickActionSection
-            identitySlotsSection
-            antiFingerprintingSection
-            hardwareAndGPUSection
-            networkAndPrivacySection
-            storageAndJSONSection
+            profileSection
+            deviceAndPrivacySection
+            storageAndActionsSection
+            advancedLinkSection
             if !cachedReport.errors.isEmpty || !cachedReport.warnings.isEmpty {
                 validationSection(cachedReport)
             }
         }
         .scrollDismissesKeyboard(.interactively)
-        .navigationTitle(draft.displayName.isEmpty ? "Customize Profile" : draft.displayName)
+        .navigationTitle(draft.displayName.isEmpty ? "Profile" : draft.displayName)
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(hasUnsavedChanges || isWiping)
         .interactiveDismissDisabled(hasUnsavedChanges || isWiping)
@@ -355,7 +351,7 @@ struct CuriumFingerprintEditorView: View {
             CuriumActivityShareSheet(text: doc.text)
                 .presentationDetents([.medium, .large])
         }
-        .alert("Profile Editor", isPresented: Binding(
+        .alert("Profile", isPresented: Binding(
             get: { alertMessage != nil },
             set: { if !$0 { alertMessage = nil } }
         )) {
@@ -367,7 +363,7 @@ struct CuriumFingerprintEditorView: View {
 
     // MARK: - Form Sections
 
-    private var personaAndPreferencesSection: some View {
+    private var profileSection: some View {
         let resolvedPalette = draft.resolvedPalette
         let resolvedSymbol = draft.resolvedSymbolName
 
@@ -384,7 +380,7 @@ struct CuriumFingerprintEditorView: View {
                         .font(.headline)
                         .foregroundStyle(draft.displayName.isEmpty ? .secondary : .primary)
                         .lineLimit(1)
-                    Text(draft.shortArchetypeSummary)
+                    Text(draft.conciseStartPostureSummary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -452,8 +448,8 @@ struct CuriumFingerprintEditorView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Text("\(resolvedPalette.title) · \(resolvedPalette.notation)")
-                        .font(.caption.monospaced())
+                    Text(resolvedPalette.title)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
@@ -480,18 +476,12 @@ struct CuriumFingerprintEditorView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("\(option.title) (\(option.notation))")
+                        .accessibilityLabel(option.title)
                         .accessibilityAddTraits(isSelected ? .isSelected : [])
                     }
                 }
             }
             .padding(.vertical, 4)
-
-            Picker("Default Site Layout", selection: siteModeBinding) {
-                ForEach(CuriumSiteMode.allCases) { mode in
-                    Text(mode.shortTitle).tag(mode)
-                }
-            }
 
             Picker("Search Engine", selection: searchEngineBinding) {
                 ForEach(CuriumSearchEngine.allCases) { engine in
@@ -499,45 +489,193 @@ struct CuriumFingerprintEditorView: View {
                 }
             }
 
-            CuriumStackedTextFieldRow(
-                title: "Notes",
-                placeholder: "Optional notes",
-                text: $draft.notes,
-                isReadOnly: false,
-                monospaced: false,
-                font: .callout,
-                autocapitalization: .sentences
-            )
-
-            LabeledContent("Profile ID") {
-                Text(draft.id)
-                    .font(.body.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-
-            LabeledContent("Revision", value: "\(draft.revision)")
-        } header: {
-            Text("Persona & Preferences")
-        } footer: {
-            if isActiveInProcess {
-                if hasPendingEngineFingerprintChanges {
-                    Text(
-                        "Display name, icon, accent, layout, and search engine apply immediately. Engine fingerprint edits apply on next launch."
-                    )
-                } else {
-                    Text(
-                        "Display name, icon, accent, default layout, and search engine apply immediately. Engine fingerprint settings below apply on next launch."
-                    )
+            Picker("Default Site Layout", selection: siteModeBinding) {
+                ForEach(CuriumSiteMode.allCases) { mode in
+                    Text(mode.shortTitle).tag(mode)
                 }
-            } else {
-                Text("Profile IDs are immutable so isolated storage directories never collide.")
             }
+        } header: {
+            Text("Profile")
+        } footer: {
+            Text(
+                "Name, icon, accent, search engine, and layout apply immediately. Duo Adaptive adjusts viewport width on the outer cover display without changing your macOS identity."
+            )
         }
     }
 
-    private var statusAndQuickActionSection: some View {
-        Section {
+    private var deviceAndPrivacySection: some View {
+        let poolVariants = CuriumFingerprintDevicePools.variants(forProfile: draft)
+
+        return Section {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Mac Hardware")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Text(hardwareProfileSummary)
+                    .font(.callout)
+                    .foregroundStyle(.primary)
+            }
+            .padding(.vertical, 2)
+
+            if !poolVariants.isEmpty {
+                Menu {
+                    Button {
+                        restoreNativeAppleHardware()
+                    } label: {
+                        if draft.usesNativeHardwareAndGPU {
+                            Label("Native Apple Silicon", systemImage: "checkmark")
+                        } else {
+                            Text("Native Apple Silicon")
+                        }
+                    }
+
+                    Divider()
+
+                    ForEach(poolVariants) { variant in
+                        Button {
+                            draft = variant.apply(to: draft)
+                            hardwareOverrideEnabled = !draft.usesNativeHardwareAndGPU
+                        } label: {
+                            if variant.matches(draft) {
+                                Label(variant.label, systemImage: "checkmark")
+                            } else {
+                                Text(variant.label)
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Choose Mac Profile…", systemImage: "laptopcomputer")
+                }
+                .accessibilityIdentifier("curium.editor.chooseHardware")
+
+                Button {
+                    if let rolled = CuriumFingerprintPresets.rollCoherentHardwareVariant(
+                        for: draft,
+                        avoiding: store.profiles.filter { $0.id != draft.id }
+                    ) {
+                        draft = rolled
+                        hardwareOverrideEnabled = !rolled.usesNativeHardwareAndGPU
+                    }
+                } label: {
+                    Label("Roll Distinct Mac", systemImage: "dice")
+                }
+                .accessibilityIdentifier("curium.editor.rollHardware")
+            }
+
+            Toggle("Anti-Fingerprinting", isOn: Binding(
+                get: { draft.fingerprintSeed != nil },
+                set: { enabled in
+                    if enabled {
+                        if draft.fingerprintSeed == nil {
+                            draft.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
+                        }
+                        if draft.farbling == nil {
+                            draft.farbling = .allEnabled
+                        }
+                    } else {
+                        draft.fingerprintSeed = nil
+                        draft.farbling = nil
+                    }
+                }
+            ))
+            .accessibilityIdentifier("curium.editor.farbling")
+
+            Picker("Proxy", selection: $proxyModeSelection) {
+                ForEach(ProxyModeChoice.allCases) { choice in
+                    Text(choice.title).tag(choice)
+                }
+            }
+
+            if proxyModeSelection == .fixed {
+                CuriumStackedTextFieldRow(
+                    title: "Proxy Rules",
+                    placeholder: "socks5://127.0.0.1:1080",
+                    text: $fixedProxyRules,
+                    isReadOnly: false,
+                    keyboardType: .URL
+                )
+
+                CuriumStackedTextFieldRow(
+                    title: "Bypass Rules",
+                    placeholder: "Optional (e.g. <-loopback>)",
+                    text: $fixedProxyBypass,
+                    isReadOnly: false
+                )
+
+                Toggle("Proxy Loopback Traffic (<-loopback>)", isOn: Binding(
+                    get: { fixedProxyBypass.contains("<-loopback>") },
+                    set: { include in
+                        var parts = fixedProxyBypass
+                            .split(separator: ";")
+                            .map { $0.trimmingCharacters(in: .whitespaces) }
+                            .filter { !$0.isEmpty && $0 != "<-loopback>" }
+                        if include { parts.append("<-loopback>") }
+                        fixedProxyBypass = parts.joined(separator: ";")
+                    }
+                ))
+            }
+
+            Picker("Timezone", selection: Binding<String>(
+                get: { draft.hardware.timezone ?? "" },
+                set: { draft.hardware.timezone = $0.isEmpty ? nil : $0 }
+            )) {
+                Text("System Default").tag("")
+                ForEach(Self.commonTimezones, id: \.self) { tz in
+                    Text(tz).tag(tz)
+                }
+                if let current = draft.hardware.timezone,
+                   !current.isEmpty,
+                   !Self.commonTimezones.contains(current)
+                {
+                    Text(current).tag(current)
+                }
+            }
+
+            Toggle("Follow System Languages", isOn: Binding(
+                get: { useSystemLanguages },
+                set: { followSystem in
+                    useSystemLanguages = followSystem
+                    if !followSystem && languagesText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        languagesText = "en-US, en"
+                    }
+                }
+            ))
+
+            if !useSystemLanguages {
+                CuriumStackedTextFieldRow(
+                    title: "Language Tags",
+                    placeholder: "en-US, en",
+                    text: $languagesText,
+                    isReadOnly: false
+                )
+
+                Menu {
+                    Button("English (US): en-US, en") { languagesText = "en-US, en" }
+                    Button("Chinese + English: zh-Hans-CN, en-US") { languagesText = "zh-Hans-CN, en-US" }
+                    Button("Japanese + English: ja-JP, en-US") { languagesText = "ja-JP, en-US" }
+                    Button("German + English: de-DE, en-US") { languagesText = "de-DE, en-US" }
+                    Button("French + English: fr-FR, en-US") { languagesText = "fr-FR, en-US" }
+                } label: {
+                    Label("Quick Language Preset…", systemImage: "globe")
+                }
+            }
+
+            Picker("WebRTC IP Policy", selection: $draft.webrtcIpHandlingPolicy) {
+                ForEach(CuriumWebRTCPolicy.allCases) { policy in
+                    Text(policy.title).tag(policy)
+                }
+            }
+
+            Toggle("Global Privacy Control (Sec-GPC)", isOn: $draft.enableGlobalPrivacyControl)
+        } header: {
+            Text("Device & Privacy")
+        } footer: {
+            Text("Device, proxy, locale, and privacy changes apply on the next cold launch.")
+        }
+    }
+
+    private var storageAndActionsSection: some View {
+        Section("Storage & Actions") {
             if !isActiveInProcess {
                 Button {
                     if hasUnsavedChanges {
@@ -555,38 +693,69 @@ struct CuriumFingerprintEditorView: View {
                 .accessibilityIdentifier("curium.editor.select")
             }
 
-            // Constant-height validation anchor so typing never shifts TextFields below.
-            validationSummaryRow
-        } footer: {
-            if isActiveInProcess {
-                Text(
-                    "This profile is currently running in Blink. Saved engine fingerprint edits bump revision and apply on the next cold launch."
-                )
+            if let currentUsage {
+                LabeledContent("Disk Footprint") {
+                    Text(
+                        currentUsage.exists
+                            ? ByteCountFormatter.string(fromByteCount: currentUsage.totalBytes, countStyle: .file)
+                            : "Not created yet"
+                    )
+                    .foregroundStyle(.secondary)
+                }
+            }
+
+            Button {
+                duplicateProfile()
+            } label: {
+                Label("Duplicate Profile", systemImage: "plus.square.on.square")
+            }
+            .disabled(isWiping || store.loadError != nil)
+
+            if !draft.isPrimaryDefault {
+                Button(role: .destructive) {
+                    activeDialog = .wipeStorage
+                } label: {
+                    HStack {
+                        Label(
+                            isWiping ? "Wiping Isolated Storage…" : "Wipe Isolated Storage",
+                            systemImage: "externaldrive.badge.xmark"
+                        )
+                        if isWiping {
+                            Spacer()
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                .disabled(isActiveInProcess || isWiping || currentUsage?.exists != true)
             }
         }
     }
 
-    private var validationSummaryRow: some View {
-        Group {
-            if !cachedReport.errors.isEmpty {
-                Label(
-                    "\(cachedReport.errors.count) validation \(cachedReport.errors.count == 1 ? "error" : "errors") — see Validation below",
-                    systemImage: "xmark.octagon.fill"
+    private var advancedLinkSection: some View {
+        Section {
+            NavigationLink {
+                CuriumProfileAdvancedView(
+                    draft: $draft,
+                    hardwareOverrideEnabled: $hardwareOverrideEnabled,
+                    copiedLabel: $copiedLabel,
+                    storageFolderDisplayName: storageFolderDisplayName,
+                    canCopyWireJSON: cachedReport.isValid,
+                    onRestoreNativeHardware: restoreNativeAppleHardware,
+                    onCopyProfileJSON: copyProfileJSON,
+                    onCopyEngineWireJSON: copyEngineWireJSON,
+                    onShareProfileJSON: shareProfileJSON
                 )
-                .font(.footnote)
-                .foregroundStyle(.red)
-            } else if !cachedReport.warnings.isEmpty {
-                Label(
-                    "\(cachedReport.warnings.count) coherence \(cachedReport.warnings.count == 1 ? "warning" : "warnings") — see Validation below",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-                .font(.footnote)
-                .foregroundStyle(.orange)
-            } else {
-                Label("Configuration valid", systemImage: "checkmark.seal.fill")
-                    .font(.footnote)
-                    .foregroundStyle(.green)
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Advanced")
+                    Text("Identity slots, farbling seed, manual GPU overrides & JSON")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
+            .accessibilityIdentifier("curium.editor.advanced")
         }
     }
 
@@ -603,6 +772,193 @@ struct CuriumFingerprintEditorView: View {
                     .foregroundStyle(.orange)
             }
         }
+    }
+
+    // MARK: - Bindings & Helpers
+
+    private var siteModeBinding: Binding<CuriumSiteMode> {
+        Binding(
+            get: { draft.resolvedSiteMode },
+            set: { newValue in
+                if newValue != draft.resolvedSiteMode {
+                    draft.siteMode = newValue
+                }
+            }
+        )
+    }
+
+    private var searchEngineBinding: Binding<CuriumSearchEngine> {
+        Binding(
+            get: { draft.resolvedSearchEngine },
+            set: { newValue in
+                if newValue != draft.resolvedSearchEngine {
+                    draft.searchEngine = newValue
+                }
+            }
+        )
+    }
+
+    private func restoreNativeAppleHardware() {
+        let preservedTimezone = draft.hardware.timezone
+        draft.hardware = CuriumHardwareOverrides(
+            hardwareConcurrency: nil,
+            deviceMemoryGB: nil,
+            timezone: preservedTimezone
+        )
+        draft.mobile.webglVendor = nil
+        draft.mobile.webglRenderer = nil
+        draft.mobile.screen = nil
+        draft.desktop.webglVendor = nil
+        draft.desktop.webglRenderer = nil
+        draft.desktop.screen = nil
+        hardwareOverrideEnabled = !draft.usesNativeHardwareAndGPU
+    }
+
+    private func selectCurrentProfile() {
+        guard !isWiping else { return }
+        let targetID: String? = savedBaseline.isPrimaryDefault ? nil : savedBaseline.id
+        if store.selectProfile(id: targetID) {
+            onSelectionChanged?()
+        } else {
+            alertMessage = store.lastPersistError ?? "Unable to select profile."
+        }
+    }
+
+    private func duplicateProfile() {
+        guard !isWiping else { return }
+        guard let copy = store.duplicateProfile(
+            from: draft.id,
+            displayName: "\(draft.displayName) Copy"
+        ) else {
+            alertMessage = store.lastPersistError ?? "Unable to duplicate profile."
+            return
+        }
+        onDuplicateToEdit?(copy)
+    }
+
+    @discardableResult
+    private func saveProfile(dismissAfterSave: Bool) -> Bool {
+        guard !isWiping else { return false }
+        let candidate = effectiveDraft
+        let preflight = Self.evaluateValidation(candidate: candidate)
+        cachedReport = preflight
+        guard preflight.isValid else {
+            alertMessage = preflight.errors.joined(separator: "\n")
+            return false
+        }
+        let report = store.upsert(candidate)
+        cachedReport = report
+        guard report.isValid else {
+            alertMessage = report.errors.joined(separator: "\n")
+            return false
+        }
+        let saved = store.profile(id: candidate.id) ?? candidate
+        draft = saved
+        savedBaseline = saved.normalizedForPersistence()
+        if saved.isPrimaryDefault {
+            let defaults = UserDefaults.standard
+            defaults.set(saved.resolvedPalette.rawValue, forKey: "curium.palette")
+            defaults.set(saved.resolvedSiteMode.rawValue, forKey: "curium.siteMode")
+            defaults.set(saved.resolvedSearchEngine.rawValue, forKey: "curium.searchEngine")
+        }
+        onSaved?(saved)
+        if dismissAfterSave {
+            dismiss()
+        }
+        return true
+    }
+
+    private func exportJSONString() -> String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(effectiveDraft) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func copyProfileJSON() {
+        guard let text = exportJSONString() else { return }
+        UIPasteboard.general.string = text
+        copiedLabel = "profile"
+    }
+
+    private func copyEngineWireJSON() {
+        do {
+            let data = try effectiveDraft.makeEngineLaunchJSON()
+            if let text = String(data: data, encoding: .utf8) {
+                UIPasteboard.general.string = text
+                copiedLabel = "wire"
+            }
+        } catch {
+            alertMessage = "Failed to encode engine wire JSON: \(error.localizedDescription)"
+        }
+    }
+
+    private func shareProfileJSON() {
+        if let text = exportJSONString() {
+            pendingShareDocument = CuriumShareDocument(text: text)
+        } else {
+            alertMessage = "Failed to encode profile JSON for sharing."
+        }
+    }
+
+    private func wipeStorage() {
+        guard !isWiping, !draft.isPrimaryDefault else { return }
+        let targetID = draft.id
+        let active = isActiveInProcess || CuriumFingerprintProfileStorage.isProfileActiveInCurrentProcess(targetID)
+        guard !active else {
+            alertMessage = CuriumFingerprintProfileStorage.WipeError.activeProfileProtected.localizedDescription
+            return
+        }
+        isWiping = true
+        Task {
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
+                        targetID,
+                        isActiveInCurrentProcess: false
+                    )
+                }.value
+                isWiping = false
+                currentUsage = CuriumFingerprintProfileStorage.UsageSnapshot(
+                    supportBytes: 0,
+                    cacheBytes: 0,
+                    exists: false
+                )
+                onWiped?()
+            } catch {
+                isWiping = false
+                alertMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+// MARK: - Secondary Advanced Profile Controls
+
+/// Power-user and protocol-level controls tucked cleanly behind `Advanced`:
+/// raw identity slots (UA / Client Hints / `navigator.platform`), granular farbling
+/// seed & surface toggles, manual hardware/GPU overrides, metadata, and JSON export.
+private struct CuriumProfileAdvancedView: View {
+    @Binding var draft: CuriumFingerprintProfile
+    @Binding var hardwareOverrideEnabled: Bool
+    @Binding var copiedLabel: String?
+    let storageFolderDisplayName: String?
+    let canCopyWireJSON: Bool
+    let onRestoreNativeHardware: () -> Void
+    let onCopyProfileJSON: () -> Void
+    let onCopyEngineWireJSON: () -> Void
+    let onShareProfileJSON: () -> Void
+
+    var body: some View {
+        Form {
+            identitySlotsSection
+            farblingDetailsSection
+            manualHardwareSection
+            metadataAndExportSection
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .navigationTitle("Advanced")
+        .navigationBarTitleDisplayMode(.inline)
     }
 
     private var identitySlotsSection: some View {
@@ -623,7 +979,7 @@ struct CuriumFingerprintEditorView: View {
             } label: {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Mobile Identity Slot")
-                    Text(slotSummary(draft.mobile, fallbackPlatform: "Android"))
+                    Text(slotSummary(draft.mobile, fallbackPlatform: "macOS"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -647,34 +1003,16 @@ struct CuriumFingerprintEditorView: View {
                 }
             }
         } header: {
-            Text("IdentitySpec (Dual-Slot)")
+            Text("Identity Slots")
         } footer: {
             Text(
-                "Mobile and Desktop slots are frozen at launch; Request Desktop Site toggles between the two slots without mutating history."
+                "Real Apple Silicon Chrome reports \"Intel Mac OS X 10_15_7\" in User-Agent and \"MacIntel\" in navigator.platform for web compatibility while advertising ARM64 in Client Hints. Keep both slots aligned to macOS so outer and inner displays never flip your OS identity."
             )
         }
     }
 
-    private var antiFingerprintingSection: some View {
+    private var farblingDetailsSection: some View {
         Section {
-            Toggle("Deterministic Per-Site Farbling", isOn: Binding(
-                get: { draft.fingerprintSeed != nil },
-                set: { enabled in
-                    if enabled {
-                        if draft.fingerprintSeed == nil {
-                            draft.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
-                        }
-                        if draft.farbling == nil {
-                            draft.farbling = .allEnabled
-                        }
-                    } else {
-                        draft.fingerprintSeed = nil
-                        draft.farbling = nil
-                    }
-                }
-            ))
-            .accessibilityIdentifier("curium.editor.farbling")
-
             if let seed = draft.fingerprintSeed {
                 LabeledContent("Seed (HMAC-SHA256)") {
                     HStack(spacing: 6) {
@@ -704,6 +1042,10 @@ struct CuriumFingerprintEditorView: View {
                 Toggle("WebAudio (Offline & Analyser)", isOn: farblingBinding(\.audio))
                 Toggle("WebGL readPixels", isOn: farblingBinding(\.webgl))
                 Toggle("Canvas TextMetrics", isOn: farblingBinding(\.textMetrics))
+            } else {
+                Text("Enable Anti-Fingerprinting on the main profile page to configure per-site farbling surfaces and seed rotation.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             Picker("Font Profile", selection: $draft.fontProfile) {
@@ -714,70 +1056,27 @@ struct CuriumFingerprintEditorView: View {
             }
 
             Picker("Speech Synthesis Voices", selection: $draft.hideSpeechVoices) {
-                Text("Auto (Hide on Non-Apple)").tag(Bool?.none)
+                Text("Auto").tag(Bool?.none)
                 Text("Hide Apple Voices").tag(Bool?.some(true))
                 Text("Native Voices").tag(Bool?.some(false))
             }
         } header: {
-            Text("Native Anti-Fingerprinting")
-        } footer: {
-            Text(
-                "Perturbations are deterministic per top-level site in Blink C++ with zero JS prototype footprint. Non-Apple font profiles hide Apple-exclusive fonts while preserving CJK & Emoji glyph fallback. Pair per-site farbling with a distinct GPU/screen variant and Fixed Proxy IP to prevent server-side services like Fingerprint Pro from linking profiles."
-            )
+            Text("Anti-Fingerprinting Surfaces")
         }
     }
 
-    private var hardwareAndGPUSection: some View {
+    private var manualHardwareSection: some View {
         Section {
             Toggle("Override Hardware & GPU", isOn: Binding(
                 get: { hardwareOverrideEnabled },
                 set: { enabled in
                     hardwareOverrideEnabled = enabled
                     if !enabled {
-                        // Explicitly restore authentic native Apple hardware & Metal GPU.
-                        draft.hardware = .native
-                        draft.mobile.webglVendor = nil
-                        draft.mobile.webglRenderer = nil
-                        draft.desktop.webglVendor = nil
-                        draft.desktop.webglRenderer = nil
+                        onRestoreNativeHardware()
                     }
                 }
             ))
             .accessibilityIdentifier("curium.editor.hwOverride")
-
-            let poolVariants = CuriumFingerprintDevicePools.variants(forProfile: draft)
-            if !poolVariants.isEmpty {
-                Menu {
-                    ForEach(poolVariants) { variant in
-                        Button {
-                            draft = variant.apply(to: draft)
-                            hardwareOverrideEnabled = !draft.usesNativeHardwareAndGPU
-                        } label: {
-                            if variant.matches(draft) {
-                                Label(variant.label, systemImage: "checkmark")
-                            } else {
-                                Text(variant.label)
-                            }
-                        }
-                    }
-                } label: {
-                    Label("Choose Hardware Variant…", systemImage: "cpu")
-                }
-                .accessibilityIdentifier("curium.editor.chooseHardware")
-
-                Button {
-                    if let rolled = CuriumFingerprintPresets.rollCoherentHardwareVariant(
-                        for: draft,
-                        avoiding: store.profiles.filter { $0.id != draft.id }
-                    ) {
-                        draft = rolled
-                        hardwareOverrideEnabled = !rolled.usesNativeHardwareAndGPU
-                    }
-                } label: {
-                    Label("Roll Coherent Hardware Variant", systemImage: "dice")
-                }
-                .accessibilityIdentifier("curium.editor.rollHardware")
-            }
 
             if let activeScreen = (draft.defaultSlot == .desktop ? draft.desktop.screen : draft.mobile.screen) {
                 LabeledContent("Active Screen") {
@@ -788,14 +1087,7 @@ struct CuriumFingerprintEditorView: View {
                 }
             }
 
-            if !hardwareOverrideEnabled {
-                Label(
-                    "Native Apple Silicon CPU, RAM, Timezone & Metal GPU preserved (zero override overhead).",
-                    systemImage: "checkmark.shield"
-                )
-                .font(.footnote)
-                .foregroundStyle(.green)
-            } else {
+            if hardwareOverrideEnabled {
                 Picker("CPU Cores", selection: $draft.hardware.hardwareConcurrency) {
                     Text("Native Device").tag(Int?.none)
                     ForEach([2, 4, 6, 8, 10, 12, 14, 16, 18, 24, 32], id: \.self) { count in
@@ -810,19 +1102,6 @@ struct CuriumFingerprintEditorView: View {
                     }
                 }
 
-                Picker("Timezone Preset", selection: Binding<String>(
-                    get: { draft.hardware.timezone ?? "" },
-                    set: { draft.hardware.timezone = $0.isEmpty ? nil : $0 }
-                )) {
-                    Text("Native Device Timezone").tag("")
-                    ForEach(Self.commonTimezones, id: \.self) { tz in
-                        Text(tz).tag(tz)
-                    }
-                    if let current = draft.hardware.timezone, !current.isEmpty, !Self.commonTimezones.contains(current) {
-                        Text(current).tag(current)
-                    }
-                }
-
                 CuriumStackedTextFieldRow(
                     title: "Custom IANA Timezone",
                     placeholder: "e.g. Europe/Berlin",
@@ -834,44 +1113,16 @@ struct CuriumFingerprintEditorView: View {
                     Button("Clear WebGL (Native Apple Metal)") {
                         applyWebGLPreset(vendor: nil, renderer: nil)
                     }
-                    Button("Apple M1 (macOS Metal)") {
-                        applyAppleSiliconWebGLPreset(chip: "Apple M1")
-                    }
-                    Button("Apple M2 (macOS Metal)") {
-                        applyAppleSiliconWebGLPreset(chip: "Apple M2")
-                    }
-                    Button("Apple M3 (macOS Metal)") {
-                        applyAppleSiliconWebGLPreset(chip: "Apple M3")
-                    }
-                    Button("Apple M3 Pro (macOS Metal)") {
-                        applyAppleSiliconWebGLPreset(chip: "Apple M3 Pro")
-                    }
-                    Button("Apple M4 (macOS Metal)") {
-                        applyAppleSiliconWebGLPreset(chip: "Apple M4")
-                    }
-                    Button("Apple M4 Pro (macOS Metal)") {
-                        applyAppleSiliconWebGLPreset(chip: "Apple M4 Pro")
-                    }
-                    Button("Apple M4 Max (macOS Metal)") {
-                        applyAppleSiliconWebGLPreset(chip: "Apple M4 Max")
-                    }
-                    Button("Apple M5 Max (macOS Metal)") {
-                        applyAppleSiliconWebGLPreset(chip: "Apple M5 Max")
-                    }
-                    Button("Qualcomm Adreno 750 (Android Mobile)") {
-                        applyMobileWebGLPreset(
-                            vendor: "Google Inc. (Qualcomm)",
-                            renderer: "ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2)"
-                        )
-                    }
-                    Button("ARM Mali-G715 (Android Mobile)") {
-                        applyMobileWebGLPreset(
-                            vendor: "Google Inc. (ARM)",
-                            renderer: "ANGLE (ARM, Mali-G715, OpenGL ES 3.2)"
-                        )
-                    }
+                    Button("Apple M1 (macOS Metal)") { applyAppleSiliconWebGLPreset(chip: "Apple M1") }
+                    Button("Apple M2 (macOS Metal)") { applyAppleSiliconWebGLPreset(chip: "Apple M2") }
+                    Button("Apple M3 (macOS Metal)") { applyAppleSiliconWebGLPreset(chip: "Apple M3") }
+                    Button("Apple M3 Pro (macOS Metal)") { applyAppleSiliconWebGLPreset(chip: "Apple M3 Pro") }
+                    Button("Apple M4 (macOS Metal)") { applyAppleSiliconWebGLPreset(chip: "Apple M4") }
+                    Button("Apple M4 Pro (macOS Metal)") { applyAppleSiliconWebGLPreset(chip: "Apple M4 Pro") }
+                    Button("Apple M4 Max (macOS Metal)") { applyAppleSiliconWebGLPreset(chip: "Apple M4 Max") }
+                    Button("Apple M5 Max (macOS Metal)") { applyAppleSiliconWebGLPreset(chip: "Apple M5 Max") }
                 } label: {
-                    Label("Apply WebGL GPU Preset…", systemImage: "cpu")
+                    Label("Apply Apple Silicon GPU Preset…", systemImage: "cpu")
                 }
 
                 CuriumStackedTextFieldRow(
@@ -911,94 +1162,22 @@ struct CuriumFingerprintEditorView: View {
                     )
                 }
             }
-        } header: {
-            Text("Hardware, Timezone & GPU")
-        } footer: {
-            Text(
-                "Leave off for authentic Apple hardware. Turn on whenever presenting a non-Apple platform (such as Android, Windows, or Linux) so reported WebGL, fonts, and CPU/RAM stay coherent without affecting native Metal rendering speed."
-            )
-        }
-    }
-
-    private var networkAndPrivacySection: some View {
-        Section("Network, Languages & Privacy") {
-            Toggle("Follow iOS System Languages", isOn: Binding(
-                get: { useSystemLanguages },
-                set: { followSystem in
-                    useSystemLanguages = followSystem
-                    if !followSystem && languagesText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        languagesText = "en-US, en"
-                    }
-                }
-            ))
-
-            if !useSystemLanguages {
-                CuriumStackedTextFieldRow(
-                    title: "BCP-47 Language Tags",
-                    placeholder: "en-US, en",
-                    text: $languagesText,
-                    isReadOnly: false
-                )
-
-                Menu {
-                    Button("English (US): en-US, en") { languagesText = "en-US, en" }
-                    Button("Chinese + English: zh-Hans-CN, en-US") { languagesText = "zh-Hans-CN, en-US" }
-                    Button("Japanese + English: ja-JP, en-US") { languagesText = "ja-JP, en-US" }
-                    Button("German + English: de-DE, en-US") { languagesText = "de-DE, en-US" }
-                    Button("French + English: fr-FR, en-US") { languagesText = "fr-FR, en-US" }
-                } label: {
-                    Label("Quick Language Preset…", systemImage: "globe")
-                }
-            }
-
-            Picker("Proxy Mode", selection: $proxyModeSelection) {
-                ForEach(ProxyModeChoice.allCases) { choice in
-                    Text(choice.title).tag(choice)
-                }
-            }
-
-            if proxyModeSelection == .fixed {
-                CuriumStackedTextFieldRow(
-                    title: "Proxy Rules",
-                    placeholder: "socks5://127.0.0.1:1080",
-                    text: $fixedProxyRules,
-                    isReadOnly: false,
-                    keyboardType: .URL
-                )
-
-                CuriumStackedTextFieldRow(
-                    title: "Bypass Rules",
-                    placeholder: "Optional (e.g. <-loopback>)",
-                    text: $fixedProxyBypass,
-                    isReadOnly: false
-                )
-
-                Toggle("Proxy Loopback Traffic (<-loopback>)", isOn: Binding(
-                    get: { fixedProxyBypass.contains("<-loopback>") },
-                    set: { include in
-                        var parts = fixedProxyBypass
-                            .split(separator: ";")
-                            .map { $0.trimmingCharacters(in: .whitespaces) }
-                            .filter { !$0.isEmpty && $0 != "<-loopback>" }
-                        if include { parts.append("<-loopback>") }
-                        fixedProxyBypass = parts.joined(separator: ";")
-                    }
-                ))
-            }
-
-            Picker("WebRTC IP Policy", selection: $draft.webrtcIpHandlingPolicy) {
-                ForEach(CuriumWebRTCPolicy.allCases) { policy in
-                    Text(policy.title).tag(policy)
-                }
-            }
 
             Toggle("Send Do Not Track (DNT: 1)", isOn: $draft.enableDoNotTrack)
-            Toggle("Global Privacy Control (Sec-GPC: 1)", isOn: $draft.enableGlobalPrivacyControl)
+        } header: {
+            Text("Manual Hardware & GPU Overrides")
         }
     }
 
-    private var storageAndJSONSection: some View {
-        Section("Storage & JSON Export") {
+    private var metadataAndExportSection: some View {
+        Section("Metadata & JSON Export") {
+            LabeledContent("Profile ID") {
+                Text(draft.id)
+                    .font(.body.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
             if let folder = storageFolderDisplayName {
                 LabeledContent("Storage Folder") {
                     Text(folder)
@@ -1008,26 +1187,20 @@ struct CuriumFingerprintEditorView: View {
                 }
             }
 
-            if let currentUsage {
-                LabeledContent("Disk Footprint") {
-                    Text(
-                        currentUsage.exists
-                            ? ByteCountFormatter.string(fromByteCount: currentUsage.totalBytes, countStyle: .file)
-                            : "Not created yet"
-                    )
-                    .foregroundStyle(.secondary)
-                }
-            }
+            LabeledContent("Revision", value: "\(draft.revision)")
+
+            CuriumStackedTextFieldRow(
+                title: "Notes",
+                placeholder: "Optional notes",
+                text: $draft.notes,
+                isReadOnly: false,
+                monospaced: false,
+                font: .callout,
+                autocapitalization: .sentences
+            )
 
             Button {
-                duplicateProfile()
-            } label: {
-                Label("Duplicate Profile", systemImage: "plus.square.on.square")
-            }
-            .disabled(isWiping || store.loadError != nil)
-
-            Button {
-                copyProfileJSON()
+                onCopyProfileJSON()
             } label: {
                 Label(
                     copiedLabel == "profile" ? "Copied Profile JSON" : "Copy Profile JSON",
@@ -1036,7 +1209,7 @@ struct CuriumFingerprintEditorView: View {
             }
 
             Button {
-                copyEngineWireJSON()
+                onCopyEngineWireJSON()
             } label: {
                 Label(
                     copiedLabel == "wire"
@@ -1045,61 +1218,14 @@ struct CuriumFingerprintEditorView: View {
                     systemImage: copiedLabel == "wire" ? "checkmark.circle" : "curlybraces"
                 )
             }
-            .disabled(!cachedReport.isValid)
+            .disabled(!canCopyWireJSON)
 
             Button {
-                if let text = exportJSONString() {
-                    pendingShareDocument = CuriumShareDocument(text: text)
-                } else {
-                    alertMessage = "Failed to encode profile JSON for sharing."
-                }
+                onShareProfileJSON()
             } label: {
                 Label("Share Profile JSON", systemImage: "square.and.arrow.up")
             }
-
-            if !draft.isPrimaryDefault {
-                Button(role: .destructive) {
-                    activeDialog = .wipeStorage
-                } label: {
-                    HStack {
-                        Label(
-                            isWiping ? "Wiping Isolated Storage…" : "Wipe Isolated Storage",
-                            systemImage: "externaldrive.badge.xmark"
-                        )
-                        if isWiping {
-                            Spacer()
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-                    }
-                }
-                .disabled(isActiveInProcess || isWiping || currentUsage?.exists != true)
-            }
         }
-    }
-
-    // MARK: - Bindings & Helpers
-
-    private var siteModeBinding: Binding<CuriumSiteMode> {
-        Binding(
-            get: { draft.resolvedSiteMode },
-            set: { newValue in
-                if newValue != draft.resolvedSiteMode {
-                    draft.siteMode = newValue
-                }
-            }
-        )
-    }
-
-    private var searchEngineBinding: Binding<CuriumSearchEngine> {
-        Binding(
-            get: { draft.resolvedSearchEngine },
-            set: { newValue in
-                if newValue != draft.resolvedSearchEngine {
-                    draft.searchEngine = newValue
-                }
-            }
-        )
     }
 
     private func farblingBinding(_ keyPath: WritableKeyPath<CuriumFarblingSettings, Bool>) -> Binding<Bool> {
@@ -1146,130 +1272,6 @@ struct CuriumFingerprintEditorView: View {
             draft.mobile.webglVendor = vendor
             draft.mobile.webglRenderer = renderer
             draft.mobile.webglProfile = .native
-        }
-    }
-
-    private func applyMobileWebGLPreset(vendor: String, renderer: String) {
-        draft.mobile.webglVendor = vendor
-        draft.mobile.webglRenderer = renderer
-        // Explicitly preserve native WebGL extension exposure; `.mobileAndroid` extension
-        // stripping triggers +11 virtual-machine false positives on Blink-on-iOS.
-        draft.mobile.webglProfile = .native
-    }
-
-    private func selectCurrentProfile() {
-        guard !isWiping else { return }
-        let targetID: String? = (savedBaseline.isPrimaryDefault && savedBaseline.matchesBuild39EngineDefaults)
-            ? nil
-            : savedBaseline.id
-        if store.selectProfile(id: targetID) {
-            onSelectionChanged?()
-        } else {
-            alertMessage = store.lastPersistError ?? "Unable to select profile."
-        }
-    }
-
-    private func duplicateProfile() {
-        guard !isWiping else { return }
-        guard let copy = store.duplicateProfile(
-            from: draft.id,
-            displayName: "\(draft.displayName) Copy"
-        ) else {
-            alertMessage = store.lastPersistError ?? "Unable to duplicate profile."
-            return
-        }
-        onDuplicateToEdit?(copy)
-    }
-
-    @discardableResult
-    private func saveProfile(dismissAfterSave: Bool) -> Bool {
-        guard !isWiping else { return false }
-        let candidate = effectiveDraft
-        let preflight = Self.evaluateValidation(candidate: candidate)
-        cachedReport = preflight
-        guard preflight.isValid else {
-            alertMessage = preflight.errors.joined(separator: "\n")
-            return false
-        }
-        let report = store.upsert(candidate)
-        cachedReport = report
-        guard report.isValid else {
-            alertMessage = report.errors.joined(separator: "\n")
-            return false
-        }
-        let saved = store.profile(id: candidate.id) ?? candidate
-        draft = saved
-        savedBaseline = saved.normalizedForPersistence()
-        if saved.isPrimaryDefault {
-            let defaults = UserDefaults.standard
-            defaults.set(saved.resolvedPalette.rawValue, forKey: "curium.palette")
-            defaults.set(saved.resolvedSiteMode.rawValue, forKey: "curium.siteMode")
-            defaults.set(saved.resolvedSearchEngine.rawValue, forKey: "curium.searchEngine")
-            if saved.supportsLegacyIdentityPickers {
-                defaults.set(saved.legacyUABrandRawValue, forKey: "curium.uaBrand")
-                defaults.set(saved.legacyMobileUARawValue, forKey: "curium.mobileUA")
-            }
-        }
-        onSaved?(saved)
-        if dismissAfterSave {
-            dismiss()
-        }
-        return true
-    }
-
-    private func exportJSONString() -> String? {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(effectiveDraft) else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-
-    private func copyProfileJSON() {
-        guard let text = exportJSONString() else { return }
-        UIPasteboard.general.string = text
-        copiedLabel = "profile"
-    }
-
-    private func copyEngineWireJSON() {
-        do {
-            let data = try effectiveDraft.makeEngineLaunchJSON()
-            if let text = String(data: data, encoding: .utf8) {
-                UIPasteboard.general.string = text
-                copiedLabel = "wire"
-            }
-        } catch {
-            alertMessage = "Failed to encode engine wire JSON: \(error.localizedDescription)"
-        }
-    }
-
-    private func wipeStorage() {
-        guard !isWiping, !draft.isPrimaryDefault else { return }
-        let targetID = draft.id
-        let active = isActiveInProcess || CuriumFingerprintProfileStorage.isProfileActiveInCurrentProcess(targetID)
-        guard !active else {
-            alertMessage = CuriumFingerprintProfileStorage.WipeError.activeProfileProtected.localizedDescription
-            return
-        }
-        isWiping = true
-        Task {
-            do {
-                try await Task.detached(priority: .userInitiated) {
-                    try CuriumFingerprintProfileStorage.wipeIsolatedProfile(
-                        targetID,
-                        isActiveInCurrentProcess: false
-                    )
-                }.value
-                isWiping = false
-                currentUsage = CuriumFingerprintProfileStorage.UsageSnapshot(
-                    supportBytes: 0,
-                    cacheBytes: 0,
-                    exists: false
-                )
-                onWiped?()
-            } catch {
-                isWiping = false
-                alertMessage = error.localizedDescription
-            }
         }
     }
 }
