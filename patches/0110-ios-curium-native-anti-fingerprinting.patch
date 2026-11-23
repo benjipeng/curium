@@ -1,36 +1,37 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: chromium-blink-ios <noreply@github.com>
-Date: Sun, 22 Nov 2026 19:22:21 -0500
+Date: Sun, 22 Nov 2026 22:57:22 -0500
 Subject: [PATCH] ios(curium): native Blink anti-fingerprinting (schema v2,
  canvas/audio/webgl/fonts/screen/pdf/speech)
 
 ---
  .../browser/curium/cr_ios_engine_bootstrap.mm |  13 +
  third_party/blink/common/BUILD.gn             |   1 +
- .../curium/curium_fingerprint_config.cc       | 713 +++++++++++++++++-
+ .../curium/curium_fingerprint_config.cc       | 712 +++++++++++++++++-
  .../common/curium/curium_fingerprint_config.h | 123 ++-
  .../blink/renderer/core/css/media_values.cc   |  16 +
  .../css/resolver/style_builder_converter.cc   |   9 +-
  .../execution_context/execution_context.cc    |  64 ++
  .../execution_context/execution_context.h     |  12 +
- .../renderer/core/frame/local_dom_window.cc   |  38 +
- .../blink/renderer/core/frame/screen.cc       |  46 ++
+ .../renderer/core/frame/local_dom_window.cc   |  39 +
+ .../blink/renderer/core/frame/screen.cc       |  47 ++
  .../blink/renderer/core/frame/screen.h        |  12 +
- .../html/canvas/canvas_async_blob_creator.cc  |  38 +
+ .../html/canvas/canvas_async_blob_creator.cc  |  41 +
  .../core/html/canvas/html_canvas_element.cc   |  19 +-
  .../core/html/canvas/html_canvas_element.h    |   3 +-
  .../renderer/core/html/canvas/text_metrics.h  |   8 +
- .../canvas2d/base_rendering_context_2d.cc     |  37 +-
+ .../canvas2d/base_rendering_context_2d.cc     |  46 +-
  .../modules/plugins/dom_plugin_array.cc       |   9 +
  .../screen_orientation_controller.cc          |  21 +
  .../modules/speech/speech_synthesis.cc        |  17 +
- .../modules/webaudio/analyser_node.cc         |  30 +
+ .../modules/webaudio/analyser_node.cc         |  39 +
  .../modules/webaudio/offline_audio_context.cc |  21 +
- .../webgl/webgl_rendering_context_base.cc     |  64 ++
+ .../webgl/webgl_rendering_context_base.cc     | 119 +++
  .../renderer/platform/fonts/font_cache.cc     |  13 +
+ .../platform/fonts/ios/font_cache_ios.mm      |   9 +-
  .../platform/graphics/image_data_buffer.cc    |  49 ++
  .../platform/graphics/image_data_buffer.h     |   8 +
- 25 files changed, 1363 insertions(+), 21 deletions(-)
+ 26 files changed, 1448 insertions(+), 22 deletions(-)
 
 diff --git a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
 index 70728f2..54f929e 100644
@@ -83,7 +84,7 @@ index 786dedb..3802c38 100644
      "//media/capture:capture_base",
      "//media/capture/mojom:video_capture_mojom_support",
 diff --git a/third_party/blink/common/curium/curium_fingerprint_config.cc b/third_party/blink/common/curium/curium_fingerprint_config.cc
-index e2542ec..120e59e 100644
+index e2542ec..f077bab 100644
 --- a/third_party/blink/common/curium/curium_fingerprint_config.cc
 +++ b/third_party/blink/common/curium/curium_fingerprint_config.cc
 @@ -17,6 +17,7 @@
@@ -354,7 +355,7 @@ index e2542ec..120e59e 100644
    if (out_config) {
      *out_config = std::move(cfg);
    }
-@@ -1049,4 +1239,499 @@ std::optional<std::string> ResolveWebGLRenderer(
+@@ -1049,4 +1239,498 @@ std::optional<std::string> ResolveWebGLRenderer(
    return slot.webgl_renderer;
  }
  
@@ -803,26 +804,25 @@ index e2542ec..120e59e 100644
 +  m.is_desktop = !metadata.mobile;
 +
 +  // Enforce geometric coherence on foldable iPhone Duo (e.g. 951x669 unfolded):
-+  // screen.width >= innerWidth && screen.height >= innerHeight.
-+  if (viewport_width > m.width || viewport_height > m.height) {
++  // screen.availWidth >= viewport_width && screen.availHeight >= viewport_height
++  // for the physical root window DIP size, preserving configured taskbar/dock
++  // deltas (avail_dx, avail_dy) on stretch.
++  if (viewport_width > m.avail_width || viewport_height > m.avail_height) {
 +    const int avail_dx = std::max(0, m.width - m.avail_width);
 +    const int avail_dy = std::max(0, m.height - m.avail_height);
 +    if (m.is_desktop) {
-+      m.width = std::max(m.width, std::max(1440, viewport_width));
-+      m.height = std::max(m.height, std::max(900, viewport_height));
++      m.width = std::max(m.width, 1440);
++      m.height = std::max(m.height, 900);
 +    } else if (viewport_width >= viewport_height) {
 +      // Unfolded Duo in landscape mobile slot: step up to tablet class.
-+      m.width = std::max(m.width, std::max(1024, viewport_width));
-+      m.height = std::max(m.height, std::max(768, viewport_height));
-+    } else {
-+      m.width = std::max(m.width, viewport_width);
-+      m.height = std::max(m.height, viewport_height);
++      m.width = std::max(m.width, 1024);
++      m.height = std::max(m.height, 768);
 +    }
-+    m.avail_width = std::max(viewport_width, m.width - avail_dx);
-+    m.avail_height = std::max(viewport_height, m.height - avail_dy);
++    m.width = std::max(m.width, viewport_width + avail_dx);
++    m.height = std::max(m.height, viewport_height + avail_dy);
++    m.avail_width = m.width - avail_dx;
++    m.avail_height = m.height - avail_dy;
 +  }
-+  m.avail_width = std::min(m.width, std::max(m.avail_width, viewport_width));
-+  m.avail_height = std::min(m.height, std::max(m.avail_height, viewport_height));
 +  m.is_landscape = (m.width >= m.height);
 +  m.orientation_angle = 0;
 +  return m;
@@ -855,7 +855,7 @@ index e2542ec..120e59e 100644
 +
  }  // namespace blink::curium
 diff --git a/third_party/blink/public/common/curium/curium_fingerprint_config.h b/third_party/blink/public/common/curium/curium_fingerprint_config.h
-index 151844a..478eca4 100644
+index 151844a..60f150b 100644
 --- a/third_party/blink/public/common/curium/curium_fingerprint_config.h
 +++ b/third_party/blink/public/common/curium/curium_fingerprint_config.h
 @@ -5,6 +5,7 @@
@@ -1012,7 +1012,7 @@ index 151844a..478eca4 100644
 +BLINK_COMMON_EXPORT bool AllowAppleSystemFontAliases();
 +
 +// Web-only Screen/MediaValues/ScreenOrientation resolution (never mutates
-+// global display::Screen; enforces Duo-safe screen >= viewport invariants).
++// global display::Screen; enforces Duo-safe avail >= root-window invariants).
 +BLINK_COMMON_EXPORT std::optional<ResolvedScreenMetrics>
 +ResolveWebScreenMetrics(const blink::UserAgentMetadata& metadata,
 +                        int viewport_width,
@@ -1230,10 +1230,10 @@ index 7361d1e..2cf8e36 100644
  
  }  // namespace blink
 diff --git a/third_party/blink/renderer/core/frame/local_dom_window.cc b/third_party/blink/renderer/core/frame/local_dom_window.cc
-index ed51dca..a5c09cc 100644
+index ed51dca..f7ca156 100644
 --- a/third_party/blink/renderer/core/frame/local_dom_window.cc
 +++ b/third_party/blink/renderer/core/frame/local_dom_window.cc
-@@ -26,6 +26,7 @@
+@@ -26,12 +26,14 @@
  
  #include "third_party/blink/renderer/core/frame/local_dom_window.h"
  
@@ -1241,7 +1241,14 @@ index ed51dca..a5c09cc 100644
  #include <memory>
  #include <optional>
  #include <utility>
-@@ -1205,6 +1206,14 @@ int LocalDOMWindow::orientation() const {
+ 
+ #include "base/command_line.h"
+ #include "base/metrics/histogram_macros.h"
++#include "base/numerics/clamped_math.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/trace_id_helper.h"
+ #include "base/trace_event/typed_macros.h"
+@@ -1205,6 +1207,14 @@ int LocalDOMWindow::orientation() const {
      return 0;
    }
  
@@ -1256,7 +1263,7 @@ index ed51dca..a5c09cc 100644
    ChromeClient& chrome_client = frame->GetChromeClient();
    int orientation = chrome_client.GetScreenInfo(*frame).orientation_angle;
    // For backward compatibility, we want to return a value in the range of
-@@ -1709,6 +1718,17 @@ int LocalDOMWindow::outerHeight() const {
+@@ -1709,6 +1719,16 @@ int LocalDOMWindow::outerHeight() const {
      return innerHeight();
    }
  
@@ -1264,30 +1271,30 @@ index ed51dca..a5c09cc 100644
 +  if (std::optional<curium::ResolvedScreenMetrics> metrics =
 +          ResolveCuriumScreenMetrics(frame)) {
 +    const int inner_h = innerHeight();
-+    if (metrics->is_desktop) {
-+      return std::max(inner_h, std::min(metrics->avail_height, inner_h + 87));
-+    }
-+    return inner_h;
++    return metrics->is_desktop
++               ? std::min(metrics->avail_height, base::ClampAdd(inner_h, 87))
++               : std::min(metrics->avail_height, inner_h);
 +  }
 +#endif
 +
    Page* page = frame->GetPage();
    if (!page) {
      return 0;
-@@ -1741,6 +1761,12 @@ int LocalDOMWindow::outerWidth() const {
+@@ -1741,6 +1761,13 @@ int LocalDOMWindow::outerWidth() const {
      return innerWidth();
    }
  
 +#if BUILDFLAG(IS_IOS)
-+  if (ResolveCuriumScreenMetrics(frame).has_value()) {
-+    return innerWidth();
++  if (std::optional<curium::ResolvedScreenMetrics> metrics =
++          ResolveCuriumScreenMetrics(frame)) {
++    return std::min(metrics->avail_width, innerWidth());
 +  }
 +#endif
 +
    Page* page = frame->GetPage();
    if (!page) {
      return 0;
-@@ -1817,6 +1843,12 @@ int LocalDOMWindow::screenX() const {
+@@ -1817,6 +1844,12 @@ int LocalDOMWindow::screenX() const {
      return 0;
    }
  
@@ -1300,7 +1307,7 @@ index ed51dca..a5c09cc 100644
    Page* page = frame->GetPage();
    if (!page) {
      return 0;
-@@ -1842,6 +1874,12 @@ int LocalDOMWindow::screenY() const {
+@@ -1842,6 +1875,12 @@ int LocalDOMWindow::screenY() const {
      return 0;
    }
  
@@ -1314,10 +1321,10 @@ index ed51dca..a5c09cc 100644
    if (!page) {
      return 0;
 diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
-index 8bc2c67..eaad2f1 100644
+index 8bc2c67..64d8812 100644
 --- a/third_party/blink/renderer/core/frame/screen.cc
 +++ b/third_party/blink/renderer/core/frame/screen.cc
-@@ -30,18 +30,50 @@
+@@ -30,6 +30,7 @@
  
  #include "base/no_destructor.h"
  #include "base/numerics/safe_conversions.h"
@@ -1325,12 +1332,11 @@ index 8bc2c67..eaad2f1 100644
  #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
  #include "third_party/blink/renderer/core/dom/document.h"
  #include "third_party/blink/renderer/core/event_target_names.h"
- #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+@@ -37,11 +38,43 @@
  #include "third_party/blink/renderer/core/frame/local_frame.h"
-+#include "third_party/blink/renderer/core/frame/local_frame_view.h"
  #include "third_party/blink/renderer/core/frame/settings.h"
-+#include "third_party/blink/renderer/core/layout/adjust_for_absolute_zoom.h"
  #include "third_party/blink/renderer/core/page/chrome_client.h"
++#include "third_party/blink/renderer/core/page/page.h"
  #include "ui/display/screen_info.h"
  #include "ui/display/screen_infos.h"
  
@@ -1348,17 +1354,19 @@ index 8bc2c67..eaad2f1 100644
 +  }
 +  LocalFrame* sizing_frame = frame;
 +  if (auto* top_local = DynamicTo<LocalFrame>(&frame->Tree().Top())) {
-+    if (top_local->View()) {
++    if (top_local->GetPage() && top_local->View() &&
++        top_local->GetWidgetForLocalRoot()) {
 +      sizing_frame = top_local;
 +    }
 +  }
 +  int viewport_width = 0;
 +  int viewport_height = 0;
-+  if (LocalFrameView* view = sizing_frame->View()) {
-+    const gfx::Size size = view->Size();
-+    const float zoom = sizing_frame->LayoutZoomFactor();
-+    viewport_width = AdjustForAbsoluteZoom::AdjustInt(size.width(), zoom);
-+    viewport_height = AdjustForAbsoluteZoom::AdjustInt(size.height(), zoom);
++  if (Page* page = sizing_frame->GetPage();
++      page && sizing_frame->View() && sizing_frame->GetWidgetForLocalRoot()) {
++    const gfx::Size root_size =
++        page->GetChromeClient().RootWindowRect(*sizing_frame).size();
++    viewport_width = root_size.width();
++    viewport_height = root_size.height();
 +  }
 +  return curium::ResolveWebScreenMetrics(window->GetUserAgentMetadata(),
 +                                         viewport_width, viewport_height);
@@ -1368,7 +1376,7 @@ index 8bc2c67..eaad2f1 100644
  Screen::Screen(LocalDOMWindow* window, int64_t display_id)
      : ExecutionContextClient(window), display_id_(display_id) {}
  
-@@ -110,6 +142,12 @@ unsigned Screen::colorDepth() const {
+@@ -110,6 +143,12 @@ unsigned Screen::colorDepth() const {
    if (!DomWindow()) {
      return unknown_color_depth;
    }
@@ -1381,7 +1389,7 @@ index 8bc2c67..eaad2f1 100644
    return GetScreenInfo().depth == 0
               ? unknown_color_depth
               : base::saturated_cast<unsigned>(GetScreenInfo().depth);
-@@ -174,6 +212,14 @@ gfx::Rect Screen::GetRect(bool available) const {
+@@ -174,6 +213,14 @@ gfx::Rect Screen::GetRect(bool available) const {
    if (!DomWindow())
      return gfx::Rect();
    LocalFrame* frame = DomWindow()->GetFrame();
@@ -1427,7 +1435,7 @@ index 787aa75..6a06f60 100644
  class CORE_EXPORT Screen : public EventTarget,
                             public ExecutionContextClient,
 diff --git a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
-index 0c175da..e9815bd 100644
+index 0c175da..7bfd91a 100644
 --- a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
 +++ b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
 @@ -9,6 +9,9 @@
@@ -1440,7 +1448,7 @@ index 0c175da..e9815bd 100644
  #include "third_party/blink/public/platform/platform.h"
  #include "third_party/blink/public/platform/task_type.h"
  #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
-@@ -192,6 +195,41 @@ CanvasAsyncBlobCreator::CanvasAsyncBlobCreator(
+@@ -192,6 +195,44 @@ CanvasAsyncBlobCreator::CanvasAsyncBlobCreator(
                             std::min(info.height(), max_dimension));
          src_data_.reset(info, src_data_.addr(), src_data_.rowBytes());
        }
@@ -1456,11 +1464,14 @@ index 0c175da..e9815bd 100644
 +            src_data_.dimensions(),
 +            ImageEncoderUtils::GetColorInfoForEncoder(
 +                src_data_.info().colorInfo(), image_->GetHdrMetadata()));
-+        if (unpremul_info.colorType() == kRGBA_8888_SkColorType &&
++        if ((unpremul_info.colorType() == kRGBA_8888_SkColorType ||
++             unpremul_info.colorType() == kBGRA_8888_SkColorType) &&
 +            unpremul_info.alphaType() == kUnpremul_SkAlphaType) {
 +          if (auto site_key = context->GetCuriumSiteKey()) {
++            const SkImageInfo rgba_info =
++                unpremul_info.makeColorType(kRGBA_8888_SkColorType);
 +            SkBitmap owned_bitmap;
-+            if (owned_bitmap.tryAllocPixels(unpremul_info) &&
++            if (owned_bitmap.tryAllocPixels(rgba_info) &&
 +                src_data_.readPixels(owned_bitmap.pixmap(), 0, 0)) {
 +              curium::FarbleRGBA8Pixels(
 +                  *site_key, static_cast<uint8_t*>(owned_bitmap.getPixels()),
@@ -1567,20 +1578,22 @@ index ad8d23d..a64d3bb 100644
  
   private:
 diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-index 6ab0849..15c96b1 100644
+index 6ab0849..e581026 100644
 --- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 +++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-@@ -35,6 +35,9 @@
+@@ -35,6 +35,11 @@
  #include "base/trace_event/memory_dump_manager.h"
  #include "base/trace_event/process_memory_dump.h"
  #include "build/build_config.h"
 +#if BUILDFLAG(IS_IOS)
 +#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#include "third_party/skia/include/core/SkString.h"
++#include "third_party/skia/include/core/SkTypeface.h"
 +#endif
  #include "cc/base/math_util.h"
  #include "cc/paint/paint_canvas.h"
  #include "cc/paint/paint_flags.h"
-@@ -1638,6 +1641,23 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+@@ -1638,6 +1643,23 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
            snapshot->PaintImageForCurrentFrame().GetSkImageInfo().bounds();
        DCHECK(!bounds.intersect(SkIRect::MakeXYWH(sx, sy, sw, sh)));
      }
@@ -1604,7 +1617,7 @@ index 6ab0849..15c96b1 100644
    }
  
    return image_data;
-@@ -2370,7 +2390,22 @@ void BaseRenderingContext2D::DrawTextInternal(
+@@ -2370,7 +2392,29 @@ void BaseRenderingContext2D::DrawTextInternal(
  }
  
  TextMetrics* BaseRenderingContext2D::measureText(const String& text) {
@@ -1616,7 +1629,14 @@ index 6ab0849..15c96b1 100644
 +      if (auto site_key = ctx->GetCuriumSiteKey()) {
 +        std::string family;
 +        if (const Font* font = metrics->GetFont()) {
-+          family = font->GetFontDescription().Family().FamilyName().Utf8();
++          if (const SimpleFontData* primary = font->PrimaryFont()) {
++            if (const SkTypeface* typeface =
++                    primary->PlatformData().Typeface()) {
++              SkString sk_family;
++              typeface->getFamilyName(&sk_family);
++              family.assign(sk_family.c_str(), sk_family.size());
++            }
++          }
 +        }
 +        metrics->ApplyCuriumScale(
 +            curium::ResolveTextMetricsScale(*site_key, family));
@@ -1750,15 +1770,17 @@ index 6c5b40a..8550cf5 100644
    std::ignore = TryEnsureMojomSynthesis();
    return voice_list_;
 diff --git a/third_party/blink/renderer/modules/webaudio/analyser_node.cc b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
-index 4bc4b15..e242ea0 100644
+index 4bc4b15..a202a74 100644
 --- a/third_party/blink/renderer/modules/webaudio/analyser_node.cc
 +++ b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
-@@ -25,6 +25,12 @@
+@@ -25,6 +25,14 @@
  
  #include "third_party/blink/renderer/modules/webaudio/analyser_node.h"
  
 +#include "build/build_config.h"
 +#if BUILDFLAG(IS_IOS)
++#include <algorithm>
++
 +#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
 +#include "third_party/blink/renderer/core/execution_context/execution_context.h"
 +#endif
@@ -1766,18 +1788,22 @@ index 4bc4b15..e242ea0 100644
  #include "third_party/blink/renderer/bindings/modules/v8/v8_analyser_options.h"
  #include "third_party/blink/renderer/modules/webaudio/analyser_handler.h"
  #include "third_party/blink/renderer/modules/webaudio/audio_graph_tracer.h"
-@@ -126,6 +132,18 @@ double AnalyserNode::smoothingTimeConstant() const {
+@@ -126,6 +134,22 @@ double AnalyserNode::smoothingTimeConstant() const {
  void AnalyserNode::getFloatFrequencyData(NotShared<DOMFloat32Array> array) {
    GetAnalyserHandler().GetFloatFrequencyData(array.Get(),
                                               context()->currentTime());
 +#if BUILDFLAG(IS_IOS)
 +  if (array && array->Data() && array->length() > 0 &&
 +      curium::IsAudioFarblingEnabled()) {
-+    if (ExecutionContext* ctx =
-+            context() ? context()->GetExecutionContext() : nullptr) {
-+      if (auto site_key = ctx->GetCuriumSiteKey()) {
-+        curium::FarbleAudioSamples(*site_key, 0xA0A10001u, array->Data(),
-+                                   array->length());
++    const size_t count =
++        std::min<size_t>(array->length(), frequencyBinCount());
++    if (count > 0) {
++      if (ExecutionContext* ctx =
++              context() ? context()->GetExecutionContext() : nullptr) {
++        if (auto site_key = ctx->GetCuriumSiteKey()) {
++          curium::FarbleAudioSamples(*site_key, 0xA0A10001u, array->Data(),
++                                     count);
++        }
 +      }
 +    }
 +  }
@@ -1785,18 +1811,21 @@ index 4bc4b15..e242ea0 100644
  }
  
  void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
-@@ -135,6 +153,18 @@ void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
+@@ -135,6 +159,21 @@ void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
  
  void AnalyserNode::getFloatTimeDomainData(NotShared<DOMFloat32Array> array) {
    GetAnalyserHandler().GetFloatTimeDomainData(array.Get());
 +#if BUILDFLAG(IS_IOS)
 +  if (array && array->Data() && array->length() > 0 &&
 +      curium::IsAudioFarblingEnabled()) {
-+    if (ExecutionContext* ctx =
-+            context() ? context()->GetExecutionContext() : nullptr) {
-+      if (auto site_key = ctx->GetCuriumSiteKey()) {
-+        curium::FarbleAudioSamples(*site_key, 0xA0A10002u, array->Data(),
-+                                   array->length());
++    const size_t count = std::min<size_t>(array->length(), fftSize());
++    if (count > 0) {
++      if (ExecutionContext* ctx =
++              context() ? context()->GetExecutionContext() : nullptr) {
++        if (auto site_key = ctx->GetCuriumSiteKey()) {
++          curium::FarbleAudioSamples(*site_key, 0xA0A10002u, array->Data(),
++                                     count);
++        }
 +      }
 +    }
 +  }
@@ -1844,7 +1873,7 @@ index a798c39..a9b505d 100644
    // can enqueue more chunks without starting a duplicate render.
    resolver->Resolve(rendered_buffer.Get());
 diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index 2f4ce19..5dfc800 100644
+index 2f4ce19..072b9a3 100644
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -1597,15 +1597,34 @@ void WebGLRenderingContextBase::InitializeNewContext() {
@@ -1912,28 +1941,84 @@ index 2f4ce19..5dfc800 100644
    return true;
  }
  
-@@ -5532,6 +5567,30 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+@@ -5531,7 +5566,86 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+     if (!binder.Succeeded()) {
        return;
      }
++#if BUILDFLAG(IS_IOS)
++    const bool can_farble =
++        curium::IsWebGLFarblingEnabled() && format == GL_RGBA &&
++        type == GL_UNSIGNED_BYTE && data && !buffer.has_value() && width > 0 &&
++        height > 0;
++    if (can_farble) {
++      GLenum pre_err;
++      while ((pre_err = ContextGL()->GetError()) != GL_NO_ERROR) {
++        if (!synthetic_errors_.Contains(pre_err)) {
++          synthetic_errors_.push_back(pre_err);
++        }
++      }
++    }
++#endif
      ContextGL()->ReadPixels(x, y, width, height, format, type, data);
 +#if BUILDFLAG(IS_IOS)
-+    if (curium::IsWebGLFarblingEnabled() && format == GL_RGBA &&
-+        type == GL_UNSIGNED_BYTE && data && !buffer.has_value() && width > 0 &&
-+        height > 0) {
-+      const WebGLImageConversion::PixelStoreParams pack =
-+          GetPackPixelStoreParams();
-+      if (pack.row_length == 0 && pack.skip_pixels == 0 &&
-+          pack.skip_rows == 0) {
-+        const size_t align = std::max<size_t>(1, static_cast<size_t>(pack.alignment));
-+        const size_t unaligned_row = static_cast<size_t>(width) * 4u;
-+        const size_t row_bytes = ((unaligned_row + align - 1u) / align) * align;
-+        const size_t total_needed =
-+            static_cast<size_t>(height - 1) * row_bytes + unaligned_row;
-+        if (total_needed <= buffer_size.ValueOrDie()) {
-+          if (ExecutionContext* ctx = GetExecutionContext()) {
-+            if (auto site_key = ctx->GetCuriumSiteKey()) {
-+              curium::FarbleRGBA8Pixels(*site_key, data, width, height,
-+                                        row_bytes, x, y, /*is_bgra=*/false);
++    if (can_farble) {
++      bool read_ok = !isContextLost();
++      if (read_ok) {
++        GLenum post_err;
++        while ((post_err = ContextGL()->GetError()) != GL_NO_ERROR) {
++          read_ok = false;
++          if (!synthetic_errors_.Contains(post_err)) {
++            synthetic_errors_.push_back(post_err);
++          }
++        }
++      }
++      if (read_ok) {
++        const WebGLImageConversion::PixelStoreParams pack =
++            GetPackPixelStoreParams();
++        if (pack.row_length >= 0 && pack.skip_pixels >= 0 &&
++            pack.skip_rows >= 0 && pack.alignment > 0) {
++          const size_t width_sz = static_cast<size_t>(width);
++          const size_t row_pixels =
++              pack.row_length > 0 ? static_cast<size_t>(pack.row_length)
++                                  : width_sz;
++          const base::CheckedNumeric<size_t> row_span =
++              base::CheckedNumeric<size_t>(
++                  static_cast<size_t>(pack.skip_pixels)) +
++              width_sz;
++          if (row_span.IsValid() && row_span.ValueOrDie() <= row_pixels) {
++            const size_t align =
++                std::max<size_t>(1, static_cast<size_t>(pack.alignment));
++            const base::CheckedNumeric<size_t> unaligned_row =
++                base::CheckedNumeric<size_t>(row_pixels) * 4u;
++            const base::CheckedNumeric<size_t> row_bytes =
++                ((unaligned_row + (align - 1u)) / align) * align;
++            const base::CheckedNumeric<size_t> last_row_bytes =
++                base::CheckedNumeric<size_t>(width_sz) * 4u;
++            const base::CheckedNumeric<size_t> start_offset =
++                base::CheckedNumeric<size_t>(
++                    static_cast<size_t>(pack.skip_rows)) *
++                    row_bytes +
++                base::CheckedNumeric<size_t>(
++                    static_cast<size_t>(pack.skip_pixels)) *
++                    4u;
++            const base::CheckedNumeric<size_t> total_needed =
++                start_offset +
++                base::CheckedNumeric<size_t>(static_cast<size_t>(height - 1)) *
++                    row_bytes +
++                last_row_bytes;
++            if (row_bytes.IsValid() && last_row_bytes.IsValid() &&
++                start_offset.IsValid() && total_needed.IsValid() &&
++                total_needed.ValueOrDie() <=
++                    static_cast<size_t>(buffer_size.ValueOrDie())) {
++              if (ExecutionContext* ctx = GetExecutionContext()) {
++                if (auto site_key = ctx->GetCuriumSiteKey()) {
++                  curium::FarbleRGBA8Pixels(
++                      *site_key,
++                      UNSAFE_TODO(data + start_offset.ValueOrDie()), width,
++                      height, row_bytes.ValueOrDie(), x, y,
++                      /*is_bgra=*/false);
++                }
++              }
 +            }
 +          }
 +        }
@@ -1943,7 +2028,7 @@ index 2f4ce19..5dfc800 100644
    }
  }
  
-@@ -8160,6 +8219,11 @@ ScriptValue WebGLRenderingContextBase::GetIntParameter(
+@@ -8160,6 +8274,11 @@ ScriptValue WebGLRenderingContextBase::GetIntParameter(
    GLint value = 0;
    if (!isContextLost()) {
      ContextGL()->GetIntegerv(pname, &value);
@@ -1986,6 +2071,36 @@ index f6a0e22..df06988 100644
  // [ios-blink-sideload] On iOS, as on Mac, system-ui is created and cached like
  // any other family (see MakeIOSSystemFontTypeface()).
  #if !BUILDFLAG(IS_APPLE)
+diff --git a/third_party/blink/renderer/platform/fonts/ios/font_cache_ios.mm b/third_party/blink/renderer/platform/fonts/ios/font_cache_ios.mm
+index 5380244..4c31124 100644
+--- a/third_party/blink/renderer/platform/fonts/ios/font_cache_ios.mm
++++ b/third_party/blink/renderer/platform/fonts/ios/font_cache_ios.mm
+@@ -10,6 +10,7 @@
+ 
+ #include "base/no_destructor.h"
+ #include "skia/ext/font_utils.h"
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
+ #include "third_party/blink/renderer/platform/font_family_names.h"
+ #include "third_party/blink/renderer/platform/fonts/font_description.h"
+ #include "third_party/blink/renderer/platform/fonts/font_platform_data.h"
+@@ -164,10 +165,16 @@ UIFontWeight UIFontWeightForCSSWeight(float weight) {
+     FontFallbackPriority fallback_priority) {
+   sk_sp<SkFontMgr> font_mgr(skia::DefaultFontMgr());
+   std::string family_name = font_description.Family().FamilyName().Utf8();
++  const char* family_cstr =
++      (!family_name.empty() &&
++       curium::IsFontFamilyAllowedForLaunch(family_name,
++                                            /*is_unique_face=*/false))
++          ? family_name.c_str()
++          : nullptr;
+   Bcp47Vector locales =
+       GetBcp47LocaleForRequest(font_description, fallback_priority);
+   sk_sp<SkTypeface> typeface(font_mgr->matchFamilyStyleCharacter(
+-      family_name.c_str(), font_description.SkiaFontStyle(), locales.data(),
++      family_cstr, font_description.SkiaFontStyle(), locales.data(),
+       locales.size(), character));
+   if (!typeface) {
+     return nullptr;
 diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
 index 059250a..b1296c5 100644
 --- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc

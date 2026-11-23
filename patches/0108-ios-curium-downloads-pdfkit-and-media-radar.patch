@@ -1,27 +1,141 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: chromium-blink-ios <noreply@github.com>
-Date: Sun, 22 Nov 2026 19:07:14 -0500
-Subject: [PATCH] iOS Curium: PDFKit download semantics, terminal task pruning,
- and Media Radar resource events
+Date: Sun, 22 Nov 2026 22:57:00 -0500
+Subject: [PATCH] iOS Curium: PDFKit download semantics, Media Radar events, and
+ isolated-world JS evaluator
 
 ---
- ios/chrome/browser/curium/DEPS                |   1 +
- .../browser/curium/curium_browser_host.mm     |  38 +++-
- .../browser/curium/curium_download_task.h     |   2 +
- .../browser/curium/curium_download_task.mm    | 117 +++++++++---
- .../curium/curium_engine_contract_internal.h  |   9 +
- ios/chrome/browser/curium/curium_tab_host.mm  | 166 ++++++++++++++++--
- ios/web/content/DEPS                          |   4 +
- .../content/download/content_download_task.h  |   6 +
- .../content/download/content_download_task.mm |  61 ++++++-
- ios/web/public/download/download_task.h       |   9 +
- 10 files changed, 368 insertions(+), 45 deletions(-)
+ content/browser/download/download_item_utils.cc    |  33 ++
+ content/browser/download/download_manager_impl.cc  |   3 +
+ content/public/browser/download_item_utils.h       |   9 +
+ ios/chrome/browser/curium/DEPS                     |   2 +
+ ios/chrome/browser/curium/curium_browser_host.mm   |  38 +-
+ ios/chrome/browser/curium/curium_download_task.h   |   2 +
+ ios/chrome/browser/curium/curium_download_task.mm  | 117 +++--
+ .../curium/curium_engine_contract_internal.h       |  15 +
+ ios/chrome/browser/curium/curium_tab_host.mm       | 550 ++++++++++++++++++++-
+ ios/web/content/DEPS                               |   4 +
+ ios/web/content/download/content_download_task.h   |   6 +
+ ios/web/content/download/content_download_task.mm  |  67 ++-
+ ios/web/public/download/download_task.h            |   9 +
+ 13 files changed, 810 insertions(+), 45 deletions(-)
 
+diff --git a/content/browser/download/download_item_utils.cc b/content/browser/download/download_item_utils.cc
+index 113e6a1..1acd7e7 100644
+--- a/content/browser/download/download_item_utils.cc
++++ b/content/browser/download/download_item_utils.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "content/public/browser/download_item_utils.h"
+ 
++#include <utility>
++
+ #include "base/memory/raw_ptr.h"
+ #include "components/download/public/common/download_item.h"
+ #include "content/public/browser/global_routing_id.h"
+@@ -34,6 +36,10 @@ class DownloadItemData : public base::SupportsUserData::Data,
+ 
+   BrowserContext* browser_context() const { return browser_context_; }
+   GlobalRenderFrameHostId id() const { return id_; }
++  const std::string& request_method() const { return request_method_; }
++  void set_request_method(std::string method) {
++    request_method_ = std::move(method);
++  }
+ 
+  private:
+   // WebContentsObserver methods.
+@@ -43,6 +49,7 @@ class DownloadItemData : public base::SupportsUserData::Data,
+   static const char kKey[];
+   raw_ptr<BrowserContext, DanglingUntriaged> browser_context_;
+   GlobalRenderFrameHostId id_;
++  std::string request_method_;
+ };
+ 
+ // static
+@@ -157,4 +164,30 @@ void DownloadItemUtils::AttachInfoForTesting(
+                    : GlobalRenderFrameHostId());
+ }
+ 
++// static
++void DownloadItemUtils::SetRequestMethod(download::DownloadItem* download_item,
++                                         std::string method) {
++  if (!download_item) {
++    return;
++  }
++  DownloadItemData* data = DownloadItemData::Get(download_item);
++  if (!data) {
++    return;
++  }
++  data->set_request_method(std::move(method));
++}
++
++// static
++std::string DownloadItemUtils::GetRequestMethod(
++    const download::DownloadItem* download_item) {
++  if (!download_item) {
++    return std::string();
++  }
++  DownloadItemData* data = DownloadItemData::Get(download_item);
++  if (!data) {
++    return std::string();
++  }
++  return data->request_method();
++}
++
+ }  // namespace content
+diff --git a/content/browser/download/download_manager_impl.cc b/content/browser/download/download_manager_impl.cc
+index 0697a86..78ac859 100644
+--- a/content/browser/download/download_manager_impl.cc
++++ b/content/browser/download/download_manager_impl.cc
+@@ -525,6 +525,9 @@ download::DownloadItemImpl* DownloadManagerImpl::CreateActiveItem(
+   DownloadItemUtils::AttachInfo(
+       download, GetBrowserContext(),
+       WebContentsImpl::FromRenderFrameHostID(global_id), global_id);
++  if (!info.method.empty()) {
++    DownloadItemUtils::SetRequestMethod(download, info.method);
++  }
+   if (delegate_) {
+     delegate_->AttachExtraInfo(download);
+ #if BUILDFLAG(IS_ANDROID)
+diff --git a/content/public/browser/download_item_utils.h b/content/public/browser/download_item_utils.h
+index 265f679..6c5a345 100644
+--- a/content/public/browser/download_item_utils.h
++++ b/content/public/browser/download_item_utils.h
+@@ -5,6 +5,8 @@
+ #ifndef CONTENT_PUBLIC_BROWSER_DOWNLOAD_ITEM_UTILS_H_
+ #define CONTENT_PUBLIC_BROWSER_DOWNLOAD_ITEM_UTILS_H_
+ 
++#include <string>
++
+ #include "content/common/content_export.h"
+ #include "content/public/browser/global_routing_id.h"
+ 
+@@ -56,6 +58,13 @@ class CONTENT_EXPORT DownloadItemUtils {
+   static void AttachInfoForTesting(download::DownloadItem* downloadItem,
+                                    BrowserContext* browser_context,
+                                    WebContents* web_contents);
++
++  // [ios-blink-sideload] Sets/gets the authoritative HTTP request method
++  // captured from DownloadCreateInfo::method when the download was created.
++  static void SetRequestMethod(download::DownloadItem* downloadItem,
++                               std::string method);
++  static std::string GetRequestMethod(
++      const download::DownloadItem* downloadItem);
+ };
+ 
+ }  // namespace content
 diff --git a/ios/chrome/browser/curium/DEPS b/ios/chrome/browser/curium/DEPS
-index 4008976..d71f9bd 100644
+index 4008976..b641905 100644
 --- a/ios/chrome/browser/curium/DEPS
 +++ b/ios/chrome/browser/curium/DEPS
-@@ -16,4 +16,5 @@ include_rules = [
+@@ -1,5 +1,6 @@
+ include_rules = [
+   "+content/public/browser",
++  "+content/public/common",
+   "+extensions/buildflags",
+   "+ios/chrome/browser/curium",
+   "+ios/chrome/browser/shared/model/browser",
+@@ -16,4 +17,5 @@ include_rules = [
    "+third_party/blink/public/common",
    "+third_party/blink/public/mojom",
    "+ui/base",
@@ -318,18 +432,24 @@ index 6865b18..1068aba 100644
  
  - (void)finishWithURL:(nullable NSURL*)url error:(nullable NSError*)error {
 diff --git a/ios/chrome/browser/curium/curium_engine_contract_internal.h b/ios/chrome/browser/curium/curium_engine_contract_internal.h
-index a98cd0d..1414ac2 100644
+index a98cd0d..142b1b5 100644
 --- a/ios/chrome/browser/curium/curium_engine_contract_internal.h
 +++ b/ios/chrome/browser/curium/curium_engine_contract_internal.h
-@@ -102,6 +102,7 @@ __attribute__((visibility("default")))
+@@ -102,6 +102,13 @@ __attribute__((visibility("default")))
  @optional
  @property(nonatomic) CGFloat topControlsHeight;
  @property(nonatomic, readonly) CGFloat topControlsShownRatio;
 +@property(nonatomic, copy, readonly, nullable) NSString* effectiveUserAgent;
++- (void)evaluateJavaScriptInIsolatedWorld:(NSString*)script
++                                allFrames:(BOOL)allFrames
++                               completion:
++                                   (void (^)(
++                                       NSArray<NSDictionary<NSString*, id>*>* _Nullable results,
++                                       NSError* _Nullable error))completion;
  @end
  
  @protocol CrIOSTabBrowserControlsV1 <CrIOSTabHostingV1>
-@@ -123,6 +124,11 @@ __attribute__((visibility("default")))
+@@ -123,6 +130,11 @@ __attribute__((visibility("default")))
                       completion:(void (^)(NSURL* _Nullable savedFileURL,
                                            NSError* _Nullable error))completion;
  - (void)cancel;
@@ -341,7 +461,7 @@ index a98cd0d..1414ac2 100644
  @end
  
  @protocol CrIOSBrowserHostDelegateV1 <NSObject>
-@@ -155,6 +161,9 @@ __attribute__((visibility("default")))
+@@ -155,6 +167,9 @@ __attribute__((visibility("default")))
                mimeType:(nullable NSString*)mimeType
          httpStatusCode:(NSInteger)httpStatusCode
           contentLength:(int64_t)contentLength;
@@ -352,10 +472,41 @@ index a98cd0d..1414ac2 100644
                           tab:(id<CrIOSTabHostingV1>)tab
      didCommitNavigationToURL:(NSURL*)url
 diff --git a/ios/chrome/browser/curium/curium_tab_host.mm b/ios/chrome/browser/curium/curium_tab_host.mm
-index fee56c9..d871db4 100644
+index fee56c9..914f4ef 100644
 --- a/ios/chrome/browser/curium/curium_tab_host.mm
 +++ b/ios/chrome/browser/curium/curium_tab_host.mm
-@@ -32,21 +32,28 @@
+@@ -8,20 +8,30 @@
+ #import <memory>
+ #import <optional>
+ #import <string>
++#import <utility>
++#import <vector>
+ 
+ #import "base/apple/foundation_util.h"
+ #import "base/check.h"
++#import "base/functional/bind.h"
++#import "base/location.h"
+ #import "base/memory/raw_ptr.h"
+ #import "base/scoped_observation.h"
+ #import "base/strings/sys_string_conversions.h"
++#import "base/time/time.h"
++#import "base/timer/timer.h"
++#import "base/values.h"
++#import "content/public/browser/global_routing_id.h"
+ #import "content/public/browser/host_zoom_map.h"
+ #import "content/public/browser/media_session.h"
+ #import "content/public/browser/navigation_controller.h"
+ #import "content/public/browser/navigation_handle.h"
+ #import "content/public/browser/reload_type.h"
+ #import "content/public/browser/render_frame_host.h"
++#import "content/public/browser/weak_document_ptr.h"
+ #import "content/public/browser/web_contents.h"
+ #import "content/public/browser/web_contents_observer.h"
++#import "content/public/common/isolated_world_ids.h"
+ #import "ios/chrome/browser/curium/curium_browser_host.h"
+ #import "ios/chrome/browser/shared/public/commands/file_upload_panel_commands.h"
+ #import "ios/chrome/browser/web/model/choose_file/choose_file_event.h"
+@@ -32,21 +42,28 @@
  #import "ios/web/public/navigation/navigation_item.h"
  #import "ios/web/public/navigation/navigation_manager.h"
  #import "ios/web/public/navigation/reload_type.h"
@@ -384,7 +535,7 @@ index fee56c9..d871db4 100644
  - (void)tabHost:(CuriumTabHost*)tabHost
      didCommitNavigationToURL:(NSURL*)url
                  navigationID:(int64_t)navigationID
-@@ -64,7 +71,8 @@ - (void)handleNavigationCommitted;
+@@ -64,7 +81,8 @@ - (void)handleNavigationCommitted;
  - (void)handleMainFrameCommit:(content::NavigationHandle*)navigation;
  - (void)updateTopControlsShownRatio:(CGFloat)ratio;
  - (void)handleWebStateDestroyed;
@@ -394,7 +545,7 @@ index fee56c9..d871db4 100644
  @end
  
  namespace {
-@@ -104,7 +112,8 @@ void ResourceLoadComplete(
+@@ -104,7 +122,8 @@ void ResourceLoadComplete(
        const content::GlobalRequestID& request_id,
        const GURL& original_url,
        const blink::mojom::ResourceLoadInfo& resource_load_info) override {
@@ -404,7 +555,7 @@ index fee56c9..d871db4 100644
    }
  
   private:
-@@ -155,6 +164,55 @@ void WebStateDestroyed(web::WebState* web_state) override {
+@@ -155,6 +174,303 @@ void WebStateDestroyed(web::WebState* web_state) override {
    std::unique_ptr<CuriumWebContentsObserver> web_contents_observer_;
  };
  
@@ -457,10 +608,258 @@ index fee56c9..d871db4 100644
 +  }
 +}
 +
++NSString* const kCuriumJavaScriptErrorDomain = @"CuriumJavaScriptErrorDomain";
++constexpr NSInteger kCuriumJavaScriptErrorDetached = -1;
++constexpr NSInteger kCuriumJavaScriptErrorNavigated = -2;
++constexpr NSInteger kCuriumJavaScriptErrorTimedOut = -3;
++constexpr NSInteger kCuriumJavaScriptErrorInvalidScript = -4;
++constexpr size_t kMaxEvaluatedFrames = 32;
++constexpr int kMaxBaseValueDepth = 32;
++constexpr base::TimeDelta kFrameEvalTimeout = base::Seconds(5);
++
++NSError* MakeJavaScriptError(NSInteger code, NSString* description) {
++  return [NSError errorWithDomain:kCuriumJavaScriptErrorDomain
++                             code:code
++                         userInfo:@{
++                           NSLocalizedDescriptionKey : description
++                         }];
++}
++
++id BaseValueToFoundation(const base::Value& value, int depth = 0) {
++  if (depth > kMaxBaseValueDepth) {
++    return nil;
++  }
++  switch (value.type()) {
++    case base::Value::Type::NONE:
++    case base::Value::Type::BINARY:
++      return nil;
++    case base::Value::Type::BOOLEAN:
++      return @(value.GetBool());
++    case base::Value::Type::INTEGER:
++      return @(value.GetInt());
++    case base::Value::Type::DOUBLE: {
++      const double number = value.GetDouble();
++      return std::isfinite(number) ? @(number) : nil;
++    }
++    case base::Value::Type::STRING:
++      return base::SysUTF8ToNSString(value.GetString());
++    case base::Value::Type::LIST: {
++      const base::ListValue& list = value.GetList();
++      NSMutableArray* array = [NSMutableArray arrayWithCapacity:list.size()];
++      for (const base::Value& elem : list) {
++        id converted = BaseValueToFoundation(elem, depth + 1);
++        [array addObject:converted ?: [NSNull null]];
++      }
++      return [array copy];
++    }
++    case base::Value::Type::DICT: {
++      const base::DictValue& dict = value.GetDict();
++      NSMutableDictionary<NSString*, id>* result =
++          [NSMutableDictionary dictionaryWithCapacity:dict.size()];
++      for (const auto [key, item] : dict) {
++        NSString* ns_key = base::SysUTF8ToNSString(key);
++        if (!ns_key) {
++          continue;
++        }
++        id converted = BaseValueToFoundation(item, depth + 1);
++        result[ns_key] = converted ?: [NSNull null];
++      }
++      return [result copy];
++    }
++  }
++}
++
++struct FrameEvalSlot {
++  content::WeakDocumentPtr frame_doc;
++  NSMutableDictionary<NSString*, id>* dict = nil;
++  bool completed = false;
++};
++
++struct FrameEvalState {
++  __weak CuriumTabHost* weak_owner;
++  content::WeakDocumentPtr primary_doc;
++  void (^completion)(NSArray<NSDictionary<NSString*, id>*>* _Nullable,
++                     NSError* _Nullable);
++  std::vector<FrameEvalSlot> slots;
++  base::OneShotTimer timeout_timer;
++  size_t pending_count = 1;  // Includes the dispatch loop until it unwinds.
++  bool finished = false;
++
++  FrameEvalState(
++      CuriumTabHost* owner,
++      content::WeakDocumentPtr primary_document,
++      void (^completion_block)(
++          NSArray<NSDictionary<NSString*, id>*>* _Nullable,
++          NSError* _Nullable))
++      : weak_owner(owner),
++        primary_doc(std::move(primary_document)),
++        completion([completion_block copy]) {}
++
++  FrameEvalState(const FrameEvalState&) = delete;
++  FrameEvalState& operator=(const FrameEvalState&) = delete;
++
++  content::RenderFrameHost* LivePrimaryMainFrame() const {
++    CuriumTabHost* owner = weak_owner;
++    if (!owner || !owner.webState) {
++      return nullptr;
++    }
++    content::WebContents* wc =
++        static_cast<web::ContentWebState*>(owner.webState)->GetWebContents();
++    if (!wc) {
++      return nullptr;
++    }
++    content::RenderFrameHost* primary_rfh =
++        primary_doc.AsRenderFrameHostIfValid();
++    if (!primary_rfh || !primary_rfh->IsActive() ||
++        !primary_rfh->IsRenderFrameLive() ||
++        primary_rfh != wc->GetPrimaryMainFrame()) {
++      return nullptr;
++    }
++    return primary_rfh;
++  }
++
++  void OnSlotSettled() {
++    if (finished || pending_count == 0) {
++      return;
++    }
++    --pending_count;
++    if (pending_count == 0) {
++      FinishIfPending();
++    }
++  }
++
++  void FinishWithError(NSError* error) {
++    if (finished) {
++      return;
++    }
++    finished = true;
++    timeout_timer.Stop();
++    auto completion_copy = completion;
++    completion = nil;
++    slots.clear();
++    if (!completion_copy) {
++      return;
++    }
++    dispatch_async(dispatch_get_main_queue(), ^{
++      completion_copy(nil, error);
++    });
++  }
++
++  void FinishIfPending() {
++    if (finished) {
++      return;
++    }
++    CuriumTabHost* owner = weak_owner;
++    if (!owner || !owner.webState) {
++      FinishWithError(MakeJavaScriptError(
++          kCuriumJavaScriptErrorDetached,
++          @"Tab detached before JavaScript evaluation completed."));
++      return;
++    }
++    if (!LivePrimaryMainFrame()) {
++      FinishWithError(MakeJavaScriptError(
++          kCuriumJavaScriptErrorNavigated,
++          @"Primary document changed before JavaScript evaluation completed."));
++      return;
++    }
++    finished = true;
++    timeout_timer.Stop();
++    auto completion_copy = completion;
++    completion = nil;
++    NSMutableArray<NSDictionary<NSString*, id>*>* snapshot =
++        [NSMutableArray arrayWithCapacity:slots.size()];
++    for (const FrameEvalSlot& slot : slots) {
++      if (slot.completed && slot.dict) {
++        [snapshot addObject:[slot.dict copy]];
++      }
++    }
++    slots.clear();
++    if (!completion_copy) {
++      return;
++    }
++    NSArray<NSDictionary<NSString*, id>*>* immutable_results = [snapshot copy];
++    __weak CuriumTabHost* weak_owner_copy = weak_owner;
++    dispatch_async(dispatch_get_main_queue(), ^{
++      CuriumTabHost* current_owner = weak_owner_copy;
++      if (!current_owner || !current_owner.webState) {
++        completion_copy(
++            nil,
++            MakeJavaScriptError(
++                kCuriumJavaScriptErrorDetached,
++                @"Tab detached before JavaScript evaluation completed."));
++        return;
++      }
++      completion_copy(immutable_results, nil);
++    });
++  }
++
++  ~FrameEvalState() { FinishIfPending(); }
++};
++
++struct FrameEvalSlotGuard {
++  std::shared_ptr<FrameEvalState> state;
++  size_t slot_index = 0;
++
++  FrameEvalSlotGuard(std::shared_ptr<FrameEvalState> eval_state, size_t index)
++      : state(std::move(eval_state)), slot_index(index) {}
++  FrameEvalSlotGuard(FrameEvalSlotGuard&& other) noexcept
++      : state(std::move(other.state)), slot_index(other.slot_index) {}
++  FrameEvalSlotGuard& operator=(FrameEvalSlotGuard&&) = delete;
++  FrameEvalSlotGuard(const FrameEvalSlotGuard&) = delete;
++  FrameEvalSlotGuard& operator=(const FrameEvalSlotGuard&) = delete;
++
++  ~FrameEvalSlotGuard() {
++    if (state) {
++      state->OnSlotSettled();
++    }
++  }
++};
++
++void OnFrameJavaScriptEvaluated(FrameEvalSlotGuard guard, base::Value value) {
++  std::shared_ptr<FrameEvalState>& state = guard.state;
++  if (!state || state->finished || guard.slot_index >= state->slots.size()) {
++    return;
++  }
++  CuriumTabHost* owner = state->weak_owner;
++  if (!owner || !owner.webState) {
++    state->FinishWithError(MakeJavaScriptError(
++        kCuriumJavaScriptErrorDetached,
++        @"Tab detached before JavaScript evaluation completed."));
++    return;
++  }
++  content::RenderFrameHost* primary_rfh = state->LivePrimaryMainFrame();
++  if (!primary_rfh) {
++    state->FinishWithError(MakeJavaScriptError(
++        kCuriumJavaScriptErrorNavigated,
++        @"Primary document changed before JavaScript evaluation completed."));
++    return;
++  }
++  FrameEvalSlot& slot = state->slots[guard.slot_index];
++  content::RenderFrameHost* frame_rfh =
++      slot.frame_doc.AsRenderFrameHostIfValid();
++  if (!frame_rfh || !frame_rfh->IsActive() ||
++      frame_rfh->IsNestedWithinFencedFrame() ||
++      frame_rfh->GetMainFrame() != primary_rfh) {
++    return;
++  }
++  if (id converted = BaseValueToFoundation(value)) {
++    slot.dict[@"result"] = converted;
++  }
++  slot.completed = true;
++}
++
++void OnFrameEvalTimeout(std::weak_ptr<FrameEvalState> weak_state) {
++  if (std::shared_ptr<FrameEvalState> state = weak_state.lock()) {
++    state->FinishWithError(MakeJavaScriptError(
++        kCuriumJavaScriptErrorTimedOut,
++        @"JavaScript evaluation timed out."));
++  }
++}
++
  }  // namespace
  
  @implementation CuriumTabHost {
-@@ -346,6 +404,28 @@ - (BOOL)isPictureInPictureActive {
+@@ -346,6 +662,28 @@ - (BOOL)isPictureInPictureActive {
    return wc && wc->HasPictureInPictureVideo();
  }
  
@@ -489,7 +888,135 @@ index fee56c9..d871db4 100644
  - (void)loadURL:(NSURL*)url {
    if (!_webState || !url) {
      return;
-@@ -609,14 +689,23 @@ - (void)handleWebStateDestroyed {
+@@ -487,6 +825,127 @@ - (void)takeSnapshotWithCompletion:(void (^)(UIImage* _Nullable))completion {
+   completion(image);
+ }
+ 
++- (void)evaluateJavaScriptInIsolatedWorld:(NSString*)script
++                                allFrames:(BOOL)allFrames
++                               completion:
++                                   (void (^)(
++                                       NSArray<NSDictionary<NSString*, id>*>* _Nullable,
++                                       NSError* _Nullable))completion {
++  CHECK([NSThread isMainThread]);
++  if (!completion) {
++    return;
++  }
++  void (^completion_copy)(NSArray<NSDictionary<NSString*, id>*>* _Nullable,
++                          NSError* _Nullable) = [completion copy];
++  if (!script || script.length == 0) {
++    dispatch_async(dispatch_get_main_queue(), ^{
++      completion_copy(
++          nil, MakeJavaScriptError(kCuriumJavaScriptErrorInvalidScript,
++                                   @"JavaScript source must not be empty."));
++    });
++    return;
++  }
++  if (!_webState) {
++    dispatch_async(dispatch_get_main_queue(), ^{
++      completion_copy(nil, MakeJavaScriptError(kCuriumJavaScriptErrorDetached,
++                                               @"Tab is detached."));
++    });
++    return;
++  }
++  content::WebContents* wc =
++      static_cast<web::ContentWebState*>(_webState)->GetWebContents();
++  content::RenderFrameHost* main_frame =
++      wc ? wc->GetPrimaryMainFrame() : nullptr;
++  if (!main_frame || !main_frame->IsActive() ||
++      !main_frame->IsRenderFrameLive() ||
++      main_frame->IsNestedWithinFencedFrame()) {
++    dispatch_async(dispatch_get_main_queue(), ^{
++      completion_copy(@[], nil);
++    });
++    return;
++  }
++
++  std::vector<content::GlobalRenderFrameHostId> target_ids;
++  if (allFrames) {
++    main_frame->ForEachRenderFrameHostWithAction(
++        [&target_ids, main_frame](content::RenderFrameHost* rfh) {
++          if (!rfh) {
++            return content::RenderFrameHost::FrameIterationAction::kContinue;
++          }
++          if (rfh->IsNestedWithinFencedFrame() ||
++              rfh->GetMainFrame() != main_frame) {
++            return content::RenderFrameHost::FrameIterationAction::
++                kSkipChildren;
++          }
++          if (rfh->IsActive() && rfh->IsRenderFrameLive()) {
++            target_ids.push_back(rfh->GetGlobalId());
++            if (target_ids.size() >= kMaxEvaluatedFrames) {
++              return content::RenderFrameHost::FrameIterationAction::kStop;
++            }
++          }
++          return content::RenderFrameHost::FrameIterationAction::kContinue;
++        });
++  } else {
++    target_ids.push_back(main_frame->GetGlobalId());
++  }
++
++  if (target_ids.empty()) {
++    dispatch_async(dispatch_get_main_queue(), ^{
++      completion_copy(@[], nil);
++    });
++    return;
++  }
++
++  const std::u16string script16 = base::SysNSStringToUTF16(script);
++  auto state = std::make_shared<FrameEvalState>(
++      self, main_frame->GetWeakDocumentPtr(), completion_copy);
++  state->slots.reserve(target_ids.size());
++
++  for (const content::GlobalRenderFrameHostId& frame_id : target_ids) {
++    content::RenderFrameHost* rfh = content::RenderFrameHost::FromID(frame_id);
++    if (!rfh || !rfh->IsActive() || !rfh->IsRenderFrameLive() ||
++        rfh->IsNestedWithinFencedFrame() ||
++        rfh->GetMainFrame() != main_frame) {
++      continue;
++    }
++    NSMutableDictionary<NSString*, id>* dict =
++        [NSMutableDictionary dictionaryWithCapacity:4];
++    dict[@"isMainFrame"] = @(rfh->IsInPrimaryMainFrame());
++    const GURL& frame_gurl = rfh->GetLastCommittedURL();
++    if (frame_gurl.is_valid()) {
++      if (NSURL* frame_ns = net::NSURLWithGURL(frame_gurl)) {
++        dict[@"frameURL"] = frame_ns;
++      }
++    }
++    const url::Origin& frame_origin = rfh->GetLastCommittedOrigin();
++    if (!frame_origin.opaque()) {
++      if (NSString* origin_str =
++              base::SysUTF8ToNSString(frame_origin.Serialize())) {
++        dict[@"frameOrigin"] = origin_str;
++      }
++    }
++    FrameEvalSlot slot;
++    slot.frame_doc = rfh->GetWeakDocumentPtr();
++    slot.dict = dict;
++    state->slots.push_back(std::move(slot));
++    const size_t slot_index = state->slots.size() - 1;
++    ++state->pending_count;
++    rfh->ExecuteJavaScriptInIsolatedWorld(
++        script16,
++        base::BindOnce(&OnFrameJavaScriptEvaluated,
++                       FrameEvalSlotGuard(state, slot_index)),
++        content::ISOLATED_WORLD_ID_CONTENT_END);
++  }
++
++  if (!state->finished && state->pending_count > 1) {
++    state->timeout_timer.Start(
++        FROM_HERE, kFrameEvalTimeout,
++        base::BindOnce(&OnFrameEvalTimeout,
++                       std::weak_ptr<FrameEvalState>(state)));
++  }
++  state->OnSlotSettled();
++}
++
+ #pragma mark - FileUploadPanelCommands
+ 
+ - (void)showFileUploadPanel {
+@@ -609,14 +1068,23 @@ - (void)handleWebStateDestroyed {
    [self detach];
  }
  
@@ -517,7 +1044,7 @@ index fee56c9..d871db4 100644
    if (!ns_url) {
      return;
    }
-@@ -626,17 +715,72 @@ - (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info {
+@@ -626,17 +1094,77 @@ - (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info {
        info.http_status_code > 0 ? info.http_status_code : 0;
    const int64_t raw_bytes = static_cast<int64_t>(info.raw_body_bytes.InBytes());
    const int64_t content_length = raw_bytes > 0 ? raw_bytes : -1;
@@ -525,12 +1052,17 @@ index fee56c9..d871db4 100644
 +  NSDictionary<NSString*, id>* event = nil;
 +  if (wantsEvent) {
 +    NSMutableDictionary<NSString*, id>* dict =
-+        [NSMutableDictionary dictionaryWithCapacity:9];
++        [NSMutableDictionary dictionaryWithCapacity:10];
 +    dict[@"url"] = ns_url;
 +    dict[@"httpStatusCode"] = @(status);
 +    dict[@"contentLength"] = @(content_length);
 +    dict[@"requestDestination"] =
 +        RequestDestinationName(info.request_destination);
++    if (!info.method.empty()) {
++      if (NSString* http_method = base::SysUTF8ToNSString(info.method)) {
++        dict[@"httpMethod"] = http_method;
++      }
++    }
 +    if (mime_type) {
 +      dict[@"mimeType"] = mime_type;
 +    }
@@ -635,7 +1167,7 @@ index f8362aa..7ccc900 100644
  
  }  // namespace web
 diff --git a/ios/web/content/download/content_download_task.mm b/ios/web/content/download/content_download_task.mm
-index e0a513b..8385efe 100644
+index e0a513b..258d168 100644
 --- a/ios/web/content/download/content_download_task.mm
 +++ b/ios/web/content/download/content_download_task.mm
 @@ -8,8 +8,16 @@
@@ -655,11 +1187,17 @@ index e0a513b..8385efe 100644
  
  namespace web {
  
-@@ -22,6 +30,45 @@
+@@ -22,6 +30,51 @@
    return base::SysUTF8ToNSString(url.GetHost());
  }
  
 +NSString* HttpMethodForItem(::download::DownloadItem* item) {
++  if (std::string method = content::DownloadItemUtils::GetRequestMethod(item);
++      !method.empty()) {
++    if (NSString* ns_method = base::SysUTF8ToNSString(method)) {
++      return ns_method;
++    }
++  }
 +  if (ui::PageTransitionCoreTypeIs(item->GetTransitionType(),
 +                                   ui::PAGE_TRANSITION_FORM_SUBMIT)) {
 +    return @"POST";
@@ -701,7 +1239,7 @@ index e0a513b..8385efe 100644
  }  // namespace
  
  ContentDownloadTask::ContentDownloadTask(
-@@ -32,7 +79,7 @@
+@@ -32,7 +85,7 @@
      : DownloadTaskImpl(web_state,
                         item->GetURL(),
                         OriginatingHostForItem(item),
@@ -710,7 +1248,7 @@ index e0a513b..8385efe 100644
                         item->GetContentDisposition(),
                         item->GetTotalBytes() > 0 ? item->GetTotalBytes() : -1,
                         item->GetMimeType(),
-@@ -40,7 +87,9 @@
+@@ -40,7 +93,9 @@
                         task_runner),
        item_(item),
        target_callback_(std::move(target_callback)),
@@ -721,7 +1259,7 @@ index e0a513b..8385efe 100644
    item_->AddObserver(this);
  }
  
-@@ -132,6 +181,14 @@
+@@ -132,6 +187,14 @@
    return suggested_name_;
  }
  

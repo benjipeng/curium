@@ -73,6 +73,19 @@ NS_SWIFT_UI_ACTOR
 - (void)exitPictureInPicture;
 /// The effective HTTP User-Agent string for this tab (respecting Desktop mode and active profile).
 @property (nonatomic, copy, readonly, nullable) NSString *effectiveUserAgent;
+/// Evaluates a synchronous JavaScript expression in an isolated world across either the
+/// primary main frame (allFrames == NO) or all active, live frames of the primary page
+/// (allFrames == YES; excludes prerender, bfcache, speculative, fenced, and guest frames;
+/// does not await JS Promises). Each result dictionary has: isMainFrame (NSNumber BOOL),
+/// frameURL (NSURL, optional), frameOrigin (NSString, optional when opaque), and result
+/// (JSON-compatible Foundation object, optional). Always invokes completion once on the
+/// main thread (with an NSError if detached, navigated away, invalid, or timed out).
+- (void)evaluateJavaScriptInIsolatedWorld:(NSString *)script
+                                allFrames:(BOOL)allFrames
+                               completion:
+    (void (^NS_SWIFT_UI_ACTOR)(
+        NSArray<NSDictionary<NSString *, id> *> *_Nullable results,
+        NSError *_Nullable error))completion;
 
 @end
 
@@ -167,7 +180,7 @@ NS_SWIFT_UI_ACTOR
 
 /// Additive subresource load event for Media Radar (pre-filtered in C++ to skip
 /// static page assets). Keys: url, originalURL, referrer, frameURL, frameOrigin,
-/// mimeType, httpStatusCode, contentLength, requestDestination.
+/// mimeType, httpMethod, httpStatusCode, contentLength, requestDestination.
 - (void)browserHost:(id<CrIOSBrowserHostV1>)host
                      tab:(id<CrIOSTabHostingV1>)tab
     didLoadResourceEvent:(NSDictionary<NSString *, id> *)event;

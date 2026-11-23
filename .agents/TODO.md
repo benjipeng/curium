@@ -135,17 +135,32 @@ Built in run `45092671606` (`b95f677`) after green `graph-diagnose.yml` (`450909
   repeated tab/worker loads against Build 40 before resizing the 64 MiB pool.
   This V8 pin requires global jitless for DrumBrake; crossing its committed-code
   cap is fatal.
-- [ ] **Build 42 `0110` real-Blink micro-fixes (3 findings from `iphone_duo_27_2` live audit).**
-  1. `canvas_async_blob_creator.cc`: allow `kBGRA_8888_SkColorType` alongside
-     `kRGBA_8888_SkColorType` (passing `is_bgra`) so Metal-backed
-     `HTMLCanvasElement.toBlob()` farbles identically to `toDataURL()` and
+- [ ] **Build 42 kernel polish & Media Radar wave (drafted in `0108` + `0110`, pending CI build & pin).**
+  Audited `LGTM` across `104/104` patches (`324` pinned files):
+  1. `0110` `canvas_async_blob_creator.cc`: normalize owned unpremul export copy
+     to `kRGBA_8888_SkColorType` (guarding `RGBA8 || BGRA8` so HDR/`F16` stays
+     untouched) so Metal `HTMLCanvasElement.toBlob()` matches `toDataURL()` and
      `OffscreenCanvas.convertToBlob()`.
-  2. `screen.cc`: avoid letting Blink's unscaled desktop virtual viewport height
-     on portrait outer displays without `<meta name="viewport">` stretch
-     `ResolveWebScreenMetrics` `screen.height` above the profile target (`1080`).
-  3. `base_rendering_context_2d.cc`: hash `site_key` (or resolved `PrimaryFont()`
-     family) instead of the pre-fallback CSS family string in
-     `ResolveTextMetricsScale` so blocked fonts match their fallback to `0.0000 px`.
+  2. `0110` `base_rendering_context_2d.cc`: hash null-checked resolved
+     `PrimaryFont()->PlatformData().Typeface()->getFamilyName()` (no CSS family
+     fallback) so blocked/missing fonts align to `0.0000 px`.
+  3. `0110` `screen.cc` + `curium_fingerprint_config.{h,cc}` + `local_dom_window.cc`:
+     use `RootWindowRect` physical DIPs (guarded on `page && View() && GetWidgetForLocalRoot()`),
+     trigger stretch on `avail_*` preserving `(avail_dx, avail_dy)`, and clamp
+     `outerWidth`/`outerHeight` (`base::ClampAdd(inner_h, 87)` on desktop).
+  4. `0110` `font_cache_ios.mm`: filter `family_name` in
+     `PlatformFallbackFontForCharacter` (`nullptr` when disallowed) to close the
+     CJK/non-Latin font-enumeration bypass without tofu.
+  5. `0110` `webgl_rendering_context_base.cc` + `analyser_node.cc`: support
+     `PACK_ROW_LENGTH`/`PACK_SKIP_*` with checked bounds + `GetError()`/`synthetic_errors_`
+     preservation around `ReadPixels`, and clamp `AnalyserNode` float farbling
+     to `frequencyBinCount()` / `fftSize()`.
+  6. `0108` `curium_tab_host.mm` + `CrIOSBrowserHostV1.h` + `download_item_utils.{h,cc}` + `download_manager_impl.cc`:
+     expose `httpMethod` in `didLoadResourceEvent:`, add `@optional`
+     `evaluateJavaScriptInIsolatedWorld:allFrames:completion:` (world
+     `ISOLATED_WORLD_ID_CONTENT_END`, `WeakDocumentPtr` + `5s` weak `OneShotTimer`,
+     fenced/guest subtree pruning), and propagate authoritative `DownloadCreateInfo::method`
+     into `ContentDownloadTask`.
 - [x] **Unstripped framework symbols artifact (`0098`).** Landed Build 37.
 - [x] **Single-process extension coexistence (`0099`).** Landed Build 37.
 - [x] **Extension APIs & native permissions prompt (`0100`).** Landed Build 37.

@@ -224,6 +224,8 @@ if missing_v8:
 # Also resolve Build 41 patched objects across content/ios/blink targets so
 # graph-diagnose verifies every newly patched TU before the 18-shard build.
 build41_specs = [
+    ("obj/content/browser/", "download_item_utils.o"),
+    ("obj/content/browser/", "download_manager_impl.o"),
     ("obj/content/browser/", "geolocation_service_impl.o"),
     ("obj/ios/web/content/", "content_permission_manager.o"),
     ("obj/ios/web/content/", "content_download_task.o"),
@@ -246,6 +248,7 @@ build41_specs = [
     ("obj/third_party/blink/renderer/modules/", "analyser_node.o"),
     ("obj/third_party/blink/renderer/modules/", "offline_audio_context.o"),
     ("obj/third_party/blink/renderer/platform/", "font_cache.o"),
+    ("obj/third_party/blink/renderer/platform/", "font_cache_ios.o"),
     ("obj/third_party/blink/renderer/platform/", "image_data_buffer.o"),
 ]
 missing_b41 = []
