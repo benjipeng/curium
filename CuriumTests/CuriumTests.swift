@@ -7390,9 +7390,26 @@ struct CuriumBuild44ContractV4Tests {
         #expect(browserStore.activeProfileID == "default")
         #expect(browserStore.tabs.first?.id == "default-tab-1")
 
+        // Stage an unconfirmed Blink download + banner on the outgoing profile; hot-swap
+        // must cancel/detach the Blink task before teardown and clear the banner.
+        let pendingTask = MockDownloadTask(
+            sourceTabID: outgoingTab.tabID,
+            originalURL: URL(string: "https://personal.example.com/archive.zip"),
+            suggestedFilename: "archive.zip",
+            mimeType: "application/zip",
+            isExplicitDownload: true,
+            totalBytes: 4_194_304
+        )
+        browserStore.browserHost(outgoingHost, didCreateDownload: pendingTask)
+        #expect(browserStore.activeDownloadBanner != nil)
+        #expect(browserStore.downloads.first?.phase == .pendingConfirmation)
+
         // Valid zero-restart hot-swap into Work profile.
         let swapped = await browserStore.switchProfile(to: workProfile.id)
         #expect(swapped)
+        #expect(pendingTask.cancelCount == 1)
+        #expect(browserStore.activeDownloadBanner == nil)
+        #expect(browserStore.downloads.first?.phase == .cancelled)
         #expect(beforeProfileCreateCount == 1)
         #expect(receivedPayloadProfileID == workProfile.id)
         #expect(browserStore.activeProfileID == workProfile.id)

@@ -1068,9 +1068,18 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         isHotSwappingProfile = true
         defer { isHotSwappingProfile = false }
 
+        // Cancel unconfirmed Blink downloads bound to the outgoing BrowserContext
+        // and clear the transient bottom banner so outgoing UI never leaks into the incoming profile.
+        for item in downloads where item.phase == .pendingConfirmation {
+            transferCoordinator.cancelDownload(item)
+        }
+        activeDownloadBanner = nil
+
         // Quiesce outgoing transfers, open-tab session, SQLite WAL, and diagnostics.
         await transferCoordinator.pauseAllActiveTransfersForRelaunch()
         syncBackgroundKeepAlive()
+        sessionSaveTask?.cancel()
+        sessionSaveTask = nil
         saveOpenTabsSession()
         await library.checkpointAsync()
         CuriumDiagnostics.shared.flushSync()
