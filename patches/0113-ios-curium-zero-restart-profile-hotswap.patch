@@ -1387,7 +1387,7 @@ index fa92cdc..2e7e391 100644
  // from which the initial bundled unpacked content-script fixture is loaded.
  base::FilePath GetIOSBundledExtensionDirectory();
 diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
-index 6a8bdd0..45f197a 100644
+index 6a8bdd0..d02c952 100644
 --- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
 +++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
 @@ -49,6 +49,7 @@
@@ -1407,14 +1407,13 @@ index 6a8bdd0..45f197a 100644
  #include "extensions/browser/service_worker/service_worker_task_queue.h"
  #include "extensions/browser/unpacked_installer.h"
  #include "extensions/browser/url_request_util.h"
-@@ -136,6 +139,16 @@ @protocol CrIOSExtensionPopupHostingV1 <NSObject>
+@@ -136,6 +139,15 @@ @protocol CrIOSExtensionPopupHostingV1 <NSObject>
  - (void)close;
  @end
  
-+@class CrIOSExtensionPopupHost;
-+
-+static NSHashTable<CrIOSExtensionPopupHost*>* GetLiveExtensionPopupHosts() {
-+  static NSHashTable<CrIOSExtensionPopupHost*>* hosts = nil;
++static NSHashTable<id<CrIOSExtensionPopupHostingV1>>*
++GetLiveExtensionPopupHosts() {
++  static NSHashTable<id<CrIOSExtensionPopupHostingV1>>* hosts = nil;
 +  if (!hosts) {
 +    hosts = [NSHashTable weakObjectsHashTable];
 +  }
@@ -1424,7 +1423,7 @@ index 6a8bdd0..45f197a 100644
  // Required V1 selectors remain stable; the UI probes optional capabilities.
  @protocol CrIOSExtensionManagingV1 <NSObject>
  - (NSArray<NSDictionary<NSString*, id>*>*)extensionsWithError:
-@@ -920,6 +933,10 @@ void InitializeIOSExtensionsForProfile(ProfileIOS* profile) {
+@@ -920,6 +932,10 @@ void InitializeIOSExtensionsForProfile(ProfileIOS* profile) {
    client->RegisterBrowserContext(browser_context, profile);
    BrowserContextDependencyManager::GetInstance()->CreateBrowserContextServices(
        browser_context);
@@ -1435,15 +1434,15 @@ index 6a8bdd0..45f197a 100644
    extensions::ExtensionSystem::Get(browser_context)
        ->InitForRegularProfile(/*extensions_enabled=*/true);
  }
-@@ -943,6 +960,73 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+@@ -943,6 +959,73 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
    client->UnregisterBrowserContext(browser_context);
  }
  
 +void PrepareIOSExtensionsForProfileHotSwap(ProfileIOS* profile) {
 +  if (content::BrowserThread::CurrentlyOn(content::BrowserThread::UI)) {
-+    NSArray<CrIOSExtensionPopupHost*>* live_popups =
++    NSArray<id<CrIOSExtensionPopupHostingV1>>* live_popups =
 +        [GetLiveExtensionPopupHosts() allObjects];
-+    for (CrIOSExtensionPopupHost* popup in live_popups) {
++    for (id<CrIOSExtensionPopupHostingV1> popup in live_popups) {
 +      [popup close];
 +    }
 +    ResetSignedImports();
@@ -1509,7 +1508,7 @@ index 6a8bdd0..45f197a 100644
  namespace extensions {
  
  // static
-@@ -2835,6 +2919,7 @@ - (instancetype)initWithExtensionID:(NSString*)extensionID
+@@ -2835,6 +2918,7 @@ - (instancetype)initWithExtensionID:(NSString*)extensionID
        }
      });
      _webState->SetDelegate(_delegate.get());
@@ -1517,7 +1516,7 @@ index 6a8bdd0..45f197a 100644
    }
    return self;
  }
-@@ -2870,6 +2955,7 @@ - (void)close {
+@@ -2870,6 +2954,7 @@ - (void)close {
      return;
    }
    _closed = YES;
@@ -2237,7 +2236,7 @@ index ce96316..7ce4bb8 100644
  
  #endif  // IOS_CHROME_BROWSER_SHARED_MODEL_PATHS_PATHS_H_
 diff --git a/ios/chrome/browser/shared/model/paths/paths.mm b/ios/chrome/browser/shared/model/paths/paths.mm
-index 6c13c5f..30bcb0f 100644
+index 6c13c5f..a67a9c9 100644
 --- a/ios/chrome/browser/shared/model/paths/paths.mm
 +++ b/ios/chrome/browser/shared/model/paths/paths.mm
 @@ -17,12 +17,14 @@
@@ -2255,7 +2254,7 @@ index 6c13c5f..30bcb0f 100644
  #import "build/branding_buildflags.h"
  #import "components/gcm_driver/gcm_driver_constants.h"
  #import "ios/chrome/browser/shared/model/paths/paths_internal.h"
-@@ -48,8 +50,65 @@
+@@ -48,8 +50,90 @@
    bool configured = false;
    bool opened = false;
    int lock_fd = -1;
@@ -2295,8 +2294,33 @@ index 6c13c5f..30bcb0f 100644
 +      profile_root.Append(FILE_PATH_LITERAL("Local State"));
 +  std::string contents;
 +  constexpr size_t kMaxLocalStateReadBytes = 4 * 1024 * 1024;
-+  if (base::ReadFileToStringWithMaxSize(local_state_path, &contents,
-+                                        kMaxLocalStateReadBytes)) {
++  bool read_ok = false;
++  int read_fd =
++      open(local_state_path.value().c_str(), O_RDONLY | O_CLOEXEC);
++  if (read_fd >= 0) {
++    char buf[4096];
++    read_ok = true;
++    while (contents.size() <= kMaxLocalStateReadBytes) {
++      const ssize_t n = read(read_fd, buf, sizeof(buf));
++      if (n < 0) {
++        if (errno == EINTR) {
++          continue;
++        }
++        read_ok = false;
++        break;
++      }
++      if (n == 0) {
++        break;
++      }
++      if (contents.size() + static_cast<size_t>(n) > kMaxLocalStateReadBytes) {
++        read_ok = false;
++        break;
++      }
++      contents.append(buf, static_cast<size_t>(n));
++    }
++    close(read_fd);
++  }
++  if (read_ok) {
 +    auto parsed = base::JSONReader::ReadAndReturnValueWithError(
 +        contents, base::JSON_PARSE_RFC);
 +    if (parsed.has_value()) {
@@ -2321,7 +2345,20 @@ index 6c13c5f..30bcb0f 100644
  CuriumProfileState& GetCuriumProfileState() {
    static base::NoDestructor<CuriumProfileState> state;
    return *state;
-@@ -227,12 +286,28 @@ bool PathProvider(int key, base::FilePath* result) {
+@@ -95,7 +179,11 @@ bool EnsureSafeDirectory(const base::FilePath& dir) {
+     }
+   } else if (errno != ENOENT) {
+     return false;
+-  } else if (!base::CreateDirectory(dir)) {
++  } else if (![[NSFileManager defaultManager]
++                     createDirectoryAtPath:base::apple::FilePathToNSString(dir)
++               withIntermediateDirectories:YES
++                                attributes:nil
++                                     error:nil]) {
+     return false;
+   }
+   if (lstat(dir.value().c_str(), &st) != 0 || S_ISLNK(st.st_mode) ||
+@@ -227,12 +315,28 @@ bool PathProvider(int key, base::FilePath* result) {
        cur = cur.Append(gcm_driver::kGCMStoreDirname);
        break;
  
@@ -2351,7 +2388,7 @@ index 6c13c5f..30bcb0f 100644
  
      case FILE_RESOURCES_PACK:
        // Catalyst builds are packaged like macOS, with the binary and resource
-@@ -334,6 +409,184 @@ bool IsCuriumProfileDirectoryOpened() {
+@@ -334,6 +438,201 @@ bool IsCuriumProfileDirectoryOpened() {
    return state.opened;
  }
  
@@ -2361,7 +2398,6 @@ index 6c13c5f..30bcb0f 100644
 +    base::FilePath* target_state_path_out,
 +    std::string* error_code_out,
 +    std::string* error_message_out) {
-+  base::ScopedAllowBlocking allow_blocking;
 +  const std::string normalized_id =
 +      profile_id.empty() ? std::string("default") : std::string(profile_id);
 +  const bool use_custom = (normalized_id != "default");
@@ -2446,7 +2482,6 @@ index 6c13c5f..30bcb0f 100644
 +}
 +
 +bool CommitHotSwapCuriumProfileDirectory() {
-+  base::ScopedAllowBlocking allow_blocking;
 +  base::FilePath new_root;
 +  base::FilePath new_state_path;
 +  {
@@ -2501,16 +2536,35 @@ index 6c13c5f..30bcb0f 100644
 +  // launch into this profile opens the exact same "Default" state directory.
 +  const base::FilePath target_local_state =
 +      new_root.Append(FILE_PATH_LITERAL("Local State"));
-+  if (!base::PathExists(target_local_state) &&
-+      new_state_path.BaseName().value() == FILE_PATH_LITERAL("Default")) {
-+    constexpr std::string_view kSeedLocalState =
-+        R"({"profile":{"info_cache":{"Default":{}},"last_used":"Default","personal_profile_name":"Default"}})";
-+    (void)base::WriteFile(target_local_state, kSeedLocalState);
++  if (new_state_path.BaseName().value() == FILE_PATH_LITERAL("Default")) {
++    int seed_fd = open(target_local_state.value().c_str(),
++                       O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
++                       0600);
++    if (seed_fd >= 0) {
++      constexpr std::string_view kSeedLocalState =
++          R"({"profile":{"info_cache":{"Default":{}},"last_used":"Default","personal_profile_name":"Default"}})";
++      size_t written = 0;
++      while (written < kSeedLocalState.size()) {
++        const ssize_t n = write(seed_fd, kSeedLocalState.data() + written,
++                                kSeedLocalState.size() - written);
++        if (n < 0) {
++          if (errno == EINTR) {
++            continue;
++          }
++          break;
++        }
++        written += static_cast<size_t>(n);
++      }
++      close(seed_fd);
++    }
 +  }
 +
 +  if (!new_root.empty()) {
++    // `new_root` was already created and verified absolute in PrepareHotSwap,
++    // so pass create=false to avoid base::CreateDirectory's ScopedBlockingCall
++    // on the UI thread.
 +    (void)base::PathService::OverrideAndCreateIfNeeded(
-+        DIR_USER_DATA, new_root, /*is_absolute=*/true, /*create=*/true);
++        DIR_USER_DATA, new_root, /*is_absolute=*/true, /*create=*/false);
 +  }
 +  return true;
 +}

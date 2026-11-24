@@ -256,7 +256,7 @@ index b641905..d7ee188 100644
    "+third_party/blink/public/common",
    "+third_party/blink/public/mojom",
 diff --git a/ios/chrome/browser/curium/curium_browser_host.mm b/ios/chrome/browser/curium/curium_browser_host.mm
-index c3a90b7..dddfef5 100644
+index c3a90b7..17ff9dd 100644
 --- a/ios/chrome/browser/curium/curium_browser_host.mm
 +++ b/ios/chrome/browser/curium/curium_browser_host.mm
 @@ -12,6 +12,7 @@
@@ -365,7 +365,7 @@ index c3a90b7..dddfef5 100644
 +  if (_isShutdown || !_browser || tabID.length == 0) {
 +    return NO;
 +  }
-+  if (!base::FeatureList::IsEnabled(content::features::kWebContentsDiscard)) {
++  if (!base::FeatureList::IsEnabled(::features::kWebContentsDiscard)) {
 +    return NO;
 +  }
 +  WebStateList* list = _browser->GetWebStateList();
@@ -409,10 +409,18 @@ index c3a90b7..dddfef5 100644
  }
  
 diff --git a/ios/chrome/browser/curium/curium_download_task.mm b/ios/chrome/browser/curium/curium_download_task.mm
-index 1068aba..8369b94 100644
+index 1068aba..c78e9d2 100644
 --- a/ios/chrome/browser/curium/curium_download_task.mm
 +++ b/ios/chrome/browser/curium/curium_download_task.mm
-@@ -54,11 +54,16 @@ @implementation CuriumDownloadTask {
+@@ -13,6 +13,7 @@
+ #import "ios/web/public/download/download_task.h"
+ #import "ios/web/public/download/download_task_observer.h"
+ #import "net/base/apple/url_conversions.h"
++#import "url/gurl.h"
+ 
+ namespace {
+ 
+@@ -54,11 +55,16 @@ @implementation CuriumDownloadTask {
    NSString* _downloadID;
    NSString* _sourceTabID;
    NSURL* _originalURL;
@@ -429,7 +437,7 @@ index 1068aba..8369b94 100644
    CrIOSDownloadState _terminalState;
    int64_t _terminalTotalBytes;
    int64_t _terminalReceivedBytes;
-@@ -76,6 +81,9 @@ - (instancetype)initWithDownloadTask:(std::unique_ptr<web::DownloadTask>)task
+@@ -76,6 +82,9 @@ - (instancetype)initWithDownloadTask:(std::unique_ptr<web::DownloadTask>)task
      _downloadID = [_task->GetIdentifier() copy] ?: [[NSUUID UUID] UUIDString];
      _sourceTabID = [sourceTabID copy];
      _originalURL = net::NSURLWithGURL(_task->GetOriginalUrl());
@@ -439,7 +447,7 @@ index 1068aba..8369b94 100644
      base::FilePath generated = _task->GenerateFileName();
      _suggestedFilename =
          base::SysUTF8ToNSString(generated.value()) ?: @"Download";
-@@ -84,6 +92,16 @@ - (instancetype)initWithDownloadTask:(std::unique_ptr<web::DownloadTask>)task
+@@ -84,6 +93,16 @@ - (instancetype)initWithDownloadTask:(std::unique_ptr<web::DownloadTask>)task
      _isExplicitDownload = _task->IsExplicitDownload();
      _isMainFrame = _task->IsMainFrameDownload();
      _httpMethod = [_task->GetHttpMethod() copy] ?: @"GET";
@@ -456,7 +464,7 @@ index 1068aba..8369b94 100644
      _terminalState = CrIOSDownloadStateCancelled;
      _terminalTotalBytes = -1;
      _terminalReceivedBytes = 0;
-@@ -170,6 +188,26 @@ - (NSString*)httpMethod {
+@@ -170,6 +189,26 @@ - (NSString*)httpMethod {
    return _httpMethod;
  }
  
@@ -483,7 +491,7 @@ index 1068aba..8369b94 100644
  - (int64_t)totalBytes {
    return _task ? _task->GetTotalBytes() : _terminalTotalBytes;
  }
-@@ -210,7 +248,36 @@ - (void)cancel {
+@@ -210,7 +249,36 @@ - (void)cancel {
  }
  
  - (void)handleTaskUpdated {
