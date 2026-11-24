@@ -69,6 +69,20 @@ NS_SWIFT_UI_ACTOR
 /// rejection details.
 + (NSDictionary<NSString *, id> *)activeFingerprintStatus;
 
+/// Applies a bounded UTF-8 runtime privacy policy JSON (<= 16 KiB,
+/// policySchemaVersion: 1) atomically to the active profile and syncs live
+/// WebContents and Blink runtime features without restarting the process.
+/// Probe via respondsToSelector: on engines older than Build 43.
++ (BOOL)applyRuntimePolicyJSON:(NSData *)jsonData
+                         error:(NSError *__autoreleasing _Nullable *_Nullable)error;
+
+/// Returns the engine's authoritative snapshot of the active runtime privacy
+/// policy (runtimePolicyVersion, appliedPolicyRevision, farblingActive,
+/// farbling, webrtcIpHandlingPolicy, enableDoNotTrack,
+/// enableGlobalPrivacyControl, hideSpeechVoices).
+/// Probe via respondsToSelector: on engines older than Build 43.
++ (NSDictionary<NSString *, id> *)activeRuntimePolicyStatus;
+
 @end
 
 NS_ASSUME_NONNULL_END

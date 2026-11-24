@@ -72,7 +72,7 @@ Probe `CrIOSEngineBootstrap` with `respondsToSelector:` for
 `fingerprintCapabilities`, `configureLaunchFingerprintConfigJSON:error:`, and
 `activeFingerprintStatus` before calling `ChromeMain`. Passing `nil` or empty
 bytes preserves Build 39 (`0105`) default behavior. Passing bounded UTF-8 JSON
-(`schemaVersion: 1`, <= 64 KiB) validates all fields, binds and locks the
+(`schemaVersion: 1..3`, <= 64 KiB) validates all fields, binds and locks the
 selected isolated profile root under `<Application Support>/ChromiumProfiles/<profileId>`
 (or `<Application Support>/Chromium` for `"default"`), and freezes the launch
 configuration once before threads start. Explicit invalid or unavailable
@@ -80,3 +80,51 @@ profiles fail closed and return `NO` with a `CrIOSFingerprintErrorDomain` error
 rather than silently opening the default profile. Query `activeFingerprintStatus`
 after startup for the engine's authoritative `appliedProfileId`,
 `profileDirectoryOpened`, `appliedConfigRevision`, `state`, and `hardwareOverridesActive`.
+
+#### Launch Schema v3 Additions (Build 43+, Backward-Compatible with v1–v2)
+
+Negotiate `schemaVersion = min(3, max(1, contractVersion))` from
+`fingerprintCapabilities` before encoding launch JSON so older engines never
+receive unknown keys:
+
+- **`ScreenOverrideConfig` (`mobile.screen` / `desktop.screen`):** Adds three
+  optional fields — `availTop` (integer `[0, 256]`), `availLeft` (integer
+  `[0, 512]`), and `devicePixelRatio` (finite number `[1.0, 4.0]`, applied only
+  to web-exposed `window.devicePixelRatio` and CSS media queries while keeping
+  native UIKit scale and touch geometry untouched).
+- **Top-level `personaSeed`:** Optional `16..64` ASCII hex string supplying a
+  deterministic per-profile seed for non-farbled surfaces (e.g. native desktop
+  `SpeechSynthesis` voice catalogs) even when `fingerprintSeed` is omitted.
+- **Additive `v3` capabilities:** `contractVersion: 3`,
+  `supportedSchemaVersions: [1, 2, 3]`, `runtimePolicyVersion: 1`,
+  `maxRuntimePolicyBytes: 16384`, `activationScopes` (`farbling`, `webrtcPolicy`,
+  `doNotTrack`, `globalPrivacyControl`, `speechVoiceHiding` = `"runtime_hot"`),
+  and `features` (`hotRuntimePrivacyPolicy`, `stealthEdgeCanvasFarbling`,
+  `nativeDesktopParityV1`, `coherentWebDPR`, `gcrwebSuppressedAtSource`,
+  `nativeKeyboardLayoutMap`, `nativeSpeechSynthesisVoices`,
+  `nativeWindowChromeSurface`, `profileCachePurgeHook`).
+
+#### Hot-Mutable Runtime Privacy Policy (Build 43+, `policySchemaVersion: 1`)
+
+Probe `CrIOSEngineBootstrap` with `respondsToSelector:` for
+`applyRuntimePolicyJSON:error:` and `activeRuntimePolicyStatus` (and verify
+`fingerprintCapabilities.features.hotRuntimePrivacyPolicy == YES`) to hot-toggle
+the six runtime-mutable privacy controls across live tabs without restarting
+the process:
+
+- **Payload (`<= 16384` bytes, strict allowlist):**
+  - `policySchemaVersion` (required integer `1`)
+  - `policyRevision` (optional uint64 `<= 9007199254740991`)
+  - `fingerprintSeed` (optional `null` or 64-character ASCII hex string)
+  - `farbling` (optional `null` or `{canvas, audio, webgl, textMetrics}` booleans)
+  - `webrtcIpHandlingPolicy` (optional string: `default`,
+    `default_public_and_private_interfaces`, `default_public_interface_only`,
+    or `disable_non_proxied_udp`)
+  - `enableDoNotTrack` (optional boolean)
+  - `enableGlobalPrivacyControl` (optional boolean)
+  - `hideSpeechVoices` (optional `null` or boolean; `null` preserves per-slot `"Auto"` platform behavior)
+- **Status (`activeRuntimePolicyStatus`):** Returns `runtimePolicyVersion`,
+  `appliedPolicyRevision`, `farblingActive`, `farbling`,
+  `webrtcIpHandlingPolicy`, `enableDoNotTrack`, `enableGlobalPrivacyControl`,
+  and `hideSpeechVoices`. On Build 43+, `GlobalPrivacyControlApi` is toggled
+  dynamically by the runtime policy rather than via a launch command-line flag.

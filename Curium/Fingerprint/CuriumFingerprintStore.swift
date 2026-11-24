@@ -64,6 +64,8 @@ final class CuriumFingerprintStore {
     private let applicationSupportRoot: URL?
     private let cachesRoot: URL?
     private let curiumSupportRoot: URL?
+    private let capabilitiesProvider: () -> CuriumEngineFingerprintCapabilities
+    private let runtimePolicyApplier: (Data, inout NSError?) -> Bool
     let isProductionDefaultFile: Bool
     private var migratedSeedIDs: Set<String> = []
     private var needsInitialPersist = false
@@ -73,6 +75,7 @@ final class CuriumFingerprintStore {
     private(set) var retiredProfileIDs: Set<String>
     private(set) var loadError: String?
     private(set) var lastPersistError: String?
+    private(set) var lastRuntimePolicyError: String?
     private(set) var recoveredFromBackup: Bool = false
 
     /// Support root directory backing this store's companion locks and per-profile SQLite/session tree.
@@ -192,19 +195,34 @@ final class CuriumFingerprintStore {
     }
 
     convenience init(fileURL: URL) {
-        self.init(fileURL: fileURL, applicationSupportRoot: nil, cachesRoot: nil, curiumSupportRoot: nil)
+        self.init(
+            fileURL: fileURL,
+            applicationSupportRoot: nil,
+            cachesRoot: nil,
+            curiumSupportRoot: nil,
+            capabilitiesProvider: nil,
+            runtimePolicyApplier: nil
+        )
     }
 
     init(
         fileURL: URL,
         applicationSupportRoot: URL? = nil,
         cachesRoot: URL? = nil,
-        curiumSupportRoot: URL? = nil
+        curiumSupportRoot: URL? = nil,
+        capabilitiesProvider: (() -> CuriumEngineFingerprintCapabilities)? = nil,
+        runtimePolicyApplier: ((Data, inout NSError?) -> Bool)? = nil
     ) {
         self.fileURL = fileURL
         self.applicationSupportRoot = applicationSupportRoot
         self.cachesRoot = cachesRoot
         self.curiumSupportRoot = curiumSupportRoot
+        self.capabilitiesProvider = capabilitiesProvider ?? {
+            CuriumFingerprintBootstrap.engineCapabilities()
+        }
+        self.runtimePolicyApplier = runtimePolicyApplier ?? { data, error in
+            CuriumApplyRuntimePrivacyPolicy(data, &error)
+        }
         let isProdDefault = applicationSupportRoot == nil
             && cachesRoot == nil
             && curiumSupportRoot == nil
@@ -786,8 +804,79 @@ final class CuriumFingerprintStore {
             profiles = previousProfiles
             selectedProfileID = previousSelection
             report.errors.append(lastPersistError ?? "Failed to save profile store to disk.")
+            return report
         }
+        _ = applyLiveRuntimePrivacyPolicyIfSupported(for: updated)
         return report
+    }
+
+    /// Hot-applies the 6 runtime-mutable privacy controls (`fingerprintSeed`, `farbling`,
+    /// `webrtcIpHandlingPolicy`, `enableDoNotTrack`, `enableGlobalPrivacyControl`,
+    /// `hideSpeechVoices`) into a live Build 43+ Blink engine without requiring a restart.
+    ///
+    /// Returns `true` iff the engine advertises `supportsHotRuntimePrivacyPolicy`, `profile`
+    /// is the active running profile, ONLY hot-mutable privacy fields changed from the active
+    /// launch snapshot, and `CuriumApplyRuntimePrivacyPolicy` succeeded (updating the launch
+    /// snapshot in place so `hasPendingActiveProfileEngineChanges` remains `false`).
+    @discardableResult
+    func applyLiveRuntimePrivacyPolicyIfSupported(
+        for profile: CuriumFingerprintProfile,
+        capabilitiesProvider: (() -> CuriumEngineFingerprintCapabilities)? = nil,
+        runtimePolicyApplier: ((Data, inout NSError?) -> Bool)? = nil
+    ) -> Bool {
+        let normalized = profile.normalizedForPersistence()
+        guard normalized.id.lowercased() == activeLaunchProfileID.lowercased(),
+              !hasPendingProfileIDChange,
+              let snapshot = CuriumFingerprintBootstrap.activeLaunchEngineSnapshot,
+              snapshot.profileID.lowercased() == normalized.id.lowercased(),
+              !snapshot.wasUnconfiguredBuild39,
+              snapshot.onlyHotMutableFieldsDiffer(from: normalized)
+        else {
+            return false
+        }
+
+        let caps = (capabilitiesProvider ?? self.capabilitiesProvider)()
+        guard caps.supportsHotRuntimePrivacyPolicy else {
+            return false
+        }
+
+        let policyRevision = CuriumFingerprintBootstrap.peekNextRuntimePolicyRevision(
+            minimum: normalized.revision
+        )
+        let jsonData: Data
+        do {
+            jsonData = try normalized.makeRuntimePrivacyPolicyJSON(policyRevision: policyRevision)
+        } catch {
+            lastRuntimePolicyError = "Failed to encode runtime privacy policy JSON: \(error.localizedDescription)"
+            Self.log.error("runtime privacy policy encode failed: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+
+        let maxBytes = caps.maxRuntimePolicyBytes > 0
+            ? min(caps.maxRuntimePolicyBytes, CuriumFingerprintSchema.maxRuntimePolicyBytes)
+            : CuriumFingerprintSchema.maxRuntimePolicyBytes
+        guard jsonData.count <= maxBytes else {
+            lastRuntimePolicyError = "Runtime privacy policy payload (\(jsonData.count) bytes) exceeds engine limit (\(maxBytes) bytes)."
+            Self.log.error("runtime privacy policy too large: \(jsonData.count) > \(maxBytes)")
+            return false
+        }
+
+        let applier = runtimePolicyApplier ?? self.runtimePolicyApplier
+        var engineError: NSError?
+        guard applier(jsonData, &engineError) else {
+            let reason = engineError?.localizedDescription
+                ?? "Blink engine rejected runtime privacy policy update."
+            lastRuntimePolicyError = reason
+            Self.log.error("runtime privacy policy apply failed: \(reason, privacy: .public)")
+            return false
+        }
+
+        lastRuntimePolicyError = nil
+        _ = CuriumFingerprintBootstrap.updateActiveSnapshotHotPrivacyFields(
+            from: normalized,
+            appliedPolicyRevision: policyRevision
+        )
+        return true
     }
 
     @discardableResult
@@ -1546,23 +1635,100 @@ enum CuriumFingerprintBootstrap {
             self.hideSpeechVoices = normalized.hideSpeechVoices
         }
 
-        func matchesEngineFields(of profile: CuriumFingerprintProfile) -> Bool {
+        private init(
+            profileID: String,
+            wasUnconfiguredBuild39: Bool,
+            defaultSlot: CuriumDefaultSlot,
+            mobile: CuriumIdentitySlot,
+            desktop: CuriumIdentitySlot,
+            languages: [String]?,
+            proxy: CuriumProxyConfig,
+            webrtcIpHandlingPolicy: CuriumWebRTCPolicy,
+            enableDoNotTrack: Bool,
+            enableGlobalPrivacyControl: Bool,
+            hardware: CuriumHardwareOverrides,
+            fingerprintSeed: String?,
+            effectiveFarbling: CuriumFarblingSettings?,
+            fontProfile: CuriumFontProfile?,
+            hideSpeechVoices: Bool?
+        ) {
+            self.profileID = profileID
+            self.wasUnconfiguredBuild39 = wasUnconfiguredBuild39
+            self.defaultSlot = defaultSlot
+            self.mobile = mobile
+            self.desktop = desktop
+            self.languages = languages
+            self.proxy = proxy
+            self.webrtcIpHandlingPolicy = webrtcIpHandlingPolicy
+            self.enableDoNotTrack = enableDoNotTrack
+            self.enableGlobalPrivacyControl = enableGlobalPrivacyControl
+            self.hardware = hardware
+            self.fingerprintSeed = fingerprintSeed
+            self.effectiveFarbling = effectiveFarbling
+            self.fontProfile = fontProfile
+            self.hideSpeechVoices = hideSpeechVoices
+        }
+
+        /// True iff all launch-frozen fields (`defaultSlot`, `mobile`, `desktop`,
+        /// `languages`, `proxy`, `hardware`, `fontProfile`) match `profile`.
+        func matchesLaunchFrozenFields(of profile: CuriumFingerprintProfile) -> Bool {
             let candidate = profile.normalizedForPersistence()
-            let candidateFarbling: CuriumFarblingSettings? =
-                candidate.fingerprintSeed != nil ? (candidate.farbling ?? .allEnabled) : nil
             return defaultSlot == candidate.defaultSlot
                 && mobile == candidate.mobile
                 && desktop == candidate.desktop
                 && languages == candidate.languages
                 && proxy == candidate.proxy
-                && webrtcIpHandlingPolicy == candidate.webrtcIpHandlingPolicy
+                && hardware == candidate.hardware
+                && fontProfile == candidate.fontProfile
+        }
+
+        /// True iff all 6 hot-mutable runtime privacy fields (`fingerprintSeed`,
+        /// `effectiveFarbling`, `webrtcIpHandlingPolicy`, `enableDoNotTrack`,
+        /// `enableGlobalPrivacyControl`, `hideSpeechVoices`) match `profile`.
+        func matchesHotMutablePrivacyFields(of profile: CuriumFingerprintProfile) -> Bool {
+            let candidate = profile.normalizedForPersistence()
+            let candidateFarbling: CuriumFarblingSettings? =
+                candidate.fingerprintSeed != nil ? (candidate.farbling ?? .allEnabled) : nil
+            return webrtcIpHandlingPolicy == candidate.webrtcIpHandlingPolicy
                 && enableDoNotTrack == candidate.enableDoNotTrack
                 && enableGlobalPrivacyControl == candidate.enableGlobalPrivacyControl
-                && hardware == candidate.hardware
                 && fingerprintSeed == candidate.fingerprintSeed
                 && effectiveFarbling == candidateFarbling
-                && fontProfile == candidate.fontProfile
                 && hideSpeechVoices == candidate.hideSpeechVoices
+        }
+
+        /// True iff every launch-frozen field matches `profile`, while at least one of
+        /// the 6 hot-mutable privacy fields differs (eligible for zero-restart live apply
+        /// on Build 43+ engines).
+        func onlyHotMutableFieldsDiffer(from profile: CuriumFingerprintProfile) -> Bool {
+            matchesLaunchFrozenFields(of: profile) && !matchesHotMutablePrivacyFields(of: profile)
+        }
+
+        func matchesEngineFields(of profile: CuriumFingerprintProfile) -> Bool {
+            matchesLaunchFrozenFields(of: profile) && matchesHotMutablePrivacyFields(of: profile)
+        }
+
+        func updatingHotPrivacyFields(from profile: CuriumFingerprintProfile) -> EngineLaunchSnapshot {
+            let candidate = profile.normalizedForPersistence()
+            let candidateFarbling: CuriumFarblingSettings? =
+                candidate.fingerprintSeed != nil ? (candidate.farbling ?? .allEnabled) : nil
+            return EngineLaunchSnapshot(
+                profileID: profileID,
+                wasUnconfiguredBuild39: wasUnconfiguredBuild39,
+                defaultSlot: defaultSlot,
+                mobile: mobile,
+                desktop: desktop,
+                languages: languages,
+                proxy: proxy,
+                webrtcIpHandlingPolicy: candidate.webrtcIpHandlingPolicy,
+                enableDoNotTrack: candidate.enableDoNotTrack,
+                enableGlobalPrivacyControl: candidate.enableGlobalPrivacyControl,
+                hardware: hardware,
+                fingerprintSeed: candidate.fingerprintSeed,
+                effectiveFarbling: candidateFarbling,
+                fontProfile: fontProfile,
+                hideSpeechVoices: candidate.hideSpeechVoices
+            )
         }
     }
 
@@ -1572,6 +1738,7 @@ enum CuriumFingerprintBootstrap {
         var activeLaunchEngineSnapshot: EngineLaunchSnapshot? = nil
         var frozenLaunchProfile: CuriumFingerprintProfile? = nil
         var sharedLockFD: Int32 = -1
+        var lastRuntimePolicyRevision: UInt64 = 0
     }
 
     private static let stateLock = OSAllocatedUnfairLock<BootstrapState>(initialState: BootstrapState())
@@ -1636,10 +1803,59 @@ enum CuriumFingerprintBootstrap {
             state.activeLaunchEngineSnapshot = snapshot
             state.frozenLaunchProfile = profile
             state.sharedLockFD = sharedLockFD
+            state.lastRuntimePolicyRevision = 0
             return prev
         }
         if oldFD >= 0 && oldFD != sharedLockFD {
             close(oldFD)
+        }
+    }
+
+    /// Computes the next strictly monotonic runtime privacy policy revision without mutating state.
+    nonisolated static func peekNextRuntimePolicyRevision(minimum: UInt64) -> UInt64 {
+        stateLock.withLock { state in
+            let incremented = state.lastRuntimePolicyRevision < CuriumFingerprintValidator.maxSafeJSONRevision
+                ? state.lastRuntimePolicyRevision + 1
+                : CuriumFingerprintValidator.maxSafeJSONRevision
+            return min(CuriumFingerprintValidator.maxSafeJSONRevision, max(incremented, max(minimum, 1)))
+        }
+    }
+
+    /// Atomically updates the 6 hot-mutable privacy fields in the active launch snapshot
+    /// (and `frozenLaunchProfile`, if present) after a Build 43+ live runtime policy apply
+    /// succeeds, keeping `hasPendingActiveProfileEngineChanges == false`.
+    @discardableResult
+    nonisolated static func updateActiveSnapshotHotPrivacyFields(
+        from profile: CuriumFingerprintProfile,
+        appliedPolicyRevision: UInt64? = nil
+    ) -> Bool {
+        let normalized = profile.normalizedForPersistence()
+        return stateLock.withLock { state in
+            guard let current = state.activeLaunchEngineSnapshot,
+                  current.profileID.lowercased() == normalized.id.lowercased()
+            else {
+                return false
+            }
+            state.activeLaunchEngineSnapshot = current.updatingHotPrivacyFields(from: normalized)
+            if var frozen = state.frozenLaunchProfile,
+               frozen.id.lowercased() == normalized.id.lowercased()
+            {
+                frozen.fingerprintSeed = normalized.fingerprintSeed
+                frozen.farbling = normalized.farbling
+                frozen.webrtcIpHandlingPolicy = normalized.webrtcIpHandlingPolicy
+                frozen.enableDoNotTrack = normalized.enableDoNotTrack
+                frozen.enableGlobalPrivacyControl = normalized.enableGlobalPrivacyControl
+                frozen.hideSpeechVoices = normalized.hideSpeechVoices
+                frozen.revision = normalized.revision
+                state.frozenLaunchProfile = frozen
+            }
+            if let appliedPolicyRevision {
+                state.lastRuntimePolicyRevision = max(
+                    state.lastRuntimePolicyRevision,
+                    min(CuriumFingerprintValidator.maxSafeJSONRevision, appliedPolicyRevision)
+                )
+            }
+            return true
         }
     }
 
@@ -1661,6 +1877,10 @@ enum CuriumFingerprintBootstrap {
     static func activeEngineStatus() -> CuriumEngineFingerprintStatus? {
         guard let dict = CuriumEngineActiveFingerprintStatusDict() else { return nil }
         return CuriumEngineFingerprintStatus(dictionary: dict)
+    }
+
+    static func activeRuntimePolicyStatus() -> [String: Any]? {
+        CuriumEngineActiveRuntimePolicyStatusDict()
     }
 
     /// Runs once on the main thread before `ChromeMain`.

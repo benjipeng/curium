@@ -245,6 +245,7 @@ static BOOL CuriumHasSwitchValueToken(NSArray<NSString *> *args,
 static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
                                                  BOOL supportsDisableSync,
                                                  BOOL hasExplicitFingerprintConfig,
+                                                 NSInteger engineContractVersion,
                                                  BOOL enableGlobalPrivacyControl,
                                                  BOOL disableWebTouchDetection,
                                                  BOOL enableDesktopKeyboardAPI,
@@ -283,10 +284,11 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
         changed |= CuriumAddSwitch(args, @"--curium-enable-jit");
     }
 
-    if (enableGlobalPrivacyControl) {
-        // Chromium 160 gates both navigator.globalPrivacyControl and the
-        // Sec-GPC header behind the GlobalPrivacyControlApi base::Feature.
-        // Only enable it when the active launch profile explicitly opted in.
+    if (enableGlobalPrivacyControl && engineContractVersion < 3) {
+        // Legacy Build 40-42 engines gate both navigator.globalPrivacyControl and
+        // the Sec-GPC header behind the launch-frozen GlobalPrivacyControlApi
+        // base::Feature. Build 43+ (contractVersion >= 3) controls it dynamically
+        // via patch 0111 with zero navigator.globalPrivacyControl === false leak.
         changed |= CuriumMergeListSwitch(args, @"--enable-features", @",", @"GlobalPrivacyControlApi");
     }
 
@@ -352,14 +354,17 @@ static void CuriumInstallCommandLineGuard(void) {
             : CuriumNormalizedAcceptLanguages([NSLocale preferredLanguages]);
         NSString *mobileModelPref = [[defaults stringForKey:@"curium.mobileModel"] copy];
         BOOL hasExplicitConfig = gCuriumExplicitFingerprintConfigured;
+        NSDictionary<NSString *, id> *caps = CuriumEngineFingerprintCapabilitiesDict();
+        NSInteger engineContractVersion = [caps[@"contractVersion"] isKindOfClass:[NSNumber class]]
+            ? [caps[@"contractVersion"] integerValue] : 0;
         BOOL enableGPC = gCuriumEnableGlobalPrivacyControl;
         BOOL disableTouchDetection = gCuriumDisableWebTouchDetection;
         BOOL enableDesktopKeyboard = gCuriumEnableDesktopKeyboardAPI;
         BOOL forceSRGB = gCuriumForceSRGBColorProfile;
         gCuriumAugmentedArguments = CuriumBuildArguments(
-            base, supportsDisableSync, hasExplicitConfig, enableGPC,
-            disableTouchDetection, enableDesktopKeyboard, forceSRGB, jitPref,
-            uaBrandPref, mobileUAPref, acceptLangPref, mobileModelPref);
+            base, supportsDisableSync, hasExplicitConfig, engineContractVersion,
+            enableGPC, disableTouchDetection, enableDesktopKeyboard, forceSRGB,
+            jitPref, uaBrandPref, mobileUAPref, acceptLangPref, mobileModelPref);
 
         Class cls = object_getClass(processInfo);
         SEL sel = @selector(arguments);
@@ -374,10 +379,11 @@ static void CuriumInstallCommandLineGuard(void) {
             method_setImplementation(method, (IMP)CuriumAugmentedProcessArguments);
         }
         NSString *detail = hasExplicitConfig
-            ? [NSString stringWithFormat:@"%lu args (disable-sync=%d, jit=%@, fingerprint=profile-json, touchDetect=%d, desktopKbd=%d)",
+            ? [NSString stringWithFormat:@"%lu args (disable-sync=%d, jit=%@, fingerprint=profile-json, contract=v%ld, touchDetect=%d, desktopKbd=%d)",
                (unsigned long)gCuriumAugmentedArguments.count,
                supportsDisableSync ? 1 : 0,
                jitPref.length > 0 ? jitPref : @"automatic",
+               (long)engineContractVersion,
                disableTouchDetection ? 0 : 1,
                enableDesktopKeyboard ? 1 : 0]
             : [NSString stringWithFormat:
@@ -655,6 +661,52 @@ NSDictionary<NSString *, id> *_Nullable CuriumEngineActiveFingerprintStatusDict(
         return nil;
     }
     return [(id)bootstrap activeFingerprintStatus];
+}
+
+BOOL CuriumApplyRuntimePrivacyPolicy(NSData *jsonData, NSError *_Nullable *_Nullable error) {
+    Class bootstrap = NSClassFromString(@"CrIOSEngineBootstrap");
+    if (![bootstrap respondsToSelector:@selector(applyRuntimePolicyJSON:error:)]) {
+        if (error) {
+            *error = [NSError errorWithDomain:CrIOSFingerprintErrorDomain
+                                         code:CrIOSFingerprintErrorUnsupportedSchema
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    @"The embedded Blink engine does not support live runtime privacy policy updates (requires Build 43+)."}];
+        }
+        return NO;
+    }
+
+    NSError *localError = nil;
+    BOOL ok = [(id)bootstrap applyRuntimePolicyJSON:(jsonData ?: [NSData data]) error:&localError];
+    if (!ok) {
+        if (error) {
+            *error = localError;
+        }
+        CuriumRecordHookStatus(@"Runtime Privacy Policy", @"failed",
+                               localError.localizedDescription ?: @"Engine rejected runtime privacy policy");
+        return NO;
+    }
+
+    NSDictionary<NSString *, id> *status = CuriumEngineActiveRuntimePolicyStatusDict();
+    NSNumber *rev = [status[@"appliedPolicyRevision"] isKindOfClass:[NSNumber class]]
+        ? status[@"appliedPolicyRevision"] : @0;
+    BOOL farblingActive = [status[@"farblingActive"] isKindOfClass:[NSNumber class]]
+        && [status[@"farblingActive"] boolValue];
+    BOOL gpc = [status[@"enableGlobalPrivacyControl"] isKindOfClass:[NSNumber class]]
+        && [status[@"enableGlobalPrivacyControl"] boolValue];
+    CuriumRecordHookStatus(@"Runtime Privacy Policy", @"active",
+                           [NSString stringWithFormat:@"rev=%llu farbling=%d gpc=%d",
+                            rev.unsignedLongLongValue,
+                            farblingActive ? 1 : 0,
+                            gpc ? 1 : 0]);
+    return YES;
+}
+
+NSDictionary<NSString *, id> *_Nullable CuriumEngineActiveRuntimePolicyStatusDict(void) {
+    Class bootstrap = NSClassFromString(@"CrIOSEngineBootstrap");
+    if (![bootstrap respondsToSelector:@selector(activeRuntimePolicyStatus)]) {
+        return nil;
+    }
+    return [(id)bootstrap activeRuntimePolicyStatus];
 }
 
 BOOL CuriumRegisterShell(id<CrIOSShellBootstrapDelegate> delegate) {

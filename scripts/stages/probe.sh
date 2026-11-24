@@ -265,6 +265,35 @@ for prefix, base in build41_specs:
                 targets.append(out)
 if missing_b41:
     sys.exit(f"Missing Build 41 device object targets: {missing_b41}")
+# Also resolve Build 43 patched objects across blink/ios targets so
+# graph-diagnose verifies every newly patched TU before the 18-shard build.
+build43_specs = [
+    ("obj/third_party/blink/common/", "curium_runtime_policy.o"),
+    ("obj/third_party/blink/common/", "curium_desktop_parity.o"),
+    ("obj/third_party/blink/common/", "global_privacy_control_util.o"),
+    ("obj/ios/web/content/", "content_web_frames_manager.o"),
+    ("obj/ios/web/content/", "content_java_script_feature_manager.o"),
+    ("obj/third_party/blink/renderer/modules/", "network_information.o"),
+    ("obj/third_party/blink/renderer/modules/", "presentation_error.o"),
+    ("obj/third_party/blink/renderer/modules/", "media_capabilities.o"),
+    ("obj/third_party/blink/renderer/modules/", "public_key_credential.o"),
+    ("obj/third_party/blink/renderer/modules/", "language_detector.o"),
+    ("obj/third_party/blink/renderer/modules/", "summarizer.o"),
+]
+missing_b43 = []
+for prefix, base in build43_specs:
+    matches = [
+        out for out in sorted(graph.producer.keys())
+        if out.startswith(prefix) and out.rsplit("/", 1)[-1] == base
+    ]
+    if not matches:
+        missing_b43.append(f"{prefix}.../{base}")
+    else:
+        for out in matches:
+            if out not in targets:
+                targets.append(out)
+if missing_b43:
+    sys.exit(f"Missing Build 43 device object targets: {missing_b43}")
 targets_path.write_text("\n".join(targets) + "\n")
 missing = set(targets) - graph.producer.keys()
 if missing:

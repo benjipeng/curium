@@ -90,6 +90,7 @@ struct CuriumFingerprintEditorView: View {
     @State private var isWiping = false
     @State private var alertMessage: String?
     @State private var pendingShareDocument: CuriumShareDocument?
+    private let supportsHotRuntimePrivacyPolicy: Bool
 
     private let iconColumns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 4)
     private let paletteColumns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 6)
@@ -166,6 +167,9 @@ struct CuriumFingerprintEditorView: View {
         }
         let initialNormalized = initialProfile.normalizedForPersistence()
         _cachedReport = State(initialValue: Self.evaluateValidation(candidate: initialNormalized))
+        self.supportsHotRuntimePrivacyPolicy = CuriumFingerprintBootstrap
+            .engineCapabilities()
+            .supportsHotRuntimePrivacyPolicy
     }
 
     private var effectiveDraft: CuriumFingerprintProfile {
@@ -566,6 +570,16 @@ struct CuriumFingerprintEditorView: View {
                 .accessibilityIdentifier("curium.editor.rollHardware")
             }
 
+            Toggle(isOn: privacyHardeningBinding) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Privacy Hardening")
+                    Text("Full farbling, Sec-GPC & non-proxied WebRTC UDP off")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .accessibilityIdentifier("curium.editor.privacyHardening")
+
             Toggle("Anti-Fingerprinting", isOn: Binding(
                 get: { draft.fingerprintSeed != nil },
                 set: { enabled in
@@ -676,7 +690,7 @@ struct CuriumFingerprintEditorView: View {
         } header: {
             Text("Device & Privacy")
         } footer: {
-            Text("Device, proxy, locale, and privacy changes apply on the next cold launch.")
+            Text(deviceAndPrivacyFooterCopy)
         }
     }
 
@@ -781,6 +795,50 @@ struct CuriumFingerprintEditorView: View {
     }
 
     // MARK: - Bindings & Helpers
+
+    private var isPrivacyHardeningEnabled: Bool {
+        draft.fingerprintSeed != nil
+            && (draft.farbling ?? .allEnabled) == .allEnabled
+            && draft.enableGlobalPrivacyControl
+            && draft.webrtcIpHandlingPolicy == .disableNonProxiedUdp
+    }
+
+    private var privacyHardeningBinding: Binding<Bool> {
+        Binding(
+            get: { isPrivacyHardeningEnabled },
+            set: { enabled in
+                if enabled {
+                    draft.farbling = .allEnabled
+                    draft.fingerprintSeed = CuriumFingerprintStore.mintFreshSeed(
+                        differentFrom: draft.fingerprintSeed
+                    )
+                    draft.enableGlobalPrivacyControl = true
+                    draft.webrtcIpHandlingPolicy = .disableNonProxiedUdp
+                } else {
+                    draft.farbling = nil
+                    draft.fingerprintSeed = nil
+                    draft.enableGlobalPrivacyControl = false
+                    if proxyModeSelection == .fixed {
+                        draft.webrtcIpHandlingPolicy = .disableNonProxiedUdp
+                    } else if case .fixed = draft.proxy {
+                        draft.webrtcIpHandlingPolicy = .disableNonProxiedUdp
+                    } else {
+                        draft.webrtcIpHandlingPolicy = .default
+                    }
+                }
+            }
+        )
+    }
+
+    private var deviceAndPrivacyFooterCopy: String {
+        if supportsHotRuntimePrivacyPolicy {
+            if isActiveInProcess {
+                return "Privacy Hardening, Anti-Fingerprinting, WebRTC IP policy, and Sec-GPC apply live on save without relaunching. Hardware, proxy, timezone, and language changes apply on the next cold launch."
+            }
+            return "Privacy Hardening toggles full farbling, Sec-GPC, and non-proxied WebRTC UDP off together. Hardware, proxy, and locale changes apply when this profile is launched; privacy controls apply live once active."
+        }
+        return "Device, proxy, locale, and privacy changes apply on the next cold launch on this engine build."
+    }
 
     private var siteModeBinding: Binding<CuriumSiteMode> {
         Binding(

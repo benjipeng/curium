@@ -1,37 +1,37 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: chromium-blink-ios <noreply@github.com>
 Date: Sun, 22 Nov 2026 22:57:22 -0500
-Subject: [PATCH] ios(curium): native Blink anti-fingerprinting (schema v2,
- canvas/audio/webgl/fonts/screen/pdf/speech)
+Subject: [PATCH] ios(curium): native Blink anti-fingerprinting (schema v3,
+ Retina ladder, web-only DPR, stealth farbling, runtime policy hooks)
 
 ---
- .../browser/curium/cr_ios_engine_bootstrap.mm |  13 +
- third_party/blink/common/BUILD.gn             |   1 +
- .../curium/curium_fingerprint_config.cc       | 712 +++++++++++++++++-
- .../common/curium/curium_fingerprint_config.h | 123 ++-
- .../blink/renderer/core/css/media_values.cc   |  16 +
- .../css/resolver/style_builder_converter.cc   |   9 +-
- .../execution_context/execution_context.cc    |  64 ++
- .../execution_context/execution_context.h     |  12 +
- .../renderer/core/frame/local_dom_window.cc   |  39 +
- .../blink/renderer/core/frame/screen.cc       |  47 ++
- .../blink/renderer/core/frame/screen.h        |  12 +
- .../html/canvas/canvas_async_blob_creator.cc  |  41 +
- .../core/html/canvas/html_canvas_element.cc   |  19 +-
- .../core/html/canvas/html_canvas_element.h    |   3 +-
- .../renderer/core/html/canvas/text_metrics.h  |   8 +
- .../canvas2d/base_rendering_context_2d.cc     |  46 +-
- .../modules/plugins/dom_plugin_array.cc       |   9 +
- .../screen_orientation_controller.cc          |  21 +
- .../modules/speech/speech_synthesis.cc        |  17 +
- .../modules/webaudio/analyser_node.cc         |  39 +
- .../modules/webaudio/offline_audio_context.cc |  21 +
- .../webgl/webgl_rendering_context_base.cc     | 119 +++
- .../renderer/platform/fonts/font_cache.cc     |  13 +
- .../platform/fonts/ios/font_cache_ios.mm      |   9 +-
- .../platform/graphics/image_data_buffer.cc    |  49 ++
- .../platform/graphics/image_data_buffer.h     |   8 +
- 26 files changed, 1448 insertions(+), 22 deletions(-)
+ .../browser/curium/cr_ios_engine_bootstrap.mm      |   13 +
+ third_party/blink/common/BUILD.gn                  |    1 +
+ .../common/curium/curium_fingerprint_config.cc     | 1064 +++++++++++++++++++-
+ .../common/curium/curium_fingerprint_config.h      |  149 ++-
+ .../blink/renderer/core/css/media_values.cc        |   41 +-
+ .../core/css/resolver/style_builder_converter.cc   |    9 +-
+ .../core/execution_context/execution_context.cc    |   68 ++
+ .../core/execution_context/execution_context.h     |   12 +
+ .../blink/renderer/core/frame/local_dom_window.cc  |   63 +-
+ third_party/blink/renderer/core/frame/screen.cc    |   48 +
+ third_party/blink/renderer/core/frame/screen.h     |   12 +
+ .../core/html/canvas/canvas_async_blob_creator.cc  |   41 +
+ .../core/html/canvas/html_canvas_element.cc        |   19 +-
+ .../core/html/canvas/html_canvas_element.h         |    3 +-
+ .../blink/renderer/core/html/canvas/text_metrics.h |    8 +
+ .../canvas/canvas2d/base_rendering_context_2d.cc   |   46 +-
+ .../renderer/modules/plugins/dom_plugin_array.cc   |    9 +
+ .../screen_orientation_controller.cc               |   21 +
+ .../renderer/modules/speech/speech_synthesis.cc    |   17 +
+ .../renderer/modules/webaudio/analyser_node.cc     |   39 +
+ .../modules/webaudio/offline_audio_context.cc      |   21 +
+ .../modules/webgl/webgl_rendering_context_base.cc  |  119 +++
+ .../blink/renderer/platform/fonts/font_cache.cc    |   13 +
+ .../renderer/platform/fonts/ios/font_cache_ios.mm  |    9 +-
+ .../platform/graphics/image_data_buffer.cc         |   49 +
+ .../renderer/platform/graphics/image_data_buffer.h |    8 +
+ 26 files changed, 1877 insertions(+), 25 deletions(-)
 
 diff --git a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
 index 70728f2..54f929e 100644
@@ -84,7 +84,7 @@ index 786dedb..3802c38 100644
      "//media/capture:capture_base",
      "//media/capture/mojom:video_capture_mojom_support",
 diff --git a/third_party/blink/common/curium/curium_fingerprint_config.cc b/third_party/blink/common/curium/curium_fingerprint_config.cc
-index e2542ec..f077bab 100644
+index e2542ec..74ff740 100644
 --- a/third_party/blink/common/curium/curium_fingerprint_config.cc
 +++ b/third_party/blink/common/curium/curium_fingerprint_config.cc
 @@ -17,6 +17,7 @@
@@ -94,8 +94,144 @@ index e2542ec..f077bab 100644
 +#include "crypto/hash.h"
  #include "net/http/http_util.h"
  #include "net/proxy_resolution/proxy_config.h"
- 
-@@ -200,19 +201,36 @@ bool ParseIdentitySlot(const base::DictValue& dict,
+
+@@ -159,6 +160,135 @@ bool Fail(ConfigError* out_error, ErrorCode code, std::string message) {
+   return false;
+ }
+
++bool IsAsciiHexDigit(unsigned char c) {
++  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
++         (c >= 'A' && c <= 'F');
++}
++
++std::string BytesToLowerHex(base::span<const uint8_t> bytes) {
++  static constexpr char kHex[] = "0123456789abcdef";
++  std::string out;
++  out.reserve(bytes.size() * 2);
++  for (uint8_t b : bytes) {
++    out.push_back(kHex[b >> 4]);
++    out.push_back(kHex[b & 0x0Fu]);
++  }
++  return out;
++}
++
++bool ParseScreenOverride(const base::DictValue& sdict,
++                         std::string_view slot_name,
++                         ScreenOverrideConfig* out_screen,
++                         ConfigError* out_error) {
++  for (const auto [k, val] : sdict) {
++    if (k != "width" && k != "height" && k != "availWidth" &&
++        k != "availHeight" && k != "colorDepth" && k != "availTop" &&
++        k != "availLeft" && k != "devicePixelRatio") {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "Unknown key in " + std::string(slot_name) + ".screen: " + k);
++    }
++  }
++  std::optional<int> w = sdict.FindInt("width");
++  std::optional<int> h = sdict.FindInt("height");
++  if (!w || !h || *w < 240 || *w > 16384 || *h < 240 || *h > 16384) {
++    return Fail(out_error, ErrorCode::kInvalidField,
++                std::string(slot_name) +
++                    ".screen width/height must be integers in [240, 16384]");
++  }
++  ScreenOverrideConfig screen;
++  screen.width = *w;
++  screen.height = *h;
++
++  if (const base::Value* aw = sdict.Find("availWidth"); aw && !aw->is_none()) {
++    if (!aw->is_int()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".screen.availWidth must be integer");
++    }
++    screen.avail_width = aw->GetInt();
++  } else {
++    screen.avail_width = *w;
++  }
++
++  if (const base::Value* ah = sdict.Find("availHeight"); ah && !ah->is_none()) {
++    if (!ah->is_int()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".screen.availHeight must be integer");
++    }
++    screen.avail_height = ah->GetInt();
++  } else {
++    screen.avail_height = *h;
++  }
++
++  if (const base::Value* cd = sdict.Find("colorDepth"); cd && !cd->is_none()) {
++    if (!cd->is_int()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".screen.colorDepth must be integer");
++    }
++    screen.color_depth = cd->GetInt();
++  } else {
++    screen.color_depth = 24;
++  }
++
++  if (screen.avail_width < 240 || screen.avail_width > screen.width ||
++      screen.avail_height < 240 || screen.avail_height > screen.height ||
++      (screen.color_depth != 24 && screen.color_depth != 30 &&
++       screen.color_depth != 32)) {
++    return Fail(out_error, ErrorCode::kInvalidField,
++                std::string(slot_name) + ".screen values are out of range");
++  }
++
++  if (const base::Value* at = sdict.Find("availTop"); at && !at->is_none()) {
++    if (!at->is_int()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".screen.availTop must be integer");
++    }
++    const int n = at->GetInt();
++    if (n < 0 || n > 256) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) +
++                      ".screen.availTop must be in [0, 256]");
++    }
++    screen.avail_top = n;
++  }
++
++  if (const base::Value* al = sdict.Find("availLeft"); al && !al->is_none()) {
++    if (!al->is_int()) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) + ".screen.availLeft must be integer");
++    }
++    const int n = al->GetInt();
++    if (n < 0 || n > 512) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) +
++                      ".screen.availLeft must be in [0, 512]");
++    }
++    screen.avail_left = n;
++  }
++
++  if (const base::Value* dpr_val = sdict.Find("devicePixelRatio");
++      dpr_val && !dpr_val->is_none()) {
++    double dpr = 0.0;
++    if (dpr_val->is_int()) {
++      dpr = static_cast<double>(dpr_val->GetInt());
++    } else if (dpr_val->is_double()) {
++      dpr = dpr_val->GetDouble();
++    } else {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) +
++                      ".screen.devicePixelRatio must be a number");
++    }
++    if (!std::isfinite(dpr) || dpr < 1.0 || dpr > 4.0) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  std::string(slot_name) +
++                      ".screen.devicePixelRatio must be in [1.0, 4.0]");
++    }
++    screen.device_pixel_ratio = dpr;
++  }
++
++  *out_screen = screen;
++  return true;
++}
++
+ bool ParseBrandList(const base::ListValue& list,
+                     std::string_view field_name,
+                     blink::UserAgentBrandList* out_brands,
+@@ -200,19 +330,36 @@ bool ParseIdentitySlot(const base::DictValue& dict,
                         std::string_view slot_name,
                         IdentitySlotConfig* out_slot,
                         ConfigError* out_error) {
@@ -144,42 +280,19 @@ index e2542ec..f077bab 100644
    };
    for (const auto [key, value] : dict) {
      if (std::find(kAllowedKeys.begin(), kAllowedKeys.end(), key) ==
-@@ -500,6 +518,96 @@ bool ParseIdentitySlot(const base::DictValue& dict,
+@@ -500,6 +647,73 @@ bool ParseIdentitySlot(const base::DictValue& dict,
      slot.webgl_renderer = *s;
    }
- 
+
 +  if (const base::Value* v = dict.Find("screen"); v && !v->is_none()) {
 +    const base::DictValue* sdict = v->GetIfDict();
 +    if (!sdict) {
 +      return Fail(out_error, ErrorCode::kInvalidField,
 +                  std::string(slot_name) + ".screen must be an object");
 +    }
-+    for (const auto [k, val] : *sdict) {
-+      if (k != "width" && k != "height" && k != "availWidth" &&
-+          k != "availHeight" && k != "colorDepth") {
-+        return Fail(out_error, ErrorCode::kInvalidField,
-+                    "Unknown key in " + std::string(slot_name) + ".screen: " + k);
-+      }
-+    }
-+    std::optional<int> w = sdict->FindInt("width");
-+    std::optional<int> h = sdict->FindInt("height");
-+    if (!w || !h || *w < 240 || *w > 16384 || *h < 240 || *h > 16384) {
-+      return Fail(out_error, ErrorCode::kInvalidField,
-+                  std::string(slot_name) +
-+                      ".screen width/height must be integers in [240, 16384]");
-+    }
 +    ScreenOverrideConfig screen;
-+    screen.width = *w;
-+    screen.height = *h;
-+    screen.avail_width = sdict->FindInt("availWidth").value_or(*w);
-+    screen.avail_height = sdict->FindInt("availHeight").value_or(*h);
-+    screen.color_depth = sdict->FindInt("colorDepth").value_or(24);
-+    if (screen.avail_width < 240 || screen.avail_width > screen.width ||
-+        screen.avail_height < 240 || screen.avail_height > screen.height ||
-+        (screen.color_depth != 24 && screen.color_depth != 30 &&
-+         screen.color_depth != 32)) {
-+      return Fail(out_error, ErrorCode::kInvalidField,
-+                  std::string(slot_name) + ".screen values are out of range");
++    if (!ParseScreenOverride(*sdict, slot_name, &screen, out_error)) {
++      return false;
 +    }
 +    slot.screen = screen;
 +  }
@@ -241,27 +354,28 @@ index e2542ec..f077bab 100644
    *out_slot = std::move(slot);
    return true;
  }
-@@ -655,7 +763,7 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
+@@ -655,7 +869,7 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
                  "Root fingerprint config must be a JSON object");
    }
- 
+
 -  static constexpr std::array<std::string_view, 12> kTopLevelKeys = {
-+  static constexpr std::array<std::string_view, 16> kTopLevelKeys = {
++  static constexpr std::array<std::string_view, 17> kTopLevelKeys = {
        "schemaVersion",
        "revision",
        "profileId",
-@@ -668,6 +776,10 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
+@@ -668,6 +882,11 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
        "enableDoNotTrack",
        "enableGlobalPrivacyControl",
        "hardware",
 +      "fingerprintSeed",
++      "personaSeed",
 +      "farbling",
 +      "fontProfile",
 +      "hideSpeechVoices",
    };
    for (const auto [key, value] : *root) {
      if (std::find(kTopLevelKeys.begin(), kTopLevelKeys.end(), key) ==
-@@ -682,7 +794,8 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
+@@ -682,7 +901,8 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
      return Fail(out_error, ErrorCode::kInvalidField,
                  "schemaVersion integer is required");
    }
@@ -271,10 +385,10 @@ index e2542ec..f077bab 100644
      return Fail(out_error, ErrorCode::kUnsupportedSchema,
                  "Unsupported schemaVersion: " +
                      base::NumberToString(*schema_version));
-@@ -963,6 +1076,83 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
+@@ -963,6 +1183,98 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
      }
    }
- 
+
 +  if (const base::Value* seed_val = root->Find("fingerprintSeed");
 +      seed_val && !seed_val->is_none()) {
 +    const std::string* hex = seed_val->GetIfString();
@@ -287,6 +401,21 @@ index e2542ec..f077bab 100644
 +    std::array<uint8_t, 32> seed{};
 +    std::copy(bytes.begin(), bytes.end(), seed.begin());
 +    cfg.fingerprint_seed = seed;
++  }
++
++  if (const base::Value* pseed_val = root->Find("personaSeed");
++      pseed_val && !pseed_val->is_none()) {
++    const std::string* hex = pseed_val->GetIfString();
++    const bool valid_hex =
++        hex && hex->size() >= 16 && hex->size() <= 64 &&
++        std::all_of(hex->begin(), hex->end(), [](unsigned char c) {
++          return IsAsciiHexDigit(c);
++        });
++    if (!valid_hex) {
++      return Fail(out_error, ErrorCode::kInvalidField,
++                  "personaSeed must be 16..64 ASCII hex characters");
++    }
++    cfg.persona_seed = base::ToLowerASCII(*hex);
 +  }
 +
 +  if (const base::Value* farb_val = root->Find("farbling");
@@ -355,10 +484,10 @@ index e2542ec..f077bab 100644
    if (out_config) {
      *out_config = std::move(cfg);
    }
-@@ -1049,4 +1239,498 @@ std::optional<std::string> ResolveWebGLRenderer(
+@@ -1049,4 +1361,728 @@ std::optional<std::string> ResolveWebGLRenderer(
    return slot.webgl_renderer;
  }
- 
+
 +namespace {
 +
 +uint64_t ReadLE64(base::span<const uint8_t> bytes, size_t offset) {
@@ -537,6 +666,47 @@ index e2542ec..f077bab 100644
 +  return WebGLProfile::kNative;
 +}
 +
++struct MacRetinaDisplayPanel {
++  int width;
++  int height;
++  int menu_bar_height;
++};
++
++constexpr std::array<MacRetinaDisplayPanel, 7> kMacRetinaDisplayLadder = {{
++    {1512, 982, 38},
++    {1710, 1107, 38},
++    {1728, 1117, 38},
++    {1800, 1169, 38},
++    {2056, 1329, 38},
++    {2560, 1440, 25},
++    {3008, 1692, 25},
++}};
++
++int InferMacOSMenuBarHeight(int width, int height) {
++  static constexpr std::array<std::pair<int, int>, 14> kNotchedMacPanels = {{
++      {1147, 745},
++      {1280, 832},
++      {1312, 848},
++      {1352, 878},
++      {1440, 932},
++      {1470, 956},
++      {1496, 967},
++      {1512, 982},
++      {1710, 1107},
++      {1710, 1112},
++      {1728, 1117},
++      {1800, 1169},
++      {1920, 1243},
++      {2056, 1329},
++  }};
++  for (const auto& [pw, ph] : kNotchedMacPanels) {
++    if (width == pw && height == ph) {
++      return 38;
++    }
++  }
++  return 25;
++}
++
 +}  // namespace
 +
 +bool IsFarblingEnabled() {
@@ -562,6 +732,24 @@ index e2542ec..f077bab 100644
 +bool IsTextMetricsFarblingEnabled() {
 +  const LaunchConfig* cfg = GetLaunchConfig();
 +  return cfg && cfg->fingerprint_seed.has_value() && cfg->farble_text_metrics;
++}
++
++std::optional<std::string> GetActivePersonaSeed() {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg) {
++    return std::nullopt;
++  }
++  if (cfg->persona_seed.has_value() && !cfg->persona_seed->empty()) {
++    return *cfg->persona_seed;
++  }
++  if (cfg->fingerprint_seed.has_value()) {
++    return BytesToLowerHex(*cfg->fingerprint_seed);
++  }
++  return std::nullopt;
++}
++
++uint64_t GetRuntimePolicyRevision() {
++  return 0;
 +}
 +
 +std::optional<std::array<uint8_t, 32>> DeriveSiteKey(
@@ -593,11 +781,38 @@ index e2542ec..f077bab 100644
 +  const size_t a_idx = 3u;
 +  const std::array<size_t, 3> rgb_indices = {r_idx, g_idx, b_idx};
 +
++  // Keep an unmodified 3-row RGB24 ring buffer so 3x3 neighborhood checks
++  // observe original source pixels and cannot cascade noise into adjacent
++  // flat or 2-color regions.
++  const size_t width_sz = static_cast<size_t>(width);
++  auto extract_rgb_row = [&](int row_y, std::vector<uint32_t>& out) {
++    const uint8_t* src = pixels + static_cast<size_t>(row_y) * row_bytes;
++    for (size_t x = 0; x < width_sz; ++x) {
++      const uint8_t* p = src + x * 4u;
++      out[x] = (static_cast<uint32_t>(p[r_idx]) << 16) |
++               (static_cast<uint32_t>(p[g_idx]) << 8) |
++               static_cast<uint32_t>(p[b_idx]);
++    }
++  };
++
++  std::vector<uint32_t> curr_rgb(width_sz);
++  extract_rgb_row(0, curr_rgb);
++  std::vector<uint32_t> prev_rgb = curr_rgb;
++  std::vector<uint32_t> next_rgb(width_sz);
++  if (height > 1) {
++    extract_rgb_row(1, next_rgb);
++  } else {
++    next_rgb = curr_rgb;
++  }
++
 +  for (int y = 0; y < height; ++y) {
 +    uint8_t* row = pixels + static_cast<size_t>(y) * row_bytes;
 +    const uint64_t wy =
 +        static_cast<uint64_t>(static_cast<int64_t>(origin_y) + y) *
 +        0xBF58476D1CE4E5B9ULL;
++    const std::array<const uint32_t*, 3> neighbor_rows = {
++        prev_rgb.data(), curr_rgb.data(), next_rgb.data()};
++
 +    for (int x = 0; x < width; ++x) {
 +      uint8_t* px = row + static_cast<size_t>(x) * 4u;
 +      // Only perturb opaque pixels; leave alpha and premul-sensitive edges untouched.
@@ -608,10 +823,44 @@ index e2542ec..f077bab 100644
 +          static_cast<uint64_t>(static_cast<int64_t>(origin_x) + x) *
 +          0x9E3779B97F4A7C15ULL;
 +      const uint64_t h = SplitMix64(k0 ^ wx ^ wy ^ k1);
-+      // Perturb ~25% of opaque pixels by +-1 LSB on one RGB channel.
++      // Perturb ~25% of eligible opaque pixels by +-1 LSB on one RGB channel.
 +      if ((h & 0x3ULL) != 0ULL) {
 +        continue;
 +      }
++
++      // Require at least 3 distinct 24-bit RGB values in the clamped 3x3
++      // neighborhood so solid fillRect/gl.clear (1 color) and crisp 2-color
++      // borders/checkerboards (<= 2 colors) remain 100% bit-exact.
++      const size_t x_sz = static_cast<size_t>(x);
++      const size_t x_left = x_sz > 0u ? (x_sz - 1u) : 0u;
++      const size_t x_right =
++          (x_sz + 1u < width_sz) ? (x_sz + 1u) : (width_sz - 1u);
++      const std::array<size_t, 3> xs = {x_left, x_sz, x_right};
++      const uint32_t c0 = curr_rgb[x_sz];
++      uint32_t c1 = c0;
++      bool has_second = false;
++      bool has_third = false;
++      for (const uint32_t* rptr : neighbor_rows) {
++        for (size_t nx : xs) {
++          const uint32_t c = rptr[nx];
++          if (c != c0) {
++            if (!has_second) {
++              c1 = c;
++              has_second = true;
++            } else if (c != c1) {
++              has_third = true;
++              break;
++            }
++          }
++        }
++        if (has_third) {
++          break;
++        }
++      }
++      if (!has_third) {
++        continue;
++      }
++
 +      const size_t ch = rgb_indices[(h >> 2) % 3u];
 +      const int delta = ((h >> 4) & 1ULL) ? 1 : -1;
 +      const uint8_t cur = px[ch];
@@ -621,6 +870,16 @@ index e2542ec..f077bab 100644
 +        px[ch] = 254u;
 +      } else {
 +        px[ch] = static_cast<uint8_t>(static_cast<int>(cur) + delta);
++      }
++    }
++
++    if (y + 1 < height) {
++      std::swap(prev_rgb, curr_rgb);
++      std::swap(curr_rgb, next_rgb);
++      if (y + 2 < height) {
++        extract_rgb_row(y + 2, next_rgb);
++      } else {
++        next_rgb = curr_rgb;
 +      }
 +    }
 +  }
@@ -653,15 +912,35 @@ index e2542ec..f077bab 100644
 +  if (!samples || count == 0) {
 +    return;
 +  }
++  // Protect globally constant buffers (e.g., AnalyserNode -100 dB silent floor
++  // and frequency=0 DC buffers).
++  const float first = samples[0];
++  bool all_equal = true;
++  for (size_t i = 1; i < count; ++i) {
++    if (samples[i] != first) {
++      all_equal = false;
++      break;
++    }
++  }
++  if (all_equal) {
++    return;
++  }
++
 +  const uint64_t k0 = ReadLE64(site_key, 8) ^
 +                      (static_cast<uint64_t>(stream_tag) * 0x9E3779B97F4A7C15ULL);
 +  const uint64_t k1 = ReadLE64(site_key, 24);
++  float prev = first;
 +  for (size_t i = 0; i < count; ++i) {
 +    const float v = samples[i];
-+    if (!std::isfinite(v) || v == 0.0f) {
++    // Protect locally flat runs (e.g., DynamicsCompressorNode lookahead).
++    const bool is_flat_run =
++        (i > 0 && i + 1 < count && v == prev && v == samples[i + 1]);
++    prev = v;
++    if (is_flat_run || !std::isfinite(v) || v == 0.0f) {
 +      continue;
 +    }
-+    const uint64_t h = SplitMix64(k0 ^ (static_cast<uint64_t>(i) * 0xD1B54A32D192ED03ULL) ^ k1);
++    const uint64_t h = SplitMix64(
++        k0 ^ (static_cast<uint64_t>(i) * 0xD1B54A32D192ED03ULL) ^ k1);
 +    const float unit =
 +        (static_cast<float>(h & 0xFFFFULL) / 65535.0f) * 2.0f - 1.0f;
 +    samples[i] = v * (1.0f + unit * 1e-6f);
@@ -801,31 +1080,112 @@ index e2542ec..f077bab 100644
 +  m.avail_width = slot.screen->avail_width;
 +  m.avail_height = slot.screen->avail_height;
 +  m.color_depth = slot.screen->color_depth;
++  m.device_pixel_ratio = slot.screen->device_pixel_ratio;
 +  m.is_desktop = !metadata.mobile;
 +
-+  // Enforce geometric coherence on foldable iPhone Duo (e.g. 951x669 unfolded):
++  const std::string effective_platform =
++      !metadata.platform.empty() ? metadata.platform
++                                 : slot.platform.value_or("macOS");
++  const bool is_desktop_macos = m.is_desktop && effective_platform == "macOS";
++
++  bool stepped_up_panel = false;
++  int stepped_menu_bar = 0;
++
++  // Enforce geometric coherence on foldable iPhone Duo (e.g. 669x951 / 951x669):
 +  // screen.availWidth >= viewport_width && screen.availHeight >= viewport_height
 +  // for the physical root window DIP size, preserving configured taskbar/dock
-+  // deltas (avail_dx, avail_dy) on stretch.
++  // deltas (avail_dx, avail_dy). On desktop macOS slots, step up along a
++  // canonical @2x Apple Retina display ladder instead of synthesizing fake
++  // non-standard heights (e.g. 1440x1015).
 +  if (viewport_width > m.avail_width || viewport_height > m.avail_height) {
 +    const int avail_dx = std::max(0, m.width - m.avail_width);
 +    const int avail_dy = std::max(0, m.height - m.avail_height);
-+    if (m.is_desktop) {
-+      m.width = std::max(m.width, 1440);
-+      m.height = std::max(m.height, 900);
-+    } else if (viewport_width >= viewport_height) {
-+      // Unfolded Duo in landscape mobile slot: step up to tablet class.
-+      m.width = std::max(m.width, 1024);
-+      m.height = std::max(m.height, 768);
++    if (is_desktop_macos) {
++      bool matched = false;
++      for (const MacRetinaDisplayPanel& panel : kMacRetinaDisplayLadder) {
++        if (panel.width - avail_dx >= viewport_width &&
++            panel.height - avail_dy >= viewport_height) {
++          m.width = panel.width;
++          m.height = panel.height;
++          m.avail_width = m.width - avail_dx;
++          m.avail_height = m.height - avail_dy;
++          stepped_up_panel = true;
++          stepped_menu_bar = panel.menu_bar_height;
++          matched = true;
++          break;
++        }
++      }
++      if (!matched) {
++        const MacRetinaDisplayPanel& largest = kMacRetinaDisplayLadder.back();
++        m.width = std::max(largest.width, viewport_width + avail_dx);
++        m.height = std::max(largest.height, viewport_height + avail_dy);
++        m.avail_width = m.width - avail_dx;
++        m.avail_height = m.height - avail_dy;
++        stepped_up_panel = true;
++        stepped_menu_bar = largest.menu_bar_height;
++      }
++    } else {
++      if (m.is_desktop) {
++        m.width = std::max(m.width, 1440);
++        m.height = std::max(m.height, 900);
++      } else if (viewport_width >= viewport_height) {
++        // Unfolded Duo in landscape mobile slot: step up to tablet class.
++        m.width = std::max(m.width, 1024);
++        m.height = std::max(m.height, 768);
++      }
++      m.width = std::max(m.width, viewport_width + avail_dx);
++      m.height = std::max(m.height, viewport_height + avail_dy);
++      m.avail_width = m.width - avail_dx;
++      m.avail_height = m.height - avail_dy;
 +    }
-+    m.width = std::max(m.width, viewport_width + avail_dx);
-+    m.height = std::max(m.height, viewport_height + avail_dy);
-+    m.avail_width = m.width - avail_dx;
-+    m.avail_height = m.height - avail_dy;
 +  }
++
++  const int max_avail_top = std::max(0, m.height - m.avail_height);
++  const int max_avail_left = std::max(0, m.width - m.avail_width);
++  if (slot.screen->avail_top.has_value()) {
++    const int desired_top =
++        (stepped_up_panel && *slot.screen->avail_top > 0)
++            ? stepped_menu_bar
++            : *slot.screen->avail_top;
++    m.avail_top = std::clamp(desired_top, 0, max_avail_top);
++  } else if (stepped_up_panel) {
++    m.avail_top = std::min(stepped_menu_bar, max_avail_top);
++  } else if (is_desktop_macos) {
++    const int inferred = InferMacOSMenuBarHeight(m.width, m.height);
++    m.avail_top = std::min(inferred, max_avail_top);
++  } else {
++    m.avail_top = 0;
++  }
++
++  if (slot.screen->avail_left.has_value()) {
++    m.avail_left = std::clamp(*slot.screen->avail_left, 0, max_avail_left);
++  } else {
++    m.avail_left = 0;
++  }
++
 +  m.is_landscape = (m.width >= m.height);
 +  m.orientation_angle = 0;
 +  return m;
++}
++
++std::optional<double> GetWebDevicePixelRatioOverride(bool is_desktop,
++                                                     double native_dpr) {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg) {
++    return std::nullopt;
++  }
++  const IdentitySlotConfig& slot = is_desktop ? cfg->desktop : cfg->mobile;
++  if (slot.screen.has_value() &&
++      slot.screen->device_pixel_ratio.has_value()) {
++    return *slot.screen->device_pixel_ratio;
++  }
++  if (is_desktop && std::isfinite(native_dpr) && native_dpr >= 2.5) {
++    const std::string desktop_platform = slot.platform.value_or("macOS");
++    if (desktop_platform == "macOS") {
++      return 2.0;
++    }
++  }
++  return std::nullopt;
 +}
 +
 +bool ShouldExposePdfViewer(const blink::UserAgentMetadata& metadata) {
@@ -845,23 +1205,22 @@ index e2542ec..f077bab 100644
 +  if (!cfg) {
 +    return false;
 +  }
-+  const bool enabled =
-+      cfg->hide_speech_voices.value_or(cfg->schema_version >= 2);
-+  if (!enabled) {
-+    return false;
++  if (cfg->hide_speech_voices.has_value()) {
++    return *cfg->hide_speech_voices;
 +  }
-+  return metadata.platform != "macOS" && metadata.platform != "iOS";
++  return cfg->schema_version >= 2 && metadata.platform != "macOS" &&
++         metadata.platform != "iOS";
 +}
 +
  }  // namespace blink::curium
 diff --git a/third_party/blink/public/common/curium/curium_fingerprint_config.h b/third_party/blink/public/common/curium/curium_fingerprint_config.h
-index 151844a..60f150b 100644
+index 151844a..50a06ba 100644
 --- a/third_party/blink/public/common/curium/curium_fingerprint_config.h
 +++ b/third_party/blink/public/common/curium/curium_fingerprint_config.h
 @@ -5,6 +5,7 @@
  #ifndef THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_FINGERPRINT_CONFIG_H_
  #define THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_FINGERPRINT_CONFIG_H_
- 
+
 +#include <array>
  #include <cstddef>
  #include <cstdint>
@@ -869,24 +1228,24 @@ index 151844a..60f150b 100644
 @@ -12,13 +13,15 @@
  #include <string_view>
  #include <vector>
- 
+
 +#include "base/containers/span.h"
  #include "third_party/blink/public/common/common_export.h"
  #include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
  #include "third_party/blink/public/mojom/peerconnection/webrtc_ip_handling_policy.mojom-shared.h"
- 
+
  namespace blink::curium {
- 
+
 -inline constexpr int kLaunchConfigSchemaVersion = 1;
-+inline constexpr int kLaunchConfigSchemaVersion = 2;
++inline constexpr int kLaunchConfigSchemaVersion = 3;
 +inline constexpr int kMinSupportedLaunchConfigSchemaVersion = 1;
  inline constexpr size_t kMaxLaunchConfigBytes = 65536;
- 
+
  enum class ErrorCode : int {
-@@ -62,6 +65,41 @@ enum class HoverTypeOverride : int {
+@@ -62,6 +65,47 @@ enum class HoverTypeOverride : int {
    kHover = 1,
  };
- 
+
 +enum class FontProfile : int {
 +  kNative = 0,
 +  kApple = 1,
@@ -909,6 +1268,9 @@ index 151844a..60f150b 100644
 +  int avail_width = 0;
 +  int avail_height = 0;
 +  int color_depth = 24;
++  std::optional<int> avail_top;
++  std::optional<int> avail_left;
++  std::optional<double> device_pixel_ratio;
 +};
 +
 +struct BLINK_COMMON_EXPORT ResolvedScreenMetrics {
@@ -920,12 +1282,15 @@ index 151844a..60f150b 100644
 +  uint16_t orientation_angle = 0;
 +  bool is_landscape = false;
 +  bool is_desktop = false;
++  int avail_top = 0;
++  int avail_left = 0;
++  std::optional<double> device_pixel_ratio;
 +};
 +
  struct BLINK_COMMON_EXPORT ConfigError {
    ConfigError();
    ConfigError(ErrorCode code, std::string message);
-@@ -117,6 +155,14 @@ struct BLINK_COMMON_EXPORT IdentitySlotConfig {
+@@ -117,6 +161,14 @@ struct BLINK_COMMON_EXPORT IdentitySlotConfig {
    // Apple Metal GPU vendor/renderer strings.
    std::optional<std::string> webgl_vendor;
    std::optional<std::string> webgl_renderer;
@@ -938,15 +1303,18 @@ index 151844a..60f150b 100644
 +  std::optional<int> webgl_max_cube_map_texture_size;
 +  std::optional<bool> pdf_viewer_enabled;
  };
- 
+
  struct BLINK_COMMON_EXPORT LaunchConfig {
-@@ -150,6 +196,16 @@ struct BLINK_COMMON_EXPORT LaunchConfig {
+@@ -150,6 +202,19 @@ struct BLINK_COMMON_EXPORT LaunchConfig {
    std::optional<float> device_memory_gb;
    std::optional<std::string> timezone;
- 
+
 +  // Optional Build 41 (schemaVersion >= 2) anti-fingerprinting configuration.
 +  // When fingerprint_seed is nullopt, all rendering/audio farbling hooks no-op.
 +  std::optional<std::array<uint8_t, 32>> fingerprint_seed;
++  // Optional Build 43 (schemaVersion >= 3) deterministic persona seed
++  // (16..64 ASCII hex chars) used when fingerprint_seed is absent.
++  std::optional<std::string> persona_seed;
 +  bool farble_canvas = true;
 +  bool farble_audio = true;
 +  bool farble_webgl = true;
@@ -957,10 +1325,10 @@ index 151844a..60f150b 100644
    bool HasHardwareOverrides() const;
    std::string AcceptLanguagesCSV() const;
    const IdentitySlotConfig& DefaultIdentity() const;
-@@ -202,6 +258,71 @@ BLINK_COMMON_EXPORT std::optional<std::string> ResolveWebGLVendor(
+@@ -202,6 +267,88 @@ BLINK_COMMON_EXPORT std::optional<std::string> ResolveWebGLVendor(
  BLINK_COMMON_EXPORT std::optional<std::string> ResolveWebGLRenderer(
      const blink::UserAgentMetadata& metadata);
- 
+
 +// Lock-free Build 41 deterministic anti-fingerprinting primitives.
 +BLINK_COMMON_EXPORT bool IsFarblingEnabled();
 +BLINK_COMMON_EXPORT bool IsCanvasFarblingEnabled();
@@ -968,12 +1336,21 @@ index 151844a..60f150b 100644
 +BLINK_COMMON_EXPORT bool IsWebGLFarblingEnabled();
 +BLINK_COMMON_EXPORT bool IsTextMetricsFarblingEnabled();
 +
++// Returns the active deterministic persona seed (explicit personaSeed if set,
++// else lower-hex fingerprintSeed), or std::nullopt if neither is configured.
++BLINK_COMMON_EXPORT std::optional<std::string> GetActivePersonaSeed();
++
++// Monotonic runtime privacy policy revision (0 in Layer 1; hooked to
++// curium_runtime_policy::GetRevision() by Layer 2).
++BLINK_COMMON_EXPORT uint64_t GetRuntimePolicyRevision();
++
 +// Derives a 32-byte per-site key via HMAC-SHA256(fingerprint_seed, site_scope).
 +BLINK_COMMON_EXPORT std::optional<std::array<uint8_t, 32>> DeriveSiteKey(
 +    std::string_view site_scope);
 +
 +// Deterministic +-1 LSB RGB perturbation on opaque (A == 255) RGBA8/BGRA8
-+// pixels using absolute canvas coordinates (origin_x + x, origin_y + y).
++// pixels whose clamped 3x3 neighborhood contains at least 3 distinct RGB
++// values, using absolute canvas coordinates (origin_x + x, origin_y + y).
 +BLINK_COMMON_EXPORT void FarbleRGBA8Pixels(
 +    base::span<const uint8_t, 32> site_key,
 +    uint8_t* pixels,
@@ -989,7 +1366,8 @@ index 151844a..60f150b 100644
 +    base::span<const uint8_t, 32> site_key,
 +    std::string_view font_family);
 +
-+// Deterministic micro-perturbation (~ -120 dB) on non-zero finite audio samples.
++// Deterministic micro-perturbation (~ -120 dB) on non-zero finite audio samples
++// outside globally constant buffers and locally flat 3-sample runs.
 +BLINK_COMMON_EXPORT void FarbleAudioSamples(
 +    base::span<const uint8_t, 32> site_key,
 +    uint32_t stream_tag,
@@ -1018,6 +1396,13 @@ index 151844a..60f150b 100644
 +                        int viewport_width,
 +                        int viewport_height);
 +
++// Web-only DPR override (never mutates ScreenInfo::device_scale_factor or
++// LocalFrame::DevicePixelRatio): explicit screen.devicePixelRatio if set, else
++// 2.0 on desktop macOS slots when native_dpr >= 2.5, else std::nullopt.
++BLINK_COMMON_EXPORT std::optional<double> GetWebDevicePixelRatioOverride(
++    bool is_desktop,
++    double native_dpr);
++
 +// Desktop navigator.pdfViewerEnabled + W3C PDF plugin availability.
 +BLINK_COMMON_EXPORT bool ShouldExposePdfViewer(
 +    const blink::UserAgentMetadata& metadata);
@@ -1027,32 +1412,34 @@ index 151844a..60f150b 100644
 +    const blink::UserAgentMetadata& metadata);
 +
  }  // namespace blink::curium
- 
+
  #endif  // THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_FINGERPRINT_CONFIG_H_
 diff --git a/third_party/blink/renderer/core/css/media_values.cc b/third_party/blink/renderer/core/css/media_values.cc
-index 8d4c988..c3e1318 100644
+index 8d4c988..7fb6f65 100644
 --- a/third_party/blink/renderer/core/css/media_values.cc
 +++ b/third_party/blink/renderer/core/css/media_values.cc
 @@ -4,6 +4,7 @@
- 
+
  #include "third_party/blink/renderer/core/css/media_values.h"
- 
+
 +#include "build/build_config.h"
  #include "third_party/blink/public/common/css/scripting.h"
  #include "third_party/blink/renderer/core/css/css_resolution_units.h"
  #include "third_party/blink/renderer/core/css/css_to_length_conversion_data.h"
-@@ -18,6 +19,9 @@
+@@ -18,6 +19,11 @@
  #include "third_party/blink/renderer/core/execution_context/execution_context.h"
  #include "third_party/blink/renderer/core/frame/local_frame.h"
  #include "third_party/blink/renderer/core/frame/local_frame_view.h"
 +#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#include "third_party/blink/renderer/core/frame/local_dom_window.h"
 +#include "third_party/blink/renderer/core/frame/screen.h"
 +#endif
  #include "third_party/blink/renderer/core/frame/settings.h"
  #include "third_party/blink/renderer/core/layout/adjust_for_absolute_zoom.h"
  #include "third_party/blink/renderer/core/layout/layout_view.h"
-@@ -164,6 +168,12 @@ double MediaValues::CalculateDynamicViewportHeight(LocalFrame* frame) {
- 
+@@ -164,6 +170,12 @@ double MediaValues::CalculateDynamicViewportHeight(LocalFrame* frame) {
+
  int MediaValues::CalculateDeviceWidth(LocalFrame* frame) {
    DCHECK(frame && frame->View() && frame->GetSettings() && frame->GetPage());
 +#if BUILDFLAG(IS_IOS)
@@ -1064,8 +1451,8 @@ index 8d4c988..c3e1318 100644
    const display::ScreenInfo& screen_info =
        frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
    int device_width = screen_info.rect.width();
-@@ -176,6 +186,12 @@ int MediaValues::CalculateDeviceWidth(LocalFrame* frame) {
- 
+@@ -176,6 +188,12 @@ int MediaValues::CalculateDeviceWidth(LocalFrame* frame) {
+
  int MediaValues::CalculateDeviceHeight(LocalFrame* frame) {
    DCHECK(frame && frame->View() && frame->GetSettings() && frame->GetPage());
 +#if BUILDFLAG(IS_IOS)
@@ -1077,12 +1464,42 @@ index 8d4c988..c3e1318 100644
    const display::ScreenInfo& screen_info =
        frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
    int device_height = screen_info.rect.height();
+@@ -193,7 +211,28 @@ bool MediaValues::CalculateStrictMode(LocalFrame* frame) {
+ }
+
+ float MediaValues::CalculateDevicePixelRatio(LocalFrame* frame) {
+-  return frame->DevicePixelRatio();
++  const float native_dpr = frame->DevicePixelRatio();
++#if BUILDFLAG(IS_IOS)
++  if (frame && !frame->IsInFencedFrameTree()) {
++    if (LocalDOMWindow* window = frame->DomWindow()) {
++      if (Page* page = frame->GetPage()) {
++        const double screen_scale = static_cast<double>(
++            page->GetChromeClient().GetScreenInfo(*frame).device_scale_factor);
++        if (screen_scale > 0.0) {
++          const bool is_desktop = !window->GetUserAgentMetadata().mobile;
++          if (std::optional<double> override_dpr =
++                  curium::GetWebDevicePixelRatioOverride(is_desktop,
++                                                         screen_scale)) {
++            return static_cast<float>(*override_dpr *
++                                      (static_cast<double>(native_dpr) /
++                                       screen_scale));
++          }
++        }
++      }
++    }
++  }
++#endif
++  return native_dpr;
+ }
+
+ bool MediaValues::CalculateDeviceSupportsHDR(LocalFrame* frame) {
 diff --git a/third_party/blink/renderer/core/css/resolver/style_builder_converter.cc b/third_party/blink/renderer/core/css/resolver/style_builder_converter.cc
 index 932181b..b54c626 100644
 --- a/third_party/blink/renderer/core/css/resolver/style_builder_converter.cc
 +++ b/third_party/blink/renderer/core/css/resolver/style_builder_converter.cc
 @@ -33,6 +33,9 @@
- 
+
  #include "base/notreached.h"
  #include "build/build_config.h"
 +#if BUILDFLAG(IS_IOS)
@@ -1107,13 +1524,13 @@ index 932181b..b54c626 100644
      }
  #endif
 diff --git a/third_party/blink/renderer/core/execution_context/execution_context.cc b/third_party/blink/renderer/core/execution_context/execution_context.cc
-index 0f95cf1..be0256f 100644
+index 0f95cf1..f8f6bcf 100644
 --- a/third_party/blink/renderer/core/execution_context/execution_context.cc
 +++ b/third_party/blink/renderer/core/execution_context/execution_context.cc
 @@ -27,6 +27,15 @@
- 
+
  #include "third_party/blink/renderer/core/execution_context/execution_context.h"
- 
+
 +#include "build/build_config.h"
 +#if BUILDFLAG(IS_IOS)
 +#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
@@ -1126,19 +1543,19 @@ index 0f95cf1..be0256f 100644
  #include "base/auto_reset.h"
  #include "base/metrics/histogram_functions.h"
  #include "base/tracing/protos/chrome_track_event.pbzero.h"
-@@ -688,4 +697,59 @@ bool ExecutionContext::IsInjectionMitigatedContext() const {
+@@ -688,4 +697,63 @@ bool ExecutionContext::IsInjectionMitigatedContext() const {
           GetContentSecurityPolicy()->TrustedTypesRequired();
  }
- 
+
 +#if BUILDFLAG(IS_IOS)
 +std::optional<std::array<uint8_t, 32>> ExecutionContext::GetCuriumSiteKey()
 +    const {
-+  if (curium_site_key_computed_) {
-+    return curium_site_key_;
-+  }
-+  curium_site_key_computed_ = true;
 +  if (!curium::IsFarblingEnabled()) {
 +    return std::nullopt;
++  }
++  const uint64_t policy_revision = curium::GetRuntimePolicyRevision();
++  if (policy_revision == 0 && curium_site_key_computed_) {
++    return curium_site_key_;
 +  }
 +
 +  // Unified top-frame origin resolution for both Window and Worker contexts.
@@ -1180,8 +1597,12 @@ index 0f95cf1..be0256f 100644
 +    // Keep unrelated unique opaque origins distinct instead of collapsing to "".
 +    scope = "opaque:" + GetExecutionContextToken().ToString();
 +  }
-+  curium_site_key_ = curium::DeriveSiteKey(scope);
-+  return curium_site_key_;
++  std::optional<std::array<uint8_t, 32>> derived = curium::DeriveSiteKey(scope);
++  if (policy_revision == 0) {
++    curium_site_key_ = derived;
++    curium_site_key_computed_ = true;
++  }
++  return derived;
 +}
 +#endif
 +
@@ -1193,12 +1614,12 @@ index 7361d1e..2cf8e36 100644
 @@ -28,12 +28,14 @@
  #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_EXECUTION_CONTEXT_EXECUTION_CONTEXT_H_
  #define THIRD_PARTY_BLINK_RENDERER_CORE_EXECUTION_CONTEXT_EXECUTION_CONTEXT_H_
- 
+
 +#include <array>
  #include <memory>
  #include <optional>
  #include <utility>
- 
+
  #include "base/memory/raw_ptr.h"
  #include "base/notreached.h"
 +#include "build/build_config.h"
@@ -1208,7 +1629,7 @@ index 7361d1e..2cf8e36 100644
 @@ -431,6 +433,12 @@ class CORE_EXPORT ExecutionContext : public Supplementable<ExecutionContext>,
    // CSP, a la https://csp.withgoogle.com/docs/strict-csp.html.
    bool IsInjectionMitigatedContext() const;
- 
+
 +#if BUILDFLAG(IS_IOS)
 +  // Lazily derived per-top-level-site HMAC-SHA256 farbling key, consistent
 +  // across Main Thread, iframes, and Workers (nullopt when farbling disabled).
@@ -1220,28 +1641,28 @@ index 7361d1e..2cf8e36 100644
    // timers useful for Spectre-style side channel attacks, so are restricted
 @@ -589,6 +597,10 @@ class CORE_EXPORT ExecutionContext : public Supplementable<ExecutionContext>,
    bool require_trusted_types_ = false;
- 
+
    std::optional<NoiseToken> canvas_noise_token_;
 +#if BUILDFLAG(IS_IOS)
 +  mutable bool curium_site_key_computed_ = false;
 +  mutable std::optional<std::array<uint8_t, 32>> curium_site_key_;
 +#endif
  };
- 
+
  }  // namespace blink
 diff --git a/third_party/blink/renderer/core/frame/local_dom_window.cc b/third_party/blink/renderer/core/frame/local_dom_window.cc
-index ed51dca..f7ca156 100644
+index ed51dca..fc09f1a 100644
 --- a/third_party/blink/renderer/core/frame/local_dom_window.cc
 +++ b/third_party/blink/renderer/core/frame/local_dom_window.cc
 @@ -26,12 +26,14 @@
- 
+
  #include "third_party/blink/renderer/core/frame/local_dom_window.h"
- 
+
 +#include <algorithm>
  #include <memory>
  #include <optional>
  #include <utility>
- 
+
  #include "base/command_line.h"
  #include "base/metrics/histogram_macros.h"
 +#include "base/numerics/clamped_math.h"
@@ -1251,7 +1672,7 @@ index ed51dca..f7ca156 100644
 @@ -1205,6 +1207,14 @@ int LocalDOMWindow::orientation() const {
      return 0;
    }
- 
+
 +#if BUILDFLAG(IS_IOS)
 +  if (std::optional<curium::ResolvedScreenMetrics> metrics =
 +          ResolveCuriumScreenMetrics(frame)) {
@@ -1266,7 +1687,7 @@ index ed51dca..f7ca156 100644
 @@ -1709,6 +1719,16 @@ int LocalDOMWindow::outerHeight() const {
      return innerHeight();
    }
- 
+
 +#if BUILDFLAG(IS_IOS)
 +  if (std::optional<curium::ResolvedScreenMetrics> metrics =
 +          ResolveCuriumScreenMetrics(frame)) {
@@ -1283,7 +1704,7 @@ index ed51dca..f7ca156 100644
 @@ -1741,6 +1761,13 @@ int LocalDOMWindow::outerWidth() const {
      return innerWidth();
    }
- 
+
 +#if BUILDFLAG(IS_IOS)
 +  if (std::optional<curium::ResolvedScreenMetrics> metrics =
 +          ResolveCuriumScreenMetrics(frame)) {
@@ -1294,38 +1715,72 @@ index ed51dca..f7ca156 100644
    Page* page = frame->GetPage();
    if (!page) {
      return 0;
-@@ -1817,6 +1844,12 @@ int LocalDOMWindow::screenX() const {
+@@ -1817,6 +1844,13 @@ int LocalDOMWindow::screenX() const {
      return 0;
    }
- 
+
 +#if BUILDFLAG(IS_IOS)
-+  if (ResolveCuriumScreenMetrics(frame).has_value()) {
-+    return 0;
++  if (std::optional<curium::ResolvedScreenMetrics> metrics =
++          ResolveCuriumScreenMetrics(frame)) {
++    return metrics->avail_left;
 +  }
 +#endif
 +
    Page* page = frame->GetPage();
    if (!page) {
      return 0;
-@@ -1842,6 +1875,12 @@ int LocalDOMWindow::screenY() const {
+@@ -1842,6 +1876,13 @@ int LocalDOMWindow::screenY() const {
      return 0;
    }
- 
+
 +#if BUILDFLAG(IS_IOS)
-+  if (ResolveCuriumScreenMetrics(frame).has_value()) {
-+    return 0;
++  if (std::optional<curium::ResolvedScreenMetrics> metrics =
++          ResolveCuriumScreenMetrics(frame)) {
++    return metrics->avail_top;
 +  }
 +#endif
 +
    Page* page = frame->GetPage();
    if (!page) {
      return 0;
+@@ -1964,11 +2005,29 @@ CSSStyleDeclaration* LocalDOMWindow::getComputedStyle(
+ }
+
+ double LocalDOMWindow::devicePixelRatio() const {
+-  if (!GetFrame()) {
++  LocalFrame* frame = GetFrame();
++  if (!frame) {
+     return 0.0;
+   }
+
+-  return GetFrame()->DevicePixelRatio();
++  const double native_dpr = static_cast<double>(frame->DevicePixelRatio());
++#if BUILDFLAG(IS_IOS)
++  if (!frame->IsInFencedFrameTree()) {
++    if (Page* page = frame->GetPage()) {
++      const double screen_scale = static_cast<double>(
++          page->GetChromeClient().GetScreenInfo(*frame).device_scale_factor);
++      if (screen_scale > 0.0) {
++        const bool is_desktop = !GetUserAgentMetadata().mobile;
++        if (std::optional<double> override_dpr =
++                curium::GetWebDevicePixelRatioOverride(is_desktop,
++                                                       screen_scale)) {
++          return *override_dpr * (native_dpr / screen_scale);
++        }
++      }
++    }
++  }
++#endif
++  return native_dpr;
+ }
+
+ ScriptPromise<ScrollResult> LocalDOMWindow::scrollBy(ScriptState* script_state,
 diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
-index 8bc2c67..64d8812 100644
+index 8bc2c67..38d850c 100644
 --- a/third_party/blink/renderer/core/frame/screen.cc
 +++ b/third_party/blink/renderer/core/frame/screen.cc
 @@ -30,6 +30,7 @@
- 
+
  #include "base/no_destructor.h"
  #include "base/numerics/safe_conversions.h"
 +#include "build/build_config.h"
@@ -1339,9 +1794,9 @@ index 8bc2c67..64d8812 100644
 +#include "third_party/blink/renderer/core/page/page.h"
  #include "ui/display/screen_info.h"
  #include "ui/display/screen_infos.h"
- 
+
  namespace blink {
- 
+
 +#if BUILDFLAG(IS_IOS)
 +std::optional<curium::ResolvedScreenMetrics> ResolveCuriumScreenMetrics(
 +    LocalFrame* frame) {
@@ -1375,7 +1830,7 @@ index 8bc2c67..64d8812 100644
 +
  Screen::Screen(LocalDOMWindow* window, int64_t display_id)
      : ExecutionContextClient(window), display_id_(display_id) {}
- 
+
 @@ -110,6 +143,12 @@ unsigned Screen::colorDepth() const {
    if (!DomWindow()) {
      return unknown_color_depth;
@@ -1389,7 +1844,7 @@ index 8bc2c67..64d8812 100644
    return GetScreenInfo().depth == 0
               ? unknown_color_depth
               : base::saturated_cast<unsigned>(GetScreenInfo().depth);
-@@ -174,6 +213,14 @@ gfx::Rect Screen::GetRect(bool available) const {
+@@ -174,6 +213,15 @@ gfx::Rect Screen::GetRect(bool available) const {
    if (!DomWindow())
      return gfx::Rect();
    LocalFrame* frame = DomWindow()->GetFrame();
@@ -1397,7 +1852,8 @@ index 8bc2c67..64d8812 100644
 +  if (std::optional<curium::ResolvedScreenMetrics> metrics =
 +          ResolveCuriumScreenMetrics(frame)) {
 +    return available
-+               ? gfx::Rect(0, 0, metrics->avail_width, metrics->avail_height)
++               ? gfx::Rect(metrics->avail_left, metrics->avail_top,
++                           metrics->avail_width, metrics->avail_height)
 +               : gfx::Rect(0, 0, metrics->width, metrics->height);
 +  }
 +#endif
@@ -1411,7 +1867,7 @@ index 787aa75..6a06f60 100644
 @@ -29,6 +29,12 @@
  #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_FRAME_SCREEN_H_
  #define THIRD_PARTY_BLINK_RENDERER_CORE_FRAME_SCREEN_H_
- 
+
 +#include <optional>
 +
 +#include "build/build_config.h"
@@ -1423,7 +1879,7 @@ index 787aa75..6a06f60 100644
  #include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_observer.h"
 @@ -44,6 +50,12 @@ struct ScreenInfo;
  namespace blink {
- 
+
  class LocalDOMWindow;
 +class LocalFrame;
 +
@@ -1431,7 +1887,7 @@ index 787aa75..6a06f60 100644
 +CORE_EXPORT std::optional<curium::ResolvedScreenMetrics>
 +ResolveCuriumScreenMetrics(LocalFrame* frame);
 +#endif
- 
+
  class CORE_EXPORT Screen : public EventTarget,
                             public ExecutionContextClient,
 diff --git a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
@@ -1492,7 +1948,7 @@ index 0c175da..7bfd91a 100644
 +#endif
      }
    }
- 
+
 diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 index bfec342..b0b437a 100644
 --- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
@@ -1520,7 +1976,7 @@ index bfec342..b0b437a 100644
 @@ -1478,6 +1482,16 @@ String HTMLCanvasElement::ToDataURLInternal(
      if (!data_buffer)
        return String("data:,");
- 
+
 +#if BUILDFLAG(IS_IOS)
 +    if (apply_curium_farbling && curium::IsCanvasFarblingEnabled()) {
 +      if (ExecutionContext* ctx = GetExecutionContext()) {
@@ -1542,20 +1998,20 @@ index bfec342..b0b437a 100644
 +  return ToDataURLInternal(mime_type, quality, kBackBuffer,
 +                           /*apply_curium_farbling=*/true);
  }
- 
+
  void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
 diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
 index d00f201..9c9870b 100644
 --- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
 +++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.h
 @@ -441,7 +441,8 @@ class CORE_EXPORT HTMLCanvasElement final
- 
+
    String ToDataURLInternal(const String& mime_type,
                             const double& quality,
 -                           SourceDrawingBuffer) const;
 +                           SourceDrawingBuffer,
 +                           bool apply_curium_farbling = false) const;
- 
+
    // Returns the transparent image resource for this canvas.
    scoped_refptr<StaticBitmapImage> GetTransparentImage();
 diff --git a/third_party/blink/renderer/core/html/canvas/text_metrics.h b/third_party/blink/renderer/core/html/canvas/text_metrics.h
@@ -1563,9 +2019,9 @@ index ad8d23d..a64d3bb 100644
 --- a/third_party/blink/renderer/core/html/canvas/text_metrics.h
 +++ b/third_party/blink/renderer/core/html/canvas/text_metrics.h
 @@ -101,6 +101,14 @@ class CORE_EXPORT TextMetrics final : public ScriptWrappable {
- 
+
    const Font* GetFont() const { return shaped_text_->GetFont(); }
- 
+
 +  void ApplyCuriumScale(double scale) {
 +    if (width_ > 0.0 && scale > 0.0) {
 +      width_ *= scale;
@@ -1575,7 +2031,7 @@ index ad8d23d..a64d3bb 100644
 +  }
 +
    void Trace(Visitor*) const override;
- 
+
   private:
 diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 index 6ab0849..e581026 100644
@@ -1615,11 +2071,11 @@ index 6ab0849..e581026 100644
 +    }
 +#endif
    }
- 
+
    return image_data;
 @@ -2370,7 +2392,29 @@ void BaseRenderingContext2D::DrawTextInternal(
  }
- 
+
  TextMetrics* BaseRenderingContext2D::measureText(const String& text) {
 -  return MakeGarbageCollected<TextMetrics>(*shapeText(text));
 +  TextMetrics* metrics = MakeGarbageCollected<TextMetrics>(*shapeText(text));
@@ -1646,7 +2102,7 @@ index 6ab0849..e581026 100644
 +#endif
 +  return metrics;
  }
- 
+
  ShapedText* BaseRenderingContext2D::shapeText(const String& text) {
 diff --git a/third_party/blink/renderer/modules/plugins/dom_plugin_array.cc b/third_party/blink/renderer/modules/plugins/dom_plugin_array.cc
 index 3608837..8346cc6 100644
@@ -1654,7 +2110,7 @@ index 3608837..8346cc6 100644
 +++ b/third_party/blink/renderer/modules/plugins/dom_plugin_array.cc
 @@ -21,6 +21,9 @@
  #include "third_party/blink/renderer/modules/plugins/dom_plugin_array.h"
- 
+
  #include "build/build_config.h"
 +#if BUILDFLAG(IS_IOS)
 +#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
@@ -1664,7 +2120,7 @@ index 3608837..8346cc6 100644
  #include "third_party/blink/renderer/core/frame/local_frame.h"
 @@ -136,6 +139,12 @@ HeapVector<Member<DOMMimeType>> DOMPluginArray::GetFixedMimeTypeArray() {
  }
- 
+
  bool DOMPluginArray::IsPdfViewerAvailable() {
 +#if BUILDFLAG(IS_IOS)
 +  if (window_ &&
@@ -1680,7 +2136,7 @@ index a8d9885..daa5317 100644
 --- a/third_party/blink/renderer/modules/screen_orientation/screen_orientation_controller.cc
 +++ b/third_party/blink/renderer/modules/screen_orientation/screen_orientation_controller.cc
 @@ -6,12 +6,16 @@
- 
+
  #include <memory>
  #include <utility>
 +#include "build/build_config.h"
@@ -1724,7 +2180,7 @@ index a8d9885..daa5317 100644
 +    current_angle = metrics->orientation_angle;
 +  }
 +#endif
- 
+
    // FIXME: sendOrientationChangeEvent() currently send an event all the
    // children of the frame, so it should only be called on the frame on
 diff --git a/third_party/blink/renderer/modules/speech/speech_synthesis.cc b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
@@ -1733,7 +2189,7 @@ index 6c5b40a..8550cf5 100644
 +++ b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
 @@ -28,6 +28,9 @@
  #include <tuple>
- 
+
  #include "build/build_config.h"
 +#if BUILDFLAG(IS_IOS)
 +#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
@@ -1742,7 +2198,7 @@ index 6c5b40a..8550cf5 100644
  #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
  #include "third_party/blink/public/platform/platform.h"
 @@ -84,6 +87,13 @@ SpeechSynthesis::SpeechSynthesis(LocalDOMWindow& window)
- 
+
  void SpeechSynthesis::OnSetVoiceList(
      Vector<mojom::blink::SpeechSynthesisVoicePtr> mojom_voices) {
 +#if BUILDFLAG(IS_IOS)
@@ -1757,7 +2213,7 @@ index 6c5b40a..8550cf5 100644
      voice_list_.push_back(
 @@ -93,6 +103,13 @@ void SpeechSynthesis::OnSetVoiceList(
  }
- 
+
  const HeapVector<Member<SpeechSynthesisVoice>>& SpeechSynthesis::getVoices() {
 +#if BUILDFLAG(IS_IOS)
 +  if (LocalDOMWindow* window = GetSupplementable();
@@ -1774,9 +2230,9 @@ index 4bc4b15..a202a74 100644
 --- a/third_party/blink/renderer/modules/webaudio/analyser_node.cc
 +++ b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
 @@ -25,6 +25,14 @@
- 
+
  #include "third_party/blink/renderer/modules/webaudio/analyser_node.h"
- 
+
 +#include "build/build_config.h"
 +#if BUILDFLAG(IS_IOS)
 +#include <algorithm>
@@ -1809,10 +2265,10 @@ index 4bc4b15..a202a74 100644
 +  }
 +#endif
  }
- 
+
  void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
 @@ -135,6 +159,21 @@ void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
- 
+
  void AnalyserNode::getFloatTimeDomainData(NotShared<DOMFloat32Array> array) {
    GetAnalyserHandler().GetFloatTimeDomainData(array.Get());
 +#if BUILDFLAG(IS_IOS)
@@ -1831,16 +2287,16 @@ index 4bc4b15..a202a74 100644
 +  }
 +#endif
  }
- 
+
  void AnalyserNode::getByteTimeDomainData(NotShared<DOMUint8Array> array) {
 diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
 index a798c39..a9b505d 100644
 --- a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
 +++ b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
 @@ -25,6 +25,11 @@
- 
+
  #include "third_party/blink/renderer/modules/webaudio/offline_audio_context.h"
- 
+
 +#include "build/build_config.h"
 +#if BUILDFLAG(IS_IOS)
 +#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
@@ -1848,10 +2304,10 @@ index a798c39..a9b505d 100644
 +
  #include <limits>
  #include <optional>
- 
+
 @@ -604,6 +609,22 @@ void OfflineAudioContext::OnChunkRendered() {
    Member<AudioBuffer> rendered_buffer = pending_render_targets_.front();
- 
+
    CHECK(rendered_buffer);
 +#if BUILDFLAG(IS_IOS)
 +  if (curium::IsAudioFarblingEnabled()) {
@@ -1877,7 +2333,7 @@ index 2f4ce19..072b9a3 100644
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -1597,15 +1597,34 @@ void WebGLRenderingContextBase::InitializeNewContext() {
- 
+
    GLint num_vertex_attribs = 0;
    ContextGL()->GetIntegerv(GL_MAX_VERTEX_ATTRIBS, &num_vertex_attribs);
 +#if BUILDFLAG(IS_IOS)
@@ -1887,7 +2343,7 @@ index 2f4ce19..072b9a3 100644
 +  }
 +#endif
    max_vertex_attribs_ = num_vertex_attribs;
- 
+
    max_texture_size_ = 0;
    ContextGL()->GetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size_);
 +#if BUILDFLAG(IS_IOS)
@@ -1922,7 +2378,7 @@ index 2f4ce19..072b9a3 100644
 +        max_renderbuffer_size_);
 +  }
 +#endif
- 
+
    // These two values from EXT_draw_buffers are lazily queried.
    max_draw_buffers_ = 0;
 @@ -4001,6 +4027,15 @@ bool WebGLRenderingContextBase::ExtensionSupportedAndAllowed(
@@ -1940,7 +2396,7 @@ index 2f4ce19..072b9a3 100644
 +#endif
    return true;
  }
- 
+
 @@ -5531,7 +5566,86 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
      if (!binder.Succeeded()) {
        return;
@@ -2027,7 +2483,7 @@ index 2f4ce19..072b9a3 100644
 +#endif
    }
  }
- 
+
 @@ -8160,6 +8274,11 @@ ScriptValue WebGLRenderingContextBase::GetIntParameter(
    GLint value = 0;
    if (!isContextLost()) {
@@ -2057,7 +2513,7 @@ index f6a0e22..df06988 100644
 @@ -160,6 +163,16 @@ const FontPlatformData* FontCache::GetFontPlatformData(
      AlternateFontName alternate_font_name) {
    TRACE_EVENT0("fonts", "FontCache::GetFontPlatformData");
- 
+
 +#if BUILDFLAG(IS_IOS)
 +  if (creation_params.CreationType() == FontFaceCreationType::kFamily &&
 +      alternate_font_name != AlternateFontName::kLastResort &&
@@ -2076,7 +2532,7 @@ index 5380244..4c31124 100644
 --- a/third_party/blink/renderer/platform/fonts/ios/font_cache_ios.mm
 +++ b/third_party/blink/renderer/platform/fonts/ios/font_cache_ios.mm
 @@ -10,6 +10,7 @@
- 
+
  #include "base/no_destructor.h"
  #include "skia/ext/font_utils.h"
 +#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
@@ -2119,7 +2575,7 @@ index 059250a..b1296c5 100644
 @@ -145,6 +149,51 @@ base::span<const uint8_t> ImageDataBuffer::PixelData() const {
    return gfx::SkPixmapToSpan(pixmap_);
  }
- 
+
 +#if BUILDFLAG(IS_IOS)
 +bool ImageDataBuffer::ApplyCuriumFarbling(
 +    base::span<const uint8_t, 32> site_key) {
@@ -2173,7 +2629,7 @@ index 8bcc283..b74433b 100644
 --- a/third_party/blink/renderer/platform/graphics/image_data_buffer.h
 +++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.h
 @@ -32,6 +32,7 @@
- 
+
  #include "base/containers/span.h"
  #include "base/memory/scoped_refptr.h"
 +#include "build/build_config.h"
@@ -2181,9 +2637,9 @@ index 8bcc283..b74433b 100644
  #include "third_party/blink/renderer/platform/image-encoders/image_encoder.h"
  #include "third_party/blink/renderer/platform/platform_export.h"
 @@ -62,6 +63,13 @@ class PLATFORM_EXPORT ImageDataBuffer {
- 
+
    base::span<const uint8_t> PixelData() const;
- 
+
 +#if BUILDFLAG(IS_IOS)
 +  // Copies pixels into an owned unpremultiplied RGBA8 buffer and applies
 +  // deterministic Curium anti-fingerprinting perturbation without mutating

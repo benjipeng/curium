@@ -1,0 +1,1349 @@
+diff --git a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+index 54f929e..1bb232b 100644
+--- a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
++++ b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+@@ -15,6 +15,7 @@
+ #import "ios/chrome/browser/shared/model/paths/paths.h"
+ #if BUILDFLAG(USE_BLINK)
+ #import "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#import "third_party/blink/public/common/curium/curium_runtime_policy.h"
+ #endif
+ 
+ namespace {
+@@ -87,22 +88,28 @@ + (void)registerShellBootstrapDelegate:
+ #if BUILDFLAG(USE_BLINK)
+   return @{
+     @"contractVersion" : @(blink::curium::kLaunchConfigSchemaVersion),
+-    @"supportedSchemaVersions" : @[ @1, @2 ],
++    @"supportedSchemaVersions" : @[ @1, @2, @3 ],
+     @"maxConfigBytes" : @(blink::curium::kMaxLaunchConfigBytes),
++    @"runtimePolicyVersion" : @(blink::curium::kRuntimePolicySchemaVersion),
++    @"maxRuntimePolicyBytes" : @(blink::curium::kMaxRuntimePolicyBytes),
+     @"activationScopes" : @{
+       @"profileIsolation" : @"launch",
+       @"identitySpec" : @"launch_dual_slot_tab_toggle",
+       @"languages" : @"launch",
+       @"proxy" : @"launch",
+-      @"webrtcPolicy" : @"launch",
++      @"webrtcPolicy" : @"runtime_hot",
++      @"doNotTrack" : @"runtime_hot",
++      @"globalPrivacyControl" : @"runtime_hot",
+       @"hardwareConcurrency" : @"launch",
+       @"deviceMemory" : @"launch",
+       @"timezone" : @"launch",
+       @"webglStrings" : @"launch_per_slot",
+       @"inputCapabilities" : @"launch_per_slot",
+-      @"farbling" : @"launch_per_site_deterministic",
++      @"farbling" : @"runtime_hot",
+       @"fontProfile" : @"launch",
+       @"screen" : @"launch_per_slot_web_only",
++      @"speechVoiceHiding" : @"runtime_hot",
++      @"profileHotSwap" : @"planned_build_44",
+     },
+     @"features" : @{
+       @"zstdBaseline" : @YES,
+@@ -122,6 +129,15 @@ + (void)registerShellBootstrapDelegate:
+       @"webScreenMasking" : @YES,
+       @"desktopPdfViewerMetadata" : @YES,
+       @"speechVoiceHiding" : @YES,
++      @"hotRuntimePrivacyPolicy" : @YES,
++      @"stealthEdgeCanvasFarbling" : @YES,
++      @"nativeDesktopParityV1" : @YES,
++      @"coherentWebDPR" : @YES,
++      @"gcrwebSuppressedAtSource" : @YES,
++      @"nativeKeyboardLayoutMap" : @YES,
++      @"nativeSpeechSynthesisVoices" : @YES,
++      @"nativeWindowChromeSurface" : @YES,
++      @"profileCachePurgeHook" : @YES,
+     },
+   };
+ #else
+@@ -239,4 +255,81 @@ + (BOOL)configureLaunchFingerprintConfigJSON:(nullable NSData*)jsonData
+ #endif
+ }
+ 
+++ (BOOL)applyRuntimePolicyJSON:(NSData*)jsonData
++                         error:(NSError* _Nullable* _Nullable)error {
++  CHECK([NSThread isMainThread]);
++#if BUILDFLAG(USE_BLINK)
++  if (!jsonData || jsonData.length == 0) {
++    if (error) {
++      *error = MakeFingerprintError(
++          CrIOSFingerprintErrorInvalidJSON,
++          "Runtime privacy policy JSON must not be empty");
++    }
++    return NO;
++  }
++
++  std::string_view json_view =
++      base::as_string_view(base::apple::NSDataToSpan(jsonData));
++  blink::curium::RuntimePolicyError policy_error;
++  if (!blink::curium::ApplyRuntimePolicyJSON(json_view, &policy_error)) {
++    if (error) {
++      *error = MakeFingerprintError(static_cast<NSInteger>(policy_error.code),
++                                    policy_error.message);
++    }
++    return NO;
++  }
++  return YES;
++#else
++  if (error) {
++    *error = MakeFingerprintError(CrIOSFingerprintErrorUnsupportedSchema,
++                                  "Blink runtime privacy policy is unavailable");
++  }
++  return NO;
++#endif
++}
++
+++ (NSDictionary<NSString*, id>*)activeRuntimePolicyStatus {
++  CHECK([NSThread isMainThread]);
++#if BUILDFLAG(USE_BLINK)
++  const blink::curium::RuntimePolicySnapshot snapshot =
++      blink::curium::GetRuntimePolicySnapshot();
++  const bool has_seed = snapshot.fingerprint_seed_bytes.has_value();
++  const bool farbling_active = has_seed && snapshot.farbling.AnyEnabled();
++  const std::string webrtc_policy(
++      blink::curium::WebRtcIpHandlingPolicyToString(
++          snapshot.webrtc_ip_handling_policy));
++  return @{
++    @"runtimePolicyVersion" : @(blink::curium::kRuntimePolicySchemaVersion),
++    @"appliedPolicyRevision" : @(snapshot.policy_revision),
++    @"farblingActive" : @(farbling_active),
++    @"farbling" : @{
++      @"canvas" : @(has_seed && snapshot.farbling.canvas),
++      @"audio" : @(has_seed && snapshot.farbling.audio),
++      @"webgl" : @(has_seed && snapshot.farbling.webgl),
++      @"textMetrics" : @(has_seed && snapshot.farbling.text_metrics),
++    },
++    @"webrtcIpHandlingPolicy" : base::SysUTF8ToNSString(webrtc_policy),
++    @"enableDoNotTrack" : @(snapshot.enable_do_not_track),
++    @"enableGlobalPrivacyControl" : @(snapshot.enable_global_privacy_control),
++    @"hideSpeechVoices" : @(snapshot.hide_speech_voices),
++  };
++#else
++  return @{
++    @"runtimePolicyVersion" : @0,
++    @"appliedPolicyRevision" : @0ULL,
++    @"farblingActive" : @NO,
++    @"farbling" : @{
++      @"canvas" : @NO,
++      @"audio" : @NO,
++      @"webgl" : @NO,
++      @"textMetrics" : @NO,
++    },
++    @"webrtcIpHandlingPolicy" : @"default",
++    @"enableDoNotTrack" : @NO,
++    @"enableGlobalPrivacyControl" : @NO,
++    @"hideSpeechVoices" : @NO,
++  };
++#endif
++}
++
+ @end
+diff --git a/ios/chrome/browser/curium/curium_browser_host.mm b/ios/chrome/browser/curium/curium_browser_host.mm
+index 2b994ab..c3a90b7 100644
+--- a/ios/chrome/browser/curium/curium_browser_host.mm
++++ b/ios/chrome/browser/curium/curium_browser_host.mm
+@@ -4,6 +4,7 @@
+ 
+ #import "ios/chrome/browser/curium/curium_browser_host.h"
+ 
++#import <cstdint>
+ #import <map>
+ #import <memory>
+ #import <utility>
+@@ -43,6 +44,8 @@
+ #import "services/network/public/mojom/clear_data_filter.mojom.h"
+ #import "services/network/public/mojom/cookie_manager.mojom.h"
+ #import "services/network/public/mojom/network_context.mojom.h"
++#import "third_party/blink/public/common/curium/curium_runtime_policy.h"
++#import "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
+ #import "third_party/blink/public/common/storage_key/storage_key.h"
+ #import "ui/base/page_transition_types.h"
+ 
+@@ -54,6 +57,8 @@ - (void)handleActiveWebStateChanged:(web::WebState*)oldActive
+ - (void)scheduleNotifyTabsUpdated;
+ - (void)handleDownloadCreated:(std::unique_ptr<web::DownloadTask>)task
+                      webState:(web::WebState*)webState;
++- (void)applyRuntimePrivacyPolicySnapshot:
++    (const blink::curium::RuntimePolicySnapshot&)snapshot;
+ @end
+ 
+ namespace {
+@@ -128,6 +133,7 @@ @implementation CuriumBrowserHost {
+   std::unique_ptr<CuriumWebStateListObserver> _listObserver;
+   std::map<web::WebState*, __strong CuriumTabHost*> _tabHosts;
+   NSMutableArray<CuriumDownloadTask*>* _downloads;
++  uintptr_t _runtimePolicyObserverToken;
+   BOOL _pendingTabsNotification;
+   BOOL _isShutdown;
+   BOOL _observesResourceLoads;
+@@ -172,6 +178,20 @@ - (instancetype)initWithBrowser:(Browser*)browser
+     for (int i = 0; i < list->count(); ++i) {
+       [self handleWebStateInserted:list->GetWebStateAt(i)];
+     }
++
++    _runtimePolicyObserverToken =
++        reinterpret_cast<uintptr_t>((__bridge void*)self);
++    __weak CuriumBrowserHost* weakSelf = self;
++    blink::curium::RegisterBrowserPolicyObserver(
++        reinterpret_cast<void*>(_runtimePolicyObserverToken),
++        base::BindRepeating(
++            ^(const blink::curium::RuntimePolicySnapshot& snapshot) {
++              CuriumBrowserHost* strongSelf = weakSelf;
++              if (!strongSelf) {
++                return;
++              }
++              [strongSelf applyRuntimePrivacyPolicySnapshot:snapshot];
++            }));
+   }
+   return self;
+ }
+@@ -186,6 +206,12 @@ - (void)shutdown {
+   }
+   _isShutdown = YES;
+ 
++  if (_runtimePolicyObserverToken != 0) {
++    blink::curium::UnregisterBrowserPolicyObserver(
++        reinterpret_cast<void*>(_runtimePolicyObserverToken));
++    _runtimePolicyObserverToken = 0;
++  }
++
+   for (CuriumDownloadTask* task in [_downloads copy]) {
+     [task invalidate];
+   }
+@@ -206,6 +232,39 @@ - (void)shutdown {
+   _browser = nullptr;
+ }
+ 
++- (void)applyRuntimePrivacyPolicySnapshot:
++    (const blink::curium::RuntimePolicySnapshot&)snapshot {
++  CHECK([NSThread isMainThread]);
++  if (_isShutdown || !_browser) {
++    return;
++  }
++  WebStateList* list = _browser->GetWebStateList();
++  if (!list) {
++    return;
++  }
++  for (int i = 0; i < list->count(); ++i) {
++    web::WebState* ws = list->GetWebStateAt(i);
++    if (!ws) {
++      continue;
++    }
++    auto* cws = static_cast<web::ContentWebState*>(ws);
++    content::WebContents* wc = cws->GetWebContents();
++    if (!wc) {
++      continue;
++    }
++    blink::RendererPreferences* renderer_prefs = wc->GetMutableRendererPrefs();
++    if (!renderer_prefs) {
++      continue;
++    }
++    renderer_prefs->webrtc_ip_handling_policy =
++        snapshot.webrtc_ip_handling_policy;
++    renderer_prefs->enable_do_not_track = snapshot.enable_do_not_track;
++    renderer_prefs->is_global_privacy_control_setting_enabled =
++        snapshot.enable_global_privacy_control;
++    wc->SyncRendererPrefs();
++  }
++}
++
+ #pragma mark - CrIOSBrowserHostV1
+ 
+ - (NSArray<id<CrIOSTabHostingV1>>*)tabs {
+diff --git a/ios/chrome/browser/curium/curium_engine_contract_internal.h b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+index 142b1b5..30b1bf5 100644
+--- a/ios/chrome/browser/curium/curium_engine_contract_internal.h
++++ b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+@@ -68,6 +68,9 @@ __attribute__((visibility("default")))
+ + (BOOL)configureLaunchFingerprintConfigJSON:(nullable NSData*)jsonData
+                                        error:(NSError* _Nullable* _Nullable)error;
+ + (NSDictionary<NSString*, id>*)activeFingerprintStatus;
+++ (BOOL)applyRuntimePolicyJSON:(NSData*)jsonData
++                         error:(NSError* _Nullable* _Nullable)error;
+++ (NSDictionary<NSString*, id>*)activeRuntimePolicyStatus;
+ @end
+ 
+ @protocol CrIOSTabHostingV1 <NSObject>
+diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
+index adfb1ee..342d30b 100644
+--- a/ios/web/content/init/ios_content_browser_client.cc
++++ b/ios/web/content/init/ios_content_browser_client.cc
+@@ -70,6 +70,7 @@
+ #import "services/network/public/mojom/network_context.mojom.h"
+ #import "services/network/public/mojom/url_loader.mojom.h"
+ #include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#include "third_party/blink/public/common/curium/curium_runtime_policy.h"
+ #include "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
+ #include "third_party/blink/public/common/switches.h"
+ #include "third_party/blink/public/common/web_preferences/web_preferences.h"
+@@ -234,13 +235,12 @@ void IOSContentBrowserClient::UpdateRendererPreferencesForWorker(
+   }
+   out_prefs->accept_languages =
+       net::HttpUtil::ExpandLanguageList(GetAcceptLangs(browser_context));
+-  if (const blink::curium::LaunchConfig* cfg =
+-          blink::curium::GetLaunchConfig()) {
+-    out_prefs->webrtc_ip_handling_policy = cfg->webrtc_ip_handling_policy;
+-    out_prefs->enable_do_not_track = cfg->enable_do_not_track;
+-    out_prefs->is_global_privacy_control_setting_enabled =
+-        cfg->enable_global_privacy_control;
+-  }
++  const blink::curium::RuntimePolicySnapshot policy =
++      blink::curium::GetRuntimePolicySnapshot();
++  out_prefs->webrtc_ip_handling_policy = policy.webrtc_ip_handling_policy;
++  out_prefs->enable_do_not_track = policy.enable_do_not_track;
++  out_prefs->is_global_privacy_control_setting_enabled =
++      policy.enable_global_privacy_control;
+ }
+ 
+ std::string IOSContentBrowserClient::GetProduct() {
+diff --git a/ios/web/content/init/ios_content_renderer_client.cc b/ios/web/content/init/ios_content_renderer_client.cc
+index 806ff32..5b67428 100644
+--- a/ios/web/content/init/ios_content_renderer_client.cc
++++ b/ios/web/content/init/ios_content_renderer_client.cc
+@@ -12,13 +12,20 @@
+ #endif
+ 
+ #import <string>
++#include <utility>
+ 
++#include "base/functional/bind.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/task/sequenced_task_runner.h"
+ #import "components/error_page/common/error.h"
+ #import "components/error_page/common/localized_error.h"
+ #import "components/grit/components_resources.h"
+ #import "components/js_injection/renderer/js_communication.h"
+ #import "content/public/renderer/render_frame.h"
+ #import "content/public/renderer/render_thread.h"
++#include "third_party/blink/public/common/curium/curium_runtime_policy.h"
++#include "third_party/blink/public/platform/web_cache.h"
++#include "third_party/blink/public/platform/web_runtime_features.h"
+ #import "third_party/blink/public/platform/web_url_error.h"
+ #import "ui/base/resource/resource_bundle.h"
+ #import "ui/base/webui/web_ui_util.h"
+@@ -28,6 +35,18 @@ namespace web {
+ 
+ namespace {
+ 
++void ApplyCuriumRendererRuntimePolicy(
++    const blink::curium::RuntimePolicySnapshot& snapshot) {
++  blink::WebRuntimeFeatures::EnableFeatureFromString(
++      "GlobalPrivacyControlApi", snapshot.enable_global_privacy_control);
++  blink::WebRuntimeFeatures::EnableFeatureFromString(
++      "GlobalPrivacyControl", snapshot.enable_global_privacy_control);
++}
++
++void PurgeCuriumRendererCaches() {
++  blink::WebCache::Clear();
++}
++
+ // [ios-blink-sideload] Chrome's network error page for the main frame, built
+ // the way ios/chrome/browser/web/model/error_page_util.mm builds it for
+ // WebKit, instead of placeholder text. A failed subframe (often a blocked ad
+@@ -61,6 +80,18 @@ IOSContentRendererClient::IOSContentRendererClient() = default;
+ IOSContentRendererClient::~IOSContentRendererClient() = default;
+ 
+ void IOSContentRendererClient::RenderThreadStarted() {
++  if (base::SequencedTaskRunner::HasCurrentDefault()) {
++    scoped_refptr<base::SequencedTaskRunner> renderer_task_runner =
++        base::SequencedTaskRunner::GetCurrentDefault();
++    blink::curium::RegisterRendererPolicyObserver(
++        renderer_task_runner,
++        base::BindRepeating(&ApplyCuriumRendererRuntimePolicy));
++    blink::curium::RegisterProfileCachePurgeHook(
++        std::move(renderer_task_runner),
++        base::BindRepeating(&PurgeCuriumRendererCaches));
++  } else {
++    ApplyCuriumRendererRuntimePolicy(blink::curium::GetRuntimePolicySnapshot());
++  }
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   GetIOSExtensionsRendererClient()->RenderThreadStarted();
+ #endif
+diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
+index a54466c..5fad494 100644
+--- a/ios/web/content/web_state/content_web_state.mm
++++ b/ios/web/content/web_state/content_web_state.mm
+@@ -71,7 +71,7 @@
+ #import "net/http/http_util.h"
+ #import "services/network/public/mojom/referrer_policy.mojom-shared.h"
+ #import "skia/ext/skia_utils_ios.h"
+-#import "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#import "third_party/blink/public/common/curium/curium_runtime_policy.h"
+ #import "third_party/blink/public/common/mediastream/media_stream_request.h"
+ #import "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
+ #import "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+@@ -226,18 +226,20 @@ void SerializeMetadata(web::proto::WebStateMetadataStorage& metadata) {
+       &kContentTabIdentityKey,
+       std::make_unique<ContentTabIdentity>(unique_identifier_));
+   // [ios-blink-sideload] Sync Blink renderer preferences (languages, WebRTC IP
+-  // handling policy, DNT/GPC) so navigator.languages and WebRTC match the
+-  // active launch profile.
++  // handling policy, DNT/GPC) so navigator.languages and live runtime privacy
++  // policy match the active profile.
+   blink::RendererPreferences* renderer_prefs =
+       web_contents_->GetMutableRendererPrefs();
+   renderer_prefs->accept_languages = net::HttpUtil::ExpandLanguageList(
+       embedder_support::GetCuriumAcceptLanguages());
+-  if (const blink::curium::LaunchConfig* cfg =
+-          blink::curium::GetLaunchConfig()) {
+-    renderer_prefs->webrtc_ip_handling_policy = cfg->webrtc_ip_handling_policy;
+-    renderer_prefs->enable_do_not_track = cfg->enable_do_not_track;
++  {
++    const blink::curium::RuntimePolicySnapshot policy =
++        blink::curium::GetRuntimePolicySnapshot();
++    renderer_prefs->webrtc_ip_handling_policy =
++        policy.webrtc_ip_handling_policy;
++    renderer_prefs->enable_do_not_track = policy.enable_do_not_track;
+     renderer_prefs->is_global_privacy_control_setting_enabled =
+-        cfg->enable_global_privacy_control;
++        policy.enable_global_privacy_control;
+   }
+   web_contents_->SyncRendererPrefs();
+   web_contents_->SetDelegate(this);
+diff --git a/third_party/blink/common/BUILD.gn b/third_party/blink/common/BUILD.gn
+index 3802c38..f533c5f 100644
+--- a/third_party/blink/common/BUILD.gn
++++ b/third_party/blink/common/BUILD.gn
+@@ -150,6 +150,7 @@ source_set("common") {
+     "crash_helpers.cc",
+     "crash_helpers.h",
+     "curium/curium_fingerprint_config.cc",
++    "curium/curium_runtime_policy.cc",
+     "custom_handlers/protocol_handler_utils.cc",
+     "device_memory/approximated_device_memory.cc",
+     "dom_storage/session_storage_namespace_id.cc",
+diff --git a/third_party/blink/common/curium/curium_fingerprint_config.cc b/third_party/blink/common/curium/curium_fingerprint_config.cc
+index 74ff740..e20f7f1 100644
+--- a/third_party/blink/common/curium/curium_fingerprint_config.cc
++++ b/third_party/blink/common/curium/curium_fingerprint_config.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#include "third_party/blink/public/common/curium/curium_runtime_policy.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -1292,6 +1293,7 @@ bool FreezeLaunchConfig(LaunchConfig config, ConfigError* out_error) {
+   storage.owned_config.emplace(std::move(config));
+   storage.last_error = ConfigError();
+   storage.active.store(&(*storage.owned_config), std::memory_order_release);
++  SeedRuntimePolicyFromLaunchConfig(&(*storage.owned_config));
+   storage.state.store(static_cast<int>(ConfigState::kConfigured),
+                       std::memory_order_release);
+   return true;
+@@ -1583,28 +1585,23 @@ int InferMacOSMenuBarHeight(int width, int height) {
+ }  // namespace
+ 
+ bool IsFarblingEnabled() {
+-  const LaunchConfig* cfg = GetLaunchConfig();
+-  return cfg && cfg->fingerprint_seed.has_value();
++  return IsRuntimeFarblingEnabled();
+ }
+ 
+ bool IsCanvasFarblingEnabled() {
+-  const LaunchConfig* cfg = GetLaunchConfig();
+-  return cfg && cfg->fingerprint_seed.has_value() && cfg->farble_canvas;
++  return IsRuntimeCanvasFarblingEnabled();
+ }
+ 
+ bool IsAudioFarblingEnabled() {
+-  const LaunchConfig* cfg = GetLaunchConfig();
+-  return cfg && cfg->fingerprint_seed.has_value() && cfg->farble_audio;
++  return IsRuntimeAudioFarblingEnabled();
+ }
+ 
+ bool IsWebGLFarblingEnabled() {
+-  const LaunchConfig* cfg = GetLaunchConfig();
+-  return cfg && cfg->fingerprint_seed.has_value() && cfg->farble_webgl;
++  return IsRuntimeWebGLFarblingEnabled();
+ }
+ 
+ bool IsTextMetricsFarblingEnabled() {
+-  const LaunchConfig* cfg = GetLaunchConfig();
+-  return cfg && cfg->fingerprint_seed.has_value() && cfg->farble_text_metrics;
++  return IsRuntimeTextMetricsFarblingEnabled();
+ }
+ 
+ std::optional<std::string> GetActivePersonaSeed() {
+@@ -1622,16 +1619,20 @@ std::optional<std::string> GetActivePersonaSeed() {
+ }
+ 
+ uint64_t GetRuntimePolicyRevision() {
+-  return 0;
++  return GetCurrentRuntimePolicyRevision();
+ }
+ 
+ std::optional<std::array<uint8_t, 32>> DeriveSiteKey(
+     std::string_view site_scope) {
+-  const LaunchConfig* cfg = GetLaunchConfig();
+-  if (!cfg || !cfg->fingerprint_seed.has_value() || site_scope.empty()) {
++  if (site_scope.empty() || !IsRuntimeFarblingEnabled()) {
++    return std::nullopt;
++  }
++  const std::optional<std::array<uint8_t, 32>> seed =
++      GetActiveFingerprintSeedBytes();
++  if (!seed.has_value()) {
+     return std::nullopt;
+   }
+-  return HmacSha256(*cfg->fingerprint_seed, site_scope);
++  return HmacSha256(*seed, site_scope);
+ }
+ 
+ void FarbleRGBA8Pixels(base::span<const uint8_t, 32> site_key,
+@@ -2074,13 +2075,13 @@ bool ShouldExposePdfViewer(const blink::UserAgentMetadata& metadata) {
+ }
+ 
+ bool ShouldHideSpeechVoices(const blink::UserAgentMetadata& metadata) {
++  if (HasExplicitHideSpeechVoicesRuntimePolicy()) {
++    return ShouldHideSpeechVoicesRuntime();
++  }
+   const LaunchConfig* cfg = GetLaunchConfig();
+   if (!cfg) {
+     return false;
+   }
+-  if (cfg->hide_speech_voices.has_value()) {
+-    return *cfg->hide_speech_voices;
+-  }
+   return cfg->schema_version >= 2 && metadata.platform != "macOS" &&
+          metadata.platform != "iOS";
+ }
+diff --git a/third_party/blink/common/curium/curium_runtime_policy.cc b/third_party/blink/common/curium/curium_runtime_policy.cc
+new file mode 100644
+index 0000000..aa48e5f
+--- /dev/null
++++ b/third_party/blink/common/curium/curium_runtime_policy.cc
+@@ -0,0 +1,650 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/public/common/curium/curium_runtime_policy.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/location.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/synchronization/lock.h"
++#include "base/values.h"
++
++namespace blink::curium {
++
++namespace {
++
++constexpr uint32_t kFlagFarblingActive = 1u << 0;
++constexpr uint32_t kFlagCanvasFarbling = 1u << 1;
++constexpr uint32_t kFlagAudioFarbling = 1u << 2;
++constexpr uint32_t kFlagWebGLFarbling = 1u << 3;
++constexpr uint32_t kFlagTextMetricsFarbling = 1u << 4;
++constexpr uint32_t kFlagGlobalPrivacyControl = 1u << 5;
++constexpr uint32_t kFlagHideSpeechVoices = 1u << 6;
++constexpr uint32_t kFlagHideSpeechVoicesExplicit = 1u << 7;
++
++constexpr double kMaxSafeJsonUint64 = 9007199254740991.0;
++
++bool Fail(RuntimePolicyError* error_out, ErrorCode code, std::string message) {
++  if (error_out) {
++    error_out->code = code;
++    error_out->message = std::move(message);
++  }
++  return false;
++}
++
++std::string BytesToLowerHex(const std::array<uint8_t, 32>& bytes) {
++  static constexpr char kHex[] = "0123456789abcdef";
++  std::string out;
++  out.reserve(64);
++  for (uint8_t b : bytes) {
++    out.push_back(kHex[b >> 4]);
++    out.push_back(kHex[b & 0x0Fu]);
++  }
++  return out;
++}
++
++uint32_t ComputeFastFlags(const RuntimePolicySnapshot& snapshot) {
++  uint32_t flags = 0u;
++  if (snapshot.fingerprint_seed_bytes.has_value()) {
++    if (snapshot.farbling.AnyEnabled()) {
++      flags |= kFlagFarblingActive;
++    }
++    if (snapshot.farbling.canvas) {
++      flags |= kFlagCanvasFarbling;
++    }
++    if (snapshot.farbling.audio) {
++      flags |= kFlagAudioFarbling;
++    }
++    if (snapshot.farbling.webgl) {
++      flags |= kFlagWebGLFarbling;
++    }
++    if (snapshot.farbling.text_metrics) {
++      flags |= kFlagTextMetricsFarbling;
++    }
++  }
++  if (snapshot.enable_global_privacy_control) {
++    flags |= kFlagGlobalPrivacyControl;
++  }
++  if (snapshot.hide_speech_voices) {
++    flags |= kFlagHideSpeechVoices;
++  }
++  if (snapshot.hide_speech_voices_explicit) {
++    flags |= kFlagHideSpeechVoicesExplicit;
++  }
++  return flags;
++}
++
++struct BrowserObserverEntry {
++  uintptr_t token = 0;
++  RuntimePolicyObserverCallback callback;
++};
++
++struct RendererObserverEntry {
++  scoped_refptr<base::SequencedTaskRunner> task_runner;
++  RuntimePolicyObserverCallback callback;
++};
++
++struct CachePurgeHookEntry {
++  scoped_refptr<base::SequencedTaskRunner> task_runner;
++  base::RepeatingClosure callback;
++};
++
++struct RuntimePolicyStorage {
++  base::Lock lock;
++  std::atomic<uint64_t> revision{0};
++  std::atomic<uint32_t> fast_flags{0};
++  bool auto_hide_speech_voices_default = false;
++  RuntimePolicySnapshot snapshot;
++  std::vector<BrowserObserverEntry> browser_observers;
++  std::vector<RendererObserverEntry> renderer_observers;
++  std::vector<CachePurgeHookEntry> cache_purge_hooks;
++};
++
++RuntimePolicyStorage& GetPolicyStorage() {
++  static base::NoDestructor<RuntimePolicyStorage> storage;
++  return *storage;
++}
++
++struct ParsedRuntimePolicyPatch {
++  std::optional<uint64_t> policy_revision;
++  bool has_fingerprint_seed = false;
++  std::optional<std::array<uint8_t, 32>> fingerprint_seed_bytes;
++  std::optional<std::string> fingerprint_seed_hex;
++  bool has_farbling = false;
++  bool clear_farbling = false;
++  std::optional<bool> farble_canvas;
++  std::optional<bool> farble_audio;
++  std::optional<bool> farble_webgl;
++  std::optional<bool> farble_text_metrics;
++  std::optional<blink::mojom::WebRtcIpHandlingPolicy> webrtc_ip_handling_policy;
++  std::optional<bool> enable_do_not_track;
++  std::optional<bool> enable_global_privacy_control;
++  bool has_hide_speech_voices = false;
++  bool clear_hide_speech_voices = false;
++  std::optional<bool> hide_speech_voices;
++};
++
++bool ParseRuntimePolicyPatch(std::string_view json,
++                             ParsedRuntimePolicyPatch* out_patch,
++                             RuntimePolicyError* error_out) {
++  if (json.empty()) {
++    return Fail(error_out, ErrorCode::kInvalidJSON,
++                "Runtime privacy policy JSON must not be empty");
++  }
++  if (json.size() > kMaxRuntimePolicyBytes) {
++    return Fail(error_out, ErrorCode::kPayloadTooLarge,
++                "Runtime privacy policy exceeds 16 KiB limit");
++  }
++  auto parsed = base::JSONReader::ReadAndReturnValueWithError(
++      json, base::JSON_PARSE_RFC);
++  if (!parsed.has_value()) {
++    return Fail(error_out, ErrorCode::kInvalidJSON,
++                "JSON parse error: " + parsed.error().message);
++  }
++  const base::DictValue* root = parsed->GetIfDict();
++  if (!root) {
++    return Fail(error_out, ErrorCode::kInvalidJSON,
++                "Root runtime privacy policy must be a JSON object");
++  }
++
++  static constexpr std::array<std::string_view, 8> kAllowedKeys = {
++      "policySchemaVersion",
++      "policyRevision",
++      "fingerprintSeed",
++      "farbling",
++      "webrtcIpHandlingPolicy",
++      "enableDoNotTrack",
++      "enableGlobalPrivacyControl",
++      "hideSpeechVoices",
++  };
++  for (const auto [key, value] : *root) {
++    if (std::find(kAllowedKeys.begin(), kAllowedKeys.end(), key) ==
++        kAllowedKeys.end()) {
++      return Fail(error_out, ErrorCode::kInvalidField,
++                  "Unknown runtime privacy policy key: " + key);
++    }
++  }
++
++  const base::Value* schema_val = root->Find("policySchemaVersion");
++  if (!schema_val || !schema_val->is_int()) {
++    return Fail(error_out, ErrorCode::kInvalidField,
++                "policySchemaVersion integer is required");
++  }
++  const int schema_version = schema_val->GetInt();
++  if (schema_version != kRuntimePolicySchemaVersion) {
++    return Fail(error_out, ErrorCode::kUnsupportedSchema,
++                "Unsupported policySchemaVersion: " +
++                    base::NumberToString(schema_version));
++  }
++
++  ParsedRuntimePolicyPatch patch;
++
++  if (const base::Value* rev = root->Find("policyRevision")) {
++    if (rev->is_int()) {
++      const int v = rev->GetInt();
++      if (v < 0) {
++        return Fail(error_out, ErrorCode::kInvalidField,
++                    "policyRevision must be non-negative");
++      }
++      patch.policy_revision = static_cast<uint64_t>(v);
++    } else if (rev->is_double()) {
++      const double d = rev->GetDouble();
++      if (!std::isfinite(d) || d < 0.0 || d > kMaxSafeJsonUint64 ||
++          std::floor(d) != d) {
++        return Fail(
++            error_out, ErrorCode::kInvalidField,
++            "policyRevision must be an integer in [0, 9007199254740991]");
++      }
++      patch.policy_revision = static_cast<uint64_t>(d);
++    } else {
++      return Fail(error_out, ErrorCode::kInvalidField,
++                  "policyRevision must be an integer");
++    }
++  }
++
++  if (const base::Value* seed_val = root->Find("fingerprintSeed")) {
++    patch.has_fingerprint_seed = true;
++    if (seed_val->is_none()) {
++      patch.fingerprint_seed_bytes = std::nullopt;
++      patch.fingerprint_seed_hex = std::nullopt;
++    } else if (const std::string* hex = seed_val->GetIfString()) {
++      std::vector<uint8_t> bytes;
++      if (hex->size() != 64 || !base::HexStringToBytes(*hex, &bytes) ||
++          bytes.size() != 32) {
++        return Fail(error_out, ErrorCode::kInvalidField,
++                    "fingerprintSeed must be null or a 64-character hex string");
++      }
++      std::array<uint8_t, 32> seed{};
++      std::copy(bytes.begin(), bytes.end(), seed.begin());
++      patch.fingerprint_seed_bytes = seed;
++      patch.fingerprint_seed_hex = base::ToLowerASCII(*hex);
++    } else {
++      return Fail(error_out, ErrorCode::kInvalidField,
++                  "fingerprintSeed must be null or a 64-character hex string");
++    }
++  }
++
++  if (const base::Value* farb_val = root->Find("farbling")) {
++    patch.has_farbling = true;
++    if (farb_val->is_none()) {
++      patch.clear_farbling = true;
++    } else if (const base::DictValue* fdict = farb_val->GetIfDict()) {
++      for (const auto [k, v] : *fdict) {
++        if (k != "canvas" && k != "audio" && k != "webgl" &&
++            k != "textMetrics") {
++          return Fail(error_out, ErrorCode::kInvalidField,
++                      "Unknown key in farbling: " + k);
++        }
++        if (!v.is_bool()) {
++          return Fail(error_out, ErrorCode::kInvalidField,
++                      "farbling." + k + " must be bool");
++        }
++      }
++      patch.farble_canvas = fdict->FindBool("canvas");
++      patch.farble_audio = fdict->FindBool("audio");
++      patch.farble_webgl = fdict->FindBool("webgl");
++      patch.farble_text_metrics = fdict->FindBool("textMetrics");
++    } else {
++      return Fail(error_out, ErrorCode::kInvalidField,
++                  "farbling must be null or an object");
++    }
++  }
++
++  if (const base::Value* webrtc = root->Find("webrtcIpHandlingPolicy")) {
++    const std::string* s = webrtc->GetIfString();
++    if (!s) {
++      return Fail(error_out, ErrorCode::kInvalidField,
++                  "webrtcIpHandlingPolicy must be a string");
++    }
++    if (*s == "default") {
++      patch.webrtc_ip_handling_policy =
++          blink::mojom::WebRtcIpHandlingPolicy::kDefault;
++    } else if (*s == "default_public_and_private_interfaces") {
++      patch.webrtc_ip_handling_policy = blink::mojom::WebRtcIpHandlingPolicy::
++          kDefaultPublicAndPrivateInterfaces;
++    } else if (*s == "default_public_interface_only") {
++      patch.webrtc_ip_handling_policy =
++          blink::mojom::WebRtcIpHandlingPolicy::kDefaultPublicInterfaceOnly;
++    } else if (*s == "disable_non_proxied_udp") {
++      patch.webrtc_ip_handling_policy =
++          blink::mojom::WebRtcIpHandlingPolicy::kDisableNonProxiedUdp;
++    } else {
++      return Fail(error_out, ErrorCode::kInvalidField,
++                  "Invalid webrtcIpHandlingPolicy: " + *s);
++    }
++  }
++
++  if (const base::Value* dnt = root->Find("enableDoNotTrack")) {
++    if (!dnt->is_bool()) {
++      return Fail(error_out, ErrorCode::kInvalidField,
++                  "enableDoNotTrack must be bool");
++    }
++    patch.enable_do_not_track = dnt->GetBool();
++  }
++
++  if (const base::Value* gpc = root->Find("enableGlobalPrivacyControl")) {
++    if (!gpc->is_bool()) {
++      return Fail(error_out, ErrorCode::kInvalidField,
++                  "enableGlobalPrivacyControl must be bool");
++    }
++    patch.enable_global_privacy_control = gpc->GetBool();
++  }
++
++  if (const base::Value* hsv = root->Find("hideSpeechVoices")) {
++    patch.has_hide_speech_voices = true;
++    if (hsv->is_none()) {
++      patch.clear_hide_speech_voices = true;
++    } else if (hsv->is_bool()) {
++      patch.hide_speech_voices = hsv->GetBool();
++    } else {
++      return Fail(error_out, ErrorCode::kInvalidField,
++                  "hideSpeechVoices must be null or bool");
++    }
++  }
++
++  *out_patch = std::move(patch);
++  return true;
++}
++
++}  // namespace
++
++RuntimePolicyError::RuntimePolicyError() = default;
++RuntimePolicyError::RuntimePolicyError(ErrorCode code, std::string message)
++    : code(code), message(std::move(message)) {}
++RuntimePolicyError::RuntimePolicyError(const RuntimePolicyError&) = default;
++RuntimePolicyError::RuntimePolicyError(RuntimePolicyError&&) noexcept = default;
++RuntimePolicyError& RuntimePolicyError::operator=(const RuntimePolicyError&) =
++    default;
++RuntimePolicyError& RuntimePolicyError::operator=(
++    RuntimePolicyError&&) noexcept = default;
++RuntimePolicyError::~RuntimePolicyError() = default;
++
++RuntimePolicySnapshot::RuntimePolicySnapshot() = default;
++RuntimePolicySnapshot::RuntimePolicySnapshot(const RuntimePolicySnapshot&) =
++    default;
++RuntimePolicySnapshot::RuntimePolicySnapshot(
++    RuntimePolicySnapshot&&) noexcept = default;
++RuntimePolicySnapshot& RuntimePolicySnapshot::operator=(
++    const RuntimePolicySnapshot&) = default;
++RuntimePolicySnapshot& RuntimePolicySnapshot::operator=(
++    RuntimePolicySnapshot&&) noexcept = default;
++RuntimePolicySnapshot::~RuntimePolicySnapshot() = default;
++
++void SeedRuntimePolicyFromLaunchConfig(const LaunchConfig* cfg) {
++  RuntimePolicySnapshot seeded;
++  seeded.policy_revision = 0;
++  bool auto_hide_default = false;
++
++  if (cfg) {
++    if (cfg->fingerprint_seed.has_value()) {
++      seeded.fingerprint_seed_bytes = cfg->fingerprint_seed;
++      seeded.fingerprint_seed_hex = BytesToLowerHex(*cfg->fingerprint_seed);
++      seeded.farbling.canvas = cfg->farble_canvas;
++      seeded.farbling.audio = cfg->farble_audio;
++      seeded.farbling.webgl = cfg->farble_webgl;
++      seeded.farbling.text_metrics = cfg->farble_text_metrics;
++    }
++    seeded.webrtc_ip_handling_policy = cfg->webrtc_ip_handling_policy;
++    seeded.enable_do_not_track = cfg->enable_do_not_track;
++    seeded.enable_global_privacy_control = cfg->enable_global_privacy_control;
++    const IdentitySlotConfig& primary = cfg->DefaultIdentity();
++    auto_hide_default = cfg->schema_version >= 2 &&
++                        primary.platform.has_value() &&
++                        !primary.platform->empty() &&
++                        *primary.platform != "macOS" &&
++                        *primary.platform != "iOS";
++    if (cfg->hide_speech_voices.has_value()) {
++      seeded.hide_speech_voices = *cfg->hide_speech_voices;
++      seeded.hide_speech_voices_explicit = true;
++    } else {
++      seeded.hide_speech_voices = auto_hide_default;
++      seeded.hide_speech_voices_explicit = false;
++    }
++  }
++
++  RuntimePolicyStorage& storage = GetPolicyStorage();
++  base::AutoLock auto_lock(storage.lock);
++  storage.auto_hide_speech_voices_default = auto_hide_default;
++  storage.snapshot = std::move(seeded);
++  storage.fast_flags.store(ComputeFastFlags(storage.snapshot),
++                           std::memory_order_release);
++  storage.revision.store(0, std::memory_order_release);
++}
++
++bool ApplyRuntimePolicyJSON(std::string_view json,
++                            RuntimePolicyError* error_out) {
++  ParsedRuntimePolicyPatch patch;
++  if (!ParseRuntimePolicyPatch(json, &patch, error_out)) {
++    return false;
++  }
++
++  RuntimePolicyStorage& storage = GetPolicyStorage();
++  RuntimePolicySnapshot committed;
++  std::vector<BrowserObserverEntry> browser_observers;
++  std::vector<RendererObserverEntry> renderer_observers;
++
++  {
++    base::AutoLock auto_lock(storage.lock);
++    RuntimePolicySnapshot next = storage.snapshot;
++    const bool had_seed = next.fingerprint_seed_bytes.has_value();
++
++    if (patch.has_fingerprint_seed) {
++      next.fingerprint_seed_bytes = patch.fingerprint_seed_bytes;
++      next.fingerprint_seed_hex = patch.fingerprint_seed_hex;
++      if (!next.fingerprint_seed_bytes.has_value()) {
++        next.farbling = FarblingConfig{};
++      }
++    }
++
++    if (patch.has_farbling) {
++      if (patch.clear_farbling) {
++        next.farbling = FarblingConfig{};
++      } else {
++        if (patch.farble_canvas.has_value()) {
++          next.farbling.canvas = *patch.farble_canvas;
++        }
++        if (patch.farble_audio.has_value()) {
++          next.farbling.audio = *patch.farble_audio;
++        }
++        if (patch.farble_webgl.has_value()) {
++          next.farbling.webgl = *patch.farble_webgl;
++        }
++        if (patch.farble_text_metrics.has_value()) {
++          next.farbling.text_metrics = *patch.farble_text_metrics;
++        }
++      }
++    } else if (!had_seed && next.fingerprint_seed_bytes.has_value() &&
++               !next.farbling.AnyEnabled()) {
++      next.farbling.canvas = true;
++      next.farbling.audio = true;
++      next.farbling.webgl = true;
++      next.farbling.text_metrics = true;
++    }
++
++    if (patch.webrtc_ip_handling_policy.has_value()) {
++      next.webrtc_ip_handling_policy = *patch.webrtc_ip_handling_policy;
++    }
++    if (patch.enable_do_not_track.has_value()) {
++      next.enable_do_not_track = *patch.enable_do_not_track;
++    }
++    if (patch.enable_global_privacy_control.has_value()) {
++      next.enable_global_privacy_control = *patch.enable_global_privacy_control;
++    }
++    if (patch.has_hide_speech_voices) {
++      if (patch.clear_hide_speech_voices) {
++        next.hide_speech_voices_explicit = false;
++        next.hide_speech_voices = storage.auto_hide_speech_voices_default;
++      } else if (patch.hide_speech_voices.has_value()) {
++        next.hide_speech_voices_explicit = true;
++        next.hide_speech_voices = *patch.hide_speech_voices;
++      }
++    }
++
++    const uint64_t prev_monotonic =
++        storage.revision.load(std::memory_order_relaxed);
++    const uint64_t next_monotonic =
++        patch.policy_revision.has_value()
++            ? std::max<uint64_t>(prev_monotonic + 1u, *patch.policy_revision)
++            : (prev_monotonic + 1u);
++    next.policy_revision = patch.policy_revision.value_or(next_monotonic);
++
++    storage.snapshot = next;
++    storage.fast_flags.store(ComputeFastFlags(storage.snapshot),
++                             std::memory_order_release);
++    storage.revision.store(next_monotonic, std::memory_order_release);
++
++    committed = next;
++    browser_observers = storage.browser_observers;
++    renderer_observers = storage.renderer_observers;
++  }
++
++  for (const BrowserObserverEntry& entry : browser_observers) {
++    if (!entry.callback.is_null()) {
++      entry.callback.Run(committed);
++    }
++  }
++  for (const RendererObserverEntry& entry : renderer_observers) {
++    if (entry.task_runner && !entry.callback.is_null()) {
++      entry.task_runner->PostTask(FROM_HERE,
++                                  base::BindOnce(entry.callback, committed));
++    }
++  }
++
++  return true;
++}
++
++RuntimePolicySnapshot GetRuntimePolicySnapshot() {
++  RuntimePolicyStorage& storage = GetPolicyStorage();
++  base::AutoLock auto_lock(storage.lock);
++  return storage.snapshot;
++}
++
++uint64_t GetCurrentRuntimePolicyRevision() {
++  return GetPolicyStorage().revision.load(std::memory_order_acquire);
++}
++
++bool IsRuntimeFarblingEnabled() {
++  return (GetPolicyStorage().fast_flags.load(std::memory_order_acquire) &
++          kFlagFarblingActive) != 0u;
++}
++
++bool IsRuntimeCanvasFarblingEnabled() {
++  return (GetPolicyStorage().fast_flags.load(std::memory_order_acquire) &
++          kFlagCanvasFarbling) != 0u;
++}
++
++bool IsRuntimeAudioFarblingEnabled() {
++  return (GetPolicyStorage().fast_flags.load(std::memory_order_acquire) &
++          kFlagAudioFarbling) != 0u;
++}
++
++bool IsRuntimeWebGLFarblingEnabled() {
++  return (GetPolicyStorage().fast_flags.load(std::memory_order_acquire) &
++          kFlagWebGLFarbling) != 0u;
++}
++
++bool IsRuntimeTextMetricsFarblingEnabled() {
++  return (GetPolicyStorage().fast_flags.load(std::memory_order_acquire) &
++          kFlagTextMetricsFarbling) != 0u;
++}
++
++bool IsGlobalPrivacyControlRuntimeEnabled() {
++  return (GetPolicyStorage().fast_flags.load(std::memory_order_acquire) &
++          kFlagGlobalPrivacyControl) != 0u;
++}
++
++bool ShouldHideSpeechVoicesRuntime() {
++  return (GetPolicyStorage().fast_flags.load(std::memory_order_acquire) &
++          kFlagHideSpeechVoices) != 0u;
++}
++
++bool HasExplicitHideSpeechVoicesRuntimePolicy() {
++  return (GetPolicyStorage().fast_flags.load(std::memory_order_acquire) &
++          kFlagHideSpeechVoicesExplicit) != 0u;
++}
++
++std::optional<std::array<uint8_t, 32>> GetActiveFingerprintSeedBytes() {
++  if (!IsRuntimeFarblingEnabled()) {
++    return std::nullopt;
++  }
++  RuntimePolicyStorage& storage = GetPolicyStorage();
++  base::AutoLock auto_lock(storage.lock);
++  if (!storage.snapshot.fingerprint_seed_bytes.has_value() ||
++      !storage.snapshot.farbling.AnyEnabled()) {
++    return std::nullopt;
++  }
++  return storage.snapshot.fingerprint_seed_bytes;
++}
++
++std::string_view WebRtcIpHandlingPolicyToString(
++    blink::mojom::WebRtcIpHandlingPolicy policy) {
++  switch (policy) {
++    case blink::mojom::WebRtcIpHandlingPolicy::kDefault:
++      return "default";
++    case blink::mojom::WebRtcIpHandlingPolicy::
++        kDefaultPublicAndPrivateInterfaces:
++      return "default_public_and_private_interfaces";
++    case blink::mojom::WebRtcIpHandlingPolicy::kDefaultPublicInterfaceOnly:
++      return "default_public_interface_only";
++    case blink::mojom::WebRtcIpHandlingPolicy::kDisableNonProxiedUdp:
++      return "disable_non_proxied_udp";
++  }
++  return "default";
++}
++
++void RegisterBrowserPolicyObserver(void* token,
++                                   RuntimePolicyObserverCallback callback) {
++  if (!token || callback.is_null()) {
++    return;
++  }
++  const uintptr_t token_id = reinterpret_cast<uintptr_t>(token);
++  RuntimePolicyStorage& storage = GetPolicyStorage();
++  base::AutoLock auto_lock(storage.lock);
++  for (BrowserObserverEntry& entry : storage.browser_observers) {
++    if (entry.token == token_id) {
++      entry.callback = std::move(callback);
++      return;
++    }
++  }
++  storage.browser_observers.push_back(
++      BrowserObserverEntry{token_id, std::move(callback)});
++}
++
++void UnregisterBrowserPolicyObserver(void* token) {
++  if (!token) {
++    return;
++  }
++  const uintptr_t token_id = reinterpret_cast<uintptr_t>(token);
++  RuntimePolicyStorage& storage = GetPolicyStorage();
++  base::AutoLock auto_lock(storage.lock);
++  auto& observers = storage.browser_observers;
++  observers.erase(
++      std::remove_if(observers.begin(), observers.end(),
++                     [token_id](const BrowserObserverEntry& entry) {
++                       return entry.token == token_id;
++                     }),
++      observers.end());
++}
++
++void RegisterRendererPolicyObserver(
++    scoped_refptr<base::SequencedTaskRunner> task_runner,
++    RuntimePolicyObserverCallback callback) {
++  if (!task_runner || callback.is_null()) {
++    return;
++  }
++  RuntimePolicySnapshot current;
++  {
++    RuntimePolicyStorage& storage = GetPolicyStorage();
++    base::AutoLock auto_lock(storage.lock);
++    storage.renderer_observers.push_back(
++        RendererObserverEntry{task_runner, callback});
++    current = storage.snapshot;
++  }
++
++  if (task_runner->RunsTasksInCurrentSequence()) {
++    callback.Run(current);
++  } else {
++    task_runner->PostTask(FROM_HERE,
++                          base::BindOnce(std::move(callback),
++                                         std::move(current)));
++  }
++}
++
++void RegisterProfileCachePurgeHook(
++    scoped_refptr<base::SequencedTaskRunner> task_runner,
++    base::RepeatingClosure callback) {
++  if (!task_runner || callback.is_null()) {
++    return;
++  }
++  RuntimePolicyStorage& storage = GetPolicyStorage();
++  base::AutoLock auto_lock(storage.lock);
++  storage.cache_purge_hooks.push_back(
++      CachePurgeHookEntry{std::move(task_runner), std::move(callback)});
++}
++
++void PurgeProfileRuntimeCaches() {
++  std::vector<CachePurgeHookEntry> hooks;
++  {
++    RuntimePolicyStorage& storage = GetPolicyStorage();
++    base::AutoLock auto_lock(storage.lock);
++    hooks = storage.cache_purge_hooks;
++  }
++  for (const CachePurgeHookEntry& entry : hooks) {
++    if (entry.task_runner && !entry.callback.is_null()) {
++      entry.task_runner->PostTask(FROM_HERE, entry.callback);
++    }
++  }
++}
++
++}  // namespace blink::curium
+diff --git a/third_party/blink/common/global_privacy_control/global_privacy_control_util.cc b/third_party/blink/common/global_privacy_control/global_privacy_control_util.cc
+index 0cce582..f81cf72 100644
+--- a/third_party/blink/common/global_privacy_control/global_privacy_control_util.cc
++++ b/third_party/blink/common/global_privacy_control/global_privacy_control_util.cc
+@@ -7,8 +7,12 @@
+ #include "base/feature_list.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/rand_util.h"
++#include "build/build_config.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_runtime_policy.h"
++#endif
+ 
+ namespace blink {
+ namespace {
+@@ -22,6 +26,11 @@ inline constexpr double kGlobalPrivacyControlSourceHistogramSampleProbability =
+ }  // namespace
+ 
+ bool IsGlobalPrivacyControlFeatureEnabled() {
++#if BUILDFLAG(IS_IOS)
++  if (curium::IsGlobalPrivacyControlRuntimeEnabled()) {
++    return true;
++  }
++#endif
+   // `kGlobalPrivacyControlForce` is kept for testing.
+   return base::FeatureList::IsEnabled(features::kGlobalPrivacyControlForce) ||
+          base::FeatureList::IsEnabled(features::kGlobalPrivacyControlApi);
+diff --git a/third_party/blink/public/common/BUILD.gn b/third_party/blink/public/common/BUILD.gn
+index edad897..747b91f 100644
+--- a/third_party/blink/public/common/BUILD.gn
++++ b/third_party/blink/public/common/BUILD.gn
+@@ -141,6 +141,7 @@ source_set("headers") {
+     "css/page_size_type.h",
+     "css/scripting.h",
+     "curium/curium_fingerprint_config.h",
++    "curium/curium_runtime_policy.h",
+     "custom_handlers/protocol_handler_utils.h",
+     "device_memory/approximated_device_memory.h",
+     "dom/dom_node_id.h",
+diff --git a/third_party/blink/public/common/curium/curium_runtime_policy.h b/third_party/blink/public/common/curium/curium_runtime_policy.h
+new file mode 100644
+index 0000000..9a7b84d
+--- /dev/null
++++ b/third_party/blink/public/common/curium/curium_runtime_policy.h
+@@ -0,0 +1,134 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_RUNTIME_POLICY_H_
++#define THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_RUNTIME_POLICY_H_
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "third_party/blink/public/common/common_export.h"
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#include "third_party/blink/public/mojom/peerconnection/webrtc_ip_handling_policy.mojom-shared.h"
++
++namespace blink::curium {
++
++inline constexpr int kRuntimePolicySchemaVersion = 1;
++inline constexpr size_t kMaxRuntimePolicyBytes = 16384;
++
++struct BLINK_COMMON_EXPORT FarblingConfig {
++  bool canvas = false;
++  bool audio = false;
++  bool webgl = false;
++  bool text_metrics = false;
++
++  bool AnyEnabled() const {
++    return canvas || audio || webgl || text_metrics;
++  }
++};
++
++struct BLINK_COMMON_EXPORT RuntimePolicyError {
++  RuntimePolicyError();
++  RuntimePolicyError(ErrorCode code, std::string message);
++  RuntimePolicyError(const RuntimePolicyError&);
++  RuntimePolicyError(RuntimePolicyError&&) noexcept;
++  RuntimePolicyError& operator=(const RuntimePolicyError&);
++  RuntimePolicyError& operator=(RuntimePolicyError&&) noexcept;
++  ~RuntimePolicyError();
++
++  ErrorCode code = ErrorCode::kNone;
++  std::string message;
++};
++
++struct BLINK_COMMON_EXPORT RuntimePolicySnapshot {
++  RuntimePolicySnapshot();
++  RuntimePolicySnapshot(const RuntimePolicySnapshot&);
++  RuntimePolicySnapshot(RuntimePolicySnapshot&&) noexcept;
++  RuntimePolicySnapshot& operator=(const RuntimePolicySnapshot&);
++  RuntimePolicySnapshot& operator=(RuntimePolicySnapshot&&) noexcept;
++  ~RuntimePolicySnapshot();
++
++  uint64_t policy_revision = 0;
++  std::optional<std::array<uint8_t, 32>> fingerprint_seed_bytes;
++  std::optional<std::string> fingerprint_seed_hex;
++  FarblingConfig farbling;
++  blink::mojom::WebRtcIpHandlingPolicy webrtc_ip_handling_policy =
++      blink::mojom::WebRtcIpHandlingPolicy::kDefault;
++  bool enable_do_not_track = false;
++  bool enable_global_privacy_control = false;
++  bool hide_speech_voices = false;
++  bool hide_speech_voices_explicit = false;
++};
++
++using RuntimePolicyObserverCallback =
++    base::RepeatingCallback<void(const RuntimePolicySnapshot&)>;
++
++// Seeds the live runtime privacy policy snapshot from the frozen launch config
++// at policy revision 0. Passing nullptr resets to default Build 39 values.
++BLINK_COMMON_EXPORT void SeedRuntimePolicyFromLaunchConfig(
++    const LaunchConfig* cfg);
++
++// Validates and atomically applies a bounded UTF-8 runtime privacy policy JSON
++// payload (<= 16 KiB, policySchemaVersion == 1, strict key allowlist). Fails
++// closed without mutating active policy state on any error.
++BLINK_COMMON_EXPORT bool ApplyRuntimePolicyJSON(
++    std::string_view json,
++    RuntimePolicyError* error_out);
++
++// Returns a thread-safe copy of the active runtime privacy policy snapshot.
++BLINK_COMMON_EXPORT RuntimePolicySnapshot GetRuntimePolicySnapshot();
++
++// Lock-free monotonic runtime policy revision counter (0 until the first
++// successful ApplyRuntimePolicyJSON call).
++BLINK_COMMON_EXPORT uint64_t GetCurrentRuntimePolicyRevision();
++
++// Lock-free hot-path flag readers backed by atomic state.
++BLINK_COMMON_EXPORT bool IsRuntimeFarblingEnabled();
++BLINK_COMMON_EXPORT bool IsRuntimeCanvasFarblingEnabled();
++BLINK_COMMON_EXPORT bool IsRuntimeAudioFarblingEnabled();
++BLINK_COMMON_EXPORT bool IsRuntimeWebGLFarblingEnabled();
++BLINK_COMMON_EXPORT bool IsRuntimeTextMetricsFarblingEnabled();
++BLINK_COMMON_EXPORT bool IsGlobalPrivacyControlRuntimeEnabled();
++BLINK_COMMON_EXPORT bool ShouldHideSpeechVoicesRuntime();
++BLINK_COMMON_EXPORT bool HasExplicitHideSpeechVoicesRuntimePolicy();
++
++// Thread-safe copy of the active 32-byte farbling seed when farbling is active.
++BLINK_COMMON_EXPORT std::optional<std::array<uint8_t, 32>>
++GetActiveFingerprintSeedBytes();
++
++// Canonical wire-string name for WebRtcIpHandlingPolicy.
++BLINK_COMMON_EXPORT std::string_view WebRtcIpHandlingPolicyToString(
++    blink::mojom::WebRtcIpHandlingPolicy policy);
++
++// Registers/unregisters browser-side observers invoked synchronously on the
++// caller (UI) thread after ApplyRuntimePolicyJSON commits a new snapshot.
++BLINK_COMMON_EXPORT void RegisterBrowserPolicyObserver(
++    void* token,
++    RuntimePolicyObserverCallback callback);
++BLINK_COMMON_EXPORT void UnregisterBrowserPolicyObserver(void* token);
++
++// Registers a renderer-side observer invoked immediately with the current
++// snapshot (synchronously when already on `task_runner`) and posted onto
++// `task_runner` whenever ApplyRuntimePolicyJSON commits a new snapshot.
++BLINK_COMMON_EXPORT void RegisterRendererPolicyObserver(
++    scoped_refptr<base::SequencedTaskRunner> task_runner,
++    RuntimePolicyObserverCallback callback);
++
++// Future-ready (Build 44) hook allowing renderer runtime caches to be purged
++// asynchronously on their owning sequence.
++BLINK_COMMON_EXPORT void RegisterProfileCachePurgeHook(
++    scoped_refptr<base::SequencedTaskRunner> task_runner,
++    base::RepeatingClosure callback);
++BLINK_COMMON_EXPORT void PurgeProfileRuntimeCaches();
++
++}  // namespace blink::curium
++
++#endif  // THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_RUNTIME_POLICY_H_

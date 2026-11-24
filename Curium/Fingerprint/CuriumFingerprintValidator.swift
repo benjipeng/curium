@@ -212,6 +212,15 @@ enum CuriumFingerprintValidator {
             if !CuriumFingerprintSchema.validColorDepths.contains(depth) {
                 report.errors.append("\(name).screen colorDepth must be 24, 30, or 32.")
             }
+            if let availTop = screen.availTop, !(0...256).contains(availTop) {
+                report.errors.append("\(name).screen availTop must be an integer in 0...256.")
+            }
+            if let availLeft = screen.availLeft, !(0...512).contains(availLeft) {
+                report.errors.append("\(name).screen availLeft must be an integer in 0...512.")
+            }
+            if let dpr = screen.devicePixelRatio, (!dpr.isFinite || dpr < 1.0 || dpr > 4.0) {
+                report.errors.append("\(name).screen devicePixelRatio must be a finite number in 1.0...4.0.")
+            }
         }
         for (limitName, limitVal) in [
             ("webglMaxTextureSize", slot.webglMaxTextureSize),

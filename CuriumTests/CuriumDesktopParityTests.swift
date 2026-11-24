@@ -82,24 +82,28 @@ private final class MockTrustedDesktopParityManager: NSObject, CrIOSExtensionMan
         fromTrustedDirectory directoryPath: String,
         completion: @escaping ([String: Any]?, NSError?) -> Void
     ) {
-        installAttempts += 1
-        lastInstalledDirectoryPath = directoryPath
-        if failFirstInstallWithRestoring && installAttempts == 1 {
-            let err = NSError(
-                domain: "CrIOSExtensionManagerErrorDomain",
-                code: 9,
-                userInfo: [NSLocalizedDescriptionKey: "Chromium is restoring installed extensions."]
-            )
-            completion(nil, err)
-            return
+        let isPiP = directoryPath.hasSuffix("/\(CuriumVideoPiPExtension.directoryName)")
+        if !isPiP {
+            installAttempts += 1
+            lastInstalledDirectoryPath = directoryPath
+            if failFirstInstallWithRestoring && installAttempts == 1 {
+                let err = NSError(
+                    domain: "CrIOSExtensionManagerErrorDomain",
+                    code: 9,
+                    userInfo: [NSLocalizedDescriptionKey: "Chromium is restoring installed extensions."]
+                )
+                completion(nil, err)
+                return
+            }
         }
+        let targetID = isPiP ? CuriumVideoPiPExtension.extensionID : CuriumDesktopParityExtension.extensionID
         let entry: [String: Any] = [
-            "id": CuriumDesktopParityExtension.extensionID,
-            "name": "Curium Desktop Parity",
-            "version": CuriumDesktopParityExtension.manifestVersion,
-            "enabled": returnInitiallyEnabled,
+            "id": targetID,
+            "name": isPiP ? "Curium Video PiP" : "Curium Desktop Parity",
+            "version": isPiP ? CuriumVideoPiPExtension.manifestVersion : CuriumDesktopParityExtension.manifestVersion,
+            "enabled": isPiP ? true : returnInitiallyEnabled,
         ]
-        if let idx = entries.firstIndex(where: { ($0["id"] as? String) == CuriumDesktopParityExtension.extensionID }) {
+        if let idx = entries.firstIndex(where: { ($0["id"] as? String) == targetID }) {
             entries[idx] = entry
         } else {
             entries.append(entry)
@@ -432,13 +436,35 @@ struct CuriumDesktopParityTests {
         #expect(desktopManager.installAttempts == 2)
         #expect((desktopManager.entries.first?["enabled"] as? Bool) == false)
 
-        // 2. Non-desktop launch (`enabled: false`): installs trusted package and immediately sets enabled = false.
-        let mobileManager = MockTrustedDesktopParityManager(trustedRootPath: trustedRoot.path)
+        // 2. Fresh non-desktop / Build 43 launch (`enabled: false`): NEVER materializes or installs desktop_parity.js.
+        let freshDisabledRoot = root.appending(path: "TrustedDisabledFresh", directoryHint: .isDirectory)
+        let mobileManager = MockTrustedDesktopParityManager(trustedRootPath: freshDisabledRoot.path)
         mobileManager.returnInitiallyEnabled = true
         await CuriumDesktopParityExtension.ensureInstalled(using: mobileManager, enabled: false)
-        #expect(mobileManager.installAttempts == 1)
-        #expect(mobileManager.setEnabledCalls.contains { $0.0 == CuriumDesktopParityExtension.extensionID && $0.1 == false })
-        #expect((mobileManager.entries.first?["enabled"] as? Bool) == false)
+        #expect(mobileManager.installAttempts == 0)
+        #expect(mobileManager.setEnabledCalls.isEmpty)
+        #expect(mobileManager.entries.isEmpty)
+        #expect(!FileManager.default.fileExists(
+            atPath: freshDisabledRoot.appending(path: CuriumDesktopParityExtension.directoryName).path
+        ))
+
+        // 3. Build 42 -> Build 43 upgrade (`enabled: false` when already installed & enabled):
+        //    disables existing extension in place with zero disk materialization or reinstall.
+        let upgradeRoot = root.appending(path: "TrustedDisabledUpgrade", directoryHint: .isDirectory)
+        let upgradeManager = MockTrustedDesktopParityManager(trustedRootPath: upgradeRoot.path)
+        upgradeManager.entries = [[
+            "id": CuriumDesktopParityExtension.extensionID,
+            "name": "Curium Desktop Parity",
+            "version": CuriumDesktopParityExtension.manifestVersion,
+            "enabled": true,
+        ]]
+        await CuriumDesktopParityExtension.ensureInstalled(using: upgradeManager, enabled: false)
+        #expect(upgradeManager.installAttempts == 0)
+        #expect(upgradeManager.setEnabledCalls.contains { $0.0 == CuriumDesktopParityExtension.extensionID && $0.1 == false })
+        #expect((upgradeManager.entries.first?["enabled"] as? Bool) == false)
+        #expect(!FileManager.default.fileExists(
+            atPath: upgradeRoot.appending(path: CuriumDesktopParityExtension.directoryName).path
+        ))
     }
 
     @Test("CuriumExtensionStore hides both built-in extensions (Video PiP and Desktop Parity) across refresh, isInstalled, badges, blocked counts, and action notifications")
@@ -831,5 +857,75 @@ struct CuriumDesktopParityTests {
         let reloaded = CuriumFingerprintStore(fileURL: storeURL)
         #expect(reloaded.profile(id: "default")?.desktop == freshStore.profile(id: "default")?.desktop)
         #expect(reloaded.profile(id: "default")?.fingerprintSeed == freshStore.profile(id: "default")?.fingerprintSeed)
+    }
+
+    @Test("CuriumExtensionStore disables Desktop Parity JS extension automatically when engine advertises Build 43 nativeDesktopParityV1")
+    @MainActor
+    func extensionStoreDisablesDesktopParityWhenNativeSupported() async throws {
+        let desktopProfile = CuriumFingerprintPresets.macosDesktopFirst
+        let mobileProfile = CuriumFingerprintPresets.defaultAuthenticChrome
+
+        let build42Caps = CuriumEngineFingerprintCapabilities(dictionary: [
+            "contractVersion": 2,
+            "supportedSchemaVersions": [1, 2],
+            "maxConfigBytes": 65_536,
+        ])
+        let build43Caps = CuriumEngineFingerprintCapabilities(dictionary: [
+            "contractVersion": 3,
+            "supportedSchemaVersions": [1, 2, 3],
+            "maxConfigBytes": 65_536,
+            "features": ["nativeDesktopParityV1": true],
+        ])
+
+        #expect(CuriumExtensionStore.shouldEnableDesktopParityExtension(for: desktopProfile, capabilities: build42Caps))
+        #expect(!CuriumExtensionStore.shouldEnableDesktopParityExtension(for: mobileProfile, capabilities: build42Caps))
+        #expect(!CuriumExtensionStore.shouldEnableDesktopParityExtension(for: desktopProfile, capabilities: build43Caps))
+        #expect(!CuriumExtensionStore.shouldEnableDesktopParityExtension(for: mobileProfile, capabilities: build43Caps))
+
+        // 1. Fresh Build 43 manager: never materializes or installs Desktop Parity extension (0 MAIN-world scripts).
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "curium-parity-native-gate-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let freshRoot = root.appending(path: "FreshTrusted", directoryHint: .isDirectory)
+        let freshManager = MockTrustedDesktopParityManager(trustedRootPath: freshRoot.path)
+        _ = CuriumExtensionStore(manager: freshManager, capabilitiesProvider: { build43Caps })
+        for _ in 0..<40 {
+            if freshManager.entries.contains(where: { ($0["id"] as? String) == CuriumVideoPiPExtension.extensionID }) {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(freshManager.installAttempts == 0)
+        #expect(!freshManager.entries.contains(where: { ($0["id"] as? String) == CuriumDesktopParityExtension.extensionID }))
+        #expect(!FileManager.default.fileExists(
+            atPath: freshRoot.appending(path: CuriumDesktopParityExtension.directoryName).path
+        ))
+
+        // 2. Build 42 -> Build 43 upgrade manager: disables pre-existing Desktop Parity extension without reinstalling.
+        let upgradeRoot = root.appending(path: "UpgradeTrusted", directoryHint: .isDirectory)
+        let upgradeManager = MockTrustedDesktopParityManager(trustedRootPath: upgradeRoot.path)
+        upgradeManager.entries = [[
+            "id": CuriumDesktopParityExtension.extensionID,
+            "name": "Curium Desktop Parity",
+            "version": CuriumDesktopParityExtension.manifestVersion,
+            "enabled": true,
+        ]]
+        _ = CuriumExtensionStore(manager: upgradeManager, capabilitiesProvider: { build43Caps })
+        for _ in 0..<40 {
+            if let entry = upgradeManager.entries.first(where: { ($0["id"] as? String) == CuriumDesktopParityExtension.extensionID }),
+               (entry["enabled"] as? Bool) == false {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let parityEntry = try #require(
+            upgradeManager.entries.first(where: { ($0["id"] as? String) == CuriumDesktopParityExtension.extensionID })
+        )
+        #expect(upgradeManager.installAttempts == 0)
+        #expect((parityEntry["enabled"] as? Bool) == false)
+        #expect(!FileManager.default.fileExists(
+            atPath: upgradeRoot.appending(path: CuriumDesktopParityExtension.directoryName).path
+        ))
     }
 }

@@ -6727,3 +6727,481 @@ struct CuriumMediaRadarAndDownloaderTests {
         #expect(a11y.recentColumns == 1)
     }
 }
+
+@Suite("Build 43 Contracts: Schema v3 & Zero-Restart Runtime Privacy Policy")
+struct CuriumBuild43ContractTests {
+    private static let build42Caps = CuriumEngineFingerprintCapabilities(dictionary: [
+        "contractVersion": 2,
+        "supportedSchemaVersions": [1, 2],
+        "maxConfigBytes": 65_536,
+    ])
+
+    private static let build43Caps = CuriumEngineFingerprintCapabilities(dictionary: [
+        "contractVersion": 3,
+        "supportedSchemaVersions": [1, 2, 3],
+        "maxConfigBytes": 65_536,
+        "runtimePolicyVersion": 1,
+        "maxRuntimePolicyBytes": 16_384,
+        "activationScopes": [
+            "farbling": "runtime_hot",
+            "webrtcPolicy": "runtime_hot",
+            "doNotTrack": "runtime_hot",
+            "globalPrivacyControl": "runtime_hot",
+            "speechVoiceHiding": "runtime_hot",
+            "profileHotSwap": "planned_build_44",
+        ],
+        "features": [
+            "hotRuntimePrivacyPolicy": true,
+            "stealthEdgeCanvasFarbling": true,
+            "nativeDesktopParityV1": true,
+            "coherentWebDPR": true,
+            "gcrwebSuppressedAtSource": true,
+            "nativeKeyboardLayoutMap": true,
+            "nativeSpeechSynthesisVoices": true,
+            "nativeWindowChromeSurface": true,
+            "profileCachePurgeHook": true,
+        ],
+    ])
+
+    @Test("Capabilities parse Build 43 v3 fields cleanly and default safely to 0/false on Build 42 and nil")
+    func capabilitiesV3AndBuild42BackwardCompat() {
+        #expect(CuriumFingerprintSchema.version == 3)
+        #expect(CuriumFingerprintSchema.minSupportedVersion == 1)
+        #expect(CuriumFingerprintSchema.runtimePolicyVersion == 1)
+        #expect(CuriumFingerprintSchema.maxRuntimePolicyBytes == 16_384)
+
+        let v3 = Self.build43Caps
+        #expect(v3.contractVersion == 3)
+        #expect(v3.supportedSchemaVersions == [1, 2, 3])
+        #expect(v3.runtimePolicyVersion == 1)
+        #expect(v3.maxRuntimePolicyBytes == 16_384)
+        #expect(v3.supportsLaunchFingerprintConfig)
+        #expect(v3.supportsNativeAntiFingerprinting)
+        #expect(v3.supportsHotRuntimePrivacyPolicy)
+        #expect(v3.supportsNativeDesktopParity)
+        #expect(v3.supportsCoherentWebDPR)
+        #expect(v3.supportsStealthEdgeFarbling)
+        #expect(v3.supportsProfileCachePurgeHook)
+
+        for legacy in [Self.build42Caps, CuriumEngineFingerprintCapabilities(dictionary: nil)] {
+            #expect(legacy.runtimePolicyVersion == 0)
+            #expect(legacy.maxRuntimePolicyBytes == 0)
+            #expect(!legacy.supportsHotRuntimePrivacyPolicy)
+            #expect(!legacy.supportsNativeDesktopParity)
+            #expect(!legacy.supportsCoherentWebDPR)
+            #expect(!legacy.supportsStealthEdgeFarbling)
+            #expect(!legacy.supportsProfileCachePurgeHook)
+        }
+    }
+
+    @Test("Schema v3 wire serialization emits availTop, availLeft, devicePixelRatio, and personaSeed while v2 downgrade strips them cleanly")
+    @MainActor
+    func schemaV3WireAndV2Downgrade() throws {
+        var macNotched = CuriumFingerprintPresets.macosDesktopFirst
+        macNotched.fingerprintSeed = nil
+        macNotched.farbling = nil
+        macNotched.desktop.screen = CuriumScreenOverride(
+            width: 1512, height: 982, availWidth: 1512, availHeight: 914, colorDepth: 30
+        )
+
+        let expectedPersonaSeed = CuriumFingerprintSchema.sha256Hex(
+            CuriumProfileFontManager.profileSeedString(for: macNotched)
+        )
+        #expect(CuriumFingerprintSchema.isValidSeedHex(expectedPersonaSeed))
+
+        // 1. Default v3 serialization infers desktop macOS availTop (38), availLeft (0), DPR (2.0), and personaSeed.
+        let v3Data = try macNotched.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US"])
+        let v3Obj = try #require(JSONSerialization.jsonObject(with: v3Data) as? [String: Any])
+        #expect((v3Obj["schemaVersion"] as? Int) == 3)
+        #expect((v3Obj["personaSeed"] as? String) == expectedPersonaSeed)
+        #expect(v3Obj["fingerprintSeed"] == nil)
+        let desktopV3 = try #require(v3Obj["desktop"] as? [String: Any])
+        let screenV3 = try #require(desktopV3["screen"] as? [String: Any])
+        #expect((screenV3["availTop"] as? Int) == 38)
+        #expect((screenV3["availLeft"] as? Int) == 0)
+        #expect((screenV3["devicePixelRatio"] as? NSNumber)?.doubleValue == 2.0)
+
+        // 2. Non-notched 2560x1440 display infers availTop == 25; explicit overrides take precedence.
+        var macExternal = macNotched
+        macExternal.desktop.screen = CuriumScreenOverride(
+            width: 2560, height: 1440, availWidth: 2560, availHeight: 1409, colorDepth: 30
+        )
+        let extV3Obj = try #require(
+            JSONSerialization.jsonObject(with: try macExternal.makeEngineLaunchJSON(schemaVersion: 3)) as? [String: Any]
+        )
+        let extScreen = try #require((extV3Obj["desktop"] as? [String: Any])?["screen"] as? [String: Any])
+        #expect((extScreen["availTop"] as? Int) == 25)
+        #expect((extScreen["availLeft"] as? Int) == 0)
+        #expect((extScreen["devicePixelRatio"] as? NSNumber)?.doubleValue == 2.0)
+
+        var explicit = macNotched
+        explicit.desktop.screen = CuriumScreenOverride(
+            width: 1728, height: 1117, availWidth: 1666, availHeight: 1079, colorDepth: 30,
+            availTop: 38, availLeft: 62, devicePixelRatio: 2.0
+        )
+        let explicitV3Obj = try #require(
+            JSONSerialization.jsonObject(with: try explicit.makeEngineLaunchJSON(schemaVersion: 3)) as? [String: Any]
+        )
+        let explicitScreenV3 = try #require((explicitV3Obj["desktop"] as? [String: Any])?["screen"] as? [String: Any])
+        #expect((explicitScreenV3["availTop"] as? Int) == 38)
+        #expect((explicitScreenV3["availLeft"] as? Int) == 62)
+        #expect((explicitScreenV3["devicePixelRatio"] as? NSNumber)?.doubleValue == 2.0)
+
+        // 3. Build 42 downgrade (schemaVersion: 2) strips all v3-only keys cleanly, even when explicit.
+        let v2Data = try explicit.makeEngineLaunchJSON(preferredSystemLanguages: ["en-US"], schemaVersion: 2)
+        let v2Obj = try #require(JSONSerialization.jsonObject(with: v2Data) as? [String: Any])
+        #expect((v2Obj["schemaVersion"] as? Int) == 2)
+        #expect(v2Obj["personaSeed"] == nil)
+        let desktopV2 = try #require(v2Obj["desktop"] as? [String: Any])
+        let screenV2 = try #require(desktopV2["screen"] as? [String: Any])
+        #expect((screenV2["width"] as? Int) == 1728)
+        #expect((screenV2["availWidth"] as? Int) == 1666)
+        #expect(screenV2["availTop"] == nil)
+        #expect(screenV2["availLeft"] == nil)
+        #expect(screenV2["devicePixelRatio"] == nil)
+
+        // 4. Store imports a v3 wire payload preserving v3 screen geometry/DPR fields.
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-v3-import-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = CuriumFingerprintStore(fileURL: dir.appending(path: CuriumFingerprintStore.fileName))
+        var importable = explicit
+        importable.id = "p-b43wire1"
+        let importReport = try store.importProfileJSON(try importable.makeEngineLaunchJSON(schemaVersion: 3))
+        #expect(importReport.isValid, "Errors: \(importReport.errors)")
+        let imported = try #require(store.profile(id: "p-b43wire1"))
+        #expect(imported.desktop.screen?.availTop == 38)
+        #expect(imported.desktop.screen?.availLeft == 62)
+        #expect(imported.desktop.screen?.devicePixelRatio == 2.0)
+    }
+
+    @Test("Validator enforces v3 screen bounds for availTop (0...256), availLeft (0...512), and devicePixelRatio (1.0...4.0)")
+    func validatorEnforcesScreenV3Bounds() {
+        var valid = CuriumFingerprintPresets.macosDesktopFirst
+        valid.id = "p-validv3"
+        valid.desktop.screen = CuriumScreenOverride(
+            width: 1728, height: 1117, availWidth: 1666, availHeight: 1079, colorDepth: 30,
+            availTop: 0, availLeft: 0, devicePixelRatio: 1.0
+        )
+        #expect(CuriumFingerprintValidator.validate(valid).isValid)
+
+        valid.desktop.screen = CuriumScreenOverride(
+            width: 1728, height: 1117, availWidth: 1666, availHeight: 1079, colorDepth: 30,
+            availTop: 256, availLeft: 512, devicePixelRatio: 4.0
+        )
+        #expect(CuriumFingerprintValidator.validate(valid).isValid)
+
+        for badScreen in [
+            CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 914, colorDepth: 30, availTop: -1),
+            CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 914, colorDepth: 30, availTop: 257),
+            CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 914, colorDepth: 30, availLeft: -1),
+            CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 914, colorDepth: 30, availLeft: 513),
+            CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 914, colorDepth: 30, devicePixelRatio: 0.99),
+            CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 914, colorDepth: 30, devicePixelRatio: 4.01),
+            CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 914, colorDepth: 30, devicePixelRatio: .nan),
+            CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 914, colorDepth: 30, devicePixelRatio: .infinity),
+        ] {
+            var bad = valid
+            bad.desktop.screen = badScreen
+            let report = CuriumFingerprintValidator.validate(bad)
+            #expect(!report.isValid, "Expected invalid report for screen \(badScreen)")
+        }
+    }
+
+    @Test("makeRuntimePrivacyPolicyJSON emits strict policySchemaVersion 1 payload with explicit nulls when farbling is OFF")
+    func runtimePrivacyPolicyJSONContract() throws {
+        let allowedKeys: Set<String> = [
+            "policySchemaVersion",
+            "policyRevision",
+            "fingerprintSeed",
+            "farbling",
+            "webrtcIpHandlingPolicy",
+            "enableDoNotTrack",
+            "enableGlobalPrivacyControl",
+            "hideSpeechVoices",
+        ]
+
+        // 1. Hardened ON
+        var hardened = CuriumFingerprintPresets.macosDesktopFirst
+        let seed = CuriumFingerprintSchema.generateRandomSeedHex()
+        hardened.fingerprintSeed = seed
+        hardened.farbling = .allEnabled
+        hardened.webrtcIpHandlingPolicy = .disableNonProxiedUdp
+        hardened.enableDoNotTrack = true
+        hardened.enableGlobalPrivacyControl = true
+        hardened.hideSpeechVoices = true
+
+        let onData = try hardened.makeRuntimePrivacyPolicyJSON(policyRevision: 7)
+        #expect(onData.count <= CuriumFingerprintSchema.maxRuntimePolicyBytes)
+        let onObj = try #require(JSONSerialization.jsonObject(with: onData) as? [String: Any])
+        #expect(Set(onObj.keys) == allowedKeys)
+        #expect((onObj["policySchemaVersion"] as? Int) == 1)
+        #expect((onObj["policyRevision"] as? NSNumber)?.uint64Value == 7)
+        #expect((onObj["fingerprintSeed"] as? String) == seed)
+        #expect((onObj["farbling"] as? [String: Bool]) == [
+            "canvas": true, "audio": true, "webgl": true, "textMetrics": true,
+        ])
+        #expect((onObj["webrtcIpHandlingPolicy"] as? String) == "disable_non_proxied_udp")
+        #expect((onObj["enableDoNotTrack"] as? Bool) == true)
+        #expect((onObj["enableGlobalPrivacyControl"] as? Bool) == true)
+        #expect((onObj["hideSpeechVoices"] as? Bool) == true)
+
+        // 2. Hardened OFF (explicit JSON null clears fingerprintSeed & farbling)
+        var clean = CuriumFingerprintPresets.macosDesktopFirst
+        clean.fingerprintSeed = nil
+        clean.farbling = nil
+        clean.webrtcIpHandlingPolicy = .default
+        clean.enableDoNotTrack = false
+        clean.enableGlobalPrivacyControl = false
+        clean.hideSpeechVoices = false
+
+        let offData = try clean.makeRuntimePrivacyPolicyJSON(policyRevision: UInt64.max)
+        #expect(offData.count <= CuriumFingerprintSchema.maxRuntimePolicyBytes)
+        let offObj = try #require(JSONSerialization.jsonObject(with: offData) as? [String: Any])
+        #expect(Set(offObj.keys) == allowedKeys)
+        #expect((offObj["policySchemaVersion"] as? Int) == 1)
+        #expect((offObj["policyRevision"] as? NSNumber)?.uint64Value == CuriumFingerprintValidator.maxSafeJSONRevision)
+        #expect(offObj["fingerprintSeed"] is NSNull)
+        #expect(offObj["farbling"] is NSNull)
+        #expect((offObj["webrtcIpHandlingPolicy"] as? String) == "default")
+        #expect((offObj["enableDoNotTrack"] as? Bool) == false)
+        #expect((offObj["enableGlobalPrivacyControl"] as? Bool) == false)
+        #expect((offObj["hideSpeechVoices"] as? Bool) == false)
+
+        // 3. Auto hideSpeechVoices (`nil`) encodes explicit JSON `null` so Build 43 preserves 3-state Auto mode.
+        var autoSpeech = clean
+        autoSpeech.hideSpeechVoices = nil
+        let autoData = try autoSpeech.makeRuntimePrivacyPolicyJSON(policyRevision: 9)
+        #expect(autoData.count <= CuriumFingerprintSchema.maxRuntimePolicyBytes)
+        let autoObj = try #require(JSONSerialization.jsonObject(with: autoData) as? [String: Any])
+        #expect(Set(autoObj.keys) == allowedKeys)
+        #expect(autoObj["hideSpeechVoices"] is NSNull)
+    }
+
+    @Test("EngineLaunchSnapshot.onlyHotMutableFieldsDiffer separates the 6 hot privacy fields from launch-frozen identity/proxy/hardware fields")
+    func snapshotOnlyHotMutableFieldsDiffer() {
+        var base = CuriumFingerprintPresets.macosDesktopFirst
+        base.id = "p-hotdiff"
+        let snapshot = CuriumFingerprintBootstrap.EngineLaunchSnapshot(
+            from: base,
+            wasUnconfiguredBuild39: false
+        )
+
+        // Unchanged or UI-only metadata edit -> false.
+        #expect(!snapshot.onlyHotMutableFieldsDiffer(from: base))
+        var metadataOnly = base
+        metadataOnly.displayName = "Renamed"
+        metadataOnly.palette = .californium
+        #expect(!snapshot.onlyHotMutableFieldsDiffer(from: metadataOnly))
+
+        // Each of the 6 hot-mutable privacy fields alone -> true.
+        var seedEdit = base
+        seedEdit.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
+        seedEdit.farbling = .allEnabled
+        #expect(snapshot.onlyHotMutableFieldsDiffer(from: seedEdit))
+
+        var farblingEdit = seedEdit
+        let seededSnapshot = CuriumFingerprintBootstrap.EngineLaunchSnapshot(
+            from: seedEdit,
+            wasUnconfiguredBuild39: false
+        )
+        farblingEdit.farbling = .stealthSafe
+        #expect(seededSnapshot.onlyHotMutableFieldsDiffer(from: farblingEdit))
+
+        var webrtcEdit = base
+        webrtcEdit.webrtcIpHandlingPolicy = .disableNonProxiedUdp
+        #expect(snapshot.onlyHotMutableFieldsDiffer(from: webrtcEdit))
+
+        var dntEdit = base
+        dntEdit.enableDoNotTrack = true
+        #expect(snapshot.onlyHotMutableFieldsDiffer(from: dntEdit))
+
+        var gpcEdit = base
+        gpcEdit.enableGlobalPrivacyControl = true
+        #expect(snapshot.onlyHotMutableFieldsDiffer(from: gpcEdit))
+
+        var speechEdit = base
+        speechEdit.hideSpeechVoices = true
+        #expect(snapshot.onlyHotMutableFieldsDiffer(from: speechEdit))
+
+        // Launch-frozen changes (alone or mixed with hot-mutable) -> false.
+        var proxyEdit = base
+        proxyEdit.proxy = .direct
+        #expect(!snapshot.onlyHotMutableFieldsDiffer(from: proxyEdit))
+
+        var mixedEdit = base
+        mixedEdit.enableGlobalPrivacyControl = true
+        mixedEdit.hardware.timezone = "Europe/Berlin"
+        #expect(!snapshot.onlyHotMutableFieldsDiffer(from: mixedEdit))
+
+        var fontEdit = base
+        fontEdit.fontProfile = .windows
+        #expect(!snapshot.onlyHotMutableFieldsDiffer(from: fontEdit))
+    }
+
+    @Test("Hot runtime privacy policy keeps hasPendingProfileSwitch false on Build 43 v3 and falls back to relaunch banner on Build 42 v2")
+    @MainActor
+    func hotApplyV3ZeroRestartVsV2RestartBanner() throws {
+        defer { CuriumFingerprintBootstrap.resetStateForTesting() }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-b43-hot-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let supportRoot = dir.appending(path: "Application Support", directoryHint: .isDirectory)
+        let cachesRoot = dir.appending(path: "Caches", directoryHint: .isDirectory)
+        let curiumRoot = dir.appending(path: "SharedCurium", directoryHint: .isDirectory)
+        let fileURL = curiumRoot.appending(path: CuriumFingerprintStore.fileName, directoryHint: .notDirectory)
+
+        var activeCaps = Self.build43Caps
+        var appliedPayloads: [Data] = []
+        var shouldFailApply = false
+
+        let store = CuriumFingerprintStore(
+            fileURL: fileURL,
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot,
+            curiumSupportRoot: curiumRoot,
+            capabilitiesProvider: { activeCaps },
+            runtimePolicyApplier: { data, err in
+                if shouldFailApply {
+                    err = NSError(
+                        domain: CrIOSFingerprintErrorDomain,
+                        code: CrIOSFingerprintErrorCode.invalidJSON.rawValue,
+                        userInfo: [NSLocalizedDescriptionKey: "Simulated policy rejection"]
+                    )
+                    return false
+                }
+                appliedPayloads.append(data)
+                return true
+            }
+        )
+
+        var launchPayloads: [Data] = []
+        let launchOutcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: store,
+            capabilitiesProvider: { activeCaps },
+            configureEngine: { data, _ in
+                if let data { launchPayloads.append(data) }
+                return true
+            }
+        )
+        #expect(launchOutcome == .configured(profileID: "default", revision: 1, nativeHardware: false))
+        let launchObj = try #require(
+            launchPayloads.last.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        )
+        #expect((launchObj["schemaVersion"] as? Int) == 3)
+        #expect(launchObj["personaSeed"] is String)
+
+        // 1. Build 43 (v3): Toggle Privacy Hardening ON -> hot-applied live, zero restart required!
+        var personal = try #require(store.profile(id: "default"))
+        let seed = CuriumFingerprintSchema.generateRandomSeedHex()
+        personal.farbling = .allEnabled
+        personal.fingerprintSeed = seed
+        personal.enableGlobalPrivacyControl = true
+        personal.webrtcIpHandlingPolicy = .disableNonProxiedUdp
+        #expect(store.upsert(personal).isValid)
+        #expect(appliedPayloads.count == 1)
+        #expect(!store.hasPendingActiveProfileEngineChanges)
+        #expect(!store.hasPendingProfileSwitch)
+        let firstPolicy = try #require(
+            JSONSerialization.jsonObject(with: appliedPayloads[0]) as? [String: Any]
+        )
+        #expect((firstPolicy["policySchemaVersion"] as? Int) == 1)
+        #expect((firstPolicy["fingerprintSeed"] as? String) == seed)
+        #expect((firstPolicy["enableGlobalPrivacyControl"] as? Bool) == true)
+        #expect((firstPolicy["webrtcIpHandlingPolicy"] as? String) == "disable_non_proxied_udp")
+        let rev1 = try #require((firstPolicy["policyRevision"] as? NSNumber)?.uint64Value)
+
+        // 2. Build 43 (v3): Toggle Privacy Hardening OFF -> second hot-apply with monotonic revision & null seed/farbling.
+        var turnedOff = try #require(store.profile(id: "default"))
+        turnedOff.farbling = nil
+        turnedOff.fingerprintSeed = nil
+        turnedOff.enableGlobalPrivacyControl = false
+        turnedOff.webrtcIpHandlingPolicy = .default
+        #expect(store.upsert(turnedOff).isValid)
+        #expect(appliedPayloads.count == 2)
+        #expect(!store.hasPendingActiveProfileEngineChanges)
+        #expect(!store.hasPendingProfileSwitch)
+        let secondPolicy = try #require(
+            JSONSerialization.jsonObject(with: appliedPayloads[1]) as? [String: Any]
+        )
+        let rev2 = try #require((secondPolicy["policyRevision"] as? NSNumber)?.uint64Value)
+        #expect(rev2 > rev1)
+        #expect(secondPolicy["fingerprintSeed"] is NSNull)
+        #expect(secondPolicy["farbling"] is NSNull)
+
+        // 3. Build 43 (v3): Engine rejection fails closed and shows relaunch banner.
+        shouldFailApply = true
+        var rejectedEdit = try #require(store.profile(id: "default"))
+        rejectedEdit.enableGlobalPrivacyControl = true
+        #expect(store.upsert(rejectedEdit).isValid)
+        #expect(appliedPayloads.count == 2)
+        #expect(store.lastRuntimePolicyError?.contains("Simulated policy rejection") == true)
+        #expect(store.hasPendingActiveProfileEngineChanges)
+        #expect(store.hasPendingProfileSwitch)
+        shouldFailApply = false
+
+        // Reverting back to off clears pending change cleanly.
+        var revertEdit = try #require(store.profile(id: "default"))
+        revertEdit.enableGlobalPrivacyControl = false
+        #expect(store.upsert(revertEdit).isValid)
+        #expect(!store.hasPendingActiveProfileEngineChanges)
+
+        // 4. Build 43 (v3): Editing an inactive profile never invokes live policy applier.
+        let secondary = try #require(store.createProfile(fromTemplate: "macos-desktop", displayName: "Secondary"))
+        var editSecondary = secondary
+        editSecondary.enableGlobalPrivacyControl = true
+        #expect(store.upsert(editSecondary).isValid)
+        #expect(appliedPayloads.count == 2)
+        #expect(!store.hasPendingProfileSwitch)
+
+        // 5. Build 43 (v3): Launch-frozen proxy edit still requires cold relaunch.
+        var proxyEdit = try #require(store.profile(id: "default"))
+        proxyEdit.proxy = .direct
+        #expect(store.upsert(proxyEdit).isValid)
+        #expect(appliedPayloads.count == 2)
+        #expect(store.hasPendingActiveProfileEngineChanges)
+        #expect(store.hasPendingProfileSwitch)
+
+        // 6. Build 42 (v2): Relaunch on Build 42 caps -> Privacy Hardening edit does NOT hot-apply and lights up restart banner.
+        activeCaps = Self.build42Caps
+        launchPayloads.removeAll()
+        let v2Launch = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: store,
+            capabilitiesProvider: { activeCaps },
+            configureEngine: { data, _ in
+                if let data { launchPayloads.append(data) }
+                return true
+            }
+        )
+        if case .configured(let id, _, _) = v2Launch {
+            #expect(id == "default")
+        } else {
+            Issue.record("Expected configured Build 42 launch, got \(v2Launch)")
+        }
+        let v2LaunchObj = try #require(
+            launchPayloads.last.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        )
+        #expect((v2LaunchObj["schemaVersion"] as? Int) == 2)
+        #expect(v2LaunchObj["personaSeed"] == nil)
+
+        var v2Hardened = try #require(store.profile(id: "default"))
+        v2Hardened.enableGlobalPrivacyControl = true
+        v2Hardened.webrtcIpHandlingPolicy = .disableNonProxiedUdp
+        #expect(store.upsert(v2Hardened).isValid)
+        #expect(appliedPayloads.count == 2)
+        #expect(store.hasPendingActiveProfileEngineChanges)
+        #expect(store.hasPendingProfileSwitch)
+
+        // 7. ObjC bridge fails closed cleanly against the currently linked Build 42 engine.
+        var bridgeError: NSError?
+        let bridgeData = try v2Hardened.makeRuntimePrivacyPolicyJSON(policyRevision: 1)
+        let applied = CuriumApplyRuntimePrivacyPolicy(bridgeData, &bridgeError)
+        if !CuriumFingerprintBootstrap.engineCapabilities().supportsHotRuntimePrivacyPolicy {
+            #expect(!applied)
+            #expect(bridgeError?.domain == CrIOSFingerprintErrorDomain)
+            #expect(bridgeError?.code == CrIOSFingerprintErrorCode.unsupportedSchema.rawValue)
+            #expect(CuriumEngineActiveRuntimePolicyStatusDict() == nil)
+        }
+    }
+}

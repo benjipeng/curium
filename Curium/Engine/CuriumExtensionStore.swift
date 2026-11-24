@@ -132,7 +132,17 @@ final class CuriumExtensionStore {
         return counts.isEmpty ? nil : counts.reduce(0, +)
     }
 
-    init(manager: (any CrIOSExtensionManagingV1)?) {
+    static func shouldEnableDesktopParityExtension(
+        for profile: CuriumFingerprintProfile,
+        capabilities: CuriumEngineFingerprintCapabilities = CuriumFingerprintBootstrap.engineCapabilities()
+    ) -> Bool {
+        profile.defaultSlot == .desktop && !capabilities.supportsNativeDesktopParity
+    }
+
+    init(
+        manager: (any CrIOSExtensionManagingV1)?,
+        capabilitiesProvider: (() -> CuriumEngineFingerprintCapabilities)? = nil
+    ) {
         self.manager = manager
         if let manager {
             Self.windows.add(self)
@@ -140,11 +150,18 @@ final class CuriumExtensionStore {
                 self?.handleActionPresentationChange(extensionID: extensionID)
             })
             observationBox = MainThreadObservationBox(token)
+            let resolveCapabilities = capabilitiesProvider ?? {
+                CuriumFingerprintBootstrap.engineCapabilities()
+            }
             Task { @MainActor in
                 await CuriumVideoPiPExtension.ensureInstalled(using: manager)
                 let active = CuriumFingerprintBootstrap.frozenLaunchProfile
                     ?? CuriumFingerprintStore.shared.activeProfile
-                let desktopParityEnabled = active.defaultSlot == .desktop
+                let capabilities = resolveCapabilities()
+                let desktopParityEnabled = Self.shouldEnableDesktopParityExtension(
+                    for: active,
+                    capabilities: capabilities
+                )
                 let profileSeed = CuriumProfileFontManager.profileSeedString(for: active)
                 let menuBarHeight = CuriumMacOSManifold.inferredMenuBarHeight(for: active.desktop.screen)
                 let dockOnLeft = CuriumMacOSManifold.prefersLeftDock(forProfileSeed: profileSeed)

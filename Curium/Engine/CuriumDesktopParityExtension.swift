@@ -1010,13 +1010,21 @@ enum CuriumDesktopParityExtension {
 
         if let idx = completedManagers.firstIndex(where: { $0.box.value === managerObj }) {
             if completedManagers[idx].enabled != enabled {
-                if let entry = (try? manager.extensions())?.first(where: { ($0["id"] as? String) == extensionID }),
-                   (entry["enabled"] as? Bool) != enabled {
-                    try? manager.setExtensionWithID(extensionID, enabled: enabled)
+                if let entry = (try? manager.extensions())?.first(where: { ($0["id"] as? String) == extensionID }) {
+                    if (entry["enabled"] as? Bool) != enabled {
+                        try? manager.setExtensionWithID(extensionID, enabled: enabled)
+                    }
+                    completedManagers[idx].enabled = enabled
+                    return
                 }
-                completedManagers[idx].enabled = enabled
+                if !enabled {
+                    completedManagers[idx].enabled = false
+                    return
+                }
+                completedManagers.remove(at: idx)
+            } else {
+                return
             }
-            return
         }
 
         let task = Task<Void, Never> { @MainActor in
@@ -1060,6 +1068,24 @@ enum CuriumDesktopParityExtension {
                 }
                 log.error("CuriumDesktopParity trusted root failed: \(err.localizedDescription, privacy: .public)")
                 return false
+            }
+
+            if !enabled {
+                do {
+                    let entries = try manager.extensions()
+                    if let existing = entries.first(where: { ($0["id"] as? String) == extensionID }),
+                       (existing["enabled"] as? Bool) != false {
+                        try? manager.setExtensionWithID(extensionID, enabled: false)
+                    }
+                    return true
+                } catch {
+                    let nsError = error as NSError
+                    if isTransientStartupError(nsError), attempt < retryBackoffs.count {
+                        try? await Task.sleep(for: retryBackoffs[attempt])
+                        continue
+                    }
+                    return true
+                }
             }
 
             let extDir: URL

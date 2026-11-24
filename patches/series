@@ -103,3 +103,5 @@
 0108-ios-curium-downloads-pdfkit-and-media-radar.patch
 0109-ios-curium-pip-upstream-and-cpp-guard.patch
 0110-ios-curium-native-anti-fingerprinting.patch
+0111-ios-curium-runtime-privacy-policy-v3.patch
+0112-ios-curium-native-desktop-parity.patch

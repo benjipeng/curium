@@ -12,8 +12,8 @@ the pinned engine first, translate to `patches/` once proven.
   `14792713617`, Chromium `160.0.8171.0`), patches `0001`–`0110`, with separate
   unstripped symbols artifact (`Chromium-Blink-160.0.8171.0-arm64-symbols`, ID
   `14793005935`). GHCR cache packages migrated to `ghcr.io/benjipeng/curium/*`.
-- **App / On `ac_duo`:** `Curium-0.1.17-b30-arm64.ipa` (Build 42, staged in LiveContainer `Documents/`).
-- **Release candidate:** `Curium-0.1.18-b31` (Build 42 pinned + pure-Swift `CuriumMacOSManifold` continuous Apple Silicon macOS identity sampler: 18 SKUs with W3C-capped `8 GB` `navigator.deviceMemory`, 14 authentic Nov-2026 chip-era macOS `14.x`/`15.x`/`26.x` releases, 8 verified Chromium Dash Chrome `156`/`157`/`158` builds, 11 mainstream `@2x` 30-bit Retina displays with `availHeight >= 960` + continuous right/bottom visible Dock, 45 clean CoreText macOS font suites, zero-noise native default on `Personal` & `macOS Desktop` cutting `tampering_ml_score` to `0.13` while keeping `Privacy Hardened` & opt-in farbling, fail-closed first-boot persistence, and `Proxy`-backed `Illegal invocation` receiver checks in `desktop_parity.js` v`1.2.1`; verified live A/B on both `iphone_duo_27_2` & `iphone_17_27_2`, `sdk 27.2`, `99/99` `CuriumTests` passing under `-warnings-as-errors`).
+- **App / Latest release:** `Curium-0.1.18-b31` (`cf78b18`, tag `curium-v0.1.18-b31`, GitHub Actions run `45322479070`, `Curium-0.1.18-b31-arm64.ipa` SHA-256 `2841113340a4611ab5ed1c285c1745fea2b59f344c043921167a7d991749d0d7`, Build 42 pinned + `CuriumMacOSManifold` continuous Apple Silicon macOS identity sampler).
+- **In flight (`feat/build-43-engine-wave`):** Build 43 engine wave (`0110`–`0112`, `EngineContract` v3) — hot-toggleable per-profile Privacy Hardening with zero app restart, stealth $3\times 3$ gradient-edge Canvas + constant/flat-run-guarded Audio farbling, canonical `@2x` Retina display ladder + coherent web-only DPR/CSS `MediaValues`, native C++ desktop parity retiring `CuriumDesktopParityExtension` on Build 43+, and Build-44-ready `PurgeProfileRuntimeCaches` / `profileHotSwap: "planned_build_44"` foundations.
 
 ## App (on the pinned engine)
 
@@ -164,9 +164,15 @@ permission element disable flag → `0107`) workarounds are retired.
 | `V8IOSJitPrepareForProcess` pre-`ChromeMain` probe (`CuriumRuntime.m`) | Prepares V8's iOS TXM / Simulator JIT pool before Crashpad installs exception handlers. | Permanent: shell-controlled JIT preference. |
 | `+[MetricsMediator logLaunchMetricsWithStartupInformation:connectedScenes:]` (`CuriumRuntime.m`) | No-op. Launch metrics walk Chrome's tab model for uploads Curium never makes. | None planned. |
 
-## Engine wave (Build 42 landed & pinned in `Kernel.lock`)
+## Engine wave (Build 43 in flight on `feat/build-43-engine-wave`; Build 42 pinned in `Kernel.lock`)
 
-Built in run `45112215845` (`29fd035`) after green `graph-diagnose.yml` (`45111093963`, `172 device objects`, `0` errors).
+Build 42 built in run `45112215845` (`29fd035`) after green `graph-diagnose.yml` (`45111093963`, `172 device objects`, `0` errors).
+
+- [ ] **Build 43 engine wave: hot Runtime Privacy Policy v3, stealth farbling, Retina DPR/screen ladder & native C++ desktop parity (`0110`–`0112`).**
+  - `0110`: `schemaVersion: 3` (`availTop`, `availLeft`, `devicePixelRatio`, `personaSeed`), 7-panel canonical `@2x` Apple Retina ladder + authentic `availTop`/`availLeft`, zoom-preserving web-only `@2x` DPR across `LocalDOMWindow` & CSS `MediaValues`, $3\times 3$ $\ge 3$-RGB-gradient `FarbleRGBA8Pixels` + flat-run-guarded `FarbleAudioSamples`, dynamic `ExecutionContext` site-key re-derivation.
+  - `0111`: Lock-free `curium_runtime_policy` (`applyRuntimePolicyJSON:error:`, `activeRuntimePolicyStatus`, `v3` `fingerprintCapabilities`), live browser+renderer observers syncing `RendererPreferences`, dynamic `Sec-GPC` (`global_privacy_control_util.cc` + `WebRuntimeFeatures`), and Build-44-ready `PurgeProfileRuntimeCaches()` / `profileHotSwap: "planned_build_44"`.
+  - `0112`: Native C++ desktop parity (`__gCrWeb`/`webkitMessageHandler` suppression at source, `window.chrome`, `Notification.permission`, 48-key macOS ANSI `GetKeyboardLayoutMap`, 199-voice seeded `speechSynthesis`, `MediaCapabilities`, `PublicKeyCredential` capabilities, `PresentationRequest`, `NetworkInformation.rtt`, `LanguageDetector`/`Summarizer`), gating off `CuriumDesktopParityExtension` when `nativeDesktopParityV1 == true`.
+  - Remaining: green `graph-diagnose.yml` + `build-ipa.yml`, `Kernel.lock` repin, `sync_curium_engine.py`, and live dual-simulator verification on `iphone_duo_27_2` & `iphone_17_27_2`.
 
 - [ ] **Verify smaller initial Wasm reservations on TXM (`ac_duo`, `0001`).**
   Landed in Build 41/42 (`0001` targets at most 8 MiB for a module's first

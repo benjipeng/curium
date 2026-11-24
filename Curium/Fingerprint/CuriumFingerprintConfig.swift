@@ -1,11 +1,14 @@
+import CryptoKit
 import Foundation
 import Security
 
 /// Schema versions shared with `third_party/blink/public/common/curium/curium_fingerprint_config.h`.
 enum CuriumFingerprintSchema {
     static let minSupportedVersion = 1
-    static let version = 2
+    static let version = 3
     static let maxPayloadBytes = 65_536
+    static let runtimePolicyVersion = 1
+    static let maxRuntimePolicyBytes = 16_384
     static let validDeviceMemoryBuckets: [Double] = [0.25, 0.5, 1, 2, 4, 8, 16, 32]
     static let validColorDepths: Set<Int> = [24, 30, 32]
     static let validFormFactors: Set<String> = [
@@ -29,6 +32,12 @@ enum CuriumFingerprintSchema {
             }
         }
         return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func sha256Hex(_ input: String) -> String {
+        SHA256.hash(data: Data(input.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     static func isValidSeedHex(_ hex: String) -> Bool {
@@ -130,6 +139,30 @@ struct CuriumScreenOverride: Codable, Equatable, Sendable {
     var availWidth: Int?
     var availHeight: Int?
     var colorDepth: Int?
+    // Build 43 (schemaVersion >= 3) optional geometry & web-only DPR overrides.
+    var availTop: Int?
+    var availLeft: Int?
+    var devicePixelRatio: Double?
+
+    init(
+        width: Int,
+        height: Int,
+        availWidth: Int? = nil,
+        availHeight: Int? = nil,
+        colorDepth: Int? = nil,
+        availTop: Int? = nil,
+        availLeft: Int? = nil,
+        devicePixelRatio: Double? = nil
+    ) {
+        self.width = width
+        self.height = height
+        self.availWidth = availWidth
+        self.availHeight = availHeight
+        self.colorDepth = colorDepth
+        self.availTop = availTop
+        self.availLeft = availLeft
+        self.devicePixelRatio = devicePixelRatio
+    }
 
     static let desktop1080pWindows = CuriumScreenOverride(
         width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, colorDepth: 24
@@ -240,7 +273,7 @@ struct CuriumIdentitySlot: Codable, Equatable, Sendable {
         maxTouchPoints != nil || pointerType != nil || hoverType != nil
     }
 
-    /// Returns a Build 40 (`schemaVersion: 1`) compatible copy with v2-only keys stripped.
+    /// Returns a Build 40 (`schemaVersion: 1`) compatible copy with v2+ keys stripped.
     func strippedForSchemaV1() -> CuriumIdentitySlot {
         var copy = self
         copy.screen = nil
@@ -249,6 +282,50 @@ struct CuriumIdentitySlot: Codable, Equatable, Sendable {
         copy.webglMaxRenderbufferSize = nil
         copy.webglMaxCubeMapTextureSize = nil
         copy.pdfViewerEnabled = nil
+        return copy
+    }
+
+    /// Returns a Build 41/42 (`schemaVersion: 2`) compatible copy with v3-only screen
+    /// geometry/DPR keys stripped so legacy engines never reject unknown fields.
+    func strippedForSchemaV2() -> CuriumIdentitySlot {
+        var copy = self
+        if var screen = copy.screen {
+            screen.availTop = nil
+            screen.availLeft = nil
+            screen.devicePixelRatio = nil
+            copy.screen = screen
+        }
+        return copy
+    }
+
+    /// Returns a Build 43 (`schemaVersion: 3`) wire-ready copy resolving desktop macOS
+    /// `availTop`, `availLeft`, and `devicePixelRatio` defaults when omitted.
+    func resolvedForSchemaV3() -> CuriumIdentitySlot {
+        var copy = self
+        guard var screen = copy.screen else { return copy }
+        let isDesktopMacOS = (mobile != true)
+            && ((platform ?? "").caseInsensitiveCompare("macOS") == .orderedSame
+                || navigatorPlatform == "MacIntel")
+        if isDesktopMacOS {
+            let availH = screen.availHeight ?? screen.height
+            if screen.availTop == nil {
+                if screen.height > availH {
+                    let inferred = CuriumMacOSManifold.inferredMenuBarHeight(for: screen)
+                    screen.availTop = min(inferred, screen.height - availH)
+                } else {
+                    screen.availTop = 0
+                }
+            }
+            if screen.availLeft == nil {
+                screen.availLeft = 0
+            }
+            if screen.devicePixelRatio == nil {
+                screen.devicePixelRatio = 2.0
+            }
+        } else if screen.availLeft == nil {
+            screen.availLeft = 0
+        }
+        copy.screen = screen
         return copy
     }
 
@@ -637,8 +714,8 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
         return copy
     }
 
-    /// Serializes strictly the engine wire schema (`schemaVersion: 2` by default, or `1` when
-    /// targeting a legacy Build 40 engine) without UI metadata.
+    /// Serializes strictly the engine wire schema (`schemaVersion: 3` by default, or `2`/`1`
+    /// when negotiating down for Build 40–42 engines) without UI metadata.
     func makeEngineLaunchJSON(
         preferredSystemLanguages: [String] = Locale.preferredLanguages,
         schemaVersion: Int = CuriumFingerprintSchema.version
@@ -656,13 +733,30 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
             max(CuriumFingerprintSchema.minSupportedVersion, schemaVersion)
         )
         let emitV2 = targetVersion >= 2
+        let emitV3 = targetVersion >= 3
+        let resolvedMobile: CuriumIdentitySlot
+        let resolvedDesktop: CuriumIdentitySlot
+        if emitV3 {
+            resolvedMobile = mobile.resolvedForSchemaV3()
+            resolvedDesktop = desktop.resolvedForSchemaV3()
+        } else if emitV2 {
+            resolvedMobile = mobile.strippedForSchemaV2()
+            resolvedDesktop = desktop.strippedForSchemaV2()
+        } else {
+            resolvedMobile = mobile.strippedForSchemaV1()
+            resolvedDesktop = desktop.strippedForSchemaV1()
+        }
+        let personaSeed: String? = emitV3
+            ? CuriumFingerprintSchema.sha256Hex(CuriumProfileFontManager.profileSeedString(for: self))
+            : nil
+
         let payload = EngineWirePayload(
             schemaVersion: targetVersion,
             revision: revision,
             profileId: id,
             defaultSlot: defaultSlot,
-            mobile: emitV2 ? mobile : mobile.strippedForSchemaV1(),
-            desktop: emitV2 ? desktop : desktop.strippedForSchemaV1(),
+            mobile: resolvedMobile,
+            desktop: resolvedDesktop,
             languages: resolvedLanguages,
             proxy: proxy,
             webrtcIpHandlingPolicy: webrtcIpHandlingPolicy,
@@ -672,7 +766,30 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
             fingerprintSeed: emitV2 ? fingerprintSeed : nil,
             farbling: (emitV2 && fingerprintSeed != nil) ? (farbling ?? .allEnabled) : nil,
             fontProfile: emitV2 ? fontProfile : nil,
-            hideSpeechVoices: emitV2 ? hideSpeechVoices : nil
+            hideSpeechVoices: emitV2 ? hideSpeechVoices : nil,
+            personaSeed: personaSeed
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(payload)
+    }
+
+    /// Serializes the Build 43 (`policySchemaVersion: 1`, `<= 16384` bytes) hot-mutable
+    /// runtime privacy policy payload for `CrIOSEngineBootstrap.applyRuntimePolicyJSON:error:`.
+    func makeRuntimePrivacyPolicyJSON(policyRevision: UInt64) throws -> Data {
+        let normalized = normalizedForPersistence()
+        let clampedRevision = min(CuriumFingerprintValidator.maxSafeJSONRevision, policyRevision)
+        let effectiveFarbling: CuriumFarblingSettings? =
+            normalized.fingerprintSeed != nil ? (normalized.farbling ?? .allEnabled) : nil
+        let payload = RuntimePrivacyPolicyWirePayload(
+            policySchemaVersion: CuriumFingerprintSchema.runtimePolicyVersion,
+            policyRevision: clampedRevision,
+            fingerprintSeed: normalized.fingerprintSeed,
+            farbling: effectiveFarbling,
+            webrtcIpHandlingPolicy: normalized.webrtcIpHandlingPolicy,
+            enableDoNotTrack: normalized.enableDoNotTrack,
+            enableGlobalPrivacyControl: normalized.enableGlobalPrivacyControl,
+            hideSpeechVoices: normalized.hideSpeechVoices
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -696,6 +813,53 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
         let farbling: CuriumFarblingSettings?
         let fontProfile: CuriumFontProfile?
         let hideSpeechVoices: Bool?
+        let personaSeed: String?
+    }
+
+    private struct RuntimePrivacyPolicyWirePayload: Encodable {
+        let policySchemaVersion: Int
+        let policyRevision: UInt64
+        let fingerprintSeed: String?
+        let farbling: CuriumFarblingSettings?
+        let webrtcIpHandlingPolicy: CuriumWebRTCPolicy
+        let enableDoNotTrack: Bool
+        let enableGlobalPrivacyControl: Bool
+        let hideSpeechVoices: Bool?
+
+        private enum CodingKeys: String, CodingKey {
+            case policySchemaVersion
+            case policyRevision
+            case fingerprintSeed
+            case farbling
+            case webrtcIpHandlingPolicy
+            case enableDoNotTrack
+            case enableGlobalPrivacyControl
+            case hideSpeechVoices
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(policySchemaVersion, forKey: .policySchemaVersion)
+            try container.encode(policyRevision, forKey: .policyRevision)
+            if let fingerprintSeed {
+                try container.encode(fingerprintSeed, forKey: .fingerprintSeed)
+            } else {
+                try container.encodeNil(forKey: .fingerprintSeed)
+            }
+            if let farbling {
+                try container.encode(farbling, forKey: .farbling)
+            } else {
+                try container.encodeNil(forKey: .farbling)
+            }
+            try container.encode(webrtcIpHandlingPolicy, forKey: .webrtcIpHandlingPolicy)
+            try container.encode(enableDoNotTrack, forKey: .enableDoNotTrack)
+            try container.encode(enableGlobalPrivacyControl, forKey: .enableGlobalPrivacyControl)
+            if let hideSpeechVoices {
+                try container.encode(hideSpeechVoices, forKey: .hideSpeechVoices)
+            } else {
+                try container.encodeNil(forKey: .hideSpeechVoices)
+            }
+        }
     }
 }
 
@@ -730,6 +894,8 @@ struct CuriumEngineFingerprintCapabilities: Equatable, Sendable {
     let contractVersion: Int
     let supportedSchemaVersions: [Int]
     let maxConfigBytes: Int
+    let runtimePolicyVersion: Int
+    let maxRuntimePolicyBytes: Int
     let features: [String: Bool]
     let activationScopes: [String: String]
 
@@ -741,11 +907,36 @@ struct CuriumEngineFingerprintCapabilities: Equatable, Sendable {
         contractVersion >= 2 || supportedSchemaVersions.contains(2)
     }
 
+    var supportsHotRuntimePrivacyPolicy: Bool {
+        if let explicit = features["hotRuntimePrivacyPolicy"] {
+            return explicit
+        }
+        return runtimePolicyVersion >= CuriumFingerprintSchema.runtimePolicyVersion
+    }
+
+    var supportsNativeDesktopParity: Bool {
+        features["nativeDesktopParityV1"] == true
+    }
+
+    var supportsCoherentWebDPR: Bool {
+        features["coherentWebDPR"] == true
+    }
+
+    var supportsStealthEdgeFarbling: Bool {
+        features["stealthEdgeCanvasFarbling"] == true
+    }
+
+    var supportsProfileCachePurgeHook: Bool {
+        features["profileCachePurgeHook"] == true
+    }
+
     init(dictionary: [String: Any]?) {
         guard let dictionary else {
             contractVersion = 0
             supportedSchemaVersions = []
             maxConfigBytes = 0
+            runtimePolicyVersion = 0
+            maxRuntimePolicyBytes = 0
             features = [:]
             activationScopes = [:]
             return
@@ -759,6 +950,8 @@ struct CuriumEngineFingerprintCapabilities: Equatable, Sendable {
             supportedSchemaVersions = []
         }
         maxConfigBytes = (dictionary["maxConfigBytes"] as? NSNumber)?.intValue ?? 0
+        runtimePolicyVersion = (dictionary["runtimePolicyVersion"] as? NSNumber)?.intValue ?? 0
+        maxRuntimePolicyBytes = (dictionary["maxRuntimePolicyBytes"] as? NSNumber)?.intValue ?? 0
         if let rawFeatures = dictionary["features"] as? [String: Any] {
             var parsed: [String: Bool] = [:]
             for (k, v) in rawFeatures {

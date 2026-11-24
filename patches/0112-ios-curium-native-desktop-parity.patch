@@ -1,0 +1,1702 @@
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios.h b/content/browser/renderer_host/render_widget_host_view_ios.h
+index 0b59f14..ef43822 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios.h
++++ b/content/browser/renderer_host/render_widget_host_view_ios.h
+@@ -10,6 +10,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "base/containers/flat_map.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/time/time.h"
+@@ -90,6 +91,7 @@ class CONTENT_EXPORT RenderWidgetHostViewIOS
+   blink::mojom::PointerLockResult LockPointer(bool) override;
+   blink::mojom::PointerLockResult ChangePointerLock(bool) override;
+   void UnlockPointer() override;
++  base::flat_map<std::string, std::string> GetKeyboardLayoutMap() override;
+   void TakeFallbackContentFrom(RenderWidgetHostView* view) override;
+   std::unique_ptr<SyntheticGestureTarget> CreateSyntheticGestureTarget()
+       override;
+diff --git a/content/browser/renderer_host/render_widget_host_view_ios.mm b/content/browser/renderer_host/render_widget_host_view_ios.mm
+index e582d1d..6595efa 100644
+--- a/content/browser/renderer_host/render_widget_host_view_ios.mm
++++ b/content/browser/renderer_host/render_widget_host_view_ios.mm
+@@ -35,6 +35,7 @@
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/common/content_switches.h"
+ #include "skia/ext/skia_utils_ios.h"
++#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
+ #include "ui/accelerated_widget_mac/display_ca_layer_tree.h"
+ #include "ui/base/ime/text_input_mode.h"
+ #include "ui/base/ime/text_input_type.h"
+@@ -269,6 +270,14 @@ bool IsTesting() {
+ }
+ void RenderWidgetHostViewIOS::UnlockPointer() {}
+ 
++base::flat_map<std::string, std::string>
++RenderWidgetHostViewIOS::GetKeyboardLayoutMap() {
++  if (blink::curium::IsDesktopMacLaunchProfile()) {
++    return blink::curium::GetMacOSEnUSKeyboardLayoutMap();
++  }
++  return RenderWidgetHostViewBase::GetKeyboardLayoutMap();
++}
++
+ 
+ void RenderWidgetHostViewIOS::TakeFallbackContentFrom(
+     RenderWidgetHostView* view) {}
+diff --git a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+index 1bb232b..4590561 100644
+--- a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
++++ b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+@@ -14,6 +14,7 @@
+ #import "build/blink_buildflags.h"
+ #import "ios/chrome/browser/shared/model/paths/paths.h"
+ #if BUILDFLAG(USE_BLINK)
++#import "third_party/blink/public/common/curium/curium_desktop_parity.h"
+ #import "third_party/blink/public/common/curium/curium_fingerprint_config.h"
+ #import "third_party/blink/public/common/curium/curium_runtime_policy.h"
+ #endif
+@@ -76,6 +77,9 @@ + (void)registerShellBootstrapDelegate:
+     (nullable id<CrIOSShellBootstrapDelegate>)delegate {
+   CHECK([NSThread isMainThread]);
+   g_shell_bootstrap_delegate = delegate;
++#if BUILDFLAG(USE_BLINK)
++  blink::curium::SetHeadlessShellActive(delegate != nil);
++#endif
+ }
+ 
+ + (nullable id<CrIOSShellBootstrapDelegate>)shellBootstrapDelegate {
+diff --git a/ios/web/content/content_permission_manager.mm b/ios/web/content/content_permission_manager.mm
+index 0c3234f..a2191c9 100644
+--- a/ios/web/content/content_permission_manager.mm
++++ b/ios/web/content/content_permission_manager.mm
+@@ -16,6 +16,7 @@
+ #import "content/public/browser/render_frame_host.h"
+ #import "content/public/browser/visibility.h"
+ #import "content/public/browser/web_contents.h"
++#import "third_party/blink/public/common/curium/curium_desktop_parity.h"
+ #import "third_party/blink/public/common/permissions/permission_utils.h"
+ #import "ui/base/l10n/l10n_util.h"
+ #import "ui/base/l10n/l10n_util_mac.h"
+@@ -95,6 +96,11 @@
+     case blink::PermissionType::AUDIO_CAPTURE:
+     case blink::PermissionType::VIDEO_CAPTURE:
+       return PermissionStatus::ASK;
++    case blink::PermissionType::NOTIFICATIONS:
++      if (blink::curium::IsDesktopMacLaunchProfile()) {
++        return PermissionStatus::ASK;
++      }
++      return PermissionStatus::DENIED;
+     default:
+       return PermissionStatus::DENIED;
+   }
+diff --git a/ios/web/content/init/BUILD.gn b/ios/web/content/init/BUILD.gn
+index 20dbf58..ff30bb2 100644
+--- a/ios/web/content/init/BUILD.gn
++++ b/ios/web/content/init/BUILD.gn
+@@ -53,6 +53,7 @@ source_set("init") {
+     "//third_party/blink/public/common",
+     "//ui/base",
+     "//ui/native_theme",
++    "//v8",
+   ]
+   if (enable_extensions_core) {
+     deps += [
+diff --git a/ios/web/content/init/DEPS b/ios/web/content/init/DEPS
+index 5f1bca8..6427363 100644
+--- a/ios/web/content/init/DEPS
++++ b/ios/web/content/init/DEPS
+@@ -18,6 +18,7 @@ include_rules = [
+   "+net/base/ip_address.h",
+   "+net/base/ip_endpoint.h",
+   "+net/base/net_errors.h",
++  "+net/http/http_connection_info.h",
+   "+net/http/http_util.h",
+   "+net/log/net_log_source.h",
+   "+net/proxy_resolution/proxy_config.h",
+@@ -26,14 +27,26 @@ include_rules = [
+   "+net/traffic_annotation/network_traffic_annotation.h",
+   "+services/device/public/cpp/geolocation",
+   "+services/service_manager/public/cpp",
++  "+third_party/blink/public/common/curium/curium_desktop_parity.h",
+   "+third_party/blink/public/common/curium/curium_fingerprint_config.h",
+   "+third_party/blink/public/common/renderer_preferences/renderer_preferences.h",
+   "+third_party/blink/public/common/switches.h",
++  "+third_party/blink/public/common/user_agent/user_agent_metadata.h",
+   "+third_party/blink/public/common/web_preferences/web_preferences.h",
++  "+third_party/blink/public/platform/platform.h",
++  "+third_party/blink/public/platform/web_url.h",
+   "+third_party/blink/public/platform/web_url_error.h",
++  "+third_party/blink/public/platform/web_url_response.h",
++  "+third_party/blink/public/web/web_document.h",
++  "+third_party/blink/public/web/web_document_loader.h",
++  "+third_party/blink/public/web/web_local_frame.h",
++  "+third_party/blink/public/web/web_local_frame_client.h",
++  "+third_party/blink/public/web/web_navigation_type.h",
++  "+third_party/blink/public/web/web_performance_timings.h",
+   "+ui/base/pointer/pointer_device.h",
+   "+ui/base/resource/resource_bundle.h",
+   "+ui/base/webui/web_ui_util.h",
+   "+ui/native_theme/native_theme.h",
++  "+v8/include",
+   # keep-sorted end
+ ]
+diff --git a/ios/web/content/init/ios_content_renderer_client.cc b/ios/web/content/init/ios_content_renderer_client.cc
+index 5b67428..de60db5 100644
+--- a/ios/web/content/init/ios_content_renderer_client.cc
++++ b/ios/web/content/init/ios_content_renderer_client.cc
+@@ -11,25 +11,54 @@
+ #import "ios/web/content/init/extensions/ios_extensions_client.h"
+ #endif
+ 
++#include <cstdint>
++#include <optional>
+ #import <string>
++#include <string_view>
++#include <tuple>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
+ #import "components/error_page/common/error.h"
+ #import "components/error_page/common/localized_error.h"
+ #import "components/grit/components_resources.h"
+ #import "components/js_injection/renderer/js_communication.h"
++#include "content/public/common/isolated_world_ids.h"
++#include "content/public/renderer/chrome_object_extensions_utils.h"
+ #import "content/public/renderer/render_frame.h"
++#include "content/public/renderer/render_frame_observer.h"
+ #import "content/public/renderer/render_thread.h"
++#include "net/http/http_connection_info.h"
++#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
+ #include "third_party/blink/public/common/curium/curium_runtime_policy.h"
++#include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
++#include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/public/platform/web_cache.h"
+ #include "third_party/blink/public/platform/web_runtime_features.h"
++#include "third_party/blink/public/platform/web_url.h"
+ #import "third_party/blink/public/platform/web_url_error.h"
++#include "third_party/blink/public/platform/web_url_response.h"
++#include "third_party/blink/public/web/web_document.h"
++#include "third_party/blink/public/web/web_document_loader.h"
++#include "third_party/blink/public/web/web_local_frame.h"
++#include "third_party/blink/public/web/web_local_frame_client.h"
++#include "third_party/blink/public/web/web_navigation_type.h"
++#include "third_party/blink/public/web/web_performance_timings.h"
+ #import "ui/base/resource/resource_bundle.h"
+ #import "ui/base/webui/web_ui_util.h"
+ #import "url/gurl.h"
++#include "v8/include/v8-context.h"
++#include "v8/include/v8-function-callback.h"
++#include "v8/include/v8-function.h"
++#include "v8/include/v8-isolate.h"
++#include "v8/include/v8-local-handle.h"
++#include "v8/include/v8-microtask-queue.h"
++#include "v8/include/v8-object.h"
++#include "v8/include/v8-primitive.h"
++#include "v8/include/v8-template.h"
+ 
+ namespace web {
+ 
+@@ -47,6 +76,378 @@ void PurgeCuriumRendererCaches() {
+   blink::WebCache::Clear();
+ }
+ 
++constexpr int kCSITransitionLink = 0;
++constexpr int kCSITransitionForwardBack = 6;
++constexpr int kCSITransitionOther = 15;
++constexpr int kCSITransitionReload = 16;
++
++std::string_view GetLoadTimesNavigationType(blink::WebNavigationType nav_type) {
++  switch (nav_type) {
++    case blink::kWebNavigationTypeLinkClicked:
++      return "LinkClicked";
++    case blink::kWebNavigationTypeFormSubmitted:
++      return "FormSubmitted";
++    case blink::kWebNavigationTypeBackForward:
++    case blink::kWebNavigationTypeRestore:
++      return "BackForward";
++    case blink::kWebNavigationTypeReload:
++      return "Reload";
++    case blink::kWebNavigationTypeFormResubmittedBackForward:
++    case blink::kWebNavigationTypeFormResubmittedReload:
++      return "Resubmitted";
++    case blink::kWebNavigationTypeOther:
++      return "Other";
++  }
++  return "Other";
++}
++
++int GetCSITransitionType(blink::WebNavigationType nav_type) {
++  switch (nav_type) {
++    case blink::kWebNavigationTypeLinkClicked:
++    case blink::kWebNavigationTypeFormSubmitted:
++    case blink::kWebNavigationTypeFormResubmittedBackForward:
++    case blink::kWebNavigationTypeFormResubmittedReload:
++      return kCSITransitionLink;
++    case blink::kWebNavigationTypeBackForward:
++    case blink::kWebNavigationTypeRestore:
++      return kCSITransitionForwardBack;
++    case blink::kWebNavigationTypeReload:
++      return kCSITransitionReload;
++    case blink::kWebNavigationTypeOther:
++      return kCSITransitionOther;
++  }
++  return kCSITransitionOther;
++}
++
++v8::Local<v8::String> MakeV8String(v8::Isolate* isolate,
++                                   std::string_view value) {
++  return v8::String::NewFromUtf8(isolate, value.data(),
++                                 v8::NewStringType::kNormal,
++                                 static_cast<int>(value.size()))
++      .ToLocalChecked();
++}
++
++v8::Local<v8::String> MakeV8Key(v8::Isolate* isolate, std::string_view key) {
++  return v8::String::NewFromUtf8(isolate, key.data(),
++                                 v8::NewStringType::kInternalized,
++                                 static_cast<int>(key.size()))
++      .ToLocalChecked();
++}
++
++v8::MaybeLocal<v8::Function> MakeNativeFunction(
++    v8::Isolate* isolate,
++    v8::Local<v8::Context> context,
++    v8::FunctionCallback callback,
++    std::string_view name) {
++  v8::Local<v8::FunctionTemplate> tmpl =
++      v8::FunctionTemplate::New(isolate, callback);
++  tmpl->RemovePrototype();
++  v8::Local<v8::Function> fn;
++  if (!tmpl->GetFunction(context).ToLocal(&fn)) {
++    return v8::MaybeLocal<v8::Function>();
++  }
++  fn->SetName(MakeV8String(isolate, name));
++  return fn;
++}
++
++bool HasDefinedProperty(v8::Isolate* isolate,
++                        v8::Local<v8::Context> context,
++                        v8::Local<v8::Object> object,
++                        std::string_view key) {
++  v8::Local<v8::Value> value;
++  return object->Get(context, MakeV8Key(isolate, key)).ToLocal(&value) &&
++         !value->IsUndefined();
++}
++
++bool SetProperty(v8::Isolate* isolate,
++                 v8::Local<v8::Context> context,
++                 v8::Local<v8::Object> object,
++                 std::string_view key,
++                 v8::Local<v8::Value> value) {
++  return object->Set(context, MakeV8Key(isolate, key), value).FromMaybe(false);
++}
++
++void CuriumLoadTimesCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++  if (context.IsEmpty()) {
++    info.GetReturnValue().Set(v8::Null(isolate));
++    return;
++  }
++
++  double request_time = base::Time::Now().InSecondsFSinceUnixEpoch();
++  double start_load_time = request_time;
++  double commit_load_time = 0.0;
++  double finish_document_load_time = 0.0;
++  double finish_load_time = 0.0;
++  double first_paint_time = 0.0;
++  constexpr double kFirstPaintAfterLoadTime = 0.0;
++  std::string_view navigation_type = "Other";
++  bool was_fetched_via_spdy = true;
++  bool was_alpn_negotiated = true;
++  std::string alpn_negotiated_protocol = "h2";
++  bool was_alternate_protocol_available = false;
++  std::string connection_info = "h2";
++
++  if (blink::WebLocalFrame* frame =
++          blink::WebLocalFrame::FrameForCurrentContext()) {
++    if (blink::WebDocumentLoader* loader = frame->GetDocumentLoader()) {
++      const blink::WebURLResponse& response = loader->GetWebResponse();
++      const blink::WebPerformanceTimings timings = frame->PerformanceTimings();
++      if (timings.navigation_start > 0.0) {
++        request_time = timings.ToEpochTime().InSecondsF();
++        start_load_time = request_time;
++        commit_load_time =
++            timings.ToEpochTime(timings.response_start).InSecondsF();
++        finish_document_load_time =
++            timings.ToEpochTime(timings.dom_content_loaded_event_end)
++                .InSecondsF();
++        finish_load_time =
++            timings.ToEpochTime(timings.load_event_end).InSecondsF();
++        first_paint_time =
++            timings.ToEpochTime(timings.first_paint).InSecondsF();
++      }
++      navigation_type = GetLoadTimesNavigationType(loader->GetNavigationType());
++      if (!response.IsNull()) {
++        was_fetched_via_spdy = response.WasFetchedViaSPDY();
++        was_alpn_negotiated = response.WasAlpnNegotiated();
++        alpn_negotiated_protocol = response.AlpnNegotiatedProtocol().Utf8();
++        was_alternate_protocol_available =
++            response.WasAlternateProtocolAvailable();
++        connection_info = std::string(
++            net::HttpConnectionInfoToString(response.ConnectionInfo()));
++      }
++    }
++  }
++
++  v8::Local<v8::Object> result = v8::Object::New(isolate);
++  if (!SetProperty(isolate, context, result, "requestTime",
++                   v8::Number::New(isolate, request_time)) ||
++      !SetProperty(isolate, context, result, "startLoadTime",
++                   v8::Number::New(isolate, start_load_time)) ||
++      !SetProperty(isolate, context, result, "commitLoadTime",
++                   v8::Number::New(isolate, commit_load_time)) ||
++      !SetProperty(isolate, context, result, "finishDocumentLoadTime",
++                   v8::Number::New(isolate, finish_document_load_time)) ||
++      !SetProperty(isolate, context, result, "finishLoadTime",
++                   v8::Number::New(isolate, finish_load_time)) ||
++      !SetProperty(isolate, context, result, "firstPaintTime",
++                   v8::Number::New(isolate, first_paint_time)) ||
++      !SetProperty(isolate, context, result, "firstPaintAfterLoadTime",
++                   v8::Number::New(isolate, kFirstPaintAfterLoadTime)) ||
++      !SetProperty(isolate, context, result, "navigationType",
++                   MakeV8String(isolate, navigation_type)) ||
++      !SetProperty(isolate, context, result, "wasFetchedViaSpdy",
++                   v8::Boolean::New(isolate, was_fetched_via_spdy)) ||
++      !SetProperty(isolate, context, result, "wasNpnNegotiated",
++                   v8::Boolean::New(isolate, was_alpn_negotiated)) ||
++      !SetProperty(isolate, context, result, "npnNegotiatedProtocol",
++                   MakeV8String(isolate, alpn_negotiated_protocol)) ||
++      !SetProperty(isolate, context, result, "wasAlternateProtocolAvailable",
++                   v8::Boolean::New(isolate,
++                                    was_alternate_protocol_available)) ||
++      !SetProperty(isolate, context, result, "connectionInfo",
++                   MakeV8String(isolate, connection_info))) {
++    info.GetReturnValue().Set(v8::Null(isolate));
++    return;
++  }
++  info.GetReturnValue().Set(result);
++}
++
++void CuriumCSICallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++  if (context.IsEmpty()) {
++    info.GetReturnValue().Set(v8::Null(isolate));
++    return;
++  }
++
++  int64_t start_ms = base::Time::Now().InMillisecondsSinceUnixEpoch();
++  int64_t onload_ms = start_ms;
++  double page_t = 0.0;
++  int tran = kCSITransitionOther;
++
++  if (blink::WebLocalFrame* frame =
++          blink::WebLocalFrame::FrameForCurrentContext()) {
++    if (blink::WebDocumentLoader* loader = frame->GetDocumentLoader()) {
++      const blink::WebPerformanceTimings timings = frame->PerformanceTimings();
++      if (timings.navigation_start > 0.0) {
++        start_ms = timings.ToEpochTime().InMilliseconds();
++        const int64_t dcl_ms =
++            timings.ToEpochTime(timings.dom_content_loaded_event_end)
++                .InMilliseconds();
++        onload_ms = dcl_ms > 0 ? dcl_ms : start_ms;
++        page_t = timings.now;
++      }
++      tran = GetCSITransitionType(loader->GetNavigationType());
++    }
++  }
++
++  v8::Local<v8::Object> result = v8::Object::New(isolate);
++  if (!SetProperty(isolate, context, result, "startE",
++                   v8::Number::New(isolate, static_cast<double>(start_ms))) ||
++      !SetProperty(isolate, context, result, "onloadT",
++                   v8::Number::New(isolate, static_cast<double>(onload_ms))) ||
++      !SetProperty(isolate, context, result, "pageT",
++                   v8::Number::New(isolate, page_t)) ||
++      !SetProperty(isolate, context, result, "tran",
++                   v8::Number::New(isolate, static_cast<double>(tran)))) {
++    info.GetReturnValue().Set(v8::Null(isolate));
++    return;
++  }
++  info.GetReturnValue().Set(result);
++}
++
++void CuriumAppGetDetailsCallback(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  info.GetReturnValue().Set(v8::Null(info.GetIsolate()));
++}
++
++void CuriumAppGetIsInstalledCallback(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  info.GetReturnValue().Set(v8::Boolean::New(info.GetIsolate(), false));
++}
++
++void CuriumAppRunningStateCallback(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  info.GetReturnValue().Set(MakeV8String(info.GetIsolate(), "cannot_run"));
++}
++
++void InstallCuriumDesktopChromeObject(v8::Local<v8::Context> context) {
++  v8::Isolate* isolate = v8::Isolate::GetCurrent();
++  if (!isolate || context.IsEmpty()) {
++    return;
++  }
++
++  v8::HandleScope handle_scope(isolate);
++  v8::MicrotasksScope microtasks_scope(
++      isolate, context->GetMicrotaskQueue(),
++      v8::MicrotasksScope::kDoNotRunMicrotasks);
++  v8::Context::Scope context_scope(context);
++
++  v8::Local<v8::Object> chrome =
++      content::GetOrCreateChromeObject(isolate, context);
++
++  if (!HasDefinedProperty(isolate, context, chrome, "loadTimes")) {
++    v8::Local<v8::Function> load_times_fn;
++    if (MakeNativeFunction(isolate, context, &CuriumLoadTimesCallback,
++                           "loadTimes")
++            .ToLocal(&load_times_fn)) {
++      std::ignore =
++          SetProperty(isolate, context, chrome, "loadTimes", load_times_fn);
++    }
++  }
++
++  if (!HasDefinedProperty(isolate, context, chrome, "csi")) {
++    v8::Local<v8::Function> csi_fn;
++    if (MakeNativeFunction(isolate, context, &CuriumCSICallback, "csi")
++            .ToLocal(&csi_fn)) {
++      std::ignore = SetProperty(isolate, context, chrome, "csi", csi_fn);
++    }
++  }
++
++  if (!HasDefinedProperty(isolate, context, chrome, "app")) {
++    v8::Local<v8::Object> app = v8::Object::New(isolate);
++    std::ignore = SetProperty(isolate, context, app, "isInstalled",
++                              v8::Boolean::New(isolate, false));
++
++    v8::Local<v8::Object> install_state = v8::Object::New(isolate);
++    std::ignore = SetProperty(isolate, context, install_state, "DISABLED",
++                              MakeV8String(isolate, "disabled"));
++    std::ignore = SetProperty(isolate, context, install_state, "INSTALLED",
++                              MakeV8String(isolate, "installed"));
++    std::ignore = SetProperty(isolate, context, install_state, "NOT_INSTALLED",
++                              MakeV8String(isolate, "not_installed"));
++    std::ignore =
++        SetProperty(isolate, context, app, "InstallState", install_state);
++
++    v8::Local<v8::Object> running_state = v8::Object::New(isolate);
++    std::ignore = SetProperty(isolate, context, running_state, "CANNOT_RUN",
++                              MakeV8String(isolate, "cannot_run"));
++    std::ignore = SetProperty(isolate, context, running_state, "READY_TO_RUN",
++                              MakeV8String(isolate, "ready_to_run"));
++    std::ignore = SetProperty(isolate, context, running_state, "RUNNING",
++                              MakeV8String(isolate, "running"));
++    std::ignore =
++        SetProperty(isolate, context, app, "RunningState", running_state);
++
++    v8::Local<v8::Function> get_details_fn;
++    if (MakeNativeFunction(isolate, context, &CuriumAppGetDetailsCallback,
++                           "getDetails")
++            .ToLocal(&get_details_fn)) {
++      std::ignore =
++          SetProperty(isolate, context, app, "getDetails", get_details_fn);
++    }
++    v8::Local<v8::Function> get_is_installed_fn;
++    if (MakeNativeFunction(isolate, context, &CuriumAppGetIsInstalledCallback,
++                           "getIsInstalled")
++            .ToLocal(&get_is_installed_fn)) {
++      std::ignore = SetProperty(isolate, context, app, "getIsInstalled",
++                                get_is_installed_fn);
++    }
++    v8::Local<v8::Function> running_state_fn;
++    if (MakeNativeFunction(isolate, context, &CuriumAppRunningStateCallback,
++                           "runningState")
++            .ToLocal(&running_state_fn)) {
++      std::ignore =
++          SetProperty(isolate, context, app, "runningState", running_state_fn);
++    }
++    std::ignore = SetProperty(isolate, context, chrome, "app", app);
++  }
++}
++
++class CuriumDesktopChromeObserver final : public content::RenderFrameObserver {
++ public:
++  explicit CuriumDesktopChromeObserver(content::RenderFrame* render_frame)
++      : content::RenderFrameObserver(render_frame) {}
++
++  void DidCreateScriptContext(v8::Local<v8::Context> context,
++                              int32_t world_id) override {
++    if (world_id != content::ISOLATED_WORLD_ID_GLOBAL || context.IsEmpty()) {
++      return;
++    }
++    blink::WebLocalFrame* web_frame =
++        render_frame() ? render_frame()->GetWebFrame() : nullptr;
++    if (!web_frame) {
++      return;
++    }
++
++    const blink::WebDocument doc = web_frame->GetDocument();
++    const GURL url = doc.IsNull() ? GURL() : GURL(doc.Url());
++    const bool allowed_url = url.is_empty() || url.SchemeIsHTTPOrHTTPS() ||
++                             url.IsAboutBlank() || url.IsAboutSrcdoc();
++    if (!allowed_url) {
++      return;
++    }
++
++    bool is_desktop_mac_frame = false;
++    if (blink::WebLocalFrameClient* client = web_frame->Client();
++        client && !client->UserAgentOverride().IsEmpty()) {
++      if (std::optional<blink::UserAgentMetadata> override_meta =
++              client->UserAgentMetadataOverride();
++          override_meta.has_value()) {
++        is_desktop_mac_frame =
++            blink::curium::IsDesktopMacParityActive(*override_meta);
++      } else {
++        is_desktop_mac_frame =
++            blink::curium::IsDesktopMacParityActive(/*is_desktop_slot=*/true);
++      }
++    } else if (blink::Platform* platform = blink::Platform::Current()) {
++      is_desktop_mac_frame = blink::curium::IsDesktopMacParityActive(
++          platform->UserAgentMetadata());
++    } else {
++      is_desktop_mac_frame = blink::curium::IsDesktopMacLaunchProfile();
++    }
++
++    if (!is_desktop_mac_frame) {
++      return;
++    }
++    InstallCuriumDesktopChromeObject(context);
++  }
++
++  void OnDestruct() override { delete this; }
++};
++
+ // [ios-blink-sideload] Chrome's network error page for the main frame, built
+ // the way ios/chrome/browser/web/model/error_page_util.mm builds it for
+ // WebKit, instead of placeholder text. A failed subframe (often a blocked ad
+@@ -92,6 +493,12 @@ void IOSContentRendererClient::RenderThreadStarted() {
+   } else {
+     ApplyCuriumRendererRuntimePolicy(blink::curium::GetRuntimePolicySnapshot());
+   }
++  if (blink::curium::IsDesktopMacLaunchProfile()) {
++    blink::WebRuntimeFeatures::EnableFeatureFromString(
++        "LanguageDetectionAPI", true);
++    blink::WebRuntimeFeatures::EnableFeatureFromString(
++        "AISummarizationAPI", true);
++  }
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   GetIOSExtensionsRendererClient()->RenderThreadStarted();
+ #endif
+@@ -113,6 +520,7 @@ void IOSContentRendererClient::RenderFrameCreated(
+   // As a RenderFrameObserver, JSCommunication handles destroying
+   // itself when its RenderFrame is destroyed.
+   new js_injection::JsCommunication(render_frame);
++  new CuriumDesktopChromeObserver(render_frame);
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   InitializeIOSExtensionsRenderFrame(render_frame);
+ #endif
+diff --git a/ios/web/content/js_messaging/content_java_script_feature_manager.mm b/ios/web/content/js_messaging/content_java_script_feature_manager.mm
+index 0f54175..c05bc32 100644
+--- a/ios/web/content/js_messaging/content_java_script_feature_manager.mm
++++ b/ios/web/content/js_messaging/content_java_script_feature_manager.mm
+@@ -15,6 +15,7 @@
+ #import "ios/web/public/js_messaging/java_script_feature.h"
+ #import "ios/web/public/js_messaging/java_script_feature_util.h"
+ #import "ios/web/public/js_messaging/script_message.h"
++#import "third_party/blink/public/common/curium/curium_desktop_parity.h"
+ 
+ namespace web {
+ 
+@@ -42,6 +43,9 @@
+ 
+ void ContentJavaScriptFeatureManager::AddDocumentStartScripts(
+     js_injection::JsCommunicationHost* js_communication_host) {
++  if (blink::curium::IsHeadlessShellActive()) {
++    return;
++  }
+   for (std::u16string user_script : document_start_scripts_) {
+     js_communication_host->AddPersistentJavaScript(
+         user_script, js_injection::mojom::DocumentInjectionTime::kDocumentStart,
+@@ -51,6 +55,9 @@
+ 
+ void ContentJavaScriptFeatureManager::InjectDocumentEndScripts(
+     content::RenderFrameHost* render_frame_host) {
++  if (blink::curium::IsHeadlessShellActive()) {
++    return;
++  }
+   for (std::u16string user_script : document_end_scripts_) {
+     render_frame_host->ExecuteJavaScript(
+         user_script, content::RenderFrameHost::JavaScriptResultCallback());
+@@ -64,6 +71,9 @@
+ 
+ void ContentJavaScriptFeatureManager::AddFeature(
+     const JavaScriptFeature* feature) {
++  if (blink::curium::IsHeadlessShellActive()) {
++    return;
++  }
+   // [ios-blink-sideload] ContentWebFramesManager decides which features get
+   // here (see IsInjectedWithoutFlag() there).
+   if (HasFeature(feature)) {
+diff --git a/ios/web/content/js_messaging/content_web_frames_manager.mm b/ios/web/content/js_messaging/content_web_frames_manager.mm
+index 48d0b21..1e37680 100644
+--- a/ios/web/content/js_messaging/content_web_frames_manager.mm
++++ b/ios/web/content/js_messaging/content_web_frames_manager.mm
+@@ -23,6 +23,7 @@
+ #import "ios/web/public/js_messaging/java_script_feature_util.h"
+ #import "ios/web/public/js_messaging/script_message.h"
+ #import "ios/web/public/web_client.h"
++#import "third_party/blink/public/common/curium/curium_desktop_parity.h"
+ 
+ namespace web {
+ 
+@@ -75,35 +76,39 @@ bool IsInjectedWithoutFlag(const JavaScriptFeature* feature) {
+       js_communication_host_(
+           std::make_unique<js_injection::JsCommunicationHost>(
+               content_web_state->GetWebContents())) {
+-  auto web_message_callback =
+-      base::BindRepeating(&ContentWebFramesManager::ScriptMessageReceived,
+-                          weak_factory_.GetWeakPtr());
+-  auto message_host_factory =
+-      std::make_unique<IOSWebMessageHostFactory>(web_message_callback);
+-  js_communication_host_->AddWebMessageHostFactory(
+-      std::move(message_host_factory), u"webkitMessageHandler", {"*"},
+-      /* world_identifier= */ 0);
+-
+   std::vector<JavaScriptFeature*> java_script_features;
+-  java_script_features.push_back(GetSendWebKitMessageJavaScriptFeature());
+-  for (JavaScriptFeature* feature :
+-       java_script_features::GetBuiltInJavaScriptFeaturesForContent(
+-           content_web_state->GetBrowserState())) {
+-    java_script_features.push_back(feature);
+-  }
+-  for (JavaScriptFeature* feature : GetWebClient()->GetJavaScriptFeatures(
+-           content_web_state->GetBrowserState())) {
+-    java_script_features.push_back(feature);
+-  }
+-  if (!base::FeatureList::IsEnabled(kContentEnableInjectedFeatureScripts)) {
+-    std::erase_if(java_script_features, [](JavaScriptFeature* feature) {
+-      return !IsInjectedWithoutFlag(feature);
+-    });
++  if (!blink::curium::IsHeadlessShellActive()) {
++    auto web_message_callback =
++        base::BindRepeating(&ContentWebFramesManager::ScriptMessageReceived,
++                            weak_factory_.GetWeakPtr());
++    auto message_host_factory =
++        std::make_unique<IOSWebMessageHostFactory>(web_message_callback);
++    js_communication_host_->AddWebMessageHostFactory(
++        std::move(message_host_factory), u"webkitMessageHandler", {"*"},
++        /* world_identifier= */ 0);
++
++    java_script_features.push_back(GetSendWebKitMessageJavaScriptFeature());
++    for (JavaScriptFeature* feature :
++         java_script_features::GetBuiltInJavaScriptFeaturesForContent(
++             content_web_state->GetBrowserState())) {
++      java_script_features.push_back(feature);
++    }
++    for (JavaScriptFeature* feature : GetWebClient()->GetJavaScriptFeatures(
++             content_web_state->GetBrowserState())) {
++      java_script_features.push_back(feature);
++    }
++    if (!base::FeatureList::IsEnabled(kContentEnableInjectedFeatureScripts)) {
++      std::erase_if(java_script_features, [](JavaScriptFeature* feature) {
++        return !IsInjectedWithoutFlag(feature);
++      });
++    }
+   }
+ 
+   js_feature_manager_ = std::make_unique<ContentJavaScriptFeatureManager>(
+       std::move(java_script_features));
+-  js_feature_manager_->AddDocumentStartScripts(js_communication_host_.get());
++  if (!blink::curium::IsHeadlessShellActive()) {
++    js_feature_manager_->AddDocumentStartScripts(js_communication_host_.get());
++  }
+ 
+   // Handle frames that may already exist if WebContents was created before
+   // this observer was attached (e.g., when created with an opener).
+@@ -200,7 +205,9 @@ bool IsInjectedWithoutFlag(const JavaScriptFeature* feature) {
+ 
+   // [ios-blink-sideload] Always: some features are injected even without
+   // kContentEnableInjectedFeatureScripts (see IsInjectedWithoutFlag()).
+-  {
++  // Suppress all __gCrWeb and ios/web feature script injection when hosted by
++  // Curium's headless shell so pages never observe iOS-only globals.
++  if (!blink::curium::IsHeadlessShellActive()) {
+     // Inject JavaScript to override `getFrameId` to return the WebFrame id
+     // chosen in `RenderFrameCreated`. This must happen even if the frame has
+     // already been added to `available_frame_hosts_`, since navigation to a new
+@@ -210,9 +217,9 @@ bool IsInjectedWithoutFlag(const JavaScriptFeature* feature) {
+         format_string, base::UTF8ToUTF16(web_frame->GetFrameId()),
+         /*offset=*/nullptr);
+     web_frame->ExecuteJavaScript(script_to_inject);
+-  }
+ 
+-  js_feature_manager_->InjectDocumentEndScripts(render_frame_host);
++    js_feature_manager_->InjectDocumentEndScripts(render_frame_host);
++  }
+ 
+   if (available_frame_hosts_.count(content_id)) {
+     return;
+diff --git a/third_party/blink/common/BUILD.gn b/third_party/blink/common/BUILD.gn
+index f533c5f..f104311 100644
+--- a/third_party/blink/common/BUILD.gn
++++ b/third_party/blink/common/BUILD.gn
+@@ -149,6 +149,7 @@ source_set("common") {
+     "context_menu_data/untrustworthy_context_menu_params.cc",
+     "crash_helpers.cc",
+     "crash_helpers.h",
++    "curium/curium_desktop_parity.cc",
+     "curium/curium_fingerprint_config.cc",
+     "curium/curium_runtime_policy.cc",
+     "custom_handlers/protocol_handler_utils.cc",
+diff --git a/third_party/blink/common/curium/curium_desktop_parity.cc b/third_party/blink/common/curium/curium_desktop_parity.cc
+new file mode 100644
+index 0000000..5763ff7
+--- /dev/null
++++ b/third_party/blink/common/curium/curium_desktop_parity.cc
+@@ -0,0 +1,451 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/strings/string_util.h"
++#include "crypto/hash.h"
++#include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++
++namespace blink::curium {
++
++namespace {
++
++std::atomic<bool> g_headless_shell_active{false};
++
++constexpr std::array<MacVoiceEntry, 199> kMacOSVoices = {{
++    {"Samantha", "en-US", true, true},
++    {"Albert", "en-US", true, false},
++    {"Alice", "it-IT", true, false},
++    {"Alva", "sv-SE", true, false},
++    {"Am\xc3\xa9lie", "fr-CA", true, false},
++    {"Amira", "ms-MY", true, false},
++    {"Anna", "de-DE", true, false},
++    {"Bad News", "en-US", true, false},
++    {"Bahh", "en-US", true, false},
++    {"Bells", "en-US", true, false},
++    {"Boing", "en-US", true, false},
++    {"Bubbles", "en-US", true, false},
++    {"Carmit", "he-IL", true, false},
++    {"Cellos", "en-US", true, false},
++    {"Damayanti", "id-ID", true, false},
++    {"Daniel", "en-GB", true, false},
++    {"Daria", "bg-BG", true, false},
++    {"Eddy (English (United States))", "en-US", true, false},
++    {"Eddy (English (United Kingdom))", "en-GB", true, false},
++    {"Eddy (Chinese (China mainland))", "zh-CN", true, false},
++    {"Eddy (Chinese (Taiwan))", "zh-TW", true, false},
++    {"Eddy (German (Germany))", "de-DE", true, false},
++    {"Eddy (Spanish (Spain))", "es-ES", true, false},
++    {"Eddy (Spanish (Mexico))", "es-MX", true, false},
++    {"Eddy (Finnish (Finland))", "fi-FI", true, false},
++    {"Eddy (French (Canada))", "fr-CA", true, false},
++    {"Eddy (French (France))", "fr-FR", true, false},
++    {"Eddy (Italian (Italy))", "it-IT", true, false},
++    {"Eddy (Japanese (Japan))", "ja-JP", true, false},
++    {"Eddy (Korean (South Korea))", "ko-KR", true, false},
++    {"Eddy (Portuguese (Brazil))", "pt-BR", true, false},
++    {"Ellen", "nl-BE", true, false},
++    {"Flo (English (United States))", "en-US", true, false},
++    {"Flo (English (United Kingdom))", "en-GB", true, false},
++    {"Flo (Chinese (China mainland))", "zh-CN", true, false},
++    {"Flo (Chinese (Taiwan))", "zh-TW", true, false},
++    {"Flo (German (Germany))", "de-DE", true, false},
++    {"Flo (Spanish (Spain))", "es-ES", true, false},
++    {"Flo (Spanish (Mexico))", "es-MX", true, false},
++    {"Flo (Finnish (Finland))", "fi-FI", true, false},
++    {"Flo (French (Canada))", "fr-CA", true, false},
++    {"Flo (French (France))", "fr-FR", true, false},
++    {"Flo (Italian (Italy))", "it-IT", true, false},
++    {"Flo (Japanese (Japan))", "ja-JP", true, false},
++    {"Flo (Korean (South Korea))", "ko-KR", true, false},
++    {"Flo (Portuguese (Brazil))", "pt-BR", true, false},
++    {"Fred", "en-US", true, false},
++    {"Geeta", "te-IN", true, false},
++    {"Good News", "en-US", true, false},
++    {"Grandma (English (United States))", "en-US", true, false},
++    {"Grandma (English (United Kingdom))", "en-GB", true, false},
++    {"Grandma (Chinese (China mainland))", "zh-CN", true, false},
++    {"Grandma (Chinese (Taiwan))", "zh-TW", true, false},
++    {"Grandma (German (Germany))", "de-DE", true, false},
++    {"Grandma (Spanish (Spain))", "es-ES", true, false},
++    {"Grandma (Spanish (Mexico))", "es-MX", true, false},
++    {"Grandma (Finnish (Finland))", "fi-FI", true, false},
++    {"Grandma (French (Canada))", "fr-CA", true, false},
++    {"Grandma (French (France))", "fr-FR", true, false},
++    {"Grandma (Italian (Italy))", "it-IT", true, false},
++    {"Grandma (Japanese (Japan))", "ja-JP", true, false},
++    {"Grandma (Korean (South Korea))", "ko-KR", true, false},
++    {"Grandma (Portuguese (Brazil))", "pt-BR", true, false},
++    {"Grandpa (English (United States))", "en-US", true, false},
++    {"Grandpa (English (United Kingdom))", "en-GB", true, false},
++    {"Grandpa (Chinese (China mainland))", "zh-CN", true, false},
++    {"Grandpa (Chinese (Taiwan))", "zh-TW", true, false},
++    {"Grandpa (German (Germany))", "de-DE", true, false},
++    {"Grandpa (Spanish (Spain))", "es-ES", true, false},
++    {"Grandpa (Spanish (Mexico))", "es-MX", true, false},
++    {"Grandpa (Finnish (Finland))", "fi-FI", true, false},
++    {"Grandpa (French (Canada))", "fr-CA", true, false},
++    {"Grandpa (French (France))", "fr-FR", true, false},
++    {"Grandpa (Italian (Italy))", "it-IT", true, false},
++    {"Grandpa (Japanese (Japan))", "ja-JP", true, false},
++    {"Grandpa (Korean (South Korea))", "ko-KR", true, false},
++    {"Grandpa (Portuguese (Brazil))", "pt-BR", true, false},
++    {"Ioana", "ro-RO", true, false},
++    {"Jacques", "fr-FR", true, false},
++    {"Jester", "en-US", true, false},
++    {"Joana", "pt-PT", true, false},
++    {"Junior", "en-US", true, false},
++    {"Kanya", "th-TH", true, false},
++    {"Karen", "en-AU", true, false},
++    {"Kathy", "en-US", true, false},
++    {"Kyoko", "ja-JP", true, false},
++    {"Lana", "hr-HR", true, false},
++    {"Laura", "sk-SK", true, false},
++    {"Lekha", "hi-IN", true, false},
++    {"Lesya", "uk-UA", true, false},
++    {"Linh", "vi-VN", true, false},
++    {"Luciana", "pt-BR", true, false},
++    {"Majed", "ar-001", true, false},
++    {"Meijia", "zh-TW", true, false},
++    {"Melina", "el-GR", true, false},
++    {"Milena", "ru-RU", true, false},
++    {"Moira", "en-IE", true, false},
++    {"Montse", "ca-ES", true, false},
++    {"M\xc3\xb3nica", "es-ES", true, false},
++    {"Nora", "nb-NO", true, false},
++    {"Organ", "en-US", true, false},
++    {"Paulina", "es-MX", true, false},
++    {"Piya", "bn-IN", true, false},
++    {"Ralph", "en-US", true, false},
++    {"Reed (English (United States))", "en-US", true, false},
++    {"Reed (English (United Kingdom))", "en-GB", true, false},
++    {"Reed (Chinese (China mainland))", "zh-CN", true, false},
++    {"Reed (Chinese (Taiwan))", "zh-TW", true, false},
++    {"Reed (German (Germany))", "de-DE", true, false},
++    {"Reed (Spanish (Spain))", "es-ES", true, false},
++    {"Reed (Spanish (Mexico))", "es-MX", true, false},
++    {"Reed (Finnish (Finland))", "fi-FI", true, false},
++    {"Reed (French (Canada))", "fr-CA", true, false},
++    {"Reed (Italian (Italy))", "it-IT", true, false},
++    {"Reed (Japanese (Japan))", "ja-JP", true, false},
++    {"Reed (Korean (South Korea))", "ko-KR", true, false},
++    {"Reed (Portuguese (Brazil))", "pt-BR", true, false},
++    {"Rishi", "en-IN", true, false},
++    {"Rocko (English (United States))", "en-US", true, false},
++    {"Rocko (English (United Kingdom))", "en-GB", true, false},
++    {"Rocko (Chinese (China mainland))", "zh-CN", true, false},
++    {"Rocko (Chinese (Taiwan))", "zh-TW", true, false},
++    {"Rocko (German (Germany))", "de-DE", true, false},
++    {"Rocko (Spanish (Spain))", "es-ES", true, false},
++    {"Rocko (Spanish (Mexico))", "es-MX", true, false},
++    {"Rocko (Finnish (Finland))", "fi-FI", true, false},
++    {"Rocko (French (Canada))", "fr-CA", true, false},
++    {"Rocko (French (France))", "fr-FR", true, false},
++    {"Rocko (Italian (Italy))", "it-IT", true, false},
++    {"Rocko (Japanese (Japan))", "ja-JP", true, false},
++    {"Rocko (Korean (South Korea))", "ko-KR", true, false},
++    {"Rocko (Portuguese (Brazil))", "pt-BR", true, false},
++    {"Sandy (English (United States))", "en-US", true, false},
++    {"Sandy (English (United Kingdom))", "en-GB", true, false},
++    {"Sandy (Chinese (China mainland))", "zh-CN", true, false},
++    {"Sandy (Chinese (Taiwan))", "zh-TW", true, false},
++    {"Sandy (German (Germany))", "de-DE", true, false},
++    {"Sandy (Spanish (Spain))", "es-ES", true, false},
++    {"Sandy (Spanish (Mexico))", "es-MX", true, false},
++    {"Sandy (Finnish (Finland))", "fi-FI", true, false},
++    {"Sandy (French (Canada))", "fr-CA", true, false},
++    {"Sandy (French (France))", "fr-FR", true, false},
++    {"Sandy (Italian (Italy))", "it-IT", true, false},
++    {"Sandy (Japanese (Japan))", "ja-JP", true, false},
++    {"Sandy (Korean (South Korea))", "ko-KR", true, false},
++    {"Sandy (Portuguese (Brazil))", "pt-BR", true, false},
++    {"Sara", "da-DK", true, false},
++    {"Satu", "fi-FI", true, false},
++    {"Shelley (English (United States))", "en-US", true, false},
++    {"Shelley (English (United Kingdom))", "en-GB", true, false},
++    {"Shelley (Chinese (China mainland))", "zh-CN", true, false},
++    {"Shelley (Chinese (Taiwan))", "zh-TW", true, false},
++    {"Shelley (German (Germany))", "de-DE", true, false},
++    {"Shelley (Spanish (Spain))", "es-ES", true, false},
++    {"Shelley (Spanish (Mexico))", "es-MX", true, false},
++    {"Shelley (Finnish (Finland))", "fi-FI", true, false},
++    {"Shelley (French (Canada))", "fr-CA", true, false},
++    {"Shelley (French (France))", "fr-FR", true, false},
++    {"Shelley (Italian (Italy))", "it-IT", true, false},
++    {"Shelley (Japanese (Japan))", "ja-JP", true, false},
++    {"Shelley (Korean (South Korea))", "ko-KR", true, false},
++    {"Shelley (Portuguese (Brazil))", "pt-BR", true, false},
++    {"Sinji", "yue-HK", true, false},
++    {"Soumya", "kn-IN", true, false},
++    {"Superstar", "en-US", true, false},
++    {"Tessa", "en-ZA", true, false},
++    {"Thomas", "fr-FR", true, false},
++    {"Tina", "sl-SI", true, false},
++    {"Tingting", "zh-CN", true, false},
++    {"Trinoids", "en-US", true, false},
++    {"T\xc3\xbcnde", "hu-HU", true, false},
++    {"Vani", "ta-IN", true, false},
++    {"Whisper", "en-US", true, false},
++    {"Wobble", "en-US", true, false},
++    {"Xander", "nl-NL", true, false},
++    {"Yelda", "tr-TR", true, false},
++    {"Yuna", "ko-KR", true, false},
++    {"Zarvox", "en-US", true, false},
++    {"Zosia", "pl-PL", true, false},
++    {"Zuzana", "cs-CZ", true, false},
++    {"Google Deutsch", "de-DE", false, false},
++    {"Google US English", "en-US", false, false},
++    {"Google UK English Female", "en-GB", false, false},
++    {"Google UK English Male", "en-GB", false, false},
++    {"Google espa\xc3\xb1ol", "es-ES", false, false},
++    {"Google espa\xc3\xb1ol de Estados Unidos", "es-US", false, false},
++    {"Google fran\xc3\xa7" "ais", "fr-FR", false, false},
++    {"Google \xe0\xa4\xb9\xe0\xa4\xbf\xe0\xa4\xa8\xe0\xa5\x8d\xe0\xa4\xa6\xe0\xa5\x80", "hi-IN", false, false},
++    {"Google Bahasa Indonesia", "id-ID", false, false},
++    {"Google italiano", "it-IT", false, false},
++    {"Google \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", "ja-JP", false, false},
++    {"Google \xed\x95\x9c\xea\xb5\xad\xec\x9d\x98", "ko-KR", false, false},
++    {"Google Nederlands", "nl-NL", false, false},
++    {"Google polski", "pl-PL", false, false},
++    {"Google portugu\xc3\xaas do Brasil", "pt-BR", false, false},
++    {"Google \xd1\x80\xd1\x83\xd1\x81\xd1\x81\xd0\xba\xd0\xb8\xd0\xb9", "ru-RU", false, false},
++    {"Google\xc2\xa0\xe6\x99\xae\xe9\x80\x9a\xe8\xaf\x9d\xef\xbc\x88\xe4\xb8\xad\xe5\x9b\xbd\xe5\xa4\xa7\xe9\x99\x86\xef\xbc\x89", "zh-CN", false, false},
++    {"Google\xc2\xa0\xe7\xb2\xa4\xe8\xaa\x9e\xef\xbc\x88\xe9\xa6\x99\xe6\xb8\xaf\xef\xbc\x89", "zh-HK", false, false},
++    {"Google \xe5\x9c\x8b\xe8\xaa\x9e\xef\xbc\x88\xe8\x87\xba\xe7\x81\xa3\xef\xbc\x89", "zh-TW", false, false},
++}};
++
++struct KeyLayoutPair {
++  const char* code;
++  const char* key;
++};
++
++constexpr std::array<KeyLayoutPair, 48> kMacOSEnUSKeyboardLayout = {{
++    {"KeyK", "k"},
++    {"KeyG", "g"},
++    {"Digit2", "2"},
++    {"Digit0", "0"},
++    {"KeyV", "v"},
++    {"KeyA", "a"},
++    {"Backquote", "`"},
++    {"KeyL", "l"},
++    {"IntlBackslash", "\xc2\xa7"},
++    {"Quote", "'"},
++    {"KeyW", "w"},
++    {"Digit8", "8"},
++    {"KeyM", "m"},
++    {"KeyH", "h"},
++    {"Period", "."},
++    {"Digit7", "7"},
++    {"Digit1", "1"},
++    {"KeyP", "p"},
++    {"KeyD", "d"},
++    {"KeyF", "f"},
++    {"KeyO", "o"},
++    {"KeyQ", "q"},
++    {"KeyC", "c"},
++    {"KeyN", "n"},
++    {"BracketLeft", "["},
++    {"KeyZ", "z"},
++    {"KeyY", "y"},
++    {"Digit3", "3"},
++    {"Digit6", "6"},
++    {"Digit5", "5"},
++    {"KeyX", "x"},
++    {"Slash", "/"},
++    {"Backslash", "\\"},
++    {"Comma", ","},
++    {"Minus", "-"},
++    {"Digit4", "4"},
++    {"KeyB", "b"},
++    {"KeyT", "t"},
++    {"Digit9", "9"},
++    {"KeyS", "s"},
++    {"KeyI", "i"},
++    {"KeyU", "u"},
++    {"Equal", "="},
++    {"KeyJ", "j"},
++    {"Semicolon", ";"},
++    {"KeyR", "r"},
++    {"BracketRight", "]"},
++    {"KeyE", "e"},
++}};
++
++bool IsWordChar(unsigned char c) {
++  return base::IsAsciiAlpha(c) || base::IsAsciiDigit(c) || c == '_';
++}
++
++bool ContainsWordTokenCaseInsensitive(std::string_view haystack,
++                                      std::string_view token) {
++  if (token.empty() || haystack.size() < token.size()) {
++    return false;
++  }
++  const size_t limit = haystack.size() - token.size();
++  for (size_t i = 0; i <= limit; ++i) {
++    if (i > 0 && IsWordChar(static_cast<unsigned char>(haystack[i - 1]))) {
++      continue;
++    }
++    const size_t end = i + token.size();
++    if (end < haystack.size() &&
++        IsWordChar(static_cast<unsigned char>(haystack[end]))) {
++      continue;
++    }
++    if (base::EqualsCaseInsensitiveASCII(haystack.substr(i, token.size()),
++                                         token)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++uint32_t ReadBE32(base::span<const uint8_t, 32> bytes, size_t offset) {
++  return (static_cast<uint32_t>(bytes[offset]) << 24) |
++         (static_cast<uint32_t>(bytes[offset + 1]) << 16) |
++         (static_cast<uint32_t>(bytes[offset + 2]) << 8) |
++         static_cast<uint32_t>(bytes[offset + 3]);
++}
++
++}  // namespace
++
++void SetHeadlessShellActive(bool active) {
++  g_headless_shell_active.store(active, std::memory_order_release);
++}
++
++bool IsHeadlessShellActive() {
++  return g_headless_shell_active.load(std::memory_order_acquire);
++}
++
++bool IsDesktopMacParityActive(bool is_desktop_slot) {
++  if (!is_desktop_slot) {
++    return false;
++  }
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg) {
++    return true;
++  }
++  const std::string desktop_platform = cfg->desktop.platform.value_or("macOS");
++  if (desktop_platform == "macOS") {
++    return true;
++  }
++  return cfg->desktop.navigator_platform.has_value() &&
++         *cfg->desktop.navigator_platform == "MacIntel";
++}
++
++bool IsDesktopMacParityActive(const blink::UserAgentMetadata& metadata) {
++  if (metadata.mobile) {
++    return false;
++  }
++  if (!metadata.platform.empty()) {
++    return metadata.platform == "macOS";
++  }
++  return IsDesktopMacParityActive(/*is_desktop_slot=*/true);
++}
++
++bool IsDesktopMacLaunchProfile() {
++  const LaunchConfig* cfg = GetLaunchConfig();
++  if (!cfg || cfg->default_slot != DefaultSlot::kDesktop) {
++    return false;
++  }
++  return IsDesktopMacParityActive(/*is_desktop_slot=*/true);
++}
++
++std::vector<MacVoiceEntry> GetSeededMacOSVoices(std::string_view persona_seed) {
++  if (persona_seed.empty()) {
++    return std::vector<MacVoiceEntry>(kMacOSVoices.begin(), kMacOSVoices.end());
++  }
++
++  std::string seed_input;
++  seed_input.reserve(32 + persona_seed.size());
++  seed_input.append("curium.desktop.parity.voices.v1:");
++  seed_input.append(persona_seed);
++  const std::array<uint8_t, 32> digest = crypto::hash::Sha256(seed_input);
++
++  uint32_t s0 = ReadBE32(digest, 0);
++  if (s0 == 0u) {
++    s0 = 0x9e3779b9u;
++  }
++  uint32_t s1 = ReadBE32(digest, 4);
++  if (s1 == 0u) {
++    s1 = 0x85ebca6bu;
++  }
++
++  auto next_rand = [&s0, &s1]() -> uint32_t {
++    uint32_t x = s0;
++    const uint32_t y = s1;
++    s0 = y;
++    x ^= (x << 23);
++    s1 = x ^ y ^ (x >> 17) ^ (y >> 26);
++    return s1 + y;
++  };
++
++  std::vector<MacVoiceEntry> selected;
++  selected.reserve(kMacOSVoices.size());
++  for (const MacVoiceEntry& entry : kMacOSVoices) {
++    const bool is_google = std::string_view(entry.name).starts_with("Google");
++    if (entry.is_default || is_google || (next_rand() % 100u) < 72u) {
++      selected.push_back(entry);
++    }
++  }
++  return selected;
++}
++
++base::flat_map<std::string, std::string> GetMacOSEnUSKeyboardLayoutMap() {
++  std::vector<std::pair<std::string, std::string>> entries;
++  entries.reserve(kMacOSEnUSKeyboardLayout.size());
++  for (const KeyLayoutPair& pair : kMacOSEnUSKeyboardLayout) {
++    entries.emplace_back(pair.code, pair.key);
++  }
++  return base::flat_map<std::string, std::string>(std::move(entries));
++}
++
++bool IsDesktopSupportedMediaCodec(std::string_view video_content_type,
++                                  std::string_view audio_content_type,
++                                  bool* power_efficient_out) {
++  const bool has_video = !video_content_type.empty();
++  const bool has_audio = !audio_content_type.empty();
++  if (!has_video && !has_audio) {
++    return false;
++  }
++
++  bool is_vp8 = false;
++  if (has_video) {
++    is_vp8 = ContainsWordTokenCaseInsensitive(video_content_type, "vp8");
++    const bool is_desktop_video =
++        is_vp8 ||
++        ContainsWordTokenCaseInsensitive(video_content_type, "vp09") ||
++        ContainsWordTokenCaseInsensitive(video_content_type, "vp9") ||
++        ContainsWordTokenCaseInsensitive(video_content_type, "av01") ||
++        ContainsWordTokenCaseInsensitive(video_content_type, "hvc1") ||
++        ContainsWordTokenCaseInsensitive(video_content_type, "avc1");
++    if (!is_desktop_video) {
++      return false;
++    }
++  }
++
++  if (has_audio) {
++    const bool is_desktop_audio =
++        ContainsWordTokenCaseInsensitive(audio_content_type, "opus") ||
++        ContainsWordTokenCaseInsensitive(audio_content_type, "mp4a");
++    if (!is_desktop_audio) {
++      return false;
++    }
++  }
++
++  if (power_efficient_out) {
++    *power_efficient_out = !is_vp8;
++  }
++  return true;
++}
++
++}  // namespace blink::curium
+diff --git a/third_party/blink/public/common/BUILD.gn b/third_party/blink/public/common/BUILD.gn
+index 747b91f..8dc4f88 100644
+--- a/third_party/blink/public/common/BUILD.gn
++++ b/third_party/blink/public/common/BUILD.gn
+@@ -140,6 +140,7 @@ source_set("headers") {
+     "css/page_orientation.h",
+     "css/page_size_type.h",
+     "css/scripting.h",
++    "curium/curium_desktop_parity.h",
+     "curium/curium_fingerprint_config.h",
+     "curium/curium_runtime_policy.h",
+     "custom_handlers/protocol_handler_utils.h",
+diff --git a/third_party/blink/public/common/curium/curium_desktop_parity.h b/third_party/blink/public/common/curium/curium_desktop_parity.h
+new file mode 100644
+index 0000000..64e55c3
+--- /dev/null
++++ b/third_party/blink/public/common/curium/curium_desktop_parity.h
+@@ -0,0 +1,62 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_DESKTOP_PARITY_H_
++#define THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_DESKTOP_PARITY_H_
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/flat_map.h"
++#include "third_party/blink/public/common/common_export.h"
++#include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
++
++namespace blink::curium {
++
++struct BLINK_COMMON_EXPORT MacVoiceEntry {
++  const char* name;
++  const char* lang;
++  bool local_service;
++  bool is_default;
++};
++
++// Tracks whether the process is hosted by Curium's headless shell delegate.
++// Stored in //third_party/blink/public/common so ios/web/content can query it
++// without depending on ios/chrome.
++BLINK_COMMON_EXPORT void SetHeadlessShellActive(bool active);
++BLINK_COMMON_EXPORT bool IsHeadlessShellActive();
++
++// Returns true when desktop macOS Web API parity should be active for a slot
++// or frame metadata.
++BLINK_COMMON_EXPORT bool IsDesktopMacParityActive(bool is_desktop_slot);
++BLINK_COMMON_EXPORT bool IsDesktopMacParityActive(
++    const blink::UserAgentMetadata& metadata);
++
++// Returns true when the frozen launch profile defaults to a desktop macOS slot.
++// Safe to call from browser-side hooks without per-frame UA metadata.
++BLINK_COMMON_EXPORT bool IsDesktopMacLaunchProfile();
++
++// Returns an authentic macOS + 19 Google TTS voice subset deterministically
++// seeded by `persona_seed` (Samantha default first + all 19 Google voices +
++// ~72% of optional Apple voices), or the full 199-voice catalog when
++// `persona_seed` is empty.
++BLINK_COMMON_EXPORT std::vector<MacVoiceEntry> GetSeededMacOSVoices(
++    std::string_view persona_seed);
++
++// Returns the 48-key macOS ANSI en-US DOM KeyboardLayoutMap (`code -> key`).
++BLINK_COMMON_EXPORT base::flat_map<std::string, std::string>
++GetMacOSEnUSKeyboardLayoutMap();
++
++// Matches desktop macOS hardware/software codecs for unencrypted
++// MediaCapabilities `type == "file"` decodingInfo probes
++// (vp09|vp9|av01|hvc1|avc1|vp8 + opus|mp4a; power_efficient = !is_vp8).
++BLINK_COMMON_EXPORT bool IsDesktopSupportedMediaCodec(
++    std::string_view video_content_type,
++    std::string_view audio_content_type,
++    bool* power_efficient_out);
++
++}  // namespace blink::curium
++
++#endif  // THIRD_PARTY_BLINK_PUBLIC_COMMON_CURIUM_CURIUM_DESKTOP_PARITY_H_
+diff --git a/third_party/blink/renderer/modules/ai/on_device_translation/language_detector.cc b/third_party/blink/renderer/modules/ai/on_device_translation/language_detector.cc
+index fd5fe7a..f26d60a 100644
+--- a/third_party/blink/renderer/modules/ai/on_device_translation/language_detector.cc
++++ b/third_party/blink/renderer/modules/ai/on_device_translation/language_detector.cc
+@@ -7,6 +7,10 @@
+ #include "base/check_deref.h"
+ #include "base/containers/fixed_flat_set.h"
+ #include "base/metrics/histogram_functions.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
++#endif
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/public/mojom/ai/model_streaming_responder.mojom-blink.h"
+ #include "third_party/blink/public/platform/web_runtime_features.h"
+@@ -245,6 +249,21 @@ ScriptPromise<V8Availability> LanguageDetector::availability(
+     return promise;
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  if (curium::IsDesktopMacParityActive(context->GetUserAgentMetadata())) {
++    if (options && options->hasExpectedInputLanguages() &&
++        !options->expectedInputLanguages().empty() &&
++        !GetBestFitLanguages(kSupportedLanguages,
++                             options->expectedInputLanguages())
++             .has_value()) {
++      resolver->Resolve(AvailabilityToV8(Availability::kUnavailable));
++    } else {
++      resolver->Resolve(AvailabilityToV8(Availability::kAvailable));
++    }
++    return promise;
++  }
++#endif
++
+   AIInterfaceProxy::GetLanguageDetectionModelStatus(
+       context, BindOnce(&OnGotStatus, WrapWeakPersistent(context),
+                         WrapPersistent(options), WrapPersistent(resolver))
+diff --git a/third_party/blink/renderer/modules/ai/summarizer.cc b/third_party/blink/renderer/modules/ai/summarizer.cc
+index 4d4b2df..0a59528 100644
+--- a/third_party/blink/renderer/modules/ai/summarizer.cc
++++ b/third_party/blink/renderer/modules/ai/summarizer.cc
+@@ -6,6 +6,13 @@
+ 
+ #include "base/metrics/metrics_hashes.h"
+ #include "base/strings/strcat.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include <optional>
++
++#include "base/check.h"
++#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
++#endif
+ #include "third_party/blink/public/mojom/ai/model_streaming_responder.mojom-blink.h"
+ #include "third_party/blink/renderer/modules/ai/ai_metrics.h"
+ #include "third_party/blink/renderer/modules/ai/ai_writing_assistance_create_client.h"
+@@ -150,6 +157,73 @@ void SummarizerBase::RecordCreateOptionMetrics(
+   }
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++namespace {
++
++bool ValidateAndCanonicalizeSummarizerOptionLanguages(
++    v8::Isolate* isolate,
++    SummarizerCreateCoreOptions* options) {
++  using LanguageList = std::optional<Vector<String>>;
++  if (options->hasExpectedContextLanguages()) {
++    LanguageList result = ValidateAndCanonicalizeBCP47Languages(
++        isolate, options->expectedContextLanguages());
++    if (!result) {
++      return false;
++    }
++    options->setExpectedContextLanguages(*result);
++  }
++
++  if (options->hasExpectedInputLanguages()) {
++    LanguageList result = ValidateAndCanonicalizeBCP47Languages(
++        isolate, options->expectedInputLanguages());
++    if (!result) {
++      return false;
++    }
++    options->setExpectedInputLanguages(*result);
++  }
++
++  if (options->hasOutputLanguage()) {
++    LanguageList result = ValidateAndCanonicalizeBCP47Languages(
++        isolate, {options->outputLanguage()});
++    if (!result) {
++      return false;
++    }
++    options->setOutputLanguage((*result)[0]);
++  }
++  return true;
++}
++
++}  // namespace
++
++// static
++ScriptPromise<V8Availability> Summarizer::availability(
++    ScriptState* script_state,
++    SummarizerCreateCoreOptions* options,
++    ExceptionState& exception_state) {
++  if (!script_state->ContextIsValid()) {
++    ThrowInvalidContextException(exception_state);
++    return ScriptPromise<V8Availability>();
++  }
++  CHECK(options);
++  if (!ValidateAndCanonicalizeSummarizerOptionLanguages(
++          script_state->GetIsolate(), options)) {
++    return ScriptPromise<V8Availability>();
++  }
++  ExecutionContext* execution_context = ExecutionContext::From(script_state);
++  if (execution_context &&
++      curium::IsDesktopMacParityActive(
++          execution_context->GetUserAgentMetadata())) {
++    auto* resolver =
++        MakeGarbageCollected<ScriptPromiseResolver<V8Availability>>(
++            script_state);
++    auto promise = resolver->Promise();
++    resolver->Resolve(AvailabilityToV8(Availability::kUnavailable));
++    return promise;
++  }
++  return SummarizerBase::availability(script_state, options, exception_state);
++}
++#endif
++
+ Summarizer::Summarizer(
+     ScriptState* script_state,
+     scoped_refptr<base::SequencedTaskRunner> task_runner,
+diff --git a/third_party/blink/renderer/modules/ai/summarizer.h b/third_party/blink/renderer/modules/ai/summarizer.h
+index 74e20a5..08772a2 100644
+--- a/third_party/blink/renderer/modules/ai/summarizer.h
++++ b/third_party/blink/renderer/modules/ai/summarizer.h
+@@ -6,6 +6,7 @@
+ #define THIRD_PARTY_BLINK_RENDERER_MODULES_AI_SUMMARIZER_H_
+ 
+ #include "base/task/sequenced_task_runner.h"
++#include "build/build_config.h"
+ #include "third_party/blink/public/mojom/ai/ai_summarizer.mojom-blink.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_summarizer_create_options.h"
+@@ -42,6 +43,12 @@ class Summarizer final : public ScriptWrappable,
+           responder) override;
+ 
+   // summarizer.idl:
++#if BUILDFLAG(IS_IOS)
++  static ScriptPromise<V8Availability> availability(
++      ScriptState* script_state,
++      SummarizerCreateCoreOptions* options,
++      ExceptionState& exception_state);
++#endif
+   ScriptPromise<IDLString> summarize(ScriptState* script_state,
+                                      const String& writing_task,
+                                      const SummarizerSummarizeOptions* options,
+diff --git a/third_party/blink/renderer/modules/credentialmanagement/public_key_credential.cc b/third_party/blink/renderer/modules/credentialmanagement/public_key_credential.cc
+index 7949295..1c9310c 100644
+--- a/third_party/blink/renderer/modules/credentialmanagement/public_key_credential.cc
++++ b/third_party/blink/renderer/modules/credentialmanagement/public_key_credential.cc
+@@ -8,6 +8,11 @@
+ #include <variant>
+ 
+ #include "third_party/abseil-cpp/absl/functional/overload.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#endif
+ #include "third_party/blink/public/mojom/webauthn/authenticator.mojom-shared.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+@@ -96,6 +101,27 @@ void OnGetClientCapabilitiesComplete(
+     results.emplace_back("extension:remoteClientDataJSON", true);
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  if (ExecutionContext* context = resolver->GetExecutionContext();
++      context &&
++      curium::IsDesktopMacParityActive(context->GetUserAgentMetadata())) {
++    auto upsert = [&results](const char* key, bool value) {
++      const String key_str(key);
++      for (auto& entry : results) {
++        if (entry.first == key_str) {
++          entry.second = value;
++          return;
++        }
++      }
++      results.emplace_back(key_str, value);
++    };
++    upsert("userVerifyingPlatformAuthenticator", true);
++    upsert("passkeyPlatformAuthenticator", true);
++    upsert("extension:payment", true);
++    upsert("extension:prf", true);
++  }
++#endif
++
+   // Results should be sorted lexicographically based on the keys.
+   std::sort(
+       results.begin(), results.end(),
+diff --git a/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc b/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
+index 20f4e5a..48338d9 100644
+--- a/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
++++ b/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
+@@ -15,6 +15,10 @@
+ #include "base/metrics/histogram_macros.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
++#endif
+ #include "media/base/media_switches.h"
+ #include "media/base/media_util.h"
+ #include "media/base/mime_util.h"
+@@ -1009,6 +1013,34 @@ ScriptPromise<MediaCapabilitiesDecodingInfo> MediaCapabilities::decodingInfo(
+   // Validation errors should return above.
+   DCHECK(message.empty());
+ 
++#if BUILDFLAG(IS_IOS)
++  if (config->type() == V8MediaDecodingType::Enum::kFile &&
++      !config->hasKeySystemConfiguration()) {
++    ExecutionContext* execution_context = ExecutionContext::From(script_state);
++    if (execution_context &&
++        curium::IsDesktopMacParityActive(
++            execution_context->GetUserAgentMetadata())) {
++      const std::string video_ct =
++          config->hasVideo() ? config->video()->contentType().Utf8()
++                             : std::string();
++      const std::string audio_ct =
++          config->hasAudio() ? config->audio()->contentType().Utf8()
++                             : std::string();
++      bool power_efficient = true;
++      if (curium::IsDesktopSupportedMediaCodec(video_ct, audio_ct,
++                                               &power_efficient)) {
++        MediaCapabilitiesDecodingInfo* info =
++            MediaCapabilitiesDecodingInfo::Create();
++        info->setSupported(true);
++        info->setSmooth(true);
++        info->setPowerEfficient(power_efficient);
++        return ToResolvedPromise<MediaCapabilitiesDecodingInfo>(script_state,
++                                                                info);
++      }
++    }
++  }
++#endif
++
+   // Fill in values for range, matrix since `VideoConfiguration` doesn't have
+   // such concepts; these aren't used, but ensure VideoColorSpace.IsSpecified()
+   // works as expected downstream.
+diff --git a/third_party/blink/renderer/modules/netinfo/network_information.cc b/third_party/blink/renderer/modules/netinfo/network_information.cc
+index 81df80e..6ff5b37 100644
+--- a/third_party/blink/renderer/modules/netinfo/network_information.cc
++++ b/third_party/blink/renderer/modules/netinfo/network_information.cc
+@@ -7,6 +7,10 @@
+ #include <algorithm>
+ 
+ #include "base/time/time.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
++#endif
+ #include "third_party/blink/public/mojom/devtools/console_message.mojom-blink.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_connection_type.h"
+@@ -139,12 +143,22 @@ uint32_t NetworkInformation::rtt() {
+     return GetNetworkStateNotifier().RoundRtt(Host(), override_rtt.value());
+   }
+ 
+-  if (!IsObserving()) {
+-    return GetNetworkStateNotifier().RoundRtt(
+-        Host(), GetNetworkStateNotifier().HttpRtt());
++  uint32_t rtt_msec =
++      IsObserving() ? http_rtt_msec_
++                    : GetNetworkStateNotifier().RoundRtt(
++                          Host(), GetNetworkStateNotifier().HttpRtt());
++#if BUILDFLAG(IS_IOS)
++  if (rtt_msec == 0) {
++    const WebConnectionType conn_type =
++        IsObserving() ? type_ : GetNetworkStateNotifier().ConnectionType();
++    ExecutionContext* context = GetExecutionContext();
++    if (conn_type != kWebConnectionTypeNone && context &&
++        curium::IsDesktopMacParityActive(context->GetUserAgentMetadata())) {
++      return 50;
++    }
+   }
+-
+-  return http_rtt_msec_;
++#endif
++  return rtt_msec;
+ }
+ 
+ double NetworkInformation::downlink() {
+diff --git a/third_party/blink/renderer/modules/presentation/presentation_error.cc b/third_party/blink/renderer/modules/presentation/presentation_error.cc
+index 8c4aa7f..53b9cc8 100644
+--- a/third_party/blink/renderer/modules/presentation/presentation_error.cc
++++ b/third_party/blink/renderer/modules/presentation/presentation_error.cc
+@@ -4,6 +4,12 @@
+ 
+ #include "third_party/blink/renderer/modules/presentation/presentation_error.h"
+ 
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/platform/bindings/script_state.h"
++#endif
+ #include "third_party/blink/public/mojom/presentation/presentation.mojom-blink.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_throw_dom_exception.h"
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+@@ -30,7 +36,24 @@ v8::Local<v8::Value> CreatePresentationError(
+       break;
+   }
+ 
+-  return V8ThrowDOMException::CreateOrDie(isolate, code, error.message);
++  String message = error.message;
++#if BUILDFLAG(IS_IOS)
++  if (message.contains("No matching route")) {
++    v8::Local<v8::Context> current_context = isolate->GetCurrentContext();
++    ScriptState* script_state =
++        current_context.IsEmpty()
++            ? nullptr
++            : ScriptState::MaybeFrom(isolate, current_context);
++    ExecutionContext* context =
++        script_state ? ExecutionContext::From(script_state) : nullptr;
++    if (context &&
++        curium::IsDesktopMacParityActive(context->GetUserAgentMetadata())) {
++      code = DOMExceptionCode::kNotFoundError;
++      message = "Route not found";
++    }
++  }
++#endif
++  return V8ThrowDOMException::CreateOrDie(isolate, code, message);
+ }
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/modules/speech/speech_synthesis.cc b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+index 8550cf5..e37af71 100644
+--- a/third_party/blink/renderer/modules/speech/speech_synthesis.cc
++++ b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+@@ -29,6 +29,11 @@
+ 
+ #include "build/build_config.h"
+ #if BUILDFLAG(IS_IOS)
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
+ #include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
+ #endif
+ #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
+@@ -88,10 +93,15 @@ SpeechSynthesis::SpeechSynthesis(LocalDOMWindow& window)
+ void SpeechSynthesis::OnSetVoiceList(
+     Vector<mojom::blink::SpeechSynthesisVoicePtr> mojom_voices) {
+ #if BUILDFLAG(IS_IOS)
+-  if (LocalDOMWindow* window = GetSupplementable();
+-      window && curium::ShouldHideSpeechVoices(window->GetUserAgentMetadata())) {
+-    voice_list_.clear();
+-    return;
++  if (LocalDOMWindow* window = GetSupplementable()) {
++    const UserAgentMetadata metadata = window->GetUserAgentMetadata();
++    if (curium::ShouldHideSpeechVoices(metadata)) {
++      voice_list_.clear();
++      return;
++    }
++    if (mojom_voices.empty() && curium::IsDesktopMacParityActive(metadata)) {
++      return;
++    }
+   }
+ #endif
+   voice_list_.clear();
+@@ -104,10 +114,34 @@ void SpeechSynthesis::OnSetVoiceList(
+ 
+ const HeapVector<Member<SpeechSynthesisVoice>>& SpeechSynthesis::getVoices() {
+ #if BUILDFLAG(IS_IOS)
+-  if (LocalDOMWindow* window = GetSupplementable();
+-      window && curium::ShouldHideSpeechVoices(window->GetUserAgentMetadata())) {
+-    voice_list_.clear();
+-    return voice_list_;
++  if (LocalDOMWindow* window = GetSupplementable()) {
++    const UserAgentMetadata metadata = window->GetUserAgentMetadata();
++    if (curium::ShouldHideSpeechVoices(metadata)) {
++      voice_list_.clear();
++      return voice_list_;
++    }
++    if (voice_list_.empty() && curium::IsDesktopMacParityActive(metadata)) {
++      const std::optional<std::string> persona_seed =
++          curium::GetActivePersonaSeed();
++      const std::vector<curium::MacVoiceEntry> voices =
++          curium::GetSeededMacOSVoices(
++              persona_seed ? std::string_view(*persona_seed)
++                           : std::string_view());
++      voice_list_.ReserveInitialCapacity(
++          static_cast<wtf_size_t>(voices.size()));
++      for (const curium::MacVoiceEntry& entry : voices) {
++        auto mojom_voice = mojom::blink::SpeechSynthesisVoice::New();
++        const String name = String::FromUtf8(entry.name);
++        mojom_voice->voice_uri = name;
++        mojom_voice->name = name;
++        mojom_voice->lang = String::FromUtf8(entry.lang);
++        mojom_voice->is_local_service = entry.local_service;
++        mojom_voice->is_default = entry.is_default;
++        voice_list_.push_back(MakeGarbageCollected<SpeechSynthesisVoice>(
++            std::move(mojom_voice)));
++      }
++      return voice_list_;
++    }
+   }
+ #endif
+   // Kick off initialization here to ensure voice list gets populated.
