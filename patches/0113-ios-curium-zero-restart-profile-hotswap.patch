@@ -1,5 +1,5 @@
 diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
-index 60ed51f..fb907d3 100644
+index 60ed51f..512c33d 100644
 --- a/content/browser/renderer_host/render_process_host_impl.cc
 +++ b/content/browser/renderer_host/render_process_host_impl.cc
 @@ -93,6 +93,10 @@
@@ -295,7 +295,7 @@ index 60ed51f..fb907d3 100644
  }
  
  // static
-@@ -5305,6 +5502,239 @@ void RenderProcessHost::ShutDownInProcessRenderer() {
+@@ -5305,6 +5502,240 @@ void RenderProcessHost::ShutDownInProcessRenderer() {
    RenderProcessHostImpl::ShutDownInProcessRenderer();
  }
  
@@ -320,7 +320,7 @@ index 60ed51f..fb907d3 100644
 +            browser_context_->GetUserData(kSiteProcessMapKeyName))) {
 +      map->RemoveProcess(this);
 +    }
-+    constexpr const void* kTrackerKeys[] = {
++    const void* const kTrackerKeys[] = {
 +        kCommittedSiteProcessCountTrackerKey,
 +        kPendingSiteProcessCountTrackerKey,
 +        kDelayedShutdownSiteProcessCountTrackerKey,
@@ -418,8 +418,9 @@ index 60ed51f..fb907d3 100644
 +
 +  if (io_thread_host_impl_) {
 +    io_thread_host_impl_->AsyncCall(
-+        &IOThreadHostImpl::SetBlobRegistryForHotSwap,
-+        base::WrapRefCounted(storage_partition_impl_->GetBlobRegistry()));
++        &IOThreadHostImpl::SetBlobRegistryForHotSwap)
++        .WithArgs(base::WrapRefCounted(
++            storage_partition_impl_->GetBlobRegistry()));
 +  }
 +
 +  if (hot_swap_dom_storage_forwarder_) {
@@ -535,7 +536,7 @@ index 60ed51f..fb907d3 100644
  // static
  RenderProcessHost::iterator RenderProcessHost::AllHostsIterator() {
    CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M152);
-@@ -5872,8 +6302,20 @@ void RenderProcessHostImpl::ResetIPC() {
+@@ -5872,8 +6303,20 @@ void RenderProcessHostImpl::ResetIPC() {
    embedded_frame_sink_provider_.reset();
  
    dom_storage_provider_receiver_.reset();
