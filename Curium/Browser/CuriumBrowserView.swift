@@ -13,6 +13,12 @@ struct CuriumBrowserView: View {
     /// root `GeometryReader` can ignore `.container` top edge without losing `safeTop`.
     @State private var windowSafeTop: CGFloat?
     @State private var sheet: Destination?
+    @State private var wideDownloadsWorkbench = false
+    @State private var isShowingWideDownloads = false
+    @State private var downloadsViewState = CuriumDownloadsViewState()
+    @State private var isTransitioningDownloadsPresentation = false
+    @State private var pendingDownloadsPresentation: DownloadsPresentationMode?
+    @State private var downloadsTransitionTask: Task<Void, Never>?
     @State private var dismissKeyboardTrigger = 0
     @State private var addressFocused = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -23,12 +29,18 @@ struct CuriumBrowserView: View {
         var id: Self { self }
     }
 
+    private enum DownloadsPresentationMode: Equatable {
+        case compactSheet
+        case wideCover
+    }
+
     private var tab: CuriumTabModel? { store.activeTab }
     private var isFullscreen: Bool { tab?.isFullscreen == true && tab?.isShowingPDF != true }
     private var showsStartPage: Bool { tab?.isBlankStartPage == true }
 
     var body: some View {
         GeometryReader { proxy in
+            let isWideDownloadsWorkbench = proxy.size.width >= 760
             let divisions = activeDivisionFrames(in: proxy)
             let clearance = topChromeClearance(in: proxy, activeDivisions: divisions)
             let bottomPane = Self.resolveBottomOverlayPane(
@@ -144,13 +156,18 @@ struct CuriumBrowserView: View {
                         openExtensions: { present(.extensions) },
                         openDownloads: {
                             store.dismissDownloadBanner()
-                            present(.downloads)
+                            openDownloads()
                         }
                     )
                 }
             }
             .onChange(of: proxy.size.width, initial: true) { _, newWidth in
                 store.updateViewportWidth(newWidth)
+            }
+            .onChange(of: isWideDownloadsWorkbench, initial: true) { _, isWide in
+                if wideDownloadsWorkbench != isWide {
+                    wideDownloadsWorkbench = isWide
+                }
             }
             .alert(
                 store.activeMediaPermissionPrompt?.title ?? "",
@@ -210,22 +227,21 @@ struct CuriumBrowserView: View {
         .onChange(of: store.activeMediaPermissionPrompt != nil) { _, presented in
             if presented { dismissAddressFocus() }
         }
-        .sheet(item: $sheet, onDismiss: {
-            if sheet == nil {
-                store.setSheetPresented(false)
-            }
-        }) { item in
+        .onChange(of: wideDownloadsWorkbench) { _, isWide in
+            handleDownloadsPostureChange(isWide: isWide)
+        }
+        .sheet(item: $sheet, onDismiss: handleSheetDismiss) { item in
             switch item {
             case .tabs: CuriumTabsSheet(store: store)
             case .extensions: CuriumExtensionsSheet(browser: store)
             case .mediaRadar:
                 CuriumMediaRadarSheet(store: store, onOpenDownloads: {
                     store.dismissDownloadBanner()
-                    present(.downloads)
+                    openDownloads()
                 })
             case .downloads:
-                CuriumDownloadsSheet(store: store)
-                    .presentationSizing(.page)
+                CuriumDownloadsSheet(store: store, viewState: $downloadsViewState)
+                    .presentationDetents([.large])
             case .bookmarks:
                 CuriumLibrarySheet(
                     store: store, section: .bookmarks,
@@ -242,6 +258,13 @@ struct CuriumBrowserView: View {
             case .profiles:
                 CuriumProfileSwitcherSheet(browserStore: store)
             }
+        }
+        .fullScreenCover(isPresented: $isShowingWideDownloads, onDismiss: handleWideDownloadsDismiss) {
+            CuriumDownloadsSheet(
+                store: store,
+                viewState: $downloadsViewState,
+                onViewportWidthChange: handleWideDownloadsViewportWidthChange
+            )
         }
         .alert("Curium", isPresented: Binding(
             get: { store.errorMessage != nil },
@@ -279,12 +302,141 @@ struct CuriumBrowserView: View {
     }
 
     private func present(_ destination: Destination) {
+        if destination == .downloads {
+            openDownloads()
+            return
+        }
+        downloadsTransitionTask?.cancel()
+        downloadsTransitionTask = nil
+        pendingDownloadsPresentation = nil
+        isTransitioningDownloadsPresentation = false
         if destination == .tabs {
             store.prepareSnapshotsForTabsSheet()
         }
         store.setSheetPresented(true)
         dismissAddressFocus()
         sheet = destination
+    }
+
+    private func openDownloads() {
+        downloadsTransitionTask?.cancel()
+        downloadsTransitionTask = nil
+        dismissAddressFocus()
+        store.setSheetPresented(true)
+
+        if wideDownloadsWorkbench {
+            promoteInspectedTransferForWideWorkbench()
+            guard !isShowingWideDownloads else { return }
+            if sheet != nil {
+                pendingDownloadsPresentation = .wideCover
+                isTransitioningDownloadsPresentation = true
+                sheet = nil
+            } else {
+                pendingDownloadsPresentation = nil
+                isTransitioningDownloadsPresentation = false
+                isShowingWideDownloads = true
+            }
+        } else {
+            guard sheet != .downloads else { return }
+            if isShowingWideDownloads {
+                pendingDownloadsPresentation = .compactSheet
+                isTransitioningDownloadsPresentation = true
+                isShowingWideDownloads = false
+            } else {
+                pendingDownloadsPresentation = nil
+                isTransitioningDownloadsPresentation = false
+                sheet = .downloads
+            }
+        }
+    }
+
+    private func handleDownloadsPostureChange(isWide: Bool) {
+        if isWide {
+            guard sheet == .downloads else { return }
+            promoteInspectedTransferForWideWorkbench()
+            downloadsTransitionTask?.cancel()
+            downloadsTransitionTask = nil
+            pendingDownloadsPresentation = .wideCover
+            isTransitioningDownloadsPresentation = true
+            sheet = nil
+        } else {
+            guard isShowingWideDownloads else { return }
+            downloadsTransitionTask?.cancel()
+            downloadsTransitionTask = nil
+            pendingDownloadsPresentation = .compactSheet
+            isTransitioningDownloadsPresentation = true
+            isShowingWideDownloads = false
+        }
+    }
+
+    private func handleWideDownloadsViewportWidthChange(_ width: CGFloat) {
+        guard width > 0 else { return }
+        store.updateViewportWidth(width)
+        let isWide = width >= 760
+        if wideDownloadsWorkbench != isWide {
+            wideDownloadsWorkbench = isWide
+        }
+    }
+
+    private func handleSheetDismiss() {
+        if pendingDownloadsPresentation == .wideCover {
+            schedulePendingDownloadsPresentation()
+            return
+        }
+        if sheet == nil && !isShowingWideDownloads && !isTransitioningDownloadsPresentation {
+            store.setSheetPresented(false)
+            resetDownloadsViewStateIfNeeded()
+        }
+    }
+
+    private func handleWideDownloadsDismiss() {
+        if pendingDownloadsPresentation == .compactSheet {
+            schedulePendingDownloadsPresentation()
+            return
+        }
+        if !isShowingWideDownloads && sheet == nil && !isTransitioningDownloadsPresentation {
+            store.setSheetPresented(false)
+            resetDownloadsViewStateIfNeeded()
+        }
+    }
+
+    private func schedulePendingDownloadsPresentation() {
+        downloadsTransitionTask?.cancel()
+        downloadsTransitionTask = Task { @MainActor in
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            defer { downloadsTransitionTask = nil }
+            guard pendingDownloadsPresentation != nil else {
+                isTransitioningDownloadsPresentation = false
+                return
+            }
+            pendingDownloadsPresentation = nil
+            guard sheet == nil && !isShowingWideDownloads else {
+                isTransitioningDownloadsPresentation = false
+                return
+            }
+            if wideDownloadsWorkbench {
+                promoteInspectedTransferForWideWorkbench()
+                isShowingWideDownloads = true
+            } else {
+                sheet = .downloads
+            }
+            isTransitioningDownloadsPresentation = false
+        }
+    }
+
+    private func promoteInspectedTransferForWideWorkbench() {
+        if let inspectedID = downloadsViewState.inspectedTransferID {
+            downloadsViewState.selectedTransferID = inspectedID
+            downloadsViewState.inspectedTransferID = nil
+        }
+    }
+
+    private func resetDownloadsViewStateIfNeeded() {
+        let initial = CuriumDownloadsViewState()
+        if downloadsViewState != initial {
+            downloadsViewState = initial
+        }
     }
 
     struct BottomOverlayPane: Equatable {

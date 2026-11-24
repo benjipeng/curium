@@ -7,7 +7,7 @@ import Observation
 final class CuriumDownload: Identifiable {
     let id: String
     let sourceTabID: String?
-    let originalURL: URL?
+    private(set) var originalURL: URL?
     private(set) var filename: String
     private(set) var mimeType: String?
     let isExplicitDownload: Bool
@@ -88,6 +88,23 @@ final class CuriumDownload: Identifiable {
 
     var canRetry: Bool {
         (phase == .failed || phase == .cancelled) && supportsHTTPReplay
+    }
+
+    /// True when this coordinator-managed HTTP transfer is paused or failed and can safely
+    /// verify and swap in a fresh download URL (excluding un-upgraded Blink/POST streams).
+    var canRefreshURL: Bool {
+        guard isManagedByCoordinator,
+              blinkTask == nil,
+              httpMethod == "GET",
+              phase == .paused || phase == .failed else {
+            return false
+        }
+        switch transportKind {
+        case .multiLaneRange, .singleStream, .hlsRemuxMP4:
+            return true
+        case .blinkNativeStream:
+            return false
+        }
     }
 
     /// Non-nil when this download originated from a specific HLS master playlist's variant row.
@@ -527,6 +544,35 @@ final class CuriumDownload: Identifiable {
         if let configuredLanes {
             let clamped = CuriumTransferRecord.clampLanes(configuredLanes)
             if self.configuredLanes != clamped { self.configuredLanes = clamped }
+        }
+    }
+
+    internal func applyRefreshedURL(
+        sourceURL: URL,
+        resolvedURL: URL,
+        eTag: String? = nil,
+        clearETagIfNil: Bool = false,
+        hlsMasterPlaylistURL: URL? = nil
+    ) {
+        if self.originalURL != sourceURL {
+            self.originalURL = sourceURL
+        }
+        if self.resolvedURL != resolvedURL {
+            self.resolvedURL = resolvedURL
+        }
+        if let eTag {
+            let strong = CuriumTransferRecord.strongETag(from: eTag)
+            if self.eTag != strong {
+                self.eTag = strong
+            }
+        } else if clearETagIfNil, self.eTag != nil {
+            self.eTag = nil
+        }
+        if let hlsMasterPlaylistURL {
+            self.storedHLSMasterPlaylistURL = hlsMasterPlaylistURL
+        }
+        if self.failure != nil {
+            self.failure = nil
         }
     }
 

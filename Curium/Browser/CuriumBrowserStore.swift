@@ -576,6 +576,12 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             }
         }
     }
+    var hasPausableActiveDownloads: Bool {
+        downloads.contains { $0.canPause }
+    }
+    var hasResumablePausedDownloads: Bool {
+        downloads.contains { $0.canResume }
+    }
     internal var backgroundKeepAliveActiveTaskCount: Int {
         backgroundKeepAlive.activeTaskCount
     }
@@ -646,6 +652,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             ),
             host: CuriumTransferCoordinator.HostBridge(
                 activeProfileID: { [weak self] in self?.activeProfileID ?? "default" },
+                activeTabID: { [weak self] in self?.activeTab?.id },
+                defaultUserAgent: { [weak self] in self?.activeProfileUserAgent() },
                 effectiveProxy: { [weak self] in self?.effectiveMediaLaunchProxy() ?? .system },
                 resolveCookieHeader: { [weak self] url, tabID in
                     guard let self, let tabID = tabID ?? self.activeTab?.id else { return nil }
@@ -1458,6 +1466,14 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         transferCoordinator.resumeDownload(item)
     }
 
+    func pauseAllActiveDownloads() {
+        transferCoordinator.pauseAllActiveDownloads()
+    }
+
+    func resumeAllPausedDownloads() {
+        transferCoordinator.resumeAllPausedDownloads()
+    }
+
     func retryDownload(_ item: CuriumDownload) {
         transferCoordinator.retryDownload(item)
     }
@@ -1470,9 +1486,62 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         transferCoordinator.removeTransfer(item)
     }
 
+    func refreshTransferURL(
+        _ item: CuriumDownload,
+        newURL: URL,
+        includeActiveTabCookies: Bool
+    ) async throws {
+        try await transferCoordinator.refreshTransferURL(
+            item,
+            newURL: newURL,
+            includeActiveTabCookies: includeActiveTabCookies
+        )
+        CuriumDiagnostics.shared.record(
+            "transfer-refresh-url",
+            "ok id=\(item.id) host=\(newURL.host ?? "-")"
+        )
+    }
+
+    func transferMatchesActiveProfile(_ item: CuriumDownload) -> Bool {
+        transferCoordinator.transferMatchesActiveProfile(item)
+    }
+
     func canInheritActiveTabCookies(for url: URL) -> Bool {
         let activeTabURL = activeTab?.engine?.currentURL ?? activeTab?.url
         return CuriumTransferCoordinator.canInheritCookies(for: url, activeTabURL: activeTabURL)
+    }
+
+    /// Resolves the active fingerprint profile's coherent desktop/mobile Chrome User-Agent
+    /// so manual downloads and HLS transfers never fall back to a hardcoded iOS Safari UA.
+    func activeProfileUserAgent() -> String {
+        let profile: CuriumFingerprintProfile = {
+            if let frozen = CuriumFingerprintBootstrap.frozenLaunchProfile,
+               frozen.id.lowercased() == activeProfileID.lowercased() {
+                return frozen
+            }
+            return fingerprintStore.profile(id: activeProfileID) ?? fingerprintStore.activeProfile
+        }()
+        let useDesktopSlot = profile.defaultSlot == .desktop || prefersDesktopByDefault()
+        let slot = useDesktopSlot ? profile.desktop : profile.mobile
+        if let explicitUA = slot.uaString?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicitUA.isEmpty {
+            return explicitUA
+        }
+        let osCpu: String = {
+            if let raw = slot.osCpu?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+                return raw
+            }
+            return useDesktopSlot ? "Macintosh; Intel Mac OS X 10_15_7" : "Linux; Android 10; K"
+        }()
+        let product: String = {
+            if let raw = slot.productVersion?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+                return raw
+            }
+            return CuriumChromeStableBaseline.productVersion
+        }()
+        let appendMobile = slot.appendMobileToken ?? (slot.mobile == true)
+        let mobileToken = appendMobile ? " Mobile" : ""
+        return "Mozilla/5.0 (\(osCpu)) AppleWebKit/537.36 (KHTML, like Gecko) \(product)\(mobileToken) Safari/537.36"
     }
 
     @discardableResult

@@ -15,6 +15,7 @@ struct CuriumTransferInspectorView: View {
 
     @State private var copiedURL = false
     @State private var copiedResetTask: Task<Void, Never>?
+    @State private var isShowingRefreshURLSheet = false
 
     private static let metricsColumns: [GridItem] = [
         GridItem(.flexible(), spacing: 12),
@@ -193,22 +194,56 @@ struct CuriumTransferInspectorView: View {
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
 
-                        Button {
-                            copySourceURL(url)
-                        } label: {
-                            Label(
-                                copiedURL ? "Copied URL" : "Copy URL",
-                                systemImage: copiedURL ? "checkmark" : "doc.on.doc"
-                            )
-                            .font(.caption.weight(.medium))
-                            .contentTransition(.symbolEffect(.replace))
+                        HStack(spacing: 8) {
+                            Button {
+                                copySourceURL(url)
+                            } label: {
+                                Label(
+                                    copiedURL ? "Copied URL" : "Copy URL",
+                                    systemImage: copiedURL ? "checkmark" : "doc.on.doc"
+                                )
+                                .font(.caption.weight(.medium))
+                                .contentTransition(.symbolEffect(.replace))
+                            }
+                            .buttonStyle(.bordered)
+                            .buttonBorderShape(.capsule)
+                            .controlSize(.small)
+                            .tint(palette.tint)
+
+                            if download.canRefreshURL {
+                                Button {
+                                    isShowingRefreshURLSheet = true
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "link.badge.plus")
+                                        Text("Update Link…")
+                                    }
+                                    .font(.caption.weight(.medium))
+                                }
+                                .buttonStyle(.bordered)
+                                .buttonBorderShape(.capsule)
+                                .controlSize(.small)
+                                .tint(palette.tint)
+                                .accessibilityIdentifier("curium.inspector.diagnostics.refreshURL")
+                            }
                         }
-                        .buttonStyle(.bordered)
-                        .buttonBorderShape(.capsule)
-                        .controlSize(.small)
-                        .tint(palette.tint)
                     }
                     .padding(.vertical, 2)
+                } else if download.canRefreshURL {
+                    Button {
+                        isShowingRefreshURLSheet = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "link.badge.plus")
+                            Text("Update Link…")
+                        }
+                        .font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    .controlSize(.small)
+                    .tint(palette.tint)
+                    .accessibilityIdentifier("curium.inspector.diagnostics.refreshURL")
                 }
 
                 if let pageURL = download.pageURL {
@@ -309,6 +344,12 @@ struct CuriumTransferInspectorView: View {
             copiedResetTask?.cancel()
             copiedResetTask = nil
         }
+        .onChange(of: download.id) { _, _ in
+            isShowingRefreshURLSheet = false
+        }
+        .sheet(isPresented: $isShowingRefreshURLSheet) {
+            CuriumRefreshURLSheet(store: store, download: download)
+        }
     }
 
     @ViewBuilder
@@ -373,6 +414,23 @@ struct CuriumTransferInspectorView: View {
                 .buttonBorderShape(.capsule)
                 .controlSize(.small)
                 .tint(palette.tint)
+            }
+
+            if download.canRefreshURL {
+                Button {
+                    isShowingRefreshURLSheet = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "link.badge.plus")
+                        Text("Update Link…")
+                    }
+                    .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .controlSize(.small)
+                .tint(palette.tint)
+                .accessibilityIdentifier("curium.inspector.refreshURL")
             }
 
             if download.phase == .completed, let fileURL = resolvedSavedURL {

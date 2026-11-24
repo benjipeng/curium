@@ -615,6 +615,244 @@ struct CuriumHLSRemuxTests {
         #expect((try await e2eAsset.loadTracks(withMediaType: .audio)).count == 1)
     }
 
+    // MARK: - 4. Media Radar Authenticated Proxy Inspection & HLS Request Header Hygiene
+
+    @Test("CuriumMediaNetworking.inspectHLS authenticates via http://user:pass@127.0.0.1 proxy lease and enforces CrossOriginRedirectAuthStripper")
+    func inspectHLSThroughAuthenticatedLoopbackHTTPProxy() async throws {
+        let username = "curium_user"
+        let password = "s3cr3t_pass"
+        let expectedProxyAuth = "Basic \(Data("\(username):\(password)".utf8).base64EncodedString())"
+        let masterManifest = """
+        #EXTM3U
+        #EXT-X-VERSION:6
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud-main",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="audio/en.m3u8"
+        #EXT-X-STREAM-INF:BANDWIDTH=1800000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2",AUDIO="aud-main"
+        720p/index.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=6200000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2",AUDIO="aud-main"
+        1080p/index.m3u8
+        """
+        let manifestBody = Data(masterManifest.utf8)
+
+        let proxy = try LoopbackAuthenticatedHTTPProxy(
+            expectedAuthorization: expectedProxyAuth
+        ) { innerRequest in
+            if innerRequest.path == "/proxy-hls/master.m3u8" {
+                return .ok(manifestBody, contentType: "application/vnd.apple.mpegurl")
+            }
+            return LoopbackHTTPResponse(statusCode: 404, reason: "Not Found", body: Data())
+        }
+        defer { proxy.stop() }
+
+        let targetURL = try #require(URL(string: "http://hls-proxy-test.example/proxy-hls/master.m3u8"))
+        let authorizedContext = CuriumMediaRequestContext(
+            cookieHeader: "sid=proxy_hls_session",
+            userAgent: CuriumHLSTransferEngine.defaultUserAgent,
+            proxy: .fixed(
+                rules: "http://\(username):\(password)@127.0.0.1:\(proxy.port)",
+                bypassRules: nil
+            )
+        )
+
+        let inspection = try await CuriumMediaNetworking.inspectHLS(
+            url: targetURL,
+            context: authorizedContext
+        )
+
+        #expect(inspection.isMasterPlaylist)
+        #expect(inspection.variants.count == 2)
+        #expect(inspection.variants.first?.url.absoluteString == "http://hls-proxy-test.example/proxy-hls/1080p/index.m3u8")
+        #expect(inspection.variants.first?.audioURI?.absoluteString == "http://hls-proxy-test.example/proxy-hls/audio/en.m3u8")
+
+        let proxyEvents = proxy.snapshotEvents()
+        #expect(
+            proxyEvents.proxyAuthHeaders.contains(expectedProxyAuth),
+            "Authenticated proxy must receive Proxy-Authorization: Basic ... from CuriumProxySessionPool lease"
+        )
+        let tunneled = try #require(proxyEvents.innerRequests.first)
+        #expect(tunneled.path == "/proxy-hls/master.m3u8")
+        #expect(tunneled.headers["cookie"] == "sid=proxy_hls_session")
+        #expect(tunneled.headers["user-agent"] == CuriumHLSTransferEngine.defaultUserAgent)
+
+        // Wrong proxy credentials must fail closed (`allowFailover = false`) instead of bypassing direct.
+        let badCredContext = CuriumMediaRequestContext(
+            proxy: .fixed(
+                rules: "http://\(username):wrong_password@127.0.0.1:\(proxy.port)",
+                bypassRules: nil
+            )
+        )
+        var didRejectBadCredentials = false
+        do {
+            _ = try await CuriumMediaNetworking.inspectHLS(url: targetURL, context: badCredContext)
+        } catch {
+            didRejectBadCredentials = true
+        }
+        #expect(didRejectBadCredentials, "inspectHLS must fail closed when fixed proxy rejects credentials with 407")
+
+        // Redirect sanitization preserves CrossOriginRedirectAuthStripper auth/downgrade & SSRF rules.
+        let sourceHTTPS = try #require(URL(string: "https://origin.example/live/master.m3u8"))
+        var crossDowngrade = URLRequest(url: try #require(URL(string: "http://cdn.other.example/live/variant.m3u8")))
+        crossDowngrade.setValue("sid=secret", forHTTPHeaderField: "Cookie")
+        crossDowngrade.setValue("Bearer tok", forHTTPHeaderField: "Authorization")
+        crossDowngrade.setValue("Basic stale", forHTTPHeaderField: "Proxy-Authorization")
+        crossDowngrade.setValue("https://origin.example/watch", forHTTPHeaderField: "Referer")
+        crossDowngrade.setValue("https://origin.example", forHTTPHeaderField: "Origin")
+        let redirectResult = CuriumMediaNetworking.validateAndSanitizeRedirectRequest(
+            crossDowngrade,
+            from: sourceHTTPS,
+            originatingHostIsPublic: true
+        )
+        if case .allowed(let sanitized, let needsRefresh) = redirectResult {
+            #expect(needsRefresh)
+            #expect(sanitized.httpShouldHandleCookies == false)
+            #expect(sanitized.value(forHTTPHeaderField: "Cookie") == nil)
+            #expect(sanitized.value(forHTTPHeaderField: "Authorization") == nil)
+            #expect(sanitized.value(forHTTPHeaderField: "Proxy-Authorization") == nil)
+            #expect(sanitized.value(forHTTPHeaderField: "Referer") == nil)
+            #expect(sanitized.value(forHTTPHeaderField: "Origin") == nil)
+        } else {
+            Issue.record("Expected cross-origin public redirect to be allowed with stripped headers, got \(redirectResult)")
+        }
+    }
+
+    @Test("CuriumHLSTransferEngine sets httpShouldHandleCookies = false on all requests and uses desktop macOS Chrome UA when config.userAgent is nil")
+    func hlsEngineDisablesAmbientCookiesAndUsesDesktopMacOSChromeDefaultUserAgent() async throws {
+        let defaultUA = CuriumHLSTransferEngine.defaultUserAgent
+        #expect(defaultUA.contains("Macintosh; Intel Mac OS X 10_15_7"))
+        #expect(defaultUA.contains(CuriumChromeStableBaseline.productVersion))
+        #expect(defaultUA.contains("AppleWebKit/537.36"))
+        #expect(defaultUA.contains("Safari/537.36"))
+        #expect(!defaultUA.contains("iPhone"))
+        #expect(!defaultUA.contains("Mobile/"))
+
+        // Plant a cross-profile ambient cookie in HTTPCookieStorage.shared on a `.default` session
+        // configuration so any request missing `httpShouldHandleCookies = false` would leak it.
+        let testHost = "hls-hygiene-cookie-test.example"
+        let ambientCookie = try #require(HTTPCookie(properties: [
+            .domain: testHost,
+            .path: "/",
+            .name: "ambient_cross_profile",
+            .value: "MUST_NOT_LEAK",
+            .secure: "TRUE"
+        ]))
+        HTTPCookieStorage.shared.setCookie(ambientCookie)
+        defer {
+            HTTPCookieStorage.shared.deleteCookie(ambientCookie)
+        }
+
+        let aesKey = Data((0..<16).map { UInt8(0x30 + $0) })
+        let mediaSeqBase: UInt64 = 7
+        var initPlain = Data([
+            0x00, 0x00, 0x00, 0x18,
+            0x66, 0x74, 0x79, 0x70, // "ftyp"
+            0x69, 0x73, 0x6F, 0x6D, // "isom"
+            0x00, 0x00, 0x02, 0x00,
+            0x69, 0x73, 0x6F, 0x6D,
+            0x69, 0x73, 0x6F, 0x36
+        ])
+        initPlain.append(Self.deterministicBytes(seed: 0x41, count: 1024))
+
+        let seg0Plain = Self.deterministicBytes(seed: 0x42, count: 2048)
+        let seg1Plain = Self.deterministicBytes(seed: 0x43, count: 2048)
+        let seg0Cipher = try Self.encryptAES128CBC(
+            plaintext: seg0Plain,
+            key: aesKey,
+            iv: CuriumHLSTransferEngine.resolveIV(explicitIV: nil, mediaSequence: mediaSeqBase)
+        )
+        let seg1Cipher = try Self.encryptAES128CBC(
+            plaintext: seg1Plain,
+            key: aesKey,
+            iv: CuriumHLSTransferEngine.resolveIV(explicitIV: nil, mediaSequence: mediaSeqBase + 1)
+        )
+
+        let masterText = """
+        #EXTM3U
+        #EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720
+        variant.m3u8
+        """
+        let variantText = """
+        #EXTM3U
+        #EXT-X-VERSION:7
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-MEDIA-SEQUENCE:\(mediaSeqBase)
+        #EXT-X-MAP:URI="init.mp4"
+        #EXT-X-KEY:METHOD=AES-128,URI="enc.key"
+        #EXTINF:4.0,
+        seg0.m4s
+        #EXTINF:4.0,
+        seg1.m4s
+        #EXT-X-ENDLIST
+        """
+
+        HLSHygieneRecordingURLProtocol.configure(
+            responses: [
+                "/hygiene/master.m3u8": (Data(masterText.utf8), "application/vnd.apple.mpegurl"),
+                "/hygiene/variant.m3u8": (Data(variantText.utf8), "application/vnd.apple.mpegurl"),
+                "/hygiene/enc.key": (aesKey, "application/octet-stream"),
+                "/hygiene/init.mp4": (initPlain, "video/mp4"),
+                "/hygiene/seg0.m4s": (seg0Cipher, "video/iso.segment"),
+                "/hygiene/seg1.m4s": (seg1Cipher, "video/iso.segment")
+            ],
+            redirects: [
+                "/hygiene/entry.m3u8": try #require(URL(string: "https://\(testHost)/hygiene/master.m3u8"))
+            ]
+        )
+        defer { HLSHygieneRecordingURLProtocol.reset() }
+
+        let sessionConfig = URLSessionConfiguration.default
+        sessionConfig.httpCookieStorage = HTTPCookieStorage.shared
+        sessionConfig.protocolClasses = [HLSHygieneRecordingURLProtocol.self]
+        let testSession = URLSession(configuration: sessionConfig)
+        defer { testSession.finishTasksAndInvalidate() }
+
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appending(path: "curium-hls-hygiene-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let stagingDir = tempRoot.appending(path: "staging", directoryHint: .isDirectory)
+        let destinationURL = tempRoot.appending(path: "output.mp4", directoryHint: .notDirectory)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let engine = CuriumHLSTransferEngine()
+        let result = try await engine.download(
+            manifestURL: try #require(URL(string: "https://\(testHost)/hygiene/entry.m3u8")),
+            stagingDirectoryURL: stagingDir,
+            destinationURL: destinationURL,
+            requestConfig: CuriumHLSRequestConfig(
+                userAgent: nil,
+                sessionFactory: { testSession }
+            ),
+            concurrency: 2
+        ) { _ in }
+
+        #expect(result.completedSegments == 2)
+        #expect(try Data(contentsOf: result.outputFileURL) == initPlain + seg0Plain + seg1Plain)
+
+        let captured = HLSHygieneRecordingURLProtocol.snapshotCapturedRequests()
+        let expectedPaths: Set<String> = [
+            "/hygiene/entry.m3u8",
+            "/hygiene/master.m3u8",
+            "/hygiene/variant.m3u8",
+            "/hygiene/enc.key",
+            "/hygiene/init.mp4",
+            "/hygiene/seg0.m4s",
+            "/hygiene/seg1.m4s"
+        ]
+        #expect(Set(captured.map(\.path)) == expectedPaths)
+
+        for req in captured {
+            #expect(
+                req.httpShouldHandleCookies == false,
+                "Expected httpShouldHandleCookies == false on \(req.path)"
+            )
+            #expect(
+                req.cookieHeader == nil,
+                "Ambient HTTPCookieStorage must never leak Cookie header onto \(req.path)"
+            )
+            let ua = try #require(req.userAgent, "Expected User-Agent header on \(req.path)")
+            #expect(ua == defaultUA)
+            #expect(!ua.contains("iPhone"))
+            #expect(!ua.contains("Mobile/"))
+        }
+    }
+
     // MARK: - Telemetry & Crypto Test Helpers
 
     private static func assertMonotonicTelemetry(
@@ -870,6 +1108,111 @@ private final class HLSBlockedRedirectURLProtocol: URLProtocol, @unchecked Senda
     override func stopLoading() {}
 }
 
+private final class HLSHygieneRecordingURLProtocol: URLProtocol, @unchecked Sendable {
+    struct CapturedRequest: Sendable {
+        let path: String
+        let httpShouldHandleCookies: Bool
+        let userAgent: String?
+        let cookieHeader: String?
+    }
+
+    private struct Storage: Sendable {
+        var responses: [String: (Data, String)] = [:]
+        var redirects: [String: URL] = [:]
+        var captured: [CapturedRequest] = []
+    }
+
+    private static let storage = LockedBox<Storage>(Storage())
+
+    static func configure(
+        responses: [String: (Data, String)],
+        redirects: [String: URL] = [:]
+    ) {
+        storage.withLock { state in
+            state.responses = responses
+            state.redirects = redirects
+            state.captured.removeAll()
+        }
+    }
+
+    static func reset() {
+        storage.withLock { state in
+            state.responses.removeAll()
+            state.redirects.removeAll()
+            state.captured.removeAll()
+        }
+    }
+
+    static func snapshotCapturedRequests() -> [CapturedRequest] {
+        storage.withLock { $0.captured }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let path = url.path
+        let record = CapturedRequest(
+            path: path,
+            httpShouldHandleCookies: request.httpShouldHandleCookies,
+            userAgent: request.value(forHTTPHeaderField: "User-Agent"),
+            cookieHeader: request.value(forHTTPHeaderField: "Cookie")
+        )
+        let action: (redirect: URL?, payload: (Data, String)?) = Self.storage.withLock { state in
+            state.captured.append(record)
+            return (state.redirects[path], state.responses[path])
+        }
+
+        if let redirectTarget = action.redirect {
+            var redirectRequest = URLRequest(url: redirectTarget)
+            // Intentionally leave Foundation's default `true` so HLSRedirectSanitizer must force it false.
+            redirectRequest.httpShouldHandleCookies = true
+            if let ua = request.value(forHTTPHeaderField: "User-Agent") {
+                redirectRequest.setValue(ua, forHTTPHeaderField: "User-Agent")
+            }
+            let redirectResp = HTTPURLResponse(
+                url: url,
+                statusCode: 302,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Location": redirectTarget.absoluteString]
+            )!
+            client?.urlProtocol(self, wasRedirectedTo: redirectRequest, redirectResponse: redirectResp)
+            return
+        }
+
+        guard let (body, contentType) = action.payload else {
+            let notFound = HTTPURLResponse(
+                url: url,
+                statusCode: 404,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Length": "0"]
+            )!
+            client?.urlProtocol(self, didReceive: notFound, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: [
+                "Content-Type": contentType,
+                "Content-Length": "\(body.count)"
+            ]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 private final class ActiveConnectionRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var connections: [ObjectIdentifier: NWConnection] = [:]
@@ -1009,6 +1352,286 @@ private final class LoopbackHTTPServer: @unchecked Sendable {
         let method = String(parts[0])
         let target = String(parts[1])
         let path = target.split(separator: "?", maxSplits: 1).first.map(String.init) ?? target
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let k = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            let v = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            headers[k] = v
+        }
+        return LoopbackHTTPRequest(method: method, path: path, headers: headers)
+    }
+
+    private static func serializeResponse(_ response: LoopbackHTTPResponse) -> Data {
+        var headerLines = [
+            "HTTP/1.1 \(response.statusCode) \(response.reason)",
+            "Content-Length: \(response.body.count)",
+            "Connection: close"
+        ]
+        for (k, v) in response.headers {
+            headerLines.append("\(k): \(v)")
+        }
+        var data = Data((headerLines.joined(separator: "\r\n") + "\r\n\r\n").utf8)
+        data.append(response.body)
+        return data
+    }
+}
+
+/// Minimal authenticated loopback HTTP `CONNECT` proxy for testing `CuriumProxySessionPool`
+/// `Proxy-Authorization: Basic ...` challenge-response and fail-closed `allowFailover = false`.
+private final class LoopbackAuthenticatedHTTPProxy: @unchecked Sendable {
+    struct ProxyEvents: Sendable {
+        var proxyAuthHeaders: [String] = []
+        var innerRequests: [LoopbackHTTPRequest] = []
+    }
+
+    let port: UInt16
+    private let listener: NWListener
+    private let connectionRegistry: ActiveConnectionRegistry
+    private let events = LockedBox<ProxyEvents>(ProxyEvents())
+    private let queue = DispatchQueue(label: "com.appautomaton.curium.test.loopback-auth-proxy", attributes: .concurrent)
+
+    init(
+        expectedAuthorization: String,
+        handler: @escaping @Sendable (LoopbackHTTPRequest) async -> LoopbackHTTPResponse
+    ) throws {
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+        let listener = try NWListener(using: params)
+        let registry = ActiveConnectionRegistry()
+        self.listener = listener
+        self.connectionRegistry = registry
+
+        let readySem = DispatchSemaphore(value: 0)
+        let stateError = LockedBox<Error?>(nil)
+        let eventsBox = self.events
+
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                readySem.signal()
+            case .failed(let err):
+                stateError.withLock { $0 = err }
+                readySem.signal()
+            default:
+                break
+            }
+        }
+
+        listener.newConnectionHandler = { [queue] connection in
+            registry.add(connection)
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .cancelled, .failed:
+                    registry.remove(connection)
+                default:
+                    break
+                }
+            }
+            connection.start(queue: queue)
+            Self.receiveProxyRequest(
+                on: connection,
+                registry: registry,
+                events: eventsBox,
+                expectedAuthorization: expectedAuthorization,
+                accumulated: Data(),
+                handler: handler
+            )
+        }
+
+        listener.start(queue: queue)
+        let waitResult = readySem.wait(timeout: .now() + 5)
+        if let err = stateError.value {
+            listener.cancel()
+            registry.cancelAll()
+            throw err
+        }
+        guard waitResult == .success, let boundPort = listener.port?.rawValue, boundPort > 0 else {
+            listener.cancel()
+            registry.cancelAll()
+            throw URLError(.cannotConnectToHost)
+        }
+        self.port = boundPort
+    }
+
+    func stop() {
+        listener.cancel()
+        connectionRegistry.cancelAll()
+    }
+
+    func snapshotEvents() -> ProxyEvents {
+        events.value
+    }
+
+    private static func receiveProxyRequest(
+        on connection: NWConnection,
+        registry: ActiveConnectionRegistry,
+        events: LockedBox<ProxyEvents>,
+        expectedAuthorization: String,
+        accumulated: Data,
+        handler: @escaping @Sendable (LoopbackHTTPRequest) async -> LoopbackHTTPResponse
+    ) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, error in
+            if error != nil {
+                registry.remove(connection)
+                connection.cancel()
+                return
+            }
+            var buffer = accumulated
+            if let data {
+                buffer.append(data)
+            }
+            let separator = Data([0x0D, 0x0A, 0x0D, 0x0A])
+            if let range = buffer.range(of: separator) {
+                let headerData = buffer.subdata(in: 0..<range.lowerBound)
+                let trailing = Data(buffer[range.upperBound...])
+                guard let parsed = Self.parseRequest(headerData) else {
+                    registry.remove(connection)
+                    connection.cancel()
+                    return
+                }
+                let suppliedAuth = parsed.headers["proxy-authorization"]
+                if let suppliedAuth {
+                    events.withLock { $0.proxyAuthHeaders.append(suppliedAuth) }
+                }
+                guard suppliedAuth == expectedAuthorization else {
+                    let challenge = Data(
+                        (
+                            "HTTP/1.1 407 Proxy Authentication Required\r\n" +
+                            "Proxy-Authenticate: Basic realm=\"CuriumTestProxy\"\r\n" +
+                            "Content-Length: 0\r\n" +
+                            "Connection: close\r\n\r\n"
+                        ).utf8
+                    )
+                    connection.send(content: challenge, completion: .contentProcessed { _ in
+                        registry.remove(connection)
+                        connection.cancel()
+                    })
+                    return
+                }
+
+                if parsed.method.uppercased() == "CONNECT" {
+                    let established = Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8)
+                    connection.send(content: established, completion: .contentProcessed { sendErr in
+                        if sendErr != nil {
+                            registry.remove(connection)
+                            connection.cancel()
+                            return
+                        }
+                        Self.receiveInnerHTTPRequest(
+                            on: connection,
+                            registry: registry,
+                            events: events,
+                            accumulated: trailing,
+                            handler: handler
+                        )
+                    })
+                    return
+                }
+
+                events.withLock { $0.innerRequests.append(parsed) }
+                Task {
+                    let resp = await handler(parsed)
+                    let wire = Self.serializeResponse(resp)
+                    connection.send(content: wire, completion: .contentProcessed { _ in
+                        registry.remove(connection)
+                        connection.cancel()
+                    })
+                }
+                return
+            }
+            if isComplete {
+                registry.remove(connection)
+                connection.cancel()
+                return
+            }
+            Self.receiveProxyRequest(
+                on: connection,
+                registry: registry,
+                events: events,
+                expectedAuthorization: expectedAuthorization,
+                accumulated: buffer,
+                handler: handler
+            )
+        }
+    }
+
+    private static func receiveInnerHTTPRequest(
+        on connection: NWConnection,
+        registry: ActiveConnectionRegistry,
+        events: LockedBox<ProxyEvents>,
+        accumulated: Data,
+        handler: @escaping @Sendable (LoopbackHTTPRequest) async -> LoopbackHTTPResponse
+    ) {
+        let separator = Data([0x0D, 0x0A, 0x0D, 0x0A])
+        if let range = accumulated.range(of: separator) {
+            let headerData = accumulated.subdata(in: 0..<range.lowerBound)
+            guard let parsed = Self.parseRequest(headerData) else {
+                registry.remove(connection)
+                connection.cancel()
+                return
+            }
+            events.withLock { $0.innerRequests.append(parsed) }
+            Task {
+                let resp = await handler(parsed)
+                let wire = Self.serializeResponse(resp)
+                connection.send(content: wire, completion: .contentProcessed { _ in
+                    registry.remove(connection)
+                    connection.cancel()
+                })
+            }
+            return
+        }
+
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, error in
+            if error != nil {
+                registry.remove(connection)
+                connection.cancel()
+                return
+            }
+            var buffer = accumulated
+            if let data {
+                buffer.append(data)
+            }
+            if buffer.range(of: separator) != nil {
+                Self.receiveInnerHTTPRequest(
+                    on: connection,
+                    registry: registry,
+                    events: events,
+                    accumulated: buffer,
+                    handler: handler
+                )
+                return
+            }
+            if isComplete {
+                registry.remove(connection)
+                connection.cancel()
+                return
+            }
+            Self.receiveInnerHTTPRequest(
+                on: connection,
+                registry: registry,
+                events: events,
+                accumulated: buffer,
+                handler: handler
+            )
+        }
+    }
+
+    private static func parseRequest(_ headerData: Data) -> LoopbackHTTPRequest? {
+        guard let text = String(data: headerData, encoding: .utf8) else { return nil }
+        let lines = text.components(separatedBy: "\r\n")
+        guard let requestLine = lines.first else { return nil }
+        let parts = requestLine.split(separator: " ")
+        guard parts.count >= 2 else { return nil }
+        let method = String(parts[0])
+        let target = String(parts[1])
+        let path: String
+        if target.contains("://"), let targetURL = URL(string: target) {
+            path = targetURL.path.isEmpty ? "/" : targetURL.path
+        } else {
+            path = target.split(separator: "?", maxSplits: 1).first.map(String.init) ?? target
+        }
         var headers: [String: String] = [:]
         for line in lines.dropFirst() {
             guard let colon = line.firstIndex(of: ":") else { continue }

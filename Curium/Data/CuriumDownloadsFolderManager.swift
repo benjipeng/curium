@@ -639,6 +639,12 @@ final class CuriumDownloadsFolderManager {
         defaults.removeObject(forKey: recordDefaultsKey)
     }
 
+    /// Opens the active Downloads folder directly in iOS Files.app via `shareddocuments://`.
+    /// Supports both custom external folders and `.defaultInternal` when `isDownloadsDirectoryVisibleInFiles` is `true`.
+    static func openActiveDownloadsFolder() {
+        CuriumSaveFolderFilesLauncher.openActiveDownloadsFolder()
+    }
+
     // MARK: - Persistent Bookmark Helpers
 
     nonisolated static func createPersistentBookmark(for url: URL) -> Data? {
@@ -860,21 +866,38 @@ private struct CuriumSaveFolderPickerSheet: UIViewControllerRepresentable {
 @MainActor
 enum CuriumSaveFolderFilesLauncher {
     static func openActiveDownloadsFolder() {
-        guard let rawPath = (try? CuriumDownloadStorage.downloadsRootDirectory())?.path,
-              !rawPath.isEmpty else {
+        guard CuriumDownloadsFolderManager.isDownloadsDirectoryVisibleInFiles else {
+            return
+        }
+        guard let directoryURL = try? CuriumDownloadStorage.downloadsRootDirectory() else {
+            return
+        }
+        if !CuriumDownloadsFolderManager.isUsingCustomDownloadsFolder {
+            try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        }
+        let rawPath = directoryURL.standardizedFileURL.path
+        guard !rawPath.isEmpty else {
             return
         }
         let encodedPath = rawPath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? rawPath
+        var seen: Set<String> = []
         let candidates: [URL] = [
-            URL(string: "shareddocuments://\(rawPath)"),
-            URL(string: "shareddocuments://\(encodedPath)"),
-            URL(string: "shareddocuments://"),
-        ].compactMap { $0 }
+            "shareddocuments://\(encodedPath)",
+            "shareddocuments://\(rawPath)",
+            "shareddocuments://",
+        ].compactMap { candidate in
+            guard seen.insert(candidate).inserted else { return nil }
+            return URL(string: candidate)
+        }
 
-        guard let primaryURL = candidates.first else { return }
-        UIApplication.shared.open(primaryURL, options: [:]) { success in
-            if !success, candidates.count > 1 {
-                UIApplication.shared.open(candidates[1], options: [:], completionHandler: nil)
+        openFirstSupported(candidates)
+    }
+
+    private static func openFirstSupported(_ candidates: [URL], index: Int = 0) {
+        guard index < candidates.count else { return }
+        UIApplication.shared.open(candidates[index], options: [:]) { success in
+            if !success {
+                openFirstSupported(candidates, index: index + 1)
             }
         }
     }
@@ -913,11 +936,14 @@ struct CuriumSaveLocationRow: View {
     }
 
     var body: some View {
-        if case .defaultInternal = folderManager.status {
+        let _ = folderManager.revision
+        let isDefaultVisibleInFiles = CuriumDownloadsFolderManager.isDownloadsDirectoryVisibleInFiles
+
+        if case .defaultInternal = folderManager.status, !isDefaultVisibleInFiles {
             Button {
                 flow.isShowingPicker = true
             } label: {
-                rowContent(chevron: "chevron.right")
+                rowContent(chevron: "chevron.right", isDefaultVisibleInFiles: false)
             }
             .foregroundStyle(Color.primary)
             .tint(Color.primary)
@@ -926,7 +952,16 @@ struct CuriumSaveLocationRow: View {
             Menu {
                 switch folderManager.status {
                 case .defaultInternal:
-                    EmptyView()
+                    Button {
+                        flow.isShowingPicker = true
+                    } label: {
+                        Label("Change Save Folder…", systemImage: "folder.badge.plus")
+                    }
+                    Button {
+                        CuriumDownloadsFolderManager.openActiveDownloadsFolder()
+                    } label: {
+                        Label("Show in Files", systemImage: "folder")
+                    }
                 case .customActive:
                     Button {
                         flow.isShowingPicker = true
@@ -934,7 +969,7 @@ struct CuriumSaveLocationRow: View {
                         Label("Change Save Folder…", systemImage: "folder.badge.gearshape")
                     }
                     Button {
-                        CuriumSaveFolderFilesLauncher.openActiveDownloadsFolder()
+                        CuriumDownloadsFolderManager.openActiveDownloadsFolder()
                     } label: {
                         Label("Show in Files", systemImage: "folder")
                     }
@@ -945,7 +980,9 @@ struct CuriumSaveLocationRow: View {
                             flow.pendingMove = CuriumSaveFolderFlowState.PendingMove(
                                 sourceDir: src,
                                 fileCount: offer.movableFileCount,
-                                destinationName: "App Storage",
+                                destinationName: CuriumDownloadsFolderManager.isDownloadsDirectoryVisibleInFiles
+                                    ? "LiveContainer › Curium"
+                                    : "App Storage",
                                 isResetToDefault: true
                             )
                         }
@@ -968,7 +1005,7 @@ struct CuriumSaveLocationRow: View {
                     }
                 }
             } label: {
-                rowContent(chevron: "chevron.up.chevron.down")
+                rowContent(chevron: "chevron.up.chevron.down", isDefaultVisibleInFiles: isDefaultVisibleInFiles)
             }
             .foregroundStyle(Color.primary)
             .tint(Color.primary)
@@ -977,7 +1014,7 @@ struct CuriumSaveLocationRow: View {
     }
 
     @ViewBuilder
-    private func rowContent(chevron: String) -> some View {
+    private func rowContent(chevron: String, isDefaultVisibleInFiles: Bool) -> some View {
         HStack(spacing: 10) {
             Text("Save Location")
                 .foregroundStyle(Color.primary)
@@ -985,7 +1022,7 @@ struct CuriumSaveLocationRow: View {
             Group {
                 switch folderManager.status {
                 case .defaultInternal:
-                    Text("App Storage")
+                    Text(isDefaultVisibleInFiles ? "LiveContainer › Curium" : "App Storage")
                         .foregroundStyle(Color.secondary)
                 case .customActive(_, _, let breadcrumb):
                     Text(breadcrumb)

@@ -93,35 +93,50 @@ private final class CuriumVideoThumbnailCache {
     }
 }
 
+enum CuriumDownloadsScope: String, CaseIterable, Identifiable, Equatable, Sendable {
+    case all = "All"
+    case active = "Active"
+    case saved = "Saved"
+
+    var id: Self { self }
+}
+
+struct CuriumDownloadsViewState: Equatable, Sendable {
+    var scope: CuriumDownloadsScope = .all
+    var searchQuery: String = ""
+    var selectedTransferID: String? = nil
+    var inspectedTransferID: String? = nil
+}
+
 struct CuriumDownloadsSheet: View {
-    private enum DownloadScope: String, CaseIterable, Identifiable {
-        case all = "All"
-        case active = "Active"
-        case saved = "Saved"
-
-        var id: Self { self }
-    }
-
     private struct QuickLookItem: Identifiable {
         let url: URL
         var id: URL { url }
     }
 
     let store: CuriumBrowserStore
+    @Binding var viewState: CuriumDownloadsViewState
+    let onViewportWidthChange: ((CGFloat) -> Void)?
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.curiumPalette) private var palette
 
-    @State private var scope: DownloadScope = .all
-    @State private var searchQuery = ""
-    @State private var selectedTransferID: String?
-    @State private var inspectedTransferID: String?
     @State private var quickLookURL: URL?
     @State private var isShowingNewDownloadSheet = false
     @State private var saveFolderFlow = CuriumSaveFolderFlowState()
     @State private var viewportWidth: CGFloat = 0
     @State private var verticalDivisionRect: CGRect?
+
+    init(
+        store: CuriumBrowserStore,
+        viewState: Binding<CuriumDownloadsViewState>,
+        onViewportWidthChange: ((CGFloat) -> Void)? = nil
+    ) {
+        self.store = store
+        self._viewState = viewState
+        self.onViewportWidthChange = onViewportWidthChange
+    }
 
     private var folderManager: CuriumDownloadsFolderManager { CuriumDownloadsFolderManager.shared }
 
@@ -133,17 +148,21 @@ struct CuriumDownloadsSheet: View {
         store.downloads.contains { $0.phase.isTerminal }
     }
 
+    private var hasQueueActions: Bool {
+        store.hasPausableActiveDownloads || store.hasResumablePausedDownloads || hasFinishedTasks
+    }
+
     private var hasAnyItems: Bool {
         !store.downloads.isEmpty || !store.savedDownloads.isEmpty
     }
 
     private var normalizedQuery: String {
-        searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        viewState.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private var filteredTransfers: [CuriumDownload] {
         let scoped: [CuriumDownload]
-        switch scope {
+        switch viewState.scope {
         case .all:
             scoped = store.downloads
         case .active:
@@ -166,7 +185,7 @@ struct CuriumDownloadsSheet: View {
     }
 
     private var filteredSavedDownloads: [CuriumSavedDownload] {
-        guard scope != .active else { return [] }
+        guard viewState.scope != .active else { return [] }
         let query = normalizedQuery
         guard !query.isEmpty else { return store.savedDownloads }
         return store.savedDownloads.filter { file in
@@ -175,7 +194,7 @@ struct CuriumDownloadsSheet: View {
     }
 
     private var resolvedSelectedTransfer: CuriumDownload? {
-        if let selectedTransferID,
+        if let selectedTransferID = viewState.selectedTransferID,
            let match = store.downloads.first(where: { $0.id == selectedTransferID }) {
             return match
         }
@@ -218,22 +237,24 @@ struct CuriumDownloadsSheet: View {
                         .onAppear {
                             viewportWidth = proxy.size.width
                             verticalDivisionRect = division
+                            onViewportWidthChange?(proxy.size.width)
                         }
                         .onChange(of: proxy.size.width) { _, newWidth in
                             viewportWidth = newWidth
+                            onViewportWidthChange?(newWidth)
                         }
                         .onChange(of: division) { _, newDivision in
                             verticalDivisionRect = newDivision
                         }
                 }
             }
-            .modifier(CuriumConditionalSearchableModifier(isEnabled: hasAnyItems, text: $searchQuery))
+            .modifier(CuriumConditionalSearchableModifier(isEnabled: hasAnyItems, text: $viewState.searchQuery))
             .curiumSaveFolderPickerFlow($saveFolderFlow) {
                 store.refreshSavedDownloads()
             }
             .navigationTitle("Downloads")
             .navigationBarTitleDisplayMode(.inline)
-            .navigationDestination(item: $inspectedTransferID) { transferID in
+            .navigationDestination(item: $viewState.inspectedTransferID) { transferID in
                 if let transfer = store.downloads.first(where: { $0.id == transferID }) {
                     CuriumTransferInspectorView(
                         store: store,
@@ -241,9 +262,9 @@ struct CuriumDownloadsSheet: View {
                         isEmbeddedInSplit: false,
                         onOpenSavedFile: openFile,
                         onDeleted: {
-                            inspectedTransferID = nil
-                            if selectedTransferID == transferID {
-                                selectedTransferID = nil
+                            viewState.inspectedTransferID = nil
+                            if viewState.selectedTransferID == transferID {
+                                viewState.selectedTransferID = nil
                             }
                         }
                     )
@@ -258,19 +279,49 @@ struct CuriumDownloadsSheet: View {
                 }
             }
             .onChange(of: isSplitExpanded) { _, expanded in
-                if expanded, let id = inspectedTransferID {
-                    selectedTransferID = id
-                    inspectedTransferID = nil
+                if expanded, let id = viewState.inspectedTransferID {
+                    viewState.selectedTransferID = id
+                    viewState.inspectedTransferID = nil
                 }
             }
             .toolbar {
-                if hasFinishedTasks {
+                if hasQueueActions {
                     ToolbarItem(placement: .topBarLeading) {
-                        Button {
-                            store.clearFinishedDownloadTasks()
+                        Menu {
+                            if store.hasPausableActiveDownloads {
+                                Button {
+                                    store.pauseAllActiveDownloads()
+                                } label: {
+                                    Label("Pause All Active", systemImage: "pause.circle")
+                                }
+                            }
+
+                            if store.hasResumablePausedDownloads {
+                                Button {
+                                    store.resumeAllPausedDownloads()
+                                } label: {
+                                    Label("Resume All Paused", systemImage: "play.circle")
+                                }
+                            }
+
+                            if hasFinishedTasks {
+                                if store.hasPausableActiveDownloads || store.hasResumablePausedDownloads {
+                                    Divider()
+                                }
+                                Button(role: .destructive) {
+                                    store.clearFinishedDownloadTasks()
+                                    if let selectedID = viewState.selectedTransferID,
+                                       !store.downloads.contains(where: { $0.id == selectedID }) {
+                                        viewState.selectedTransferID = nil
+                                    }
+                                } label: {
+                                    Label("Clear Finished", systemImage: "trash")
+                                }
+                            }
                         } label: {
-                            Label("Clear Finished", systemImage: "trash")
+                            Label("Queue Actions", systemImage: "ellipsis.circle")
                         }
+                        .accessibilityIdentifier("curium.downloads.queueActions")
                     }
                 }
 
@@ -317,9 +368,9 @@ struct CuriumDownloadsSheet: View {
         .curiumSheetErrorAlert(store: store)
         .sheet(isPresented: $isShowingNewDownloadSheet) {
             CuriumNewDownloadSheet(store: store) { started in
-                selectedTransferID = started.id
-                if scope == .saved {
-                    scope = .all
+                viewState.selectedTransferID = started.id
+                if viewState.scope == .saved {
+                    viewState.scope = .all
                 }
             }
         }
@@ -371,7 +422,7 @@ struct CuriumDownloadsSheet: View {
                         isEmbeddedInSplit: true,
                         onOpenSavedFile: openFile,
                         onDeleted: {
-                            selectedTransferID = nil
+                            viewState.selectedTransferID = nil
                         }
                     )
                 } else {
@@ -464,8 +515,8 @@ struct CuriumDownloadsSheet: View {
                 }
             } else {
                 Section {
-                    Picker("Scope", selection: $scope) {
-                        ForEach(DownloadScope.allCases) { option in
+                    Picker("Scope", selection: $viewState.scope) {
+                        ForEach(CuriumDownloadsScope.allCases) { option in
                             Text(option.rawValue).tag(option)
                         }
                     }
@@ -478,9 +529,9 @@ struct CuriumDownloadsSheet: View {
                 if transfers.isEmpty && savedFiles.isEmpty {
                     Section {
                         if !normalizedQuery.isEmpty {
-                            ContentUnavailableView.search(text: searchQuery)
+                            ContentUnavailableView.search(text: viewState.searchQuery)
                                 .listRowBackground(Color.clear)
-                        } else if scope == .active {
+                        } else if viewState.scope == .active {
                             ContentUnavailableView(
                                 "No Active Transfers",
                                 systemImage: "arrow.down.circle",
@@ -573,9 +624,9 @@ struct CuriumDownloadsSheet: View {
         .contentShape(Rectangle())
         .onTapGesture {
             if isSplit {
-                selectedTransferID = item.id
+                viewState.selectedTransferID = item.id
             } else {
-                inspectedTransferID = item.id
+                viewState.inspectedTransferID = item.id
             }
         }
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
@@ -588,11 +639,11 @@ struct CuriumDownloadsSheet: View {
             } else {
                 Button(role: .destructive) {
                     store.removeTransfer(item)
-                    if selectedTransferID == item.id {
-                        selectedTransferID = nil
+                    if viewState.selectedTransferID == item.id {
+                        viewState.selectedTransferID = nil
                     }
-                    if inspectedTransferID == item.id {
-                        inspectedTransferID = nil
+                    if viewState.inspectedTransferID == item.id {
+                        viewState.inspectedTransferID = nil
                     }
                 } label: {
                     Label("Delete", systemImage: "trash")
@@ -658,11 +709,11 @@ struct CuriumDownloadsSheet: View {
 
             Button(role: .destructive) {
                 store.removeTransfer(item)
-                if selectedTransferID == item.id {
-                    selectedTransferID = nil
+                if viewState.selectedTransferID == item.id {
+                    viewState.selectedTransferID = nil
                 }
-                if inspectedTransferID == item.id {
-                    inspectedTransferID = nil
+                if viewState.inspectedTransferID == item.id {
+                    viewState.inspectedTransferID = nil
                 }
             } label: {
                 Label("Remove from List", systemImage: "trash")
@@ -693,7 +744,11 @@ struct CuriumDownloadsSheet: View {
         case .customActive:
             Text("Saved to \(displayPath). Shared across all profiles and accessible in Files.")
         case .defaultInternal:
-            Text("Saved to \(displayPath). Choose a folder in Files or iCloud Drive to browse downloads directly in Files. Shared across all profiles.")
+            if CuriumDownloadsFolderManager.isDownloadsDirectoryVisibleInFiles {
+                Text("Saved to \(displayPath). Accessible in Files and shared across all profiles.")
+            } else {
+                Text("Saved to \(displayPath). Choose a folder in Files or iCloud Drive to browse downloads directly in Files. Shared across all profiles.")
+            }
         }
     }
 

@@ -9,6 +9,31 @@ import os
 // MARK: - Deterministic Loopback HTTP/1.1 Server for Transfer Routing Tests
 
 private final class RoutingLoopbackServer: @unchecked Sendable {
+    struct Request: Sendable {
+        let method: String
+        let path: String
+        let headers: [String: String]
+    }
+
+    struct Response: Sendable {
+        let statusLine: String
+        let headers: [(String, String)]
+        let body: Data
+        let delayMicrosPer64K: useconds_t
+
+        init(
+            statusLine: String,
+            headers: [(String, String)] = [],
+            body: Data = Data(),
+            delayMicrosPer64K: useconds_t = 0
+        ) {
+            self.statusLine = statusLine
+            self.headers = headers
+            self.body = body
+            self.delayMicrosPer64K = delayMicrosPer64K
+        }
+    }
+
     enum Behavior: Sendable {
         /// Standard multi-lane `206 Partial Content` byte-range file server.
         case range206(payload: Data, eTag: String?, contentDisposition: String?, uniformDelayMicrosPer64K: useconds_t)
@@ -18,6 +43,8 @@ private final class RoutingLoopbackServer: @unchecked Sendable {
         case status200NoRange(payload: Data, delayMicrosPer64K: useconds_t = 0)
         /// Serves an fMP4 HLS `.m3u8` playlist + init + segments.
         case hlsFMP4(playlistPath: String, initMap: Data, segments: [Data])
+        /// Custom per-request routing handler for multi-endpoint refresh-URL scenarios.
+        case custom(@Sendable (Request) -> Response)
     }
 
     struct Stats: Sendable {
@@ -26,6 +53,8 @@ private final class RoutingLoopbackServer: @unchecked Sendable {
         var rangeRequests = 0
         var receivedCookies: [String] = []
         var receivedPaths: [String] = []
+        var receivedUserAgents: [String] = []
+        var receivedRanges: [(path: String, range: String)] = []
     }
 
     private struct MutableState: Sendable {
@@ -151,6 +180,7 @@ private final class RoutingLoopbackServer: @unchecked Sendable {
         guard let requestLine = lines.first else { return }
         let parts = requestLine.split(separator: " ")
         guard parts.count >= 2 else { return }
+        let method = String(parts[0])
         let path = String(parts[1])
 
         var headers: [String: String] = [:]
@@ -163,15 +193,22 @@ private final class RoutingLoopbackServer: @unchecked Sendable {
 
         let rangeHeader = headers["range"]
         let cookieHeader = headers["cookie"]
+        let userAgentHeader = headers["user-agent"]
         let isProbe = (rangeHeader == "bytes=0-0")
 
         let behavior: Behavior = state.withLock { s in
             s.stats.totalRequests += 1
             s.stats.receivedPaths.append(path)
             if isProbe { s.stats.probeRequests += 1 }
-            if rangeHeader != nil && !isProbe { s.stats.rangeRequests += 1 }
+            if let rangeHeader {
+                s.stats.receivedRanges.append((path: path, range: rangeHeader))
+                if !isProbe { s.stats.rangeRequests += 1 }
+            }
             if let cookie = cookieHeader {
                 s.stats.receivedCookies.append(cookie)
+            }
+            if let ua = userAgentHeader {
+                s.stats.receivedUserAgents.append(ua)
             }
             return s.behavior
         }
@@ -193,7 +230,7 @@ private final class RoutingLoopbackServer: @unchecked Sendable {
             if let eTag { extra += "ETag: \(eTag)\r\n" }
             if let contentDisposition { extra += "Content-Disposition: \(contentDisposition)\r\n" }
 
-            if let rangeHeader, let (start, end) = parseRange(rangeHeader, total: total) {
+            if let rangeHeader, let (start, end) = Self.parseRange(rangeHeader, total: total) {
                 let slice = payload[start...end]
                 let resp = "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes \(start)-\(end)/\(total)\r\nContent-Length: \(slice.count)\r\n\(extra)Connection: close\r\n\r\n"
                 sendAll(fd: fd, data: Data(resp.utf8))
@@ -203,6 +240,27 @@ private final class RoutingLoopbackServer: @unchecked Sendable {
                 sendAll(fd: fd, data: Data(resp.utf8))
                 sendChunkedWithDelay(fd: fd, slice: payload, delayMicrosPer64K: delayMicros)
             }
+
+        case .custom(let handler):
+            let response = handler(Request(method: method, path: path, headers: headers))
+            var headerBlock = "HTTP/1.1 \(response.statusLine)\r\n"
+            var hasContentLength = false
+            for (k, v) in response.headers {
+                if k.lowercased() == "content-length" {
+                    hasContentLength = true
+                }
+                headerBlock += "\(k): \(v)\r\n"
+            }
+            if !hasContentLength {
+                headerBlock += "Content-Length: \(response.body.count)\r\n"
+            }
+            headerBlock += "Connection: close\r\n\r\n"
+            sendAll(fd: fd, data: Data(headerBlock.utf8))
+            sendChunkedWithDelay(
+                fd: fd,
+                slice: response.body,
+                delayMicrosPer64K: isProbe ? 0 : response.delayMicrosPer64K
+            )
 
         case .hlsFMP4(let playlistPath, let initMap, let segments):
             if path == playlistPath {
@@ -234,7 +292,7 @@ private final class RoutingLoopbackServer: @unchecked Sendable {
         }
     }
 
-    private func parseRange(_ header: String, total: Int) -> (Int, Int)? {
+    static func parseRange(_ header: String, total: Int) -> (Int, Int)? {
         guard header.lowercased().hasPrefix("bytes="), total > 0 else { return nil }
         let spec = header.dropFirst(6)
         let bounds = spec.split(separator: "-", omittingEmptySubsequences: false)
@@ -1460,5 +1518,804 @@ struct CuriumTransferRoutingTests {
         }
         #expect(singleFinished)
         #expect(singleItem.saveDestinationLabel == "CustomExportFolder")
+    }
+
+    // MARK: - Workstream 2B: Fail-Closed Refresh-URL Resume & Batch Queue Controls
+
+    @Test("Range refreshTransferURL resumes after 403 expiration from exact .part cursor without re-fetching completed bytes (SHA-256 bit-exact)")
+    @MainActor
+    func rangeRefreshURLResumesAfter403BitExactWithoutRedownloading() async throws {
+        let sandbox = try makeRoutingSandbox("curium-refresh-range-ok")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let downloadsRoot = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+        let stagingRoot = sandbox.appending(path: "Staging", directoryHint: .isDirectory)
+        let dbURL = sandbox.appending(path: "Transfers/transfers.sqlite3", directoryHint: .notDirectory)
+        try FileManager.default.createDirectory(at: downloadsRoot, withIntermediateDirectories: true)
+
+        let payload = makeSyntheticPayload(bytes: 1_024 * 1024)
+        let expectedSHA = sha256Hex(payload)
+        let strongETag = "\"signed-asset-v1\""
+        let sliceHalf = payload.count / 2 // 512 KiB per initial slice with 2 lanes
+
+        let server = try RoutingLoopbackServer(behavior: .custom { req in
+            let range = req.headers["range"]
+            if req.path == "/expired.bin" {
+                if range == "bytes=0-0" {
+                    return RoutingLoopbackServer.Response(
+                        statusLine: "206 Partial Content",
+                        headers: [
+                            ("Accept-Ranges", "bytes"),
+                            ("Content-Type", "application/octet-stream"),
+                            ("Content-Range", "bytes 0-0/\(payload.count)"),
+                            ("ETag", strongETag),
+                        ],
+                        body: Data(payload[0...0])
+                    )
+                }
+                if let range, let (start, end) = RoutingLoopbackServer.parseRange(range, total: payload.count) {
+                    // Allow the first 128 KiB window of each slice, then expire with HTTP 403.
+                    let inSlice0FirstWindow = start == 0
+                    let inSlice1FirstWindow = start == sliceHalf
+                    if inSlice0FirstWindow || inSlice1FirstWindow {
+                        let chunk = Data(payload[start...end])
+                        return RoutingLoopbackServer.Response(
+                            statusLine: "206 Partial Content",
+                            headers: [
+                                ("Accept-Ranges", "bytes"),
+                                ("Content-Type", "application/octet-stream"),
+                                ("Content-Range", "bytes \(start)-\(end)/\(payload.count)"),
+                                ("ETag", strongETag),
+                            ],
+                            body: chunk
+                        )
+                    }
+                }
+                return RoutingLoopbackServer.Response(
+                    statusLine: "403 Forbidden",
+                    headers: [("Content-Type", "text/plain")],
+                    body: Data("Signed URL expired".utf8)
+                )
+            }
+
+            if req.path == "/fresh.bin",
+               let range,
+               let (start, end) = RoutingLoopbackServer.parseRange(range, total: payload.count) {
+                let chunk = Data(payload[start...end])
+                return RoutingLoopbackServer.Response(
+                    statusLine: "206 Partial Content",
+                    headers: [
+                        ("Accept-Ranges", "bytes"),
+                        ("Content-Type", "application/octet-stream"),
+                        ("Content-Range", "bytes \(start)-\(end)/\(payload.count)"),
+                        ("ETag", strongETag),
+                    ],
+                    body: chunk
+                )
+            }
+
+            return RoutingLoopbackServer.Response(statusLine: "404 Not Found")
+        })
+        defer { server.stop() }
+
+        let rangeConfig = CuriumRangeEngineConfiguration(
+            maxLanes: 2,
+            maxWindowBytes: 128 * 1024,
+            minimumStealBytes: 256 * 1024,
+            multiLaneThresholdBytes: 512 * 1024,
+            probeTimeoutSeconds: 3.5,
+            maxWindowRetryAttempts: 2,
+            retryBaseDelaySeconds: 0.02
+        )
+        let store = CuriumBrowserStore(
+            host: nil,
+            downloadsRoot: downloadsRoot,
+            restoreSession: false,
+            transferDatabaseURL: dbURL,
+            transferStagingRoot: stagingRoot,
+            transferRangeConfiguration: rangeConfig
+        )
+        await store.waitForTransferHydration()
+
+        let item = try #require(await store.startManualDownload(
+            url: server.url(path: "/expired.bin"),
+            suggestedFilename: "signed.bin",
+            lanes: 2,
+            includeActiveTabCookies: false
+        ))
+
+        let reachedFailed = await waitForCondition(timeoutSeconds: 6.0) {
+            item.phase == .failed
+        }
+        #expect(reachedFailed)
+        #expect(item.canRefreshURL)
+        #expect(item.receivedBytes >= 128 * 1024)
+        #expect(item.receivedBytes < Int64(payload.count))
+        #expect(!item.slices.isEmpty)
+
+        // Capture completed byte spans before refresh so we can prove zero bytes are re-downloaded.
+        let completedSpansBeforeRefresh: [(Int64, Int64)] = item.slices.compactMap { slice in
+            guard slice.currentOffset > slice.startOffset else { return nil }
+            return (slice.startOffset, slice.currentOffset - 1)
+        }
+        #expect(!completedSpansBeforeRefresh.isEmpty)
+
+        let freshURL = server.url(path: "/fresh.bin")
+        try await store.refreshTransferURL(item, newURL: freshURL, includeActiveTabCookies: false)
+
+        let completed = await waitForCondition(timeoutSeconds: 6.0) {
+            item.phase == .completed
+        }
+        #expect(completed)
+        #expect(item.resolvedURL == freshURL)
+        #expect(item.originalURL == freshURL)
+        #expect(item.failure == nil)
+
+        let savedURL = try #require(item.savedURL)
+        #expect(sha256Hex(try Data(contentsOf: savedURL)) == expectedSHA)
+
+        // Every non-probe byte-range request sent to `/fresh.bin` must lie strictly outside already-downloaded spans.
+        let freshRanges = server.snapshotStats().receivedRanges.filter { $0.path == "/fresh.bin" }
+        let freshProbeRanges = freshRanges.filter { $0.range == "bytes=0-0" }
+        let freshDataRanges = freshRanges.filter { $0.range != "bytes=0-0" }
+        #expect(freshProbeRanges.count == 1)
+        #expect(!freshDataRanges.isEmpty)
+
+        for entry in freshDataRanges {
+            let parsed = try #require(RoutingLoopbackServer.parseRange(entry.range, total: payload.count))
+            let reqStart = Int64(parsed.0)
+            let reqEnd = Int64(parsed.1)
+            for (doneStart, doneEnd) in completedSpansBeforeRefresh {
+                let overlapsCompleted = reqStart <= doneEnd && reqEnd >= doneStart
+                #expect(!overlapsCompleted)
+            }
+        }
+    }
+
+    @Test("Range refreshTransferURL rejects wrong totalBytes (.payloadSizeMismatch) leaving .part and slices untouched")
+    @MainActor
+    func rangeRefreshURLRejectsPayloadSizeMismatchWithoutMutatingStaging() async throws {
+        let sandbox = try makeRoutingSandbox("curium-refresh-size-mismatch")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let downloadsRoot = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+        let stagingRoot = sandbox.appending(path: "Staging", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: downloadsRoot, withIntermediateDirectories: true)
+
+        let payload = makeSyntheticPayload(bytes: 768 * 1024)
+        let wrongPayload = makeSyntheticPayload(bytes: 768 * 1024 + 4096)
+        let strongETag = "\"size-check-v1\""
+
+        let server = try RoutingLoopbackServer(behavior: .custom { req in
+            let range = req.headers["range"]
+            if req.path == "/expired.bin" {
+                if range == "bytes=0-0" {
+                    return RoutingLoopbackServer.Response(
+                        statusLine: "206 Partial Content",
+                        headers: [
+                            ("Accept-Ranges", "bytes"),
+                            ("Content-Type", "application/octet-stream"),
+                            ("Content-Range", "bytes 0-0/\(payload.count)"),
+                            ("ETag", strongETag),
+                        ],
+                        body: Data(payload[0...0])
+                    )
+                }
+                if let range, let (start, end) = RoutingLoopbackServer.parseRange(range, total: payload.count), start == 0 {
+                    return RoutingLoopbackServer.Response(
+                        statusLine: "206 Partial Content",
+                        headers: [
+                            ("Accept-Ranges", "bytes"),
+                            ("Content-Type", "application/octet-stream"),
+                            ("Content-Range", "bytes \(start)-\(end)/\(payload.count)"),
+                            ("ETag", strongETag),
+                        ],
+                        body: Data(payload[start...end])
+                    )
+                }
+                return RoutingLoopbackServer.Response(statusLine: "403 Forbidden")
+            }
+
+            if req.path == "/wrong-size.bin",
+               let range,
+               let (start, end) = RoutingLoopbackServer.parseRange(range, total: wrongPayload.count) {
+                return RoutingLoopbackServer.Response(
+                    statusLine: "206 Partial Content",
+                    headers: [
+                        ("Accept-Ranges", "bytes"),
+                        ("Content-Type", "application/octet-stream"),
+                        ("Content-Range", "bytes \(start)-\(end)/\(wrongPayload.count)"),
+                        ("ETag", strongETag),
+                    ],
+                    body: Data(wrongPayload[start...end])
+                )
+            }
+
+            return RoutingLoopbackServer.Response(statusLine: "404 Not Found")
+        })
+        defer { server.stop() }
+
+        let rangeConfig = CuriumRangeEngineConfiguration(
+            maxLanes: 1,
+            maxWindowBytes: 128 * 1024,
+            minimumStealBytes: 256 * 1024,
+            multiLaneThresholdBytes: 512 * 1024,
+            probeTimeoutSeconds: 3.5,
+            maxWindowRetryAttempts: 1,
+            retryBaseDelaySeconds: 0.02
+        )
+        let store = CuriumBrowserStore(
+            host: nil,
+            downloadsRoot: downloadsRoot,
+            restoreSession: false,
+            transferStagingRoot: stagingRoot,
+            transferRangeConfiguration: rangeConfig
+        )
+
+        let expiredURL = server.url(path: "/expired.bin")
+        let item = try #require(await store.startManualDownload(
+            url: expiredURL,
+            suggestedFilename: "asset.bin",
+            lanes: 1,
+            includeActiveTabCookies: false
+        ))
+
+        let failed = await waitForCondition(timeoutSeconds: 6.0) { item.phase == .failed }
+        #expect(failed)
+        #expect(item.canRefreshURL)
+
+        let partURL = stagingRoot
+            .appending(path: item.id, directoryHint: .isDirectory)
+            .appending(path: "asset.bin.part", directoryHint: .notDirectory)
+        let partSHABefore = sha256Hex(try Data(contentsOf: partURL))
+        let slicesBefore = item.slices
+        let receivedBefore = item.receivedBytes
+
+        await #expect(throws: CuriumTransferRefreshError.payloadSizeMismatch(
+            expected: Int64(payload.count),
+            actual: Int64(wrongPayload.count)
+        )) {
+            try await store.refreshTransferURL(
+                item,
+                newURL: server.url(path: "/wrong-size.bin"),
+                includeActiveTabCookies: false
+            )
+        }
+
+        #expect(sha256Hex(try Data(contentsOf: partURL)) == partSHABefore)
+        #expect(item.slices == slicesBefore)
+        #expect(item.receivedBytes == receivedBefore)
+        #expect(item.resolvedURL == expiredURL)
+        #expect(item.originalURL == expiredURL)
+        #expect(item.phase == .failed)
+    }
+
+    @Test("Range refreshTransferURL rejects mismatched strong ETag (.entityTagMismatch) leaving .part untouched")
+    @MainActor
+    func rangeRefreshURLRejectsEntityTagMismatchWithoutMutatingStaging() async throws {
+        let sandbox = try makeRoutingSandbox("curium-refresh-etag-mismatch")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let downloadsRoot = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+        let stagingRoot = sandbox.appending(path: "Staging", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: downloadsRoot, withIntermediateDirectories: true)
+
+        let payload = makeSyntheticPayload(bytes: 768 * 1024)
+        let oldETag = "\"etag-alpha\""
+        let newETag = "\"etag-beta\""
+
+        let server = try RoutingLoopbackServer(behavior: .custom { req in
+            let range = req.headers["range"]
+            if req.path == "/expired.bin" {
+                if range == "bytes=0-0" {
+                    return RoutingLoopbackServer.Response(
+                        statusLine: "206 Partial Content",
+                        headers: [
+                            ("Accept-Ranges", "bytes"),
+                            ("Content-Type", "application/octet-stream"),
+                            ("Content-Range", "bytes 0-0/\(payload.count)"),
+                            ("ETag", oldETag),
+                        ],
+                        body: Data(payload[0...0])
+                    )
+                }
+                if let range, let (start, end) = RoutingLoopbackServer.parseRange(range, total: payload.count), start == 0 {
+                    return RoutingLoopbackServer.Response(
+                        statusLine: "206 Partial Content",
+                        headers: [
+                            ("Accept-Ranges", "bytes"),
+                            ("Content-Type", "application/octet-stream"),
+                            ("Content-Range", "bytes \(start)-\(end)/\(payload.count)"),
+                            ("ETag", oldETag),
+                        ],
+                        body: Data(payload[start...end])
+                    )
+                }
+                return RoutingLoopbackServer.Response(statusLine: "403 Forbidden")
+            }
+
+            if req.path == "/wrong-etag.bin",
+               let range,
+               let (start, end) = RoutingLoopbackServer.parseRange(range, total: payload.count) {
+                return RoutingLoopbackServer.Response(
+                    statusLine: "206 Partial Content",
+                    headers: [
+                        ("Accept-Ranges", "bytes"),
+                        ("Content-Type", "application/octet-stream"),
+                        ("Content-Range", "bytes \(start)-\(end)/\(payload.count)"),
+                        ("ETag", newETag),
+                    ],
+                    body: Data(payload[start...end])
+                )
+            }
+
+            return RoutingLoopbackServer.Response(statusLine: "404 Not Found")
+        })
+        defer { server.stop() }
+
+        let rangeConfig = CuriumRangeEngineConfiguration(
+            maxLanes: 1,
+            maxWindowBytes: 128 * 1024,
+            minimumStealBytes: 256 * 1024,
+            multiLaneThresholdBytes: 512 * 1024,
+            probeTimeoutSeconds: 3.5,
+            maxWindowRetryAttempts: 1,
+            retryBaseDelaySeconds: 0.02
+        )
+        let store = CuriumBrowserStore(
+            host: nil,
+            downloadsRoot: downloadsRoot,
+            restoreSession: false,
+            transferStagingRoot: stagingRoot,
+            transferRangeConfiguration: rangeConfig
+        )
+
+        let expiredURL = server.url(path: "/expired.bin")
+        let item = try #require(await store.startManualDownload(
+            url: expiredURL,
+            suggestedFilename: "etag-asset.bin",
+            lanes: 1,
+            includeActiveTabCookies: false
+        ))
+
+        let failed = await waitForCondition(timeoutSeconds: 6.0) { item.phase == .failed }
+        #expect(failed)
+
+        let partURL = stagingRoot
+            .appending(path: item.id, directoryHint: .isDirectory)
+            .appending(path: "etag-asset.bin.part", directoryHint: .notDirectory)
+        let partSHABefore = sha256Hex(try Data(contentsOf: partURL))
+        let slicesBefore = item.slices
+
+        await #expect(throws: CuriumTransferRefreshError.entityTagMismatch(expected: oldETag, actual: newETag)) {
+            try await store.refreshTransferURL(
+                item,
+                newURL: server.url(path: "/wrong-etag.bin"),
+                includeActiveTabCookies: false
+            )
+        }
+
+        #expect(sha256Hex(try Data(contentsOf: partURL)) == partSHABefore)
+        #expect(item.slices == slicesBefore)
+        #expect(item.eTag == oldETag)
+        #expect(item.resolvedURL == expiredURL)
+        #expect(item.phase == .failed)
+    }
+
+    @Test("Range refreshTransferURL rejects HTML 200 login page (.rangeNotSupported) leaving .part untouched")
+    @MainActor
+    func rangeRefreshURLRejectsHTMLLoginPageWithoutMutatingStaging() async throws {
+        let sandbox = try makeRoutingSandbox("curium-refresh-html-reject")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let downloadsRoot = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+        let stagingRoot = sandbox.appending(path: "Staging", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: downloadsRoot, withIntermediateDirectories: true)
+
+        let payload = makeSyntheticPayload(bytes: 768 * 1024)
+        let strongETag = "\"html-guard-v1\""
+
+        let server = try RoutingLoopbackServer(behavior: .custom { req in
+            let range = req.headers["range"]
+            if req.path == "/expired.bin" {
+                if range == "bytes=0-0" {
+                    return RoutingLoopbackServer.Response(
+                        statusLine: "206 Partial Content",
+                        headers: [
+                            ("Accept-Ranges", "bytes"),
+                            ("Content-Type", "application/octet-stream"),
+                            ("Content-Range", "bytes 0-0/\(payload.count)"),
+                            ("ETag", strongETag),
+                        ],
+                        body: Data(payload[0...0])
+                    )
+                }
+                if let range, let (start, end) = RoutingLoopbackServer.parseRange(range, total: payload.count), start == 0 {
+                    return RoutingLoopbackServer.Response(
+                        statusLine: "206 Partial Content",
+                        headers: [
+                            ("Accept-Ranges", "bytes"),
+                            ("Content-Type", "application/octet-stream"),
+                            ("Content-Range", "bytes \(start)-\(end)/\(payload.count)"),
+                            ("ETag", strongETag),
+                        ],
+                        body: Data(payload[start...end])
+                    )
+                }
+                return RoutingLoopbackServer.Response(statusLine: "403 Forbidden")
+            }
+
+            if req.path == "/login.html" {
+                let html = Data("<!doctype html><html><body>Sign in to continue</body></html>".utf8)
+                return RoutingLoopbackServer.Response(
+                    statusLine: "200 OK",
+                    headers: [("Content-Type", "text/html; charset=utf-8")],
+                    body: html
+                )
+            }
+
+            return RoutingLoopbackServer.Response(statusLine: "404 Not Found")
+        })
+        defer { server.stop() }
+
+        let rangeConfig = CuriumRangeEngineConfiguration(
+            maxLanes: 1,
+            maxWindowBytes: 128 * 1024,
+            minimumStealBytes: 256 * 1024,
+            multiLaneThresholdBytes: 512 * 1024,
+            probeTimeoutSeconds: 3.5,
+            maxWindowRetryAttempts: 1,
+            retryBaseDelaySeconds: 0.02
+        )
+        let store = CuriumBrowserStore(
+            host: nil,
+            downloadsRoot: downloadsRoot,
+            restoreSession: false,
+            transferStagingRoot: stagingRoot,
+            transferRangeConfiguration: rangeConfig
+        )
+
+        let expiredURL = server.url(path: "/expired.bin")
+        let item = try #require(await store.startManualDownload(
+            url: expiredURL,
+            suggestedFilename: "protected.bin",
+            lanes: 1,
+            includeActiveTabCookies: false
+        ))
+
+        let failed = await waitForCondition(timeoutSeconds: 6.0) { item.phase == .failed }
+        #expect(failed)
+
+        let partURL = stagingRoot
+            .appending(path: item.id, directoryHint: .isDirectory)
+            .appending(path: "protected.bin.part", directoryHint: .notDirectory)
+        let partSHABefore = sha256Hex(try Data(contentsOf: partURL))
+        let slicesBefore = item.slices
+
+        await #expect(throws: CuriumTransferRefreshError.rangeNotSupported) {
+            try await store.refreshTransferURL(
+                item,
+                newURL: server.url(path: "/login.html"),
+                includeActiveTabCookies: false
+            )
+        }
+
+        #expect(sha256Hex(try Data(contentsOf: partURL)) == partSHABefore)
+        #expect(item.slices == slicesBefore)
+        #expect(item.resolvedURL == expiredURL)
+        #expect(item.phase == .failed)
+    }
+
+    @Test("HLS refreshTransferURL resumes matching 6-segment VOD without re-fetching completed segments and rejects 7-segment mismatch fail-closed")
+    @MainActor
+    func hlsRefreshURLResumesAtCheckpointAndRejectsSegmentCountMismatch() async throws {
+        let sandbox = try makeRoutingSandbox("curium-refresh-hls")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let downloadsRoot = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+        let stagingRoot = sandbox.appending(path: "Staging", directoryHint: .isDirectory)
+        let dbURL = sandbox.appending(path: "Transfers/transfers.sqlite3", directoryHint: .notDirectory)
+        try FileManager.default.createDirectory(at: downloadsRoot, withIntermediateDirectories: true)
+
+        let initMap = makeMinimalFMP4Box(fourCC: "ftyp", bodySize: 24)
+        let segments: [Data] = (0..<6).map { idx in
+            let bodySize = 64 + idx * 16
+            var data = Data()
+            var be = UInt32(8 + bodySize).bigEndian
+            withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
+            data.append(Data((idx % 2 == 0 ? "moof" : "mdat").utf8))
+            data.append(Data(repeating: UInt8(0x40 + idx), count: bodySize))
+            return data
+        }
+        let expectedMP4 = ([initMap] + segments).reduce(Data(), +)
+
+        let makeVODPlaylist: @Sendable (String, Int, Bool, Bool) -> Data = { prefix, count, includeEndList, isFMP4 in
+            var m3u8 = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n"
+            if isFMP4 {
+                m3u8 += "#EXT-X-MAP:URI=\"\(prefix)/init.mp4\"\n"
+            }
+            for idx in 0..<count {
+                let ext = isFMP4 ? "m4s" : "ts"
+                m3u8 += "#EXTINF:4.0,\n\(prefix)/seg\(idx).\(ext)\n"
+            }
+            if includeEndList {
+                m3u8 += "#EXT-X-ENDLIST\n"
+            }
+            return Data(m3u8.utf8)
+        }
+
+        let server = try RoutingLoopbackServer(behavior: .custom { req in
+            switch req.path {
+            case "/old/index.m3u8":
+                return RoutingLoopbackServer.Response(
+                    statusLine: "200 OK",
+                    headers: [("Content-Type", "application/vnd.apple.mpegurl")],
+                    body: makeVODPlaylist("/old", 6, true, true)
+                )
+            case "/old/init.mp4":
+                return RoutingLoopbackServer.Response(
+                    statusLine: "200 OK",
+                    headers: [("Content-Type", "video/mp4")],
+                    body: initMap
+                )
+            case "/old/seg0.m4s", "/old/seg1.m4s", "/old/seg2.m4s":
+                let idx = Int(req.path.dropFirst("/old/seg".count).dropLast(4))!
+                return RoutingLoopbackServer.Response(
+                    statusLine: "200 OK",
+                    headers: [("Content-Type", "video/iso.segment")],
+                    body: segments[idx]
+                )
+            case "/old/seg3.m4s", "/old/seg4.m4s", "/old/seg5.m4s":
+                return RoutingLoopbackServer.Response(
+                    statusLine: "403 Forbidden",
+                    headers: [("Content-Type", "text/plain")],
+                    body: Data("Expired HLS token".utf8)
+                )
+            case "/bad-7seg/index.m3u8":
+                return RoutingLoopbackServer.Response(
+                    statusLine: "200 OK",
+                    headers: [("Content-Type", "application/vnd.apple.mpegurl")],
+                    body: makeVODPlaylist("/bad-7seg", 7, true, true)
+                )
+            case "/live/index.m3u8":
+                return RoutingLoopbackServer.Response(
+                    statusLine: "200 OK",
+                    headers: [("Content-Type", "application/vnd.apple.mpegurl")],
+                    body: makeVODPlaylist("/live", 6, false, true)
+                )
+            case "/ts-6seg/index.m3u8":
+                return RoutingLoopbackServer.Response(
+                    statusLine: "200 OK",
+                    headers: [("Content-Type", "application/vnd.apple.mpegurl")],
+                    body: makeVODPlaylist("/ts-6seg", 6, true, false)
+                )
+            case "/fresh-6seg/index.m3u8":
+                return RoutingLoopbackServer.Response(
+                    statusLine: "200 OK",
+                    headers: [("Content-Type", "application/vnd.apple.mpegurl")],
+                    body: makeVODPlaylist("/fresh", 6, true, true)
+                )
+            case "/fresh/init.mp4":
+                return RoutingLoopbackServer.Response(
+                    statusLine: "200 OK",
+                    headers: [("Content-Type", "video/mp4")],
+                    body: initMap
+                )
+            default:
+                if req.path.hasPrefix("/fresh/seg"), req.path.hasSuffix(".m4s"),
+                   let idx = Int(req.path.dropFirst("/fresh/seg".count).dropLast(4)),
+                   segments.indices.contains(idx) {
+                    return RoutingLoopbackServer.Response(
+                        statusLine: "200 OK",
+                        headers: [("Content-Type", "video/iso.segment")],
+                        body: segments[idx]
+                    )
+                }
+                return RoutingLoopbackServer.Response(statusLine: "404 Not Found")
+            }
+        })
+        defer { server.stop() }
+
+        let store = CuriumBrowserStore(
+            host: nil,
+            downloadsRoot: downloadsRoot,
+            restoreSession: false,
+            transferDatabaseURL: dbURL,
+            transferStagingRoot: stagingRoot
+        )
+        await store.waitForTransferHydration()
+
+        let oldPlaylistURL = server.url(path: "/old/index.m3u8")
+        // Use 1 lane so segments 0, 1, 2 flush deterministically before seg3 hits 403.
+        let item = try #require(await store.startManualDownload(
+            url: oldPlaylistURL,
+            suggestedFilename: "lecture.mp4",
+            lanes: 1,
+            includeActiveTabCookies: false
+        ))
+
+        let reachedFailed = await waitForCondition(timeoutSeconds: 6.0) {
+            item.phase == .failed
+        }
+        #expect(reachedFailed)
+        #expect(item.canRefreshURL)
+        #expect(item.completedSegments == 3)
+        #expect(item.totalSegments == 6)
+
+        let videoPartURL = stagingRoot
+            .appending(path: item.id, directoryHint: .isDirectory)
+            .appending(path: "video.part", directoryHint: .notDirectory)
+        let videoPartSHABefore = sha256Hex(try Data(contentsOf: videoPartURL))
+
+        // 1. 7-segment VOD playlist fails closed with `.hlsSegmentCountMismatch` leaving `video.part` untouched.
+        await #expect(throws: CuriumTransferRefreshError.hlsSegmentCountMismatch(expected: 6, actual: 7)) {
+            try await store.refreshTransferURL(
+                item,
+                newURL: server.url(path: "/bad-7seg/index.m3u8"),
+                includeActiveTabCookies: false
+            )
+        }
+        #expect(sha256Hex(try Data(contentsOf: videoPartURL)) == videoPartSHABefore)
+        #expect(item.completedSegments == 3)
+        #expect(item.resolvedURL == oldPlaylistURL)
+        #expect(item.phase == .failed)
+
+        // 2. Live playlist (no #EXT-X-ENDLIST) fails closed with `.hlsLiveStreamNotResumable`.
+        await #expect(throws: CuriumTransferRefreshError.hlsLiveStreamNotResumable) {
+            try await store.refreshTransferURL(
+                item,
+                newURL: server.url(path: "/live/index.m3u8"),
+                includeActiveTabCookies: false
+            )
+        }
+        #expect(sha256Hex(try Data(contentsOf: videoPartURL)) == videoPartSHABefore)
+
+        // 3. MPEG-TS playlist against fMP4 checkpoint fails closed with `.hlsFormatMismatch`.
+        await #expect(throws: CuriumTransferRefreshError.hlsFormatMismatch) {
+            try await store.refreshTransferURL(
+                item,
+                newURL: server.url(path: "/ts-6seg/index.m3u8"),
+                includeActiveTabCookies: false
+            )
+        }
+        #expect(sha256Hex(try Data(contentsOf: videoPartURL)) == videoPartSHABefore)
+
+        // 4. Matching 6-segment fMP4 VOD playlist resumes from segment 3 without re-fetching 0..2 or init.mp4!
+        let freshPlaylistURL = server.url(path: "/fresh-6seg/index.m3u8")
+        try await store.refreshTransferURL(
+            item,
+            newURL: freshPlaylistURL,
+            includeActiveTabCookies: false
+        )
+
+        let completed = await waitForCondition(timeoutSeconds: 6.0) {
+            item.phase == .completed
+        }
+        #expect(completed)
+        #expect(item.resolvedURL == freshPlaylistURL)
+
+        let savedURL = try #require(item.savedURL)
+        #expect(try Data(contentsOf: savedURL) == expectedMP4)
+
+        let paths = server.snapshotStats().receivedPaths
+        #expect(!paths.contains("/fresh/init.mp4"))
+        #expect(!paths.contains("/fresh/seg0.m4s"))
+        #expect(!paths.contains("/fresh/seg1.m4s"))
+        #expect(!paths.contains("/fresh/seg2.m4s"))
+        #expect(paths.contains("/fresh/seg3.m4s"))
+        #expect(paths.contains("/fresh/seg4.m4s"))
+        #expect(paths.contains("/fresh/seg5.m4s"))
+    }
+
+    @Test("pauseAllActiveDownloads and resumeAllPausedDownloads control batch queue cleanly and manual downloads send active profile UA")
+    @MainActor
+    func batchPauseAndResumeControlsAndProfileUserAgent() async throws {
+        let sandbox = try makeRoutingSandbox("curium-batch-controls")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let downloadsRoot = sandbox.appending(path: "Downloads", directoryHint: .isDirectory)
+        let stagingRoot = sandbox.appending(path: "Staging", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: downloadsRoot, withIntermediateDirectories: true)
+
+        let payload = makeSyntheticPayload(bytes: 1_024 * 1024)
+        let expectedSHA = sha256Hex(payload)
+        let server = try RoutingLoopbackServer(
+            behavior: .range206(
+                payload: payload,
+                eTag: "\"batch-v1\"",
+                contentDisposition: nil,
+                uniformDelayMicrosPer64K: 45_000
+            )
+        )
+        defer { server.stop() }
+
+        let store = CuriumBrowserStore(
+            host: nil,
+            downloadsRoot: downloadsRoot,
+            restoreSession: false,
+            transferStagingRoot: stagingRoot
+        )
+        #expect(!store.hasPausableActiveDownloads)
+        #expect(!store.hasResumablePausedDownloads)
+
+        let item1 = try #require(await store.startManualDownload(
+            url: server.url(path: "/batch-1.bin"),
+            suggestedFilename: "batch-1.bin",
+            lanes: 2,
+            includeActiveTabCookies: false
+        ))
+        let item2 = try #require(await store.startManualDownload(
+            url: server.url(path: "/batch-2.bin"),
+            suggestedFilename: "batch-2.bin",
+            lanes: 2,
+            includeActiveTabCookies: false
+        ))
+
+        let bothActive = await waitForCondition(timeoutSeconds: 6.0) {
+            item1.phase == .downloading && item2.phase == .downloading
+        }
+        #expect(bothActive)
+        #expect(store.hasPausableActiveDownloads)
+        #expect(!store.hasResumablePausedDownloads)
+
+        store.pauseAllActiveDownloads()
+
+        let bothPaused = await waitForCondition(timeoutSeconds: 6.0) {
+            item1.phase == .paused && item2.phase == .paused
+        }
+        #expect(bothPaused)
+        #expect(!store.hasPausableActiveDownloads)
+        #expect(store.hasResumablePausedDownloads)
+        #expect(item1.canRefreshURL)
+        #expect(item2.canRefreshURL)
+
+        server.setBehavior(.range206(
+            payload: payload,
+            eTag: "\"batch-v1\"",
+            contentDisposition: nil,
+            uniformDelayMicrosPer64K: 0
+        ))
+        store.resumeAllPausedDownloads()
+
+        let bothCompleted = await waitForCondition(timeoutSeconds: 6.0) {
+            item1.phase == .completed && item2.phase == .completed
+        }
+        #expect(bothCompleted)
+        #expect(!store.hasPausableActiveDownloads)
+        #expect(!store.hasResumablePausedDownloads)
+        #expect(sha256Hex(try Data(contentsOf: try #require(item1.savedURL))) == expectedSHA)
+        #expect(sha256Hex(try Data(contentsOf: try #require(item2.savedURL))) == expectedSHA)
+
+        // Manual downloads without active tab cookies must carry the active profile's Chrome User-Agent.
+        let expectedProfileUA = store.activeProfileUserAgent()
+        #expect(expectedProfileUA.contains("Chrome/"))
+        #expect(!expectedProfileUA.contains("iPhone"))
+        let userAgents = server.snapshotStats().receivedUserAgents
+        #expect(!userAgents.isEmpty)
+        #expect(userAgents.contains(expectedProfileUA))
+        #expect(!userAgents.contains(where: { $0.contains("iPhone; CPU iPhone OS") }))
+
+        // Un-upgraded Blink POST tasks must remain excluded from URL refresh (`canRefreshURL == false`).
+        let mockHost = RoutingMockBrowserHost()
+        let postTask = RoutingMockDownloadTask(
+            downloadID: "blink-post-no-refresh",
+            sourceTabID: nil,
+            originalURL: server.url(path: "/post-export.csv"),
+            suggestedFilename: "post-export.csv",
+            httpMethod: "POST",
+            totalBytes: 128,
+            holdInProgressUntilCancelled: true
+        )
+        store.browserHost(mockHost, didCreateDownload: postTask)
+        let postItem = try #require(store.downloads.first { $0.id == "blink-post-no-refresh" })
+        #expect(!postItem.canRefreshURL)
+        await #expect(throws: CuriumTransferRefreshError.transferNotEligible) {
+            try await store.refreshTransferURL(
+                postItem,
+                newURL: server.url(path: "/batch-1.bin"),
+                includeActiveTabCookies: false
+            )
+        }
+        store.cancelDownload(postItem)
     }
 }

@@ -4,6 +4,57 @@ import OSLog
 import UIKit
 import os
 
+/// Fail-closed verification errors emitted when refreshing an expired or broken download link.
+/// None of these errors ever mutate staged `.part`, `video.part`, slice cursors, or SQLite state.
+enum CuriumTransferRefreshError: LocalizedError, Equatable, Sendable {
+    case invalidURL
+    case transferNotEligible
+    case transferInProgress
+    case rangeNotSupported
+    case payloadSizeMismatch(expected: Int64, actual: Int64?)
+    case entityTagMismatch(expected: String, actual: String)
+    case lastModifiedMismatch(expected: String, actual: String)
+    case hlsLiveStreamNotResumable
+    case hlsFormatMismatch
+    case hlsSegmentCountMismatch(expected: Int, actual: Int)
+    case hlsVariantAmbiguous
+    case probeFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidURL:
+            return "Enter a valid http:// or https:// download URL."
+        case .transferNotEligible:
+            return "This transfer can’t be resumed with a replacement link."
+        case .transferInProgress:
+            return "Pause the transfer before updating its download link."
+        case .rangeNotSupported:
+            return "The new link does not support resumable byte ranges (HTTP 206) or returned a web page. Your partial file was preserved."
+        case .payloadSizeMismatch(let expected, let actual):
+            let expectedText = CuriumTransferFormatters.bytes(expected)
+            if let actual {
+                let actualText = CuriumTransferFormatters.bytes(actual)
+                return "File size mismatch: expected \(expectedText), but the new link reports \(actualText). Your partial file was not modified."
+            }
+            return "File size mismatch: expected \(expectedText), but the new link did not report a file size. Your partial file was not modified."
+        case .entityTagMismatch(let expected, let actual):
+            return "File identity (ETag) mismatch: expected \(expected), got \(actual). Your partial file was not modified."
+        case .lastModifiedMismatch(let expected, let actual):
+            return "File modification date mismatch: expected \(expected), got \(actual). Your partial file was not modified."
+        case .hlsLiveStreamNotResumable:
+            return "The new playlist is a live stream and cannot resume a VOD download. Your partial stream was not modified."
+        case .hlsFormatMismatch:
+            return "The new HLS playlist uses a different container format (fMP4 vs MPEG-TS). Your partial stream was not modified."
+        case .hlsSegmentCountMismatch(let expected, let actual):
+            return "HLS segment count mismatch: expected \(expected) segments, but the new playlist has \(actual). Your partial stream was not modified."
+        case .hlsVariantAmbiguous:
+            return "The master playlist has multiple matching variants. Paste the direct variant .m3u8 URL to resume safely."
+        case .probeFailed(let detail):
+            return detail.isEmpty ? "Could not verify the replacement download link." : detail
+        }
+    }
+}
+
 /// Smart 4-source transfer router and durable lifecycle coordinator bridging
 /// Blink downloads, Media Radar Direct, Media Radar HLS, and Manual `+ New Download`
 /// onto `CuriumRangeTransferEngine`, `CuriumHLSTransferEngine`, `CuriumTransferStore`,
@@ -45,6 +96,8 @@ final class CuriumTransferCoordinator {
 
     struct HostBridge {
         var activeProfileID: @MainActor () -> String
+        var activeTabID: @MainActor () -> String? = { nil }
+        var defaultUserAgent: @MainActor () -> String? = { nil }
         var effectiveProxy: @MainActor () -> CuriumProxyConfig
         var resolveCookieHeader: @MainActor (URL, String?) async -> String?
         var tabContext: @MainActor (String?) -> (userAgent: String?, pageURL: URL?)
@@ -110,6 +163,7 @@ final class CuriumTransferCoordinator {
     /// In-memory only auth cookies—never written to SQLite.
     private var transientCookiesByID: [String: String] = [:]
     private var customFilenameTransferIDs: Set<String> = []
+    private var refreshingTransferIDs: Set<String> = []
     private var hydrationTask: Task<Void, Never>?
 
     init(environment: Environment, host: HostBridge) {
@@ -500,12 +554,14 @@ final class CuriumTransferCoordinator {
         var cookieHeader: String?
         var referer: String?
         var origin: String?
-        var userAgent: String?
+        var userAgent: String? = Self.nonEmptyTrimmed(host.defaultUserAgent())
         var sourceTabID: String?
 
         if includeActiveTabCookies {
             sourceTabID = activeTabID
-            userAgent = activeTabUserAgent
+            if let tabUA = Self.nonEmptyTrimmed(activeTabUserAgent) {
+                userAgent = tabUA
+            }
             if let tabURL = activeTabURL, CuriumHLSParser.isAllowedHTTPURL(tabURL) {
                 referer = Self.safeRefererString(from: tabURL, targetURL: url)
                 if !CrossOriginRedirectAuthStripper.isHTTPSDowngrade(from: tabURL, to: url) {
@@ -581,7 +637,648 @@ final class CuriumTransferCoordinator {
         return item
     }
 
-    // MARK: - User Actions: Pause / Resume / Retry / Cancel / Remove
+    // MARK: - User Actions: Pause / Resume / Retry / Cancel / Remove / Batch & Refresh URL
+
+    var hasPausableActiveDownloads: Bool {
+        host.allDownloads().contains { $0.canPause }
+    }
+
+    var hasResumablePausedDownloads: Bool {
+        host.allDownloads().contains { $0.canResume }
+    }
+
+    func pauseAllActiveDownloads() {
+        let pausable = host.allDownloads().filter { $0.canPause }
+        // Transition queued items to `.paused` first so cancelling active tasks never promotes them.
+        for item in pausable where item.phase == .queued {
+            pauseDownload(item)
+        }
+        for item in pausable where item.phase != .queued {
+            pauseDownload(item)
+        }
+    }
+
+    func resumeAllPausedDownloads() {
+        // Reverse order matches FIFO queue priority (`downloads` inserts newest at index 0).
+        let resumable = host.allDownloads().reversed().filter { $0.canResume }
+        for item in resumable {
+            resumeDownload(item)
+        }
+    }
+
+    func transferMatchesActiveProfile(_ item: CuriumDownload) -> Bool {
+        guard let record = recordsByID[item.id] else { return true }
+        return record.sourceProfileID.caseInsensitiveCompare(host.activeProfileID()) == .orderedSame
+    }
+
+    /// Fail-closed replacement-URL verification and resume for expired signed links (Range & HLS).
+    ///
+    /// Guarantees that `.part`, `video.part`, `slices`, `hlsCheckpoint`, SQLite, and `CuriumDownload`
+    /// remain strictly unmodified until every transport-specific integrity gate passes.
+    func refreshTransferURL(
+        _ item: CuriumDownload,
+        newURL: URL,
+        includeActiveTabCookies: Bool
+    ) async throws {
+        // Gate 1: Scheme, eligibility, active-task exclusion, and SSRF protection.
+        guard CuriumHLSParser.isAllowedHTTPURL(newURL) else {
+            throw CuriumTransferRefreshError.invalidURL
+        }
+        guard runningTasksByID[item.id] == nil,
+              !refreshingTransferIDs.contains(item.id) else {
+            throw CuriumTransferRefreshError.transferInProgress
+        }
+        guard item.canRefreshURL,
+              itemsByID[item.id] === item,
+              let initialRecord = recordsByID[item.id] else {
+            throw CuriumTransferRefreshError.transferNotEligible
+        }
+        let originatingURL = initialRecord.pageURL
+        guard CuriumHLSParser.isAllowedTargetURL(newURL, originatingURL: originatingURL) else {
+            throw CuriumTransferRefreshError.probeFailed(
+                "Blocked private or local network host (\(newURL.host ?? "private"))."
+            )
+        }
+
+        refreshingTransferIDs.insert(item.id)
+        defer { refreshingTransferIDs.remove(item.id) }
+
+        // Resolve candidate auth/headers without mutating any persisted or transient transfer state.
+        let sameProfile = initialRecord.sourceProfileID.caseInsensitiveCompare(host.activeProfileID()) == .orderedSame
+        let useActiveTabAuth = includeActiveTabCookies && sameProfile
+        let resolvedActiveTabID: String? = useActiveTabAuth ? host.activeTabID() : nil
+        let activeTabCtx: (userAgent: String?, pageURL: URL?) = useActiveTabAuth
+            ? host.tabContext(resolvedActiveTabID)
+            : (nil, nil)
+
+        if useActiveTabAuth,
+           let tabURL = activeTabCtx.pageURL,
+           !CuriumHLSParser.isAllowedTargetURL(newURL, originatingURL: tabURL) {
+            throw CuriumTransferRefreshError.probeFailed(
+                "Blocked private or local network host (\(newURL.host ?? "private"))."
+            )
+        }
+
+        let candidateUserAgent: String?
+        let candidateReferer: String?
+        let candidateOrigin: String?
+        let candidateCookie: String?
+
+        if useActiveTabAuth {
+            candidateUserAgent = Self.nonEmptyTrimmed(activeTabCtx.userAgent)
+                ?? Self.nonEmptyTrimmed(initialRecord.userAgent)
+                ?? Self.nonEmptyTrimmed(host.defaultUserAgent())
+            candidateReferer = Self.safeRefererString(from: activeTabCtx.pageURL, targetURL: newURL)
+            if let tabURL = activeTabCtx.pageURL,
+               CuriumHLSParser.isAllowedHTTPURL(tabURL),
+               !CrossOriginRedirectAuthStripper.isHTTPSDowngrade(from: tabURL, to: newURL) {
+                candidateOrigin = Self.originString(for: tabURL)
+            } else {
+                candidateOrigin = nil
+            }
+            candidateCookie = await host.resolveCookieHeader(newURL, resolvedActiveTabID)
+        } else {
+            candidateUserAgent = Self.nonEmptyTrimmed(initialRecord.userAgent)
+                ?? Self.nonEmptyTrimmed(host.defaultUserAgent())
+            let downgraded = CrossOriginRedirectAuthStripper.isHTTPSDowngrade(
+                from: initialRecord.pageURL,
+                to: newURL
+            )
+            candidateReferer = downgraded ? nil : initialRecord.referer
+            candidateOrigin = downgraded ? nil : initialRecord.origin
+            candidateCookie = nil
+        }
+
+        let probeHeaders = buildHTTPHeaders(
+            userAgent: candidateUserAgent,
+            referer: candidateReferer,
+            origin: candidateOrigin,
+            cookie: candidateCookie
+        )
+        let proxy = host.effectiveProxy()
+        let probeCookieResolver: (@Sendable (URL) async -> String?)?
+        if useActiveTabAuth {
+            probeCookieResolver = { [weak self] targetURL in
+                guard let self else { return nil }
+                return await self.resolveProbeCookie(for: targetURL, tabID: resolvedActiveTabID)
+            }
+        } else {
+            probeCookieResolver = nil
+        }
+
+        if initialRecord.transportKind == .hlsRemuxMP4 {
+            try await refreshHLSTransferURL(
+                item: item,
+                initialRecord: initialRecord,
+                newURL: newURL,
+                originatingURL: originatingURL,
+                probeHeaders: probeHeaders,
+                proxy: proxy,
+                probeCookieResolver: probeCookieResolver,
+                useActiveTabAuth: useActiveTabAuth,
+                resolvedActiveTabID: resolvedActiveTabID,
+                candidateUserAgent: candidateUserAgent,
+                candidateReferer: candidateReferer,
+                candidateOrigin: candidateOrigin,
+                candidateCookie: candidateCookie
+            )
+        } else {
+            try await refreshRangeTransferURL(
+                item: item,
+                initialRecord: initialRecord,
+                newURL: newURL,
+                originatingURL: originatingURL,
+                probeHeaders: probeHeaders,
+                proxy: proxy,
+                probeCookieResolver: probeCookieResolver,
+                useActiveTabAuth: useActiveTabAuth,
+                resolvedActiveTabID: resolvedActiveTabID,
+                candidateUserAgent: candidateUserAgent,
+                candidateReferer: candidateReferer,
+                candidateOrigin: candidateOrigin,
+                candidateCookie: candidateCookie
+            )
+        }
+    }
+
+    private func refreshRangeTransferURL(
+        item: CuriumDownload,
+        initialRecord: CuriumTransferRecord,
+        newURL: URL,
+        originatingURL: URL?,
+        probeHeaders: [String: String],
+        proxy: CuriumProxyConfig,
+        probeCookieResolver: (@Sendable (URL) async -> String?)?,
+        useActiveTabAuth: Bool,
+        resolvedActiveTabID: String?,
+        candidateUserAgent: String?,
+        candidateReferer: String?,
+        candidateOrigin: String?,
+        candidateCookie: String?
+    ) async throws {
+        let existingTotal = initialRecord.totalBytes ?? 0
+        let stagedPartURL = (try? resolvedStagingDirectory(named: initialRecord.stagingDirectoryName))?
+            .appending(path: initialRecord.stagingFileName, directoryHint: .notDirectory)
+        let partDiskSize = stagedPartURL.flatMap(Self.fileSize(at:)) ?? 0
+        let hasReusableRangeState: Bool = {
+            guard existingTotal > 0,
+                  !initialRecord.slices.isEmpty,
+                  CuriumSliceCoordinator.isValidResumePartition(initialRecord.slices, totalBytes: existingTotal),
+                  partDiskSize >= existingTotal else {
+                return false
+            }
+            return initialRecord.receivedBytes > 0
+                || initialRecord.slices.contains(where: { $0.downloadedBytes > 0 })
+        }()
+
+        let probe: CuriumRangeProbeResult
+        do {
+            probe = try await environment.rangeEngine.probe(
+                url: newURL,
+                headers: probeHeaders,
+                proxy: proxy,
+                originatingURL: originatingURL,
+                cookieResolver: probeCookieResolver,
+                timeoutSeconds: environment.rangeConfiguration.probeTimeoutSeconds
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let rangeErr as CuriumRangeTransferError {
+            switch rangeErr {
+            case .disallowedURLScheme:
+                throw CuriumTransferRefreshError.invalidURL
+            default:
+                throw CuriumTransferRefreshError.probeFailed(rangeErr.localizedDescription)
+            }
+        } catch {
+            throw CuriumTransferRefreshError.probeFailed(error.localizedDescription)
+        }
+
+        if hasReusableRangeState {
+            // Gate A: Require 206 byte ranges and reject HTML login/interstitial pages.
+            guard probe.statusCode == 206,
+                  probe.supportsByteRanges,
+                  !probe.isHTMLResponse else {
+                throw CuriumTransferRefreshError.rangeNotSupported
+            }
+            // Gate B: Exact payload byte-size match.
+            guard let probedTotal = probe.totalBytes, probedTotal == existingTotal else {
+                throw CuriumTransferRefreshError.payloadSizeMismatch(
+                    expected: existingTotal,
+                    actual: probe.totalBytes
+                )
+            }
+            // Gate C: Strong ETag identity match, falling back to Last-Modified when neither has a strong ETag.
+            let existingStrongETag = CuriumTransferRecord.strongETag(from: initialRecord.eTag)
+            let probedStrongETag = CuriumTransferRecord.strongETag(from: probe.eTag)
+            if let existingStrongETag, let probedStrongETag {
+                guard existingStrongETag == probedStrongETag else {
+                    throw CuriumTransferRefreshError.entityTagMismatch(
+                        expected: existingStrongETag,
+                        actual: probedStrongETag
+                    )
+                }
+            } else if let existingLM = Self.nonEmptyTrimmed(initialRecord.lastModified),
+                      let probedLM = Self.nonEmptyTrimmed(probe.lastModified) {
+                guard existingLM == probedLM else {
+                    throw CuriumTransferRefreshError.lastModifiedMismatch(
+                        expected: existingLM,
+                        actual: probedLM
+                    )
+                }
+            }
+        } else {
+            // Zero reusable staged bytes: accept any valid 200/206 non-HTML response.
+            guard (probe.statusCode == 200 || probe.statusCode == 206),
+                  !probe.isHTMLResponse else {
+                throw CuriumTransferRefreshError.rangeNotSupported
+            }
+        }
+
+        // Re-verify transfer state after awaiting network probe before committing any mutation.
+        guard runningTasksByID[item.id] == nil else {
+            throw CuriumTransferRefreshError.transferInProgress
+        }
+        guard item.canRefreshURL,
+              itemsByID[item.id] === item,
+              var record = recordsByID[item.id] else {
+            throw CuriumTransferRefreshError.transferNotEligible
+        }
+
+        record.sourceURL = newURL
+        record.resolvedURL = probe.finalURL
+        if hasReusableRangeState {
+            record.eTag = probe.eTag ?? record.eTag
+            record.lastModified = probe.lastModified ?? record.lastModified
+        } else {
+            record.eTag = probe.eTag
+            record.lastModified = probe.lastModified
+            if let probedTotal = probe.totalBytes {
+                record.totalBytes = probedTotal
+            }
+            if let probedMime = probe.mimeType,
+               record.mimeType == nil || record.mimeType == "application/octet-stream" {
+                record.mimeType = probedMime
+            }
+        }
+        record.userAgent = candidateUserAgent
+        record.referer = candidateReferer
+        record.origin = candidateOrigin
+        record.includeTabCookies = useActiveTabAuth
+        if useActiveTabAuth {
+            record.sourceTabID = resolvedActiveTabID ?? record.sourceTabID
+            if let cookie = Self.nonEmptyTrimmed(candidateCookie) {
+                transientCookiesByID[item.id] = cookie
+            } else {
+                transientCookiesByID.removeValue(forKey: item.id)
+            }
+        } else {
+            transientCookiesByID.removeValue(forKey: item.id)
+        }
+        record.failureMessage = nil
+        record.updatedAt = Date()
+        recordsByID[item.id] = record
+
+        if let store = transferStore {
+            await store.upsert(record.normalizedForPersistence())
+        }
+
+        item.applyRefreshedURL(
+            sourceURL: newURL,
+            resolvedURL: probe.finalURL,
+            eTag: record.eTag,
+            clearETagIfNil: !hasReusableRangeState
+        )
+        resumeDownload(item)
+    }
+
+    private func refreshHLSTransferURL(
+        item: CuriumDownload,
+        initialRecord: CuriumTransferRecord,
+        newURL: URL,
+        originatingURL: URL?,
+        probeHeaders: [String: String],
+        proxy: CuriumProxyConfig,
+        probeCookieResolver: (@Sendable (URL) async -> String?)?,
+        useActiveTabAuth: Bool,
+        resolvedActiveTabID: String?,
+        candidateUserAgent: String?,
+        candidateReferer: String?,
+        candidateOrigin: String?,
+        candidateCookie: String?
+    ) async throws {
+        let existingCP = initialRecord.hlsCheckpoint
+        let hasCompletedSegments = (existingCP?.completedSegments ?? 0) > 0
+            || (existingCP?.audioCompletedSegments ?? 0) > 0
+
+        let initialFetch = try await fetchHLSPlaylistTextForRefresh(
+            url: newURL,
+            headers: probeHeaders,
+            proxy: proxy,
+            originatingURL: originatingURL,
+            cookieResolver: probeCookieResolver
+        )
+
+        let inspection: CuriumHLSMasterInspection
+        do {
+            inspection = try CuriumHLSParser.parseMasterOrMedia(
+                text: initialFetch.text,
+                baseURL: initialFetch.finalURL
+            )
+        } catch {
+            throw CuriumTransferRefreshError.probeFailed(error.localizedDescription)
+        }
+
+        if case .unsupportedDRM(let method) = inspection.encryption {
+            throw CuriumTransferRefreshError.probeFailed("DRM-protected HLS stream (\(method)) cannot be downloaded.")
+        }
+
+        let finalMasterURL: URL?
+        let finalVariantURL: URL
+        let finalAudioURL: URL?
+        let videoPlaylistText: String
+
+        if inspection.isMasterPlaylist {
+            guard !inspection.variants.isEmpty else {
+                throw CuriumTransferRefreshError.probeFailed("Master HLS playlist contained zero playable variants.")
+            }
+
+            let selectedVariant: CuriumHLSVariant
+            if hasCompletedSegments {
+                let expectsSeparateAudio = (existingCP?.audioPlaylistURL != nil)
+                    || ((existingCP?.audioCompletedSegments ?? 0) > 0)
+                let audioMatched = inspection.variants.filter { ($0.audioURI != nil) == expectsSeparateAudio }
+                if audioMatched.count == 1 {
+                    selectedVariant = audioMatched[0]
+                } else if audioMatched.count > 1 {
+                    let resMatched = audioMatched.filter { variant in
+                        guard let label = variant.resolutionLabel, !label.isEmpty else { return false }
+                        return initialRecord.filename.localizedCaseInsensitiveContains("(\(label))")
+                    }
+                    if resMatched.count == 1 {
+                        selectedVariant = resMatched[0]
+                    } else {
+                        throw CuriumTransferRefreshError.hlsVariantAmbiguous
+                    }
+                } else {
+                    throw CuriumTransferRefreshError.hlsVariantAmbiguous
+                }
+            } else {
+                let resMatched = inspection.variants.filter { variant in
+                    guard let label = variant.resolutionLabel, !label.isEmpty else { return false }
+                    return initialRecord.filename.localizedCaseInsensitiveContains("(\(label))")
+                }
+                selectedVariant = (resMatched.count == 1 ? resMatched[0] : inspection.variants[0])
+            }
+
+            finalMasterURL = initialFetch.finalURL
+            finalAudioURL = selectedVariant.audioURI
+
+            let variantHeaders = CrossOriginRedirectAuthStripper.stripCrossOriginAuthHeaders(
+                from: probeHeaders,
+                sourceURL: initialFetch.finalURL,
+                destinationURL: selectedVariant.url
+            )
+            let variantFetch = try await fetchHLSPlaylistTextForRefresh(
+                url: selectedVariant.url,
+                headers: variantHeaders,
+                proxy: proxy,
+                originatingURL: originatingURL ?? initialFetch.finalURL,
+                cookieResolver: probeCookieResolver
+            )
+            finalVariantURL = variantFetch.finalURL
+            videoPlaylistText = variantFetch.text
+        } else {
+            finalMasterURL = nil
+            finalVariantURL = initialFetch.finalURL
+            finalAudioURL = existingCP?.audioPlaylistURL
+            videoPlaylistText = initialFetch.text
+        }
+
+        let parsedVideoMeta: CuriumHLSMediaPlaylist
+        let parsedVideoEngine: CuriumHLSTransferEngine.ParsedMediaPlaylist
+        do {
+            parsedVideoMeta = try CuriumHLSParser.parseMediaPlaylist(
+                text: videoPlaylistText,
+                baseURL: finalVariantURL
+            )
+            parsedVideoEngine = try CuriumHLSTransferEngine.parseMediaPlaylist(
+                manifestText: videoPlaylistText,
+                baseURL: finalVariantURL,
+                originatingURL: originatingURL ?? finalVariantURL
+            )
+        } catch {
+            throw CuriumTransferRefreshError.probeFailed(error.localizedDescription)
+        }
+
+        if case .unsupportedDRM(let method) = parsedVideoMeta.encryptionSummary {
+            throw CuriumTransferRefreshError.probeFailed("DRM-protected HLS stream (\(method)) cannot be downloaded.")
+        }
+        if parsedVideoMeta.isLiveStream {
+            throw CuriumTransferRefreshError.hlsLiveStreamNotResumable
+        }
+        guard !parsedVideoEngine.segments.isEmpty else {
+            throw CuriumTransferRefreshError.probeFailed("HLS playlist contained zero playable media segments.")
+        }
+
+        var combinedSegmentCount = parsedVideoEngine.segments.count
+        if let audioURL = finalAudioURL {
+            let audioHeaders = CrossOriginRedirectAuthStripper.stripCrossOriginAuthHeaders(
+                from: probeHeaders,
+                sourceURL: finalMasterURL ?? initialFetch.finalURL,
+                destinationURL: audioURL
+            )
+            let audioFetch = try await fetchHLSPlaylistTextForRefresh(
+                url: audioURL,
+                headers: audioHeaders,
+                proxy: proxy,
+                originatingURL: originatingURL ?? finalVariantURL,
+                cookieResolver: probeCookieResolver
+            )
+            let parsedAudioMeta: CuriumHLSMediaPlaylist
+            let parsedAudioEngine: CuriumHLSTransferEngine.ParsedMediaPlaylist
+            do {
+                parsedAudioMeta = try CuriumHLSParser.parseMediaPlaylist(
+                    text: audioFetch.text,
+                    baseURL: audioFetch.finalURL
+                )
+                parsedAudioEngine = try CuriumHLSTransferEngine.parseMediaPlaylist(
+                    manifestText: audioFetch.text,
+                    baseURL: audioFetch.finalURL,
+                    originatingURL: originatingURL ?? audioFetch.finalURL
+                )
+            } catch {
+                throw CuriumTransferRefreshError.probeFailed(error.localizedDescription)
+            }
+            if parsedAudioMeta.isLiveStream {
+                throw CuriumTransferRefreshError.hlsLiveStreamNotResumable
+            }
+            guard !parsedAudioEngine.segments.isEmpty else {
+                throw CuriumTransferRefreshError.probeFailed("HLS audio playlist contained zero playable segments.")
+            }
+            combinedSegmentCount += parsedAudioEngine.segments.count
+        }
+
+        if hasCompletedSegments, let cp = existingCP {
+            guard parsedVideoEngine.isFragmentedMP4 == cp.isFMP4 else {
+                throw CuriumTransferRefreshError.hlsFormatMismatch
+            }
+            let expectedTotal = cp.totalSegments ?? initialRecord.totalSegments
+            if let expectedTotal, expectedTotal > 0 {
+                guard combinedSegmentCount == expectedTotal else {
+                    throw CuriumTransferRefreshError.hlsSegmentCountMismatch(
+                        expected: expectedTotal,
+                        actual: combinedSegmentCount
+                    )
+                }
+            } else if combinedSegmentCount < cp.completedSegments {
+                throw CuriumTransferRefreshError.hlsSegmentCountMismatch(
+                    expected: cp.completedSegments,
+                    actual: combinedSegmentCount
+                )
+            }
+        }
+
+        // Re-verify transfer state after awaiting playlist fetches before committing any mutation.
+        guard runningTasksByID[item.id] == nil else {
+            throw CuriumTransferRefreshError.transferInProgress
+        }
+        guard item.canRefreshURL,
+              itemsByID[item.id] === item,
+              var record = recordsByID[item.id] else {
+            throw CuriumTransferRefreshError.transferNotEligible
+        }
+
+        record.sourceURL = newURL
+        record.resolvedURL = finalVariantURL
+        var updatedCP = record.hlsCheckpoint ?? CuriumHLSCheckpoint(playlistURL: finalVariantURL)
+        updatedCP.playlistURL = finalVariantURL
+        updatedCP.audioPlaylistURL = finalAudioURL
+        if let finalMasterURL {
+            updatedCP.masterPlaylistURL = finalMasterURL
+        }
+        updatedCP.preloadedPlaylistText = nil
+        if !hasCompletedSegments {
+            updatedCP.isFMP4 = parsedVideoEngine.isFragmentedMP4
+            updatedCP.totalSegments = combinedSegmentCount
+        }
+        record.hlsCheckpoint = updatedCP
+        record.userAgent = candidateUserAgent
+        record.referer = candidateReferer
+        record.origin = candidateOrigin
+        record.includeTabCookies = useActiveTabAuth
+        if useActiveTabAuth {
+            record.sourceTabID = resolvedActiveTabID ?? record.sourceTabID
+            if let cookie = Self.nonEmptyTrimmed(candidateCookie) {
+                transientCookiesByID[item.id] = cookie
+            } else {
+                transientCookiesByID.removeValue(forKey: item.id)
+            }
+        } else {
+            transientCookiesByID.removeValue(forKey: item.id)
+        }
+        record.failureMessage = nil
+        record.updatedAt = Date()
+        recordsByID[item.id] = record
+
+        if let store = transferStore {
+            await store.upsert(record.normalizedForPersistence())
+        }
+
+        item.applyRefreshedURL(
+            sourceURL: newURL,
+            resolvedURL: finalVariantURL,
+            eTag: nil,
+            hlsMasterPlaylistURL: finalMasterURL
+        )
+        resumeDownload(item)
+    }
+
+    private func fetchHLSPlaylistTextForRefresh(
+        url: URL,
+        headers: [String: String],
+        proxy: CuriumProxyConfig,
+        originatingURL: URL?,
+        cookieResolver: (@Sendable (URL) async -> String?)?
+    ) async throws -> (text: String, finalURL: URL) {
+        guard CuriumHLSParser.isAllowedHTTPURL(url) else {
+            throw CuriumTransferRefreshError.invalidURL
+        }
+        guard CuriumHLSParser.isAllowedTargetURL(url, originatingURL: originatingURL) else {
+            throw CuriumTransferRefreshError.probeFailed(
+                "Blocked private or local network host (\(url.host ?? "private"))."
+            )
+        }
+
+        let lease = CuriumProxySessionPool.acquireSessionLease(
+            for: .hlsStream,
+            proxy: proxy,
+            targetURL: url
+        )
+        defer { lease.release() }
+
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
+        req.httpMethod = "GET"
+        req.httpShouldHandleCookies = false
+        for (key, value) in headers {
+            req.setValue(value, forHTTPHeaderField: key)
+        }
+        if req.value(forHTTPHeaderField: "Cookie") == nil,
+           let cookieResolver,
+           let resolvedCookie = Self.nonEmptyTrimmed(await cookieResolver(url)) {
+            req.setValue(resolvedCookie, forHTTPHeaderField: "Cookie")
+        }
+
+        let redirectGuard = CrossOriginRedirectAuthStripper(
+            originatingURL: originatingURL ?? url,
+            cookieResolver: cookieResolver
+        )
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await lease.session.data(for: req, delegate: redirectGuard)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let urlErr as URLError where urlErr.code == .cancelled && Task.isCancelled {
+            throw CancellationError()
+        } catch {
+            throw CuriumTransferRefreshError.probeFailed(error.localizedDescription)
+        }
+
+        guard let http = response as? HTTPURLResponse else {
+            throw CuriumTransferRefreshError.probeFailed("Server returned an invalid HTTP response.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            throw CuriumTransferRefreshError.probeFailed("Server responded with HTTP \(http.statusCode).")
+        }
+        let finalURL = http.url ?? url
+        guard CuriumHLSParser.isAllowedHTTPURL(finalURL) else {
+            throw CuriumTransferRefreshError.invalidURL
+        }
+        guard CuriumHLSParser.isAllowedTargetURL(finalURL, originatingURL: originatingURL ?? url) else {
+            throw CuriumTransferRefreshError.probeFailed(
+                "Blocked private or local network host (\(finalURL.host ?? "private"))."
+            )
+        }
+        guard data.count <= CuriumHLSParser.maxPlaylistBytes else {
+            throw CuriumTransferRefreshError.probeFailed(
+                CuriumHLSParserError.playlistTooLarge(bytes: data.count).localizedDescription
+            )
+        }
+        guard var decoded = String(data: data, encoding: .utf8)
+            ?? String(data: data, encoding: .isoLatin1) else {
+            throw CuriumTransferRefreshError.probeFailed("Unable to decode HLS playlist response.")
+        }
+        if decoded.hasPrefix("\u{FEFF}") {
+            decoded.removeFirst()
+        }
+        return (decoded, finalURL)
+    }
+
+    private func resolveProbeCookie(for targetURL: URL, tabID: String?) async -> String? {
+        await host.resolveCookieHeader(targetURL, tabID)
+    }
 
     func pauseDownload(_ item: CuriumDownload) {
         guard item.isManagedByCoordinator else { return }
@@ -1297,8 +1994,10 @@ final class CuriumTransferCoordinator {
                 }
             }
 
+            let resolvedUserAgent = Self.nonEmptyTrimmed(record.userAgent)
+                ?? Self.nonEmptyTrimmed(host.defaultUserAgent())
             let baseHeaders = buildHTTPHeaders(
-                userAgent: record.userAgent,
+                userAgent: resolvedUserAgent,
                 referer: record.referer,
                 origin: record.origin,
                 cookie: initialCookie
@@ -1531,6 +2230,20 @@ final class CuriumTransferCoordinator {
             copy.isActiveLane = false
             return copy
         }
+        let elapsed = metersByID[transferID]?.elapsedSeconds ?? item.elapsedSeconds
+        let peak = metersByID[transferID]?.peakSpeedBytesPerSec ?? item.peakSpeedBytesPerSec
+        let samples = metersByID[transferID]?.samples ?? item.throughputSamples
+        item.updateRangeTelemetry(
+            receivedBytes: latest.receivedBytes,
+            knownTotalBytes: latest.totalBytes ?? item.knownTotalBytes,
+            slices: inactiveSlices,
+            activeLanes: 0,
+            speedBytesPerSec: 0,
+            peakSpeedBytesPerSec: peak,
+            throughputSamples: samples,
+            etaSeconds: nil,
+            elapsedSeconds: elapsed
+        )
         if var record = recordsByID[transferID] {
             record.receivedBytes = latest.receivedBytes
             if let total = latest.totalBytes {
@@ -1648,8 +2361,10 @@ final class CuriumTransferCoordinator {
                 primaryURL: manifestURL
             )
 
+            let resolvedUserAgent = Self.nonEmptyTrimmed(record.userAgent)
+                ?? Self.nonEmptyTrimmed(host.defaultUserAgent())
             let requestConfig = CuriumHLSRequestConfig(
-                userAgent: record.userAgent,
+                userAgent: resolvedUserAgent,
                 referer: record.referer,
                 origin: record.origin,
                 extraHeaders: [:],
@@ -1753,6 +2468,25 @@ final class CuriumTransferCoordinator {
             } else {
                 if let latest = latestBox.latest {
                     syncHLSCheckpoint(from: latest, transferID: id)
+                    if var record = recordsByID[id] {
+                        record.receivedBytes = latest.receivedBytes
+                        record.completedSegments = latest.completedSegments
+                        record.totalSegments = latest.totalSegments > 0 ? latest.totalSegments : record.totalSegments
+                        record.estimatedTotalBytes = latest.estimatedTotalBytes ?? record.estimatedTotalBytes
+                        recordsByID[id] = record
+                    }
+                    item.updateHLSTelemetry(
+                        receivedBytes: latest.receivedBytes,
+                        estimatedTotalBytes: latest.estimatedTotalBytes ?? item.estimatedTotalBytes,
+                        completedSegments: latest.completedSegments,
+                        totalSegments: latest.totalSegments > 0 ? latest.totalSegments : item.totalSegments,
+                        activeLanes: 0,
+                        speedBytesPerSec: 0,
+                        peakSpeedBytesPerSec: meter.peakSpeedBytesPerSec,
+                        throughputSamples: meter.samples,
+                        etaSeconds: nil,
+                        elapsedSeconds: meter.elapsedSeconds
+                    )
                 }
                 handleFailedOutcome(for: item, message: error.localizedDescription, meter: meter)
             }
@@ -2276,6 +3010,14 @@ final class CuriumTransferCoordinator {
             return "\(labels[labels.count - 3]).\(lastTwo)"
         }
         return lastTwo
+    }
+
+    private nonisolated static func nonEmptyTrimmed(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
     }
 
     private nonisolated static func fileSize(at url: URL) -> Int64? {

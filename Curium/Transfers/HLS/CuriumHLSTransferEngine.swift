@@ -251,7 +251,7 @@ public struct CuriumHLSTransferEngine: Sendable {
     }
 
     public static let defaultUserAgent =
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 27_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Mobile/15E148 Safari/604.1"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) \(CuriumChromeStableBaseline.productVersion) Safari/537.36"
 
     private static let maxPendingBufferBytes = 32 * 1024 * 1024
     private static let fmp4Extensions: Set<String> = ["m4s", "mp4", "m4v", "m4a", "cmfv", "cmfa"]
@@ -1370,6 +1370,7 @@ public struct CuriumHLSTransferEngine: Sendable {
             do {
                 var req = URLRequest(url: url)
                 req.timeoutInterval = requestTimeout
+                req.httpShouldHandleCookies = false
                 var hasCookieHeader = false
                 for (k, v) in headers {
                     req.setValue(v, forHTTPHeaderField: k)
@@ -1498,6 +1499,7 @@ public struct CuriumHLSTransferEngine: Sendable {
         cfg.httpMaximumConnectionsPerHost = 20
         cfg.httpShouldSetCookies = false
         cfg.httpCookieAcceptPolicy = .never
+        cfg.httpCookieStorage = nil
         cfg.urlCache = nil
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         return (URLSession(configuration: cfg), true)
@@ -1559,7 +1561,8 @@ public struct CuriumHLSTransferEngine: Sendable {
         var keysLower = Set(merged.keys.map { $0.lowercased() })
 
         if !keysLower.contains("user-agent") {
-            merged["User-Agent"] = (config.userAgent?.isEmpty == false) ? config.userAgent! : defaultUserAgent
+            let trimmedUA = config.userAgent?.trimmingCharacters(in: .whitespacesAndNewlines)
+            merged["User-Agent"] = (trimmedUA?.isEmpty == false) ? trimmedUA! : defaultUserAgent
             keysLower.insert("user-agent")
         }
         if !keysLower.contains("accept") {
@@ -1904,6 +1907,7 @@ private actor AESKeyCache {
                 do {
                     var req = URLRequest(url: url)
                     req.timeoutInterval = 15
+                    req.httpShouldHandleCookies = false
                     var hasCookie = false
                     for (k, v) in scopedHeaders {
                         req.setValue(v, forHTTPHeaderField: k)
@@ -2064,10 +2068,11 @@ private enum HLSRedirectSanitizer {
     }
 
     static func sanitizedRedirectRequest(from sourceURL: URL?, to request: URLRequest) -> URLRequest {
-        guard !isSameOrigin(sourceURL, request.url) else {
-            return request
-        }
         var sanitized = request
+        sanitized.httpShouldHandleCookies = false
+        guard !isSameOrigin(sourceURL, request.url) else {
+            return sanitized
+        }
         if let headers = sanitized.allHTTPHeaderFields {
             for key in headers.keys where authHeaderNames.contains(key.lowercased()) {
                 sanitized.setValue(nil, forHTTPHeaderField: key)

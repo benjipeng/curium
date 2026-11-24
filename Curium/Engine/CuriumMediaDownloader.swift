@@ -397,7 +397,8 @@ enum CuriumMediaNetworking {
         return request
     }
 
-    /// Fetches and parses an HLS Master or Media playlist over an ephemeral, scheme- & SSRF-guarded session.
+    /// Fetches and parses an HLS Master or Media playlist over a pooled, proxy-aware,
+    /// scheme- & SSRF-guarded session (`allowFailover = false` + authenticated fixed proxies).
     static func inspectHLS(
         url: URL,
         context: CuriumMediaRequestContext,
@@ -420,8 +421,12 @@ enum CuriumMediaNetworking {
             provider: cookieProvider
         )
         let coordinator = BoundedFetchCoordinator()
-        let session = makeEphemeralSession(proxy: context.proxy, delegate: coordinator)
-        defer { session.finishTasksAndInvalidate() }
+        let lease = CuriumProxySessionPool.acquireSessionLease(
+            for: .streamProber,
+            proxy: context.proxy,
+            targetURL: url
+        )
+        defer { lease.release() }
 
         let request = makeRequest(url: url, context: context)
         let originatingHostIsPublic = isOriginatingHostPublic(
@@ -436,7 +441,7 @@ enum CuriumMediaNetworking {
             }
         let (data, finalURL) = try await coordinator.fetchData(
             request: request,
-            session: session,
+            session: lease.session,
             maxBytes: CuriumHLSParser.maxPlaylistBytes,
             originatingHostIsPublic: originatingHostIsPublic,
             cookieResolver: cookieResolver
@@ -657,29 +662,30 @@ enum CuriumMediaNetworking {
             return .rejectedPrivateNetwork(targetURL.host ?? "private")
         }
 
-        var sanitized = proposed
-        sanitized.httpShouldHandleCookies = false
-
-        // Strip Referer across https -> http downgrades (checking both previous hop and Referer header).
-        if targetURL.scheme?.lowercased() == "http" {
-            if let previousURL, previousURL.scheme?.lowercased() == "https" {
-                sanitized.setValue(nil, forHTTPHeaderField: "Referer")
-            } else if let refHeader = sanitized.value(forHTTPHeaderField: "Referer"),
-                      let refURL = URL(string: refHeader),
-                      refURL.scheme?.lowercased() == "https" {
-                sanitized.setValue(nil, forHTTPHeaderField: "Referer")
+        // Delegate scheme, SSRF, cross-origin auth (`Cookie`, `Authorization`, `Proxy-Authorization`),
+        // `httpShouldHandleCookies = false`, and HTTPS->HTTP downgrade (`Referer`/`Origin`)
+        // sanitization to the shared `CrossOriginRedirectAuthStripper`.
+        let decision = CrossOriginRedirectAuthStripper.evaluateRedirect(
+            from: previousURL,
+            to: proposed,
+            originatingURL: nil
+        )
+        switch decision {
+        case .rejectDisallowedScheme(let scheme):
+            return .rejectedScheme(scheme)
+        case .rejectPrivateNetwork(let host):
+            return .rejectedPrivateNetwork(host)
+        case .allow(var sanitized, let crossOriginNeedsRefresh):
+            // RFC 6265 cookie safety: keep existing Cookie only on exact (scheme, host, directoryPath)
+            // match; strip and trigger cookieProvider refresh across host, scheme, port, or path changes.
+            let prevScope = previousURL.flatMap(HostCookieCache.scopeKey(for:))
+            let nextScope = HostCookieCache.scopeKey(for: targetURL)
+            if crossOriginNeedsRefresh || prevScope == nil || prevScope != nextScope {
+                sanitized.setValue(nil, forHTTPHeaderField: "Cookie")
+                return .allowed(sanitized, needsCookieRefresh: true)
             }
+            return .allowed(sanitized, needsCookieRefresh: false)
         }
-
-        // RFC 6265 cookie safety: keep existing Cookie only on exact (scheme, host, directoryPath)
-        // match; strip and trigger cookieProvider refresh across host, scheme, or path changes.
-        let prevScope = previousURL.flatMap(HostCookieCache.scopeKey(for:))
-        let nextScope = HostCookieCache.scopeKey(for: targetURL)
-        if prevScope == nil || prevScope != nextScope {
-            sanitized.setValue(nil, forHTTPHeaderField: "Cookie")
-            return .allowed(sanitized, needsCookieRefresh: true)
-        }
-        return .allowed(sanitized, needsCookieRefresh: false)
     }
 
     static func sanitizeRedirectRequest(
@@ -734,6 +740,7 @@ private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @
         originatingHostIsPublic: Bool = false,
         cookieResolver: (@Sendable (URL) async -> String?)? = nil
     ) async throws -> (Data, URL) {
+        try Task.checkCancellation()
         guard let url = request.url, CuriumHLSParser.isAllowedHTTPURL(url) else {
             throw CuriumMediaDownloadError.disallowedURLScheme(request.url?.scheme ?? "unknown")
         }
@@ -742,6 +749,7 @@ private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @
         }
 
         let dataTask = session.dataTask(with: request)
+        dataTask.delegate = self
         let taskID = dataTask.taskIdentifier
 
         return try await withTaskCancellationHandler {
@@ -1110,10 +1118,10 @@ final class CuriumDirectMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         )
         self.coordinator = coordinator
 
-        let session = CuriumMediaNetworking.makeEphemeralSession(
+        let lease = CuriumProxySessionPool.acquireSessionLease(
+            for: .rangeTransfer,
             proxy: context.proxy,
-            delegate: coordinator,
-            timeoutIntervalForResource: Self.resourceTimeoutInterval
+            targetURL: url
         )
         // Direct <video>/<audio> fetches are non-CORS; omit `Origin:` so strict S3/CDN WAFs accept them.
         let request = CuriumMediaNetworking.makeRequest(
@@ -1121,8 +1129,9 @@ final class CuriumDirectMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
             context: context,
             includeOrigin: false
         )
-        let downloadTask = session.downloadTask(with: request)
-        coordinator.attach(session: session, task: downloadTask)
+        let downloadTask = lease.session.downloadTask(with: request)
+        downloadTask.delegate = coordinator
+        coordinator.attach(lease: lease, task: downloadTask)
         downloadTask.resume()
     }
 
@@ -1187,7 +1196,7 @@ final class CuriumDirectMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
 
 private final class DirectDownloadCoordinator: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private struct MutableState {
-        var session: URLSession?
+        var lease: CuriumProxySessionPool.SessionLease?
         var task: URLSessionDownloadTask?
         var currentURL: URL
         var cancelled = false
@@ -1220,9 +1229,9 @@ private final class DirectDownloadCoordinator: NSObject, URLSessionDownloadDeleg
         super.init()
     }
 
-    func attach(session: URLSession, task: URLSessionDownloadTask) {
+    func attach(lease: CuriumProxySessionPool.SessionLease, task: URLSessionDownloadTask) {
         lock.withLock { state in
-            state.session = session
+            state.lease = lease
             state.task = task
         }
     }
@@ -1232,15 +1241,15 @@ private final class DirectDownloadCoordinator: NSObject, URLSessionDownloadDeleg
     }
 
     func cancel() {
-        let (session, task) = lock.withLock { state -> (URLSession?, URLSessionDownloadTask?) in
+        let (lease, task) = lock.withLock { state -> (CuriumProxySessionPool.SessionLease?, URLSessionDownloadTask?) in
             state.cancelled = true
-            let pair = (state.session, state.task)
-            state.session = nil
+            let pair = (state.lease, state.task)
+            state.lease = nil
             state.task = nil
             return pair
         }
         task?.cancel()
-        session?.invalidateAndCancel()
+        lease?.release()
     }
 
     func urlSession(
@@ -1375,27 +1384,28 @@ private final class DirectDownloadCoordinator: NSObject, URLSessionDownloadDeleg
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
-        session.finishTasksAndInvalidate()
-        let outcome: Result<(URL, Int64), any Error>? = lock.withLock { state in
-            guard !state.completed else { return nil }
+        let (lease, outcome): (CuriumProxySessionPool.SessionLease?, Result<(URL, Int64), any Error>?) = lock.withLock { state in
+            guard !state.completed else { return (nil, nil) }
             state.completed = true
-            state.session = nil
+            let heldLease = state.lease
+            state.lease = nil
             state.task = nil
 
             if state.cancelled || (error as NSError?)?.code == NSURLErrorCancelled {
-                return .failure(CancellationError())
+                return (heldLease, .failure(CancellationError()))
             }
             if let recorded = state.recordedError {
-                return .failure(recorded)
+                return (heldLease, .failure(recorded))
             }
             if let error {
-                return .failure(error)
+                return (heldLease, .failure(error))
             }
             guard state.movedSuccessfully else {
-                return .failure(CuriumMediaDownloadError.invalidHTTPResponse)
+                return (heldLease, .failure(CuriumMediaDownloadError.invalidHTTPResponse))
             }
-            return .success((destinationURL, state.finalByteCount))
+            return (heldLease, .success((destinationURL, state.finalByteCount)))
         }
+        lease?.release()
 
         guard let outcome else { return }
         if case .failure = outcome {
@@ -1664,10 +1674,15 @@ final class CuriumHLSMediaDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         }
 
         let coordinator = BoundedFetchCoordinator()
-        let session = CuriumMediaNetworking.makeEphemeralSession(proxy: baseContext.proxy, delegate: coordinator)
+        let lease = CuriumProxySessionPool.acquireSessionLease(
+            for: .hlsStream,
+            proxy: baseContext.proxy,
+            targetURL: playlistURL
+        )
         defer {
-            session.invalidateAndCancel()
+            lease.release()
         }
+        let session = lease.session
 
         let cookieCache = CuriumMediaNetworking.HostCookieCache(
             baseURL: playlistURL,
