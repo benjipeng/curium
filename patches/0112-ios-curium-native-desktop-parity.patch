@@ -1,3 +1,33 @@
+diff --git a/content/browser/notifications/blink_notification_service_impl.cc b/content/browser/notifications/blink_notification_service_impl.cc
+index 3de4730..0b2fdb7 100644
+--- a/content/browser/notifications/blink_notification_service_impl.cc
++++ b/content/browser/notifications/blink_notification_service_impl.cc
+@@ -12,6 +12,10 @@
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/metrics/histogram_functions.h"
++#include "build/build_config.h"
++#if BUILDFLAG(IS_IOS)
++#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
++#endif
+ #include "content/browser/notifications/notification_event_dispatcher_impl.h"
+ #include "content/browser/notifications/platform_notification_context_impl.h"
+ #include "content/browser/notifications/platform_notification_service_routing.h"
+@@ -127,6 +131,14 @@ void BlinkNotificationServiceImpl::OnContextShutdown() {
+ void BlinkNotificationServiceImpl::GetPermissionStatus(
+     GetPermissionStatusCallback callback) {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
++#if BUILDFLAG(IS_IOS)
++  if (browser_context_ &&
++      !GetPlatformNotificationServiceFor(browser_context_) &&
++      blink::curium::IsDesktopMacLaunchProfile()) {
++    std::move(callback).Run(CheckPermissionStatus());
++    return;
++  }
++#endif
+   if (!browser_context_ ||
+       !GetPlatformNotificationServiceFor(browser_context_)) {
+     std::move(callback).Run(blink::mojom::PermissionStatus::DENIED);
 diff --git a/content/browser/renderer_host/render_widget_host_view_ios.h b/content/browser/renderer_host/render_widget_host_view_ios.h
 index 0b59f14..ef43822 100644
 --- a/content/browser/renderer_host/render_widget_host_view_ios.h
@@ -91,20 +121,8 @@ index 0c3234f..a2191c9 100644
      default:
        return PermissionStatus::DENIED;
    }
-diff --git a/ios/web/content/init/BUILD.gn b/ios/web/content/init/BUILD.gn
-index 20dbf58..ff30bb2 100644
---- a/ios/web/content/init/BUILD.gn
-+++ b/ios/web/content/init/BUILD.gn
-@@ -53,6 +53,7 @@ source_set("init") {
-     "//third_party/blink/public/common",
-     "//ui/base",
-     "//ui/native_theme",
-+    "//v8",
-   ]
-   if (enable_extensions_core) {
-     deps += [
 diff --git a/ios/web/content/init/DEPS b/ios/web/content/init/DEPS
-index 5f1bca8..6427363 100644
+index 7af0a15..5250046 100644
 --- a/ios/web/content/init/DEPS
 +++ b/ios/web/content/init/DEPS
 @@ -18,6 +18,7 @@ include_rules = [
@@ -115,17 +133,20 @@ index 5f1bca8..6427363 100644
    "+net/http/http_util.h",
    "+net/log/net_log_source.h",
    "+net/proxy_resolution/proxy_config.h",
-@@ -26,14 +27,26 @@ include_rules = [
+@@ -26,13 +27,25 @@ include_rules = [
    "+net/traffic_annotation/network_traffic_annotation.h",
    "+services/device/public/cpp/geolocation",
    "+services/service_manager/public/cpp",
 +  "+third_party/blink/public/common/curium/curium_desktop_parity.h",
    "+third_party/blink/public/common/curium/curium_fingerprint_config.h",
+   "+third_party/blink/public/common/curium/curium_runtime_policy.h",
    "+third_party/blink/public/common/renderer_preferences/renderer_preferences.h",
    "+third_party/blink/public/common/switches.h",
 +  "+third_party/blink/public/common/user_agent/user_agent_metadata.h",
    "+third_party/blink/public/common/web_preferences/web_preferences.h",
 +  "+third_party/blink/public/platform/platform.h",
+   "+third_party/blink/public/platform/web_cache.h",
++  "+third_party/blink/public/platform/web_runtime_features.h",
 +  "+third_party/blink/public/platform/web_url.h",
    "+third_party/blink/public/platform/web_url_error.h",
 +  "+third_party/blink/public/platform/web_url_response.h",
@@ -138,37 +159,31 @@ index 5f1bca8..6427363 100644
    "+ui/base/pointer/pointer_device.h",
    "+ui/base/resource/resource_bundle.h",
    "+ui/base/webui/web_ui_util.h",
-   "+ui/native_theme/native_theme.h",
-+  "+v8/include",
-   # keep-sorted end
- ]
 diff --git a/ios/web/content/init/ios_content_renderer_client.cc b/ios/web/content/init/ios_content_renderer_client.cc
-index 5b67428..de60db5 100644
+index c094026..614c820 100644
 --- a/ios/web/content/init/ios_content_renderer_client.cc
 +++ b/ios/web/content/init/ios_content_renderer_client.cc
-@@ -11,25 +11,54 @@
- #import "ios/web/content/init/extensions/ios_extensions_client.h"
- #endif
+@@ -13,22 +13,40 @@
  
-+#include <cstdint>
+ #include <cstddef>
+ #include <cstdint>
 +#include <optional>
  #import <string>
-+#include <string_view>
+ #include <string_view>
 +#include <tuple>
- #include <utility>
++#include <utility>
  
  #include "base/functional/bind.h"
- #include "base/memory/scoped_refptr.h"
  #include "base/task/sequenced_task_runner.h"
 +#include "base/time/time.h"
  #import "components/error_page/common/error.h"
  #import "components/error_page/common/localized_error.h"
  #import "components/grit/components_resources.h"
  #import "components/js_injection/renderer/js_communication.h"
-+#include "content/public/common/isolated_world_ids.h"
+ #include "content/public/common/isolated_world_ids.h"
 +#include "content/public/renderer/chrome_object_extensions_utils.h"
  #import "content/public/renderer/render_frame.h"
-+#include "content/public/renderer/render_frame_observer.h"
+ #include "content/public/renderer/render_frame_observer.h"
  #import "content/public/renderer/render_thread.h"
 +#include "net/http/http_connection_info.h"
 +#include "third_party/blink/public/common/curium/curium_desktop_parity.h"
@@ -176,7 +191,7 @@ index 5b67428..de60db5 100644
 +#include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
 +#include "third_party/blink/public/platform/platform.h"
  #include "third_party/blink/public/platform/web_cache.h"
- #include "third_party/blink/public/platform/web_runtime_features.h"
++#include "third_party/blink/public/platform/web_runtime_features.h"
 +#include "third_party/blink/public/platform/web_url.h"
  #import "third_party/blink/public/platform/web_url_error.h"
 +#include "third_party/blink/public/platform/web_url_response.h"
@@ -189,19 +204,7 @@ index 5b67428..de60db5 100644
  #import "ui/base/resource/resource_bundle.h"
  #import "ui/base/webui/web_ui_util.h"
  #import "url/gurl.h"
-+#include "v8/include/v8-context.h"
-+#include "v8/include/v8-function-callback.h"
-+#include "v8/include/v8-function.h"
-+#include "v8/include/v8-isolate.h"
-+#include "v8/include/v8-local-handle.h"
-+#include "v8/include/v8-microtask-queue.h"
-+#include "v8/include/v8-object.h"
-+#include "v8/include/v8-primitive.h"
-+#include "v8/include/v8-template.h"
- 
- namespace web {
- 
-@@ -47,6 +76,378 @@ void PurgeCuriumRendererCaches() {
+@@ -172,6 +190,381 @@ void PurgeCuriumRendererCaches() {
    blink::WebCache::Clear();
  }
  
@@ -268,14 +271,17 @@ index 5b67428..de60db5 100644
 +    v8::Local<v8::Context> context,
 +    v8::FunctionCallback callback,
 +    std::string_view name) {
-+  v8::Local<v8::FunctionTemplate> tmpl =
-+      v8::FunctionTemplate::New(isolate, callback);
++  v8::Local<v8::String> v8_name = MakeV8String(isolate, name);
++  v8::Local<v8::FunctionTemplate> tmpl = v8::FunctionTemplate::New(
++      isolate, callback, v8::Local<v8::Value>(), v8::Local<v8::Signature>(),
++      /*length=*/0, v8::ConstructorBehavior::kThrow);
 +  tmpl->RemovePrototype();
++  tmpl->SetClassName(v8_name);
 +  v8::Local<v8::Function> fn;
 +  if (!tmpl->GetFunction(context).ToLocal(&fn)) {
 +    return v8::MaybeLocal<v8::Function>();
 +  }
-+  fn->SetName(MakeV8String(isolate, name));
++  fn->SetName(v8_name);
 +  return fn;
 +}
 +
@@ -580,9 +586,9 @@ index 5b67428..de60db5 100644
  // [ios-blink-sideload] Chrome's network error page for the main frame, built
  // the way ios/chrome/browser/web/model/error_page_util.mm builds it for
  // WebKit, instead of placeholder text. A failed subframe (often a blocked ad
-@@ -92,6 +493,12 @@ void IOSContentRendererClient::RenderThreadStarted() {
-   } else {
-     ApplyCuriumRendererRuntimePolicy(blink::curium::GetRuntimePolicySnapshot());
+@@ -210,6 +603,12 @@ void IOSContentRendererClient::RenderThreadStarted() {
+         base::SequencedTaskRunner::GetCurrentDefault(),
+         base::BindRepeating(&PurgeCuriumRendererCaches));
    }
 +  if (blink::curium::IsDesktopMacLaunchProfile()) {
 +    blink::WebRuntimeFeatures::EnableFeatureFromString(
@@ -593,10 +599,10 @@ index 5b67428..de60db5 100644
  #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
    GetIOSExtensionsRendererClient()->RenderThreadStarted();
  #endif
-@@ -113,6 +520,7 @@ void IOSContentRendererClient::RenderFrameCreated(
-   // As a RenderFrameObserver, JSCommunication handles destroying
+@@ -232,6 +631,7 @@ void IOSContentRendererClient::RenderFrameCreated(
    // itself when its RenderFrame is destroyed.
    new js_injection::JsCommunication(render_frame);
+   new CuriumRuntimePolicyFrameObserver(render_frame);
 +  new CuriumDesktopChromeObserver(render_frame);
  #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
    InitializeIOSExtensionsRenderFrame(render_frame);

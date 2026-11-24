@@ -266,6 +266,39 @@ index 142b1b5..30b1bf5 100644
  @end
  
  @protocol CrIOSTabHostingV1 <NSObject>
+diff --git a/ios/web/content/init/BUILD.gn b/ios/web/content/init/BUILD.gn
+index 20dbf58..ff30bb2 100644
+--- a/ios/web/content/init/BUILD.gn
++++ b/ios/web/content/init/BUILD.gn
+@@ -53,6 +53,7 @@ source_set("init") {
+     "//third_party/blink/public/common",
+     "//ui/base",
+     "//ui/native_theme",
++    "//v8",
+   ]
+   if (enable_extensions_core) {
+     deps += [
+diff --git a/ios/web/content/init/DEPS b/ios/web/content/init/DEPS
+index 5f1bca8..7af0a15 100644
+--- a/ios/web/content/init/DEPS
++++ b/ios/web/content/init/DEPS
+@@ -27,13 +27,16 @@ include_rules = [
+   "+services/device/public/cpp/geolocation",
+   "+services/service_manager/public/cpp",
+   "+third_party/blink/public/common/curium/curium_fingerprint_config.h",
++  "+third_party/blink/public/common/curium/curium_runtime_policy.h",
+   "+third_party/blink/public/common/renderer_preferences/renderer_preferences.h",
+   "+third_party/blink/public/common/switches.h",
+   "+third_party/blink/public/common/web_preferences/web_preferences.h",
++  "+third_party/blink/public/platform/web_cache.h",
+   "+third_party/blink/public/platform/web_url_error.h",
+   "+ui/base/pointer/pointer_device.h",
+   "+ui/base/resource/resource_bundle.h",
+   "+ui/base/webui/web_ui_util.h",
+   "+ui/native_theme/native_theme.h",
++  "+v8/include",
+   # keep-sorted end
+ ]
 diff --git a/ios/web/content/init/ios_content_browser_client.cc b/ios/web/content/init/ios_content_browser_client.cc
 index adfb1ee..342d30b 100644
 --- a/ios/web/content/init/ios_content_browser_client.cc
@@ -299,41 +332,169 @@ index adfb1ee..342d30b 100644
  
  std::string IOSContentBrowserClient::GetProduct() {
 diff --git a/ios/web/content/init/ios_content_renderer_client.cc b/ios/web/content/init/ios_content_renderer_client.cc
-index 806ff32..5b67428 100644
+index 806ff32..c094026 100644
 --- a/ios/web/content/init/ios_content_renderer_client.cc
 +++ b/ios/web/content/init/ios_content_renderer_client.cc
-@@ -12,13 +12,20 @@
+@@ -11,23 +11,167 @@
+ #import "ios/web/content/init/extensions/ios_extensions_client.h"
  #endif
  
++#include <cstddef>
++#include <cstdint>
  #import <string>
-+#include <utility>
++#include <string_view>
  
 +#include "base/functional/bind.h"
-+#include "base/memory/scoped_refptr.h"
 +#include "base/task/sequenced_task_runner.h"
  #import "components/error_page/common/error.h"
  #import "components/error_page/common/localized_error.h"
  #import "components/grit/components_resources.h"
  #import "components/js_injection/renderer/js_communication.h"
++#include "content/public/common/isolated_world_ids.h"
  #import "content/public/renderer/render_frame.h"
++#include "content/public/renderer/render_frame_observer.h"
  #import "content/public/renderer/render_thread.h"
 +#include "third_party/blink/public/common/curium/curium_runtime_policy.h"
 +#include "third_party/blink/public/platform/web_cache.h"
-+#include "third_party/blink/public/platform/web_runtime_features.h"
  #import "third_party/blink/public/platform/web_url_error.h"
  #import "ui/base/resource/resource_bundle.h"
  #import "ui/base/webui/web_ui_util.h"
-@@ -28,6 +35,18 @@ namespace web {
+ #import "url/gurl.h"
++#include "v8/include/v8-context.h"
++#include "v8/include/v8-exception.h"
++#include "v8/include/v8-function-callback.h"
++#include "v8/include/v8-function.h"
++#include "v8/include/v8-isolate.h"
++#include "v8/include/v8-local-handle.h"
++#include "v8/include/v8-microtask-queue.h"
++#include "v8/include/v8-object.h"
++#include "v8/include/v8-primitive.h"
++#include "v8/include/v8-template.h"
+ 
+ namespace web {
  
  namespace {
  
-+void ApplyCuriumRendererRuntimePolicy(
-+    const blink::curium::RuntimePolicySnapshot& snapshot) {
-+  blink::WebRuntimeFeatures::EnableFeatureFromString(
-+      "GlobalPrivacyControlApi", snapshot.enable_global_privacy_control);
-+  blink::WebRuntimeFeatures::EnableFeatureFromString(
-+      "GlobalPrivacyControl", snapshot.enable_global_privacy_control);
++v8::Local<v8::String> MakeCuriumGPCV8String(v8::Isolate* isolate,
++                                            std::string_view value) {
++  return v8::String::NewFromUtf8(isolate, value.data(),
++                                 v8::NewStringType::kNormal,
++                                 static_cast<int>(value.size()))
++      .ToLocalChecked();
 +}
++
++v8::Local<v8::String> MakeCuriumGPCV8Key(v8::Isolate* isolate,
++                                         std::string_view key) {
++  return v8::String::NewFromUtf8(isolate, key.data(),
++                                 v8::NewStringType::kInternalized,
++                                 static_cast<int>(key.size()))
++      .ToLocalChecked();
++}
++
++void InvokeCuriumNavigatorGPCGetter(
++    const v8::FunctionCallbackInfo<v8::Value>& info,
++    std::string_view expected_ctor) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::Local<v8::Object> recv = info.This();
++  if (recv.IsEmpty() || !recv->IsObject() || recv->InternalFieldCount() <= 0) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        MakeCuriumGPCV8String(isolate, "Illegal invocation")));
++    return;
++  }
++  v8::String::Utf8Value ctor(isolate, recv->GetConstructorName());
++  if (!*ctor || ctor.length() < 0 ||
++      std::string_view(*ctor, static_cast<size_t>(ctor.length())) !=
++          expected_ctor) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        MakeCuriumGPCV8String(isolate, "Illegal invocation")));
++    return;
++  }
++  info.GetReturnValue().Set(
++      blink::curium::IsGlobalPrivacyControlRuntimeEnabled());
++}
++
++void CuriumNavigatorGPCCallback(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  InvokeCuriumNavigatorGPCGetter(info, "Navigator");
++}
++
++void CuriumWorkerNavigatorGPCCallback(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  InvokeCuriumNavigatorGPCGetter(info, "WorkerNavigator");
++}
++
++void MaybeInstallCuriumNavigatorGPC(v8::Local<v8::Context> context,
++                                    bool is_worker) {
++  if (!blink::curium::IsGlobalPrivacyControlRuntimeEnabled() ||
++      context.IsEmpty()) {
++    return;
++  }
++  v8::Isolate* isolate = v8::Isolate::GetCurrent();
++  if (!isolate) {
++    return;
++  }
++
++  v8::HandleScope handle_scope(isolate);
++  v8::MicrotasksScope microtasks_scope(
++      isolate, context->GetMicrotaskQueue(),
++      v8::MicrotasksScope::kDoNotRunMicrotasks);
++  v8::Context::Scope context_scope(context);
++  v8::TryCatch try_catch(isolate);
++
++  v8::Local<v8::Value> navigator_val;
++  if (!context->Global()
++           ->Get(context, MakeCuriumGPCV8Key(isolate, "navigator"))
++           .ToLocal(&navigator_val) ||
++      navigator_val.IsEmpty() || !navigator_val->IsObject()) {
++    return;
++  }
++  v8::Local<v8::Object> navigator_obj = navigator_val.As<v8::Object>();
++  v8::Local<v8::Value> proto_val = navigator_obj->GetPrototype();
++  if (proto_val.IsEmpty() || !proto_val->IsObject()) {
++    return;
++  }
++  v8::Local<v8::Object> navigator_proto = proto_val.As<v8::Object>();
++  v8::Local<v8::String> gpc_key =
++      MakeCuriumGPCV8Key(isolate, "globalPrivacyControl");
++  if (navigator_proto->HasOwnProperty(context, gpc_key).FromMaybe(false)) {
++    return;
++  }
++
++  v8::Local<v8::FunctionTemplate> tmpl = v8::FunctionTemplate::New(
++      isolate,
++      is_worker ? &CuriumWorkerNavigatorGPCCallback
++                : &CuriumNavigatorGPCCallback,
++      v8::Local<v8::Value>(), v8::Local<v8::Signature>(), /*length=*/0,
++      v8::ConstructorBehavior::kThrow, v8::SideEffectType::kHasNoSideEffect);
++  tmpl->RemovePrototype();
++  tmpl->SetClassName(MakeCuriumGPCV8String(isolate, "get globalPrivacyControl"));
++
++  v8::Local<v8::Function> getter_fn;
++  if (!tmpl->GetFunction(context).ToLocal(&getter_fn)) {
++    return;
++  }
++  getter_fn->SetName(MakeCuriumGPCV8String(isolate, "get globalPrivacyControl"));
++  navigator_proto->SetAccessorProperty(gpc_key, getter_fn,
++                                       v8::Local<v8::Function>(),
++                                       v8::PropertyAttribute::None);
++}
++
++class CuriumRuntimePolicyFrameObserver final
++    : public content::RenderFrameObserver {
++ public:
++  explicit CuriumRuntimePolicyFrameObserver(content::RenderFrame* render_frame)
++      : content::RenderFrameObserver(render_frame) {}
++
++  void DidCreateScriptContext(v8::Local<v8::Context> context,
++                              int32_t world_id) override {
++    if (world_id != content::ISOLATED_WORLD_ID_GLOBAL || context.IsEmpty()) {
++      return;
++    }
++    MaybeInstallCuriumNavigatorGPC(context, /*is_worker=*/false);
++  }
++
++  void OnDestruct() override { delete this; }
++};
 +
 +void PurgeCuriumRendererCaches() {
 +  blink::WebCache::Clear();
@@ -342,25 +503,61 @@ index 806ff32..5b67428 100644
  // [ios-blink-sideload] Chrome's network error page for the main frame, built
  // the way ios/chrome/browser/web/model/error_page_util.mm builds it for
  // WebKit, instead of placeholder text. A failed subframe (often a blocked ad
-@@ -61,6 +80,18 @@ IOSContentRendererClient::IOSContentRendererClient() = default;
+@@ -61,6 +205,11 @@ IOSContentRendererClient::IOSContentRendererClient() = default;
  IOSContentRendererClient::~IOSContentRendererClient() = default;
  
  void IOSContentRendererClient::RenderThreadStarted() {
 +  if (base::SequencedTaskRunner::HasCurrentDefault()) {
-+    scoped_refptr<base::SequencedTaskRunner> renderer_task_runner =
-+        base::SequencedTaskRunner::GetCurrentDefault();
-+    blink::curium::RegisterRendererPolicyObserver(
-+        renderer_task_runner,
-+        base::BindRepeating(&ApplyCuriumRendererRuntimePolicy));
 +    blink::curium::RegisterProfileCachePurgeHook(
-+        std::move(renderer_task_runner),
++        base::SequencedTaskRunner::GetCurrentDefault(),
 +        base::BindRepeating(&PurgeCuriumRendererCaches));
-+  } else {
-+    ApplyCuriumRendererRuntimePolicy(blink::curium::GetRuntimePolicySnapshot());
 +  }
  #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
    GetIOSExtensionsRendererClient()->RenderThreadStarted();
  #endif
+@@ -82,6 +231,7 @@ void IOSContentRendererClient::RenderFrameCreated(
+   // As a RenderFrameObserver, JSCommunication handles destroying
+   // itself when its RenderFrame is destroyed.
+   new js_injection::JsCommunication(render_frame);
++  new CuriumRuntimePolicyFrameObserver(render_frame);
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   InitializeIOSExtensionsRenderFrame(render_frame);
+ #endif
+@@ -120,6 +270,11 @@ void IOSContentRendererClient::RunScriptsAtDocumentIdle(
+ #endif
+ }
+ 
++void IOSContentRendererClient::DidInitializeWorkerContextOnWorkerThread(
++    v8::Local<v8::Context> context) {
++  MaybeInstallCuriumNavigatorGPC(context, /*is_worker=*/true);
++}
++
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+ void IOSContentRendererClient::
+     DidInitializeServiceWorkerContextOnWorkerThread(
+@@ -139,6 +294,9 @@ void IOSContentRendererClient::WillEvaluateServiceWorkerOnWorkerThread(
+     const GURL& service_worker_scope,
+     const GURL& script_url,
+     const blink::ServiceWorkerToken& service_worker_token) {
++  if (!script_url.SchemeIs("chrome-extension")) {
++    MaybeInstallCuriumNavigatorGPC(v8_context, /*is_worker=*/true);
++  }
+   if (auto* dispatcher = GetIOSExtensionsRendererClient()->dispatcher()) {
+     dispatcher->WillEvaluateServiceWorkerOnWorkerThread(
+         context_proxy, v8_context, service_worker_version_id,
+diff --git a/ios/web/content/init/ios_content_renderer_client.h b/ios/web/content/init/ios_content_renderer_client.h
+index 991de8a..4fef6f7 100644
+--- a/ios/web/content/init/ios_content_renderer_client.h
++++ b/ios/web/content/init/ios_content_renderer_client.h
+@@ -31,6 +31,8 @@ class IOSContentRendererClient : public content::ContentRendererClient {
+   void RunScriptsAtDocumentStart(content::RenderFrame* render_frame) override;
+   void RunScriptsAtDocumentEnd(content::RenderFrame* render_frame) override;
+   void RunScriptsAtDocumentIdle(content::RenderFrame* render_frame) override;
++  void DidInitializeWorkerContextOnWorkerThread(
++      v8::Local<v8::Context> context) override;
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   void DidInitializeServiceWorkerContextOnWorkerThread(
+       blink::WebServiceWorkerContextProxy* context_proxy,
 diff --git a/ios/web/content/web_state/content_web_state.mm b/ios/web/content/web_state/content_web_state.mm
 index a54466c..5fad494 100644
 --- a/ios/web/content/web_state/content_web_state.mm

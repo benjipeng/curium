@@ -268,6 +268,7 @@ if missing_b41:
 # Also resolve Build 43 patched objects across blink/ios targets so
 # graph-diagnose verifies every newly patched TU before the 18-shard build.
 build43_specs = [
+    ("obj/content/browser/", "blink_notification_service_impl.o"),
     ("obj/third_party/blink/common/", "curium_runtime_policy.o"),
     ("obj/third_party/blink/common/", "curium_desktop_parity.o"),
     ("obj/third_party/blink/common/", "global_privacy_control_util.o"),
