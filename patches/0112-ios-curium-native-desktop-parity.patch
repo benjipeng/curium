@@ -160,12 +160,12 @@ index 7af0a15..5250046 100644
    "+ui/base/resource/resource_bundle.h",
    "+ui/base/webui/web_ui_util.h",
 diff --git a/ios/web/content/init/ios_content_renderer_client.cc b/ios/web/content/init/ios_content_renderer_client.cc
-index c094026..614c820 100644
+index 64b35be..13c951a 100644
 --- a/ios/web/content/init/ios_content_renderer_client.cc
 +++ b/ios/web/content/init/ios_content_renderer_client.cc
-@@ -13,22 +13,40 @@
+@@ -12,22 +12,40 @@
+ #endif
  
- #include <cstddef>
  #include <cstdint>
 +#include <optional>
  #import <string>
@@ -204,7 +204,7 @@ index c094026..614c820 100644
  #import "ui/base/resource/resource_bundle.h"
  #import "ui/base/webui/web_ui_util.h"
  #import "url/gurl.h"
-@@ -172,6 +190,381 @@ void PurgeCuriumRendererCaches() {
+@@ -186,6 +204,381 @@ void PurgeCuriumRendererCaches() {
    blink::WebCache::Clear();
  }
  
@@ -586,7 +586,7 @@ index c094026..614c820 100644
  // [ios-blink-sideload] Chrome's network error page for the main frame, built
  // the way ios/chrome/browser/web/model/error_page_util.mm builds it for
  // WebKit, instead of placeholder text. A failed subframe (often a blocked ad
-@@ -210,6 +603,12 @@ void IOSContentRendererClient::RenderThreadStarted() {
+@@ -224,6 +617,12 @@ void IOSContentRendererClient::RenderThreadStarted() {
          base::SequencedTaskRunner::GetCurrentDefault(),
          base::BindRepeating(&PurgeCuriumRendererCaches));
    }
@@ -599,7 +599,7 @@ index c094026..614c820 100644
  #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
    GetIOSExtensionsRendererClient()->RenderThreadStarted();
  #endif
-@@ -232,6 +631,7 @@ void IOSContentRendererClient::RenderFrameCreated(
+@@ -246,6 +645,7 @@ void IOSContentRendererClient::RenderFrameCreated(
    // itself when its RenderFrame is destroyed.
    new js_injection::JsCommunication(render_frame);
    new CuriumRuntimePolicyFrameObserver(render_frame);

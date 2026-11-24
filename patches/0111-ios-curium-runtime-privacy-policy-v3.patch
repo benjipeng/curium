@@ -332,14 +332,13 @@ index adfb1ee..342d30b 100644
  
  std::string IOSContentBrowserClient::GetProduct() {
 diff --git a/ios/web/content/init/ios_content_renderer_client.cc b/ios/web/content/init/ios_content_renderer_client.cc
-index 806ff32..c094026 100644
+index 806ff32..64b35be 100644
 --- a/ios/web/content/init/ios_content_renderer_client.cc
 +++ b/ios/web/content/init/ios_content_renderer_client.cc
-@@ -11,23 +11,167 @@
+@@ -11,23 +11,181 @@
  #import "ios/web/content/init/extensions/ios_extensions_client.h"
  #endif
  
-+#include <cstddef>
 +#include <cstdint>
  #import <string>
 +#include <string_view>
@@ -361,6 +360,7 @@ index 806ff32..c094026 100644
  #import "ui/base/webui/web_ui_util.h"
  #import "url/gurl.h"
 +#include "v8/include/v8-context.h"
++#include "v8/include/v8-data.h"
 +#include "v8/include/v8-exception.h"
 +#include "v8/include/v8-function-callback.h"
 +#include "v8/include/v8-function.h"
@@ -391,40 +391,40 @@ index 806ff32..c094026 100644
 +      .ToLocalChecked();
 +}
 +
-+void InvokeCuriumNavigatorGPCGetter(
-+    const v8::FunctionCallbackInfo<v8::Value>& info,
-+    std::string_view expected_ctor) {
++void CuriumNavigatorGPCCallback(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
 +  v8::Isolate* isolate = info.GetIsolate();
-+  v8::Local<v8::Object> recv = info.This();
-+  if (recv.IsEmpty() || !recv->IsObject() || recv->InternalFieldCount() <= 0) {
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++  v8::Local<v8::Data> data = info.Data();
++  if (context.IsEmpty() || data.IsEmpty() || !data->IsValue()) {
 +    isolate->ThrowException(v8::Exception::TypeError(
 +        MakeCuriumGPCV8String(isolate, "Illegal invocation")));
 +    return;
 +  }
-+  v8::String::Utf8Value ctor(isolate, recv->GetConstructorName());
-+  if (!*ctor || ctor.length() < 0 ||
-+      std::string_view(*ctor, static_cast<size_t>(ctor.length())) !=
-+          expected_ctor) {
++  v8::Local<v8::Value> data_val = data.As<v8::Value>();
++  if (!data_val->IsFunction()) {
 +    isolate->ThrowException(v8::Exception::TypeError(
 +        MakeCuriumGPCV8String(isolate, "Illegal invocation")));
++    return;
++  }
++  v8::Local<v8::Function> brand_check = data_val.As<v8::Function>();
++  v8::TryCatch try_catch(isolate);
++  v8::Local<v8::Value> ignored;
++  if (!brand_check->Call(isolate, context, info.This(), 0, nullptr)
++           .ToLocal(&ignored)) {
++    if (try_catch.HasCaught()) {
++      try_catch.ReThrow();
++    } else {
++      isolate->ThrowException(v8::Exception::TypeError(
++          MakeCuriumGPCV8String(isolate, "Illegal invocation")));
++    }
 +    return;
 +  }
 +  info.GetReturnValue().Set(
 +      blink::curium::IsGlobalPrivacyControlRuntimeEnabled());
 +}
 +
-+void CuriumNavigatorGPCCallback(
-+    const v8::FunctionCallbackInfo<v8::Value>& info) {
-+  InvokeCuriumNavigatorGPCGetter(info, "Navigator");
-+}
-+
-+void CuriumWorkerNavigatorGPCCallback(
-+    const v8::FunctionCallbackInfo<v8::Value>& info) {
-+  InvokeCuriumNavigatorGPCGetter(info, "WorkerNavigator");
-+}
-+
-+void MaybeInstallCuriumNavigatorGPC(v8::Local<v8::Context> context,
-+                                    bool is_worker) {
++void MaybeInstallCuriumNavigatorGPC(v8::Local<v8::Context> context) {
 +  if (!blink::curium::IsGlobalPrivacyControlRuntimeEnabled() ||
 +      context.IsEmpty()) {
 +    return;
@@ -460,12 +460,26 @@ index 806ff32..c094026 100644
 +    return;
 +  }
 +
++  v8::Local<v8::Value> online_desc_val;
++  if (!navigator_proto
++           ->GetOwnPropertyDescriptor(context,
++                                      MakeCuriumGPCV8Key(isolate, "onLine"))
++           .ToLocal(&online_desc_val) ||
++      online_desc_val.IsEmpty() || !online_desc_val->IsObject()) {
++    return;
++  }
++  v8::Local<v8::Value> brand_getter_val;
++  if (!online_desc_val.As<v8::Object>()
++           ->Get(context, MakeCuriumGPCV8Key(isolate, "get"))
++           .ToLocal(&brand_getter_val) ||
++      brand_getter_val.IsEmpty() || !brand_getter_val->IsFunction()) {
++    return;
++  }
++
 +  v8::Local<v8::FunctionTemplate> tmpl = v8::FunctionTemplate::New(
-+      isolate,
-+      is_worker ? &CuriumWorkerNavigatorGPCCallback
-+                : &CuriumNavigatorGPCCallback,
-+      v8::Local<v8::Value>(), v8::Local<v8::Signature>(), /*length=*/0,
-+      v8::ConstructorBehavior::kThrow, v8::SideEffectType::kHasNoSideEffect);
++      isolate, &CuriumNavigatorGPCCallback, brand_getter_val,
++      v8::Local<v8::Signature>(), /*length=*/0,
++      v8::ConstructorBehavior::kThrow);
 +  tmpl->RemovePrototype();
 +  tmpl->SetClassName(MakeCuriumGPCV8String(isolate, "get globalPrivacyControl"));
 +
@@ -490,7 +504,7 @@ index 806ff32..c094026 100644
 +    if (world_id != content::ISOLATED_WORLD_ID_GLOBAL || context.IsEmpty()) {
 +      return;
 +    }
-+    MaybeInstallCuriumNavigatorGPC(context, /*is_worker=*/false);
++    MaybeInstallCuriumNavigatorGPC(context);
 +  }
 +
 +  void OnDestruct() override { delete this; }
@@ -503,7 +517,7 @@ index 806ff32..c094026 100644
  // [ios-blink-sideload] Chrome's network error page for the main frame, built
  // the way ios/chrome/browser/web/model/error_page_util.mm builds it for
  // WebKit, instead of placeholder text. A failed subframe (often a blocked ad
-@@ -61,6 +205,11 @@ IOSContentRendererClient::IOSContentRendererClient() = default;
+@@ -61,6 +219,11 @@ IOSContentRendererClient::IOSContentRendererClient() = default;
  IOSContentRendererClient::~IOSContentRendererClient() = default;
  
  void IOSContentRendererClient::RenderThreadStarted() {
@@ -515,7 +529,7 @@ index 806ff32..c094026 100644
  #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
    GetIOSExtensionsRendererClient()->RenderThreadStarted();
  #endif
-@@ -82,6 +231,7 @@ void IOSContentRendererClient::RenderFrameCreated(
+@@ -82,6 +245,7 @@ void IOSContentRendererClient::RenderFrameCreated(
    // As a RenderFrameObserver, JSCommunication handles destroying
    // itself when its RenderFrame is destroyed.
    new js_injection::JsCommunication(render_frame);
@@ -523,24 +537,24 @@ index 806ff32..c094026 100644
  #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
    InitializeIOSExtensionsRenderFrame(render_frame);
  #endif
-@@ -120,6 +270,11 @@ void IOSContentRendererClient::RunScriptsAtDocumentIdle(
+@@ -120,6 +284,11 @@ void IOSContentRendererClient::RunScriptsAtDocumentIdle(
  #endif
  }
  
 +void IOSContentRendererClient::DidInitializeWorkerContextOnWorkerThread(
 +    v8::Local<v8::Context> context) {
-+  MaybeInstallCuriumNavigatorGPC(context, /*is_worker=*/true);
++  MaybeInstallCuriumNavigatorGPC(context);
 +}
 +
  #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
  void IOSContentRendererClient::
      DidInitializeServiceWorkerContextOnWorkerThread(
-@@ -139,6 +294,9 @@ void IOSContentRendererClient::WillEvaluateServiceWorkerOnWorkerThread(
+@@ -139,6 +308,9 @@ void IOSContentRendererClient::WillEvaluateServiceWorkerOnWorkerThread(
      const GURL& service_worker_scope,
      const GURL& script_url,
      const blink::ServiceWorkerToken& service_worker_token) {
 +  if (!script_url.SchemeIs("chrome-extension")) {
-+    MaybeInstallCuriumNavigatorGPC(v8_context, /*is_worker=*/true);
++    MaybeInstallCuriumNavigatorGPC(v8_context);
 +  }
    if (auto* dispatcher = GetIOSExtensionsRendererClient()->dispatcher()) {
      dispatcher->WillEvaluateServiceWorkerOnWorkerThread(
