@@ -786,10 +786,27 @@ struct CuriumDesktopParityTests {
             #expect(validChromePrefixes.contains { sampled.chrome.fullVersion.hasPrefix($0) })
             #expect(sampled.chrome.productVersion == "Chrome/\(sampled.chrome.major).0.0.0")
 
-            // M1 non-notched SKUs never pair with notched built-in panels.
+            // Physical Apple Silicon SKU × Display coherence:
+            // - M1 non-notched SKUs never pair with notched built-in panels.
+            // - 16" MacBook Pro panels (1728×1117, 2056×1329) only pair with 10+ core 16" Pro/Max SKUs.
+            // - MacBook Air notched panels (1710×1107, 1920×1243, 1710×1112) only pair with base M2/M3/M4 SKUs.
+            // - 14" MacBook Pro panel (1800×1169) never pairs with base M1 or M2.
+            #expect(sampled.display.isCompatible(with: sampled.sku))
             if !sampled.sku.prefersNotchedBuiltIn {
                 #expect(!sampled.display.isNotchedBuiltIn)
                 #expect(sampled.display.menuBarHeight == 25)
+            }
+            if sampled.display.panelClass == .macBookPro16Notched {
+                #expect(sampled.sku.chipName.contains("Pro") || sampled.sku.chipName.contains("Max"))
+                #expect(sampled.sku.cores >= 10)
+                #expect(sampled.sku.id != "m1pro-8c" && sampled.sku.id != "m2pro-10c" && sampled.sku.id != "m3pro-11c")
+            }
+            if sampled.display.panelClass == .macBookAirNotched {
+                #expect(!sampled.sku.chipName.contains("Pro") && !sampled.sku.chipName.contains("Max"))
+                #expect(sampled.sku.chipName != "Apple M1")
+            }
+            if sampled.display.panelClass == .macBookPro14Notched {
+                #expect(sampled.sku.chipName != "Apple M1" && sampled.sku.chipName != "Apple M2")
             }
             #expect(CuriumMacOSManifold.inferredMenuBarHeight(for: sampled.screen) == sampled.display.menuBarHeight)
             #expect(CuriumMacOSManifold.prefersLeftDock(forProfileSeed: "any-seed") == false)

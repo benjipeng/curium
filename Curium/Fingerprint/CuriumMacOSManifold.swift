@@ -21,6 +21,17 @@ import Security
 /// `s52` TTS voices, every fresh `Personal` install and every new profile draws from a
 /// vast authentic Apple Silicon Mac population without storing any burn/replay history.
 enum CuriumMacOSManifold {
+    enum PanelClass: Hashable, Sendable {
+        /// Notched 13"/15" MacBook Air panels (`1710×1107`, `1920×1243`, `1710×1112`): base M2/M3/M4 Air only.
+        case macBookAirNotched
+        /// Notched 14" MacBook Pro panel (`1800×1169`): 14" Pro SKUs (M1 Pro/Max, M2 Pro/Max, M3/M3 Pro, M4/M4 Pro).
+        case macBookPro14Notched
+        /// Notched 16" MacBook Pro panels (`1728×1117`, `2056×1329`): 10+ core 16" Pro/Max SKUs only.
+        case macBookPro16Notched
+        /// Non-notched iMac 4.5K / Studio Display / external 4K-5K-6K HiDPI displays (`25 pt` menu bar): compatible with every Mac.
+        case desktopExternalHiDPI
+    }
+
     struct AppleSiliconSKU: Equatable, Sendable {
         let id: String
         let chipName: String
@@ -29,8 +40,12 @@ enum CuriumMacOSManifold {
         let memoryGB: Double
         /// Minimum major macOS version that could ship on this silicon generation (`14`, `15`, or `26`).
         let minMacOSMajor: Int
-        /// Whether this chip generation shipped in notched MacBooks (affecting typical built-in menu bar height).
-        let prefersNotchedBuiltIn: Bool
+        /// Physically shippable built-in/external display classes for this Apple Silicon SKU.
+        let supportedPanels: Set<PanelClass>
+
+        var prefersNotchedBuiltIn: Bool {
+            !supportedPanels.isDisjoint(with: [.macBookAirNotched, .macBookPro14Notched, .macBookPro16Notched])
+        }
 
         var webglRenderer: String {
             "ANGLE (Apple, ANGLE Metal Renderer: \(chipName), Unspecified Version)"
@@ -58,10 +73,18 @@ enum CuriumMacOSManifold {
         let height: Int
         /// `38` for notched MacBook Air/Pro panels (M2+ Air, M1+ 14"/16" Pro); `25` for iMac and external HiDPI displays.
         let menuBarHeight: Int
-        /// `true` for M1–M4 built-in panels that require a notched-capable chip (`false` for iMac / external HiDPI monitors compatible with every chip).
-        let isNotchedBuiltIn: Bool
+        /// Physical Apple display family used to enforce genuine chip × panel coherence.
+        let panelClass: PanelClass
         /// Relative real-world market prevalence weight (avoids rare-device penalties).
         let weight: Int
+
+        var isNotchedBuiltIn: Bool {
+            panelClass != .desktopExternalHiDPI
+        }
+
+        func isCompatible(with sku: AppleSiliconSKU) -> Bool {
+            sku.supportedPanels.contains(panelClass)
+        }
     }
 
     enum DockPlacement: Equatable, Sendable {
@@ -97,26 +120,34 @@ enum CuriumMacOSManifold {
 
     /// 18 genuine Apple Silicon SKUs spanning M1 through M4 Pro (8–14 CPU cores).
     /// All report Chromium's W3C-capped `navigator.deviceMemory = 8` (real Chrome on macOS
-    /// never exposes `16` or `32` regardless of physical unified memory).
+    /// never exposes `16` or `32` regardless of physical unified memory), and each SKU is
+    /// restricted to physically authentic Apple display classes (e.g. 16" MBP panels only on
+    /// 10+ core 16" Pro/Max SKUs, notched Air panels only on base M2/M3/M4 Air SKUs).
     static let appleSiliconSKUs: [AppleSiliconSKU] = [
-        AppleSiliconSKU(id: "m1-8c-base", chipName: "Apple M1", cores: 8, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: false),
-        AppleSiliconSKU(id: "m1-8c-16m", chipName: "Apple M1", cores: 8, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: false),
-        AppleSiliconSKU(id: "m1pro-8c", chipName: "Apple M1 Pro", cores: 8, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m1pro-10c-a", chipName: "Apple M1 Pro", cores: 10, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m1pro-10c-b", chipName: "Apple M1 Pro", cores: 10, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m1max-10c", chipName: "Apple M1 Max", cores: 10, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m2-8c-base", chipName: "Apple M2", cores: 8, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m2-8c-16m", chipName: "Apple M2", cores: 8, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m2pro-10c", chipName: "Apple M2 Pro", cores: 10, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m2pro-12c-a", chipName: "Apple M2 Pro", cores: 12, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m2pro-12c-b", chipName: "Apple M2 Pro", cores: 12, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m2max-12c", chipName: "Apple M2 Max", cores: 12, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m3-8c-base", chipName: "Apple M3", cores: 8, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m3-8c-16m", chipName: "Apple M3", cores: 8, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m3pro-11c", chipName: "Apple M3 Pro", cores: 11, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m3pro-12c", chipName: "Apple M3 Pro", cores: 12, memoryGB: 8, minMacOSMajor: 14, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m4-10c", chipName: "Apple M4", cores: 10, memoryGB: 8, minMacOSMajor: 15, prefersNotchedBuiltIn: true),
-        AppleSiliconSKU(id: "m4pro-14c", chipName: "Apple M4 Pro", cores: 14, memoryGB: 8, minMacOSMajor: 15, prefersNotchedBuiltIn: true),
+        AppleSiliconSKU(id: "m1-8c-base", chipName: "Apple M1", cores: 8, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.desktopExternalHiDPI]),
+        AppleSiliconSKU(id: "m1-8c-16m", chipName: "Apple M1", cores: 8, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.desktopExternalHiDPI]),
+        // 8-core M1 Pro shipped exclusively in the 14" MacBook Pro (never 16" MBP or MacBook Air).
+        AppleSiliconSKU(id: "m1pro-8c", chipName: "Apple M1 Pro", cores: 8, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookPro14Notched, .desktopExternalHiDPI]),
+        AppleSiliconSKU(id: "m1pro-10c-a", chipName: "Apple M1 Pro", cores: 10, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookPro14Notched, .macBookPro16Notched, .desktopExternalHiDPI]),
+        AppleSiliconSKU(id: "m1pro-10c-b", chipName: "Apple M1 Pro", cores: 10, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookPro14Notched, .macBookPro16Notched, .desktopExternalHiDPI]),
+        AppleSiliconSKU(id: "m1max-10c", chipName: "Apple M1 Max", cores: 10, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookPro14Notched, .macBookPro16Notched, .desktopExternalHiDPI]),
+        // Base M2 shipped in notched 13"/15" MacBook Air (never 14"/16" MacBook Pro).
+        AppleSiliconSKU(id: "m2-8c-base", chipName: "Apple M2", cores: 8, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookAirNotched, .desktopExternalHiDPI]),
+        AppleSiliconSKU(id: "m2-8c-16m", chipName: "Apple M2", cores: 8, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookAirNotched, .desktopExternalHiDPI]),
+        // 10-core M2 Pro shipped exclusively in the 14" MacBook Pro & Mac mini (16" MBP started at 12 cores).
+        AppleSiliconSKU(id: "m2pro-10c", chipName: "Apple M2 Pro", cores: 10, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookPro14Notched, .desktopExternalHiDPI]),
+        AppleSiliconSKU(id: "m2pro-12c-a", chipName: "Apple M2 Pro", cores: 12, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookPro14Notched, .macBookPro16Notched, .desktopExternalHiDPI]),
+        AppleSiliconSKU(id: "m2pro-12c-b", chipName: "Apple M2 Pro", cores: 12, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookPro14Notched, .macBookPro16Notched, .desktopExternalHiDPI]),
+        AppleSiliconSKU(id: "m2max-12c", chipName: "Apple M2 Max", cores: 12, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookPro14Notched, .macBookPro16Notched, .desktopExternalHiDPI]),
+        // Base M3 shipped in notched 13"/15" MacBook Air, 14" MacBook Pro, and 24" iMac (never 16" MBP).
+        AppleSiliconSKU(id: "m3-8c-base", chipName: "Apple M3", cores: 8, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookAirNotched, .macBookPro14Notched, .desktopExternalHiDPI]),
+        AppleSiliconSKU(id: "m3-8c-16m", chipName: "Apple M3", cores: 8, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookAirNotched, .macBookPro14Notched, .desktopExternalHiDPI]),
+        // 11-core M3 Pro shipped exclusively in the 14" MacBook Pro (16" MBP started at 12 cores).
+        AppleSiliconSKU(id: "m3pro-11c", chipName: "Apple M3 Pro", cores: 11, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookPro14Notched, .desktopExternalHiDPI]),
+        AppleSiliconSKU(id: "m3pro-12c", chipName: "Apple M3 Pro", cores: 12, memoryGB: 8, minMacOSMajor: 14, supportedPanels: [.macBookPro14Notched, .macBookPro16Notched, .desktopExternalHiDPI]),
+        // Base M4 shipped in notched 13"/15" MacBook Air, 14" MacBook Pro, 24" iMac, and Mac mini (never 16" MBP).
+        AppleSiliconSKU(id: "m4-10c", chipName: "Apple M4", cores: 10, memoryGB: 8, minMacOSMajor: 15, supportedPanels: [.macBookAirNotched, .macBookPro14Notched, .desktopExternalHiDPI]),
+        AppleSiliconSKU(id: "m4pro-14c", chipName: "Apple M4 Pro", cores: 14, memoryGB: 8, minMacOSMajor: 15, supportedPanels: [.macBookPro14Notched, .macBookPro16Notched, .desktopExternalHiDPI]),
     ]
 
     /// Authentic public Apple macOS point releases (Sonoma 14.x, Sequoia 15.x, Tahoe 26.x)
@@ -159,22 +190,22 @@ enum CuriumMacOSManifold {
     /// `iphone_duo_27_2` Inner Portrait (`951 pt`) while excluding rare custom-scaled panels.
     static let displayGeometries: [DisplayGeometrySpec] = [
         // MacBook Air 15" M2–M4 (notched 38 pt menu bar)
-        DisplayGeometrySpec(width: 1710, height: 1107, menuBarHeight: 38, isNotchedBuiltIn: true, weight: 8),
-        DisplayGeometrySpec(width: 1920, height: 1243, menuBarHeight: 38, isNotchedBuiltIn: true, weight: 4),
+        DisplayGeometrySpec(width: 1710, height: 1107, menuBarHeight: 38, panelClass: .macBookAirNotched, weight: 8),
+        DisplayGeometrySpec(width: 1920, height: 1243, menuBarHeight: 38, panelClass: .macBookAirNotched, weight: 4),
         // MacBook Air 13" M2–M4 "More Space" (notched 38 pt menu bar)
-        DisplayGeometrySpec(width: 1710, height: 1112, menuBarHeight: 38, isNotchedBuiltIn: true, weight: 6),
+        DisplayGeometrySpec(width: 1710, height: 1112, menuBarHeight: 38, panelClass: .macBookAirNotched, weight: 6),
         // MacBook Pro 14" M1–M4 "More Space" (notched 38 pt menu bar)
-        DisplayGeometrySpec(width: 1800, height: 1169, menuBarHeight: 38, isNotchedBuiltIn: true, weight: 7),
-        // MacBook Pro 16" M1–M4 default & "More Space" (notched 38 pt menu bar)
-        DisplayGeometrySpec(width: 1728, height: 1117, menuBarHeight: 38, isNotchedBuiltIn: true, weight: 10),
-        DisplayGeometrySpec(width: 2056, height: 1329, menuBarHeight: 38, isNotchedBuiltIn: true, weight: 5),
-        // iMac 24" 4.5K Retina (non-notch 25 pt menu bar)
-        DisplayGeometrySpec(width: 2048, height: 1152, menuBarHeight: 25, isNotchedBuiltIn: false, weight: 6),
-        DisplayGeometrySpec(width: 2240, height: 1260, menuBarHeight: 25, isNotchedBuiltIn: false, weight: 8),
+        DisplayGeometrySpec(width: 1800, height: 1169, menuBarHeight: 38, panelClass: .macBookPro14Notched, weight: 7),
+        // MacBook Pro 16" M1–M4 default & "More Space" (notched 38 pt menu bar; 10+ core 16" Pro/Max SKUs only)
+        DisplayGeometrySpec(width: 1728, height: 1117, menuBarHeight: 38, panelClass: .macBookPro16Notched, weight: 10),
+        DisplayGeometrySpec(width: 2056, height: 1329, menuBarHeight: 38, panelClass: .macBookPro16Notched, weight: 5),
+        // iMac 24" 4.5K Retina / external 4K HiDPI (non-notch 25 pt menu bar)
+        DisplayGeometrySpec(width: 2048, height: 1152, menuBarHeight: 25, panelClass: .desktopExternalHiDPI, weight: 6),
+        DisplayGeometrySpec(width: 2240, height: 1260, menuBarHeight: 25, panelClass: .desktopExternalHiDPI, weight: 8),
         // Studio Display 27" 5K / 4K-5K-6K HiDPI external displays (non-notch 25 pt menu bar)
-        DisplayGeometrySpec(width: 2560, height: 1440, menuBarHeight: 25, isNotchedBuiltIn: false, weight: 10),
-        DisplayGeometrySpec(width: 2880, height: 1620, menuBarHeight: 25, isNotchedBuiltIn: false, weight: 5),
-        DisplayGeometrySpec(width: 3008, height: 1692, menuBarHeight: 25, isNotchedBuiltIn: false, weight: 6),
+        DisplayGeometrySpec(width: 2560, height: 1440, menuBarHeight: 25, panelClass: .desktopExternalHiDPI, weight: 10),
+        DisplayGeometrySpec(width: 2880, height: 1620, menuBarHeight: 25, panelClass: .desktopExternalHiDPI, weight: 5),
+        DisplayGeometrySpec(width: 3008, height: 1692, menuBarHeight: 25, panelClass: .desktopExternalHiDPI, weight: 6),
     ]
 
     /// Known authentic macOS menu bar heights for legacy/explicitly selected displays
@@ -265,12 +296,9 @@ enum CuriumMacOSManifold {
             guard let s = primarySlot(in: cur).screen else { return nil }
             return "\(s.width)x\(s.height)"
         }
-        var displayPool = displayGeometries.filter { spec in
-            if spec.isNotchedBuiltIn && !sku.prefersNotchedBuiltIn {
-                return false
-            }
-            return "\(spec.width)x\(spec.height)" != excludedRes
-        }
+        let compatibleDisplays = displayGeometries.filter { $0.isCompatible(with: sku) }
+        var displayPool = compatibleDisplays.filter { "\($0.width)x\($0.height)" != excludedRes }
+        if displayPool.isEmpty { displayPool = compatibleDisplays }
         if displayPool.isEmpty { displayPool = displayGeometries }
         let freshDisplays = displayPool.filter { !usedResolutions.contains("\($0.width)x\($0.height)") }
         let display = weightedRandomElement(from: freshDisplays.isEmpty ? displayPool : freshDisplays, weight: \.weight)
