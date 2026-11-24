@@ -219,13 +219,17 @@ struct CuriumFingerprintEditorView: View {
             return matched.label
         }
         var parts: [String] = []
+        let primarySlot = draft.defaultSlot == .desktop ? draft.desktop : draft.mobile
+        if let chipName = CuriumMacOSManifold.chipDisplayName(fromWebGLRenderer: primarySlot.webglRenderer) {
+            parts.append(chipName)
+        }
         if let cores = draft.hardware.hardwareConcurrency {
             parts.append("\(cores)c")
         }
         if let mem = draft.hardware.deviceMemoryGB {
             parts.append(mem < 1 ? "\(mem) GB" : "\(Int(mem)) GB")
         }
-        if let screen = (draft.defaultSlot == .desktop ? draft.desktop.screen : draft.mobile.screen) {
+        if let screen = primarySlot.screen {
             parts.append("\(screen.width)×\(screen.height)")
         }
         return parts.isEmpty ? "Custom Hardware" : parts.joined(separator: " · ")
@@ -570,7 +574,9 @@ struct CuriumFingerprintEditorView: View {
                             draft.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
                         }
                         if draft.farbling == nil {
-                            draft.farbling = .allEnabled
+                            draft.farbling = draft.templateID == CuriumFingerprintPresets.privacyHardened.id
+                                ? .allEnabled
+                                : .stealthSafe
                         }
                     } else {
                         draft.fingerprintSeed = nil

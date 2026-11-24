@@ -502,6 +502,8 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
            let chipLabel = matchedVariant.label.split(separator: "·").first?.trimmingCharacters(in: .whitespaces),
            !chipLabel.isEmpty {
             parts.append(chipLabel)
+        } else if let manifoldChip = CuriumMacOSManifold.chipDisplayName(fromWebGLRenderer: primarySlot.webglRenderer) {
+            parts.append(manifoldChip)
         } else if usesNativeHardwareAndGPU {
             parts.append("Native Apple")
         } else {

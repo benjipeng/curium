@@ -13,7 +13,7 @@ the pinned engine first, translate to `patches/` once proven.
   unstripped symbols artifact (`Chromium-Blink-160.0.8171.0-arm64-symbols`, ID
   `14793005935`). GHCR cache packages migrated to `ghcr.io/benjipeng/curium/*`.
 - **App / On `ac_duo`:** `Curium-0.1.17-b30-arm64.ipa` (Build 42, staged in LiveContainer `Documents/`).
-- **Local candidate:** `Curium-0.1.17-b30` on `feat/build-41-engine-wave` (Build 42 pinned + pure Apple Silicon macOS profiles + same-IP per-profile `Visitor ID` independence via native CoreText macOS font suites, stealth-safe Audio+WebGL farbling, seeded TTS voices, mainstream macOS 26.3.1 baseline + Dock geometry, and color-profile coherence; verified live on `iphone_duo_27_2` Simulator, `sdk 27.2`, `97/97` `CuriumTests` passing under `-warnings-as-errors`, Release ARM64 IPA packaged at `dist/Curium-0.1.17-b30-arm64.ipa`).
+- **Release candidate:** `Curium-0.1.18-b31` (Build 42 pinned + pure-Swift `CuriumMacOSManifold` continuous Apple Silicon macOS identity sampler: 18 SKUs with W3C-capped `8 GB` `navigator.deviceMemory`, 14 authentic Nov-2026 chip-era macOS `14.x`/`15.x`/`26.x` releases, 8 verified Chromium Dash Chrome `156`/`157`/`158` builds, 11 mainstream `@2x` 30-bit Retina displays with `availHeight >= 960` + continuous right/bottom visible Dock, 45 clean CoreText macOS font suites, zero-noise native default on `Personal` & `macOS Desktop` cutting `tampering_ml_score` to `0.13` while keeping `Privacy Hardened` & opt-in farbling, fail-closed first-boot persistence, and `Proxy`-backed `Illegal invocation` receiver checks in `desktop_parity.js` v`1.2.1`; verified live A/B on both `iphone_duo_27_2` & `iphone_17_27_2`, `sdk 27.2`, `99/99` `CuriumTests` passing under `-warnings-as-errors`).
 
 ## App (on the pinned engine)
 

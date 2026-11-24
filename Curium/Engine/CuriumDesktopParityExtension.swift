@@ -11,7 +11,7 @@ import OSLog
 /// deltas only when `navigator.platform === 'MacIntel'`.
 enum CuriumDesktopParityExtension {
     static let directoryName = "curium_desktop_parity"
-    static let manifestVersion = "1.1.0"
+    static let manifestVersion = "1.2.1"
     static let versionStampFileName = ".curium_version"
 
     /// Static RSA-2048 SubjectPublicKeyInfo (DER, base64-encoded).
@@ -77,9 +77,14 @@ enum CuriumDesktopParityExtension {
     }
 
     /// Renders `desktop_parity.js` optionally seeded for a specific profile so each
-    /// profile emits a distinct, realistic subset of optional macOS system voices
-    /// while preserving the default voice and all 19 Google Chrome TTS voices.
-    static func parityScript(profileSeed: String?) -> String {
+    /// profile emits a distinct, realistic subset of optional macOS system voices,
+    /// accurate notched (`38 pt`) vs non-notched (`25 pt`) menu bar `availTop`, and
+    /// authentic Left/Right/Bottom Dock `availLeft` placement.
+    static func parityScript(
+        profileSeed: String?,
+        menuBarHeight: Int = 38,
+        dockOnLeft: Bool = false
+    ) -> String {
         let voiceSeedHex: String
         if let profileSeed, !profileSeed.isEmpty {
             let digest = SHA256.hash(data: Data(("curium.desktop.parity.voices.v1:" + profileSeed).utf8))
@@ -87,10 +92,11 @@ enum CuriumDesktopParityExtension {
         } else {
             voiceSeedHex = ""
         }
-        return parityScriptTemplate.replacingOccurrences(
-            of: "__CURIUM_VOICE_SEED_HEX__",
-            with: voiceSeedHex
-        )
+        let clampedMenuBar = max(24, min(40, menuBarHeight))
+        return parityScriptTemplate
+            .replacingOccurrences(of: "__CURIUM_VOICE_SEED_HEX__", with: voiceSeedHex)
+            .replacingOccurrences(of: "__CURIUM_MENU_BAR_HEIGHT__", with: String(clampedMenuBar))
+            .replacingOccurrences(of: "__CURIUM_DOCK_LEFT__", with: dockOnLeft ? "1" : "0")
     }
 
     private static let parityScriptTemplate: String = #"""
@@ -98,6 +104,8 @@ enum CuriumDesktopParityExtension {
   'use strict';
 
   const PROFILE_VOICE_SEED = '__CURIUM_VOICE_SEED_HEX__';
+  const MENU_BAR_HEIGHT = __CURIUM_MENU_BAR_HEIGHT__;
+  const DOCK_ON_LEFT = __CURIUM_DOCK_LEFT__ === 1;
   const patched = new WeakSet();
 
   const IOS_LEAKS = [
@@ -234,6 +242,12 @@ enum CuriumDesktopParityExtension {
       Object.defineProperty(bound, 'length', { value: length, configurable: true });
     } catch (_) {}
     return bound;
+  }
+
+  function wrapNativeMethod(w, orig, applyTrap) {
+    return new w.Proxy(orig, {
+      apply: applyTrap,
+    });
   }
 
   function stripLeaks(w) {
@@ -424,8 +438,8 @@ enum CuriumDesktopParityExtension {
         if (permDesc && typeof permDesc.get === 'function' && permDesc.configurable !== false) {
           const origPermGet = permDesc.get;
           Object.defineProperty(w.Notification, 'permission', {
-            get: makeNativeFn('get permission', 0, () => {
-              const val = origPermGet.call(w.Notification);
+            get: wrapNativeMethod(w, origPermGet, (target, thisArg, args) => {
+              const val = Reflect.apply(target, thisArg, args);
               return val === 'denied' ? 'default' : val;
             }),
             enumerable: permDesc.enumerable,
@@ -439,8 +453,8 @@ enum CuriumDesktopParityExtension {
       if (w.Permissions && w.Permissions.prototype &&
           typeof w.Permissions.prototype.query === 'function') {
         const origQuery = w.Permissions.prototype.query;
-        const wrappedQuery = makeNativeFn('query', 1, (...args) => {
-          const p = origQuery.apply(w.navigator.permissions, args);
+        const wrappedQuery = wrapNativeMethod(w, origQuery, (target, thisArg, args) => {
+          const p = Reflect.apply(target, thisArg, args);
           const desc = args[0];
           if (!desc || desc.name !== 'notifications') return p;
           return p.then((status) => {
@@ -495,8 +509,8 @@ enum CuriumDesktopParityExtension {
         if (rttDesc && typeof rttDesc.get === 'function' && rttDesc.configurable !== false) {
           const origRtt = rttDesc.get;
           Object.defineProperty(netProto, 'rtt', {
-            get: makeNativeFn('get rtt', 0, () => {
-              const val = origRtt.call(w.navigator.connection);
+            get: wrapNativeMethod(w, origRtt, (target, thisArg, args) => {
+              const val = Reflect.apply(target, thisArg, args);
               return val === 0 ? 50 : val;
             }),
             enumerable: rttDesc.enumerable,
@@ -506,25 +520,30 @@ enum CuriumDesktopParityExtension {
       }
     } catch (_) {}
 
-    // 5. macOS top menu bar Screen.prototype.availTop & availLeft.
+    // 5. macOS top menu bar Screen.prototype.availTop & availLeft (preserve native `this` brand check).
     try {
       if (w.Screen && w.Screen.prototype) {
         const screenProto = w.Screen.prototype;
         const availTopDesc = Object.getOwnPropertyDescriptor(screenProto, 'availTop');
         if (!availTopDesc || availTopDesc.configurable !== false) {
           const origAvailTop = availTopDesc?.get;
+          const availTopGetter = typeof origAvailTop === 'function'
+            ? wrapNativeMethod(w, origAvailTop, (target, thisArg, args) => {
+                const nativeAvailTop = Reflect.apply(target, thisArg, args);
+                const h = thisArg.height;
+                const ah = thisArg.availHeight;
+                if (nativeAvailTop === 0 && h > ah) {
+                  return Math.min(MENU_BAR_HEIGHT, h - ah);
+                }
+                return nativeAvailTop;
+              })
+            : makeNativeFn('get availTop', 0, () => {
+                const h = w.screen.height;
+                const ah = w.screen.availHeight;
+                return h > ah ? Math.min(MENU_BAR_HEIGHT, h - ah) : 0;
+              });
           Object.defineProperty(screenProto, 'availTop', {
-            get: makeNativeFn('get availTop', 0, () => {
-              const nativeAvailTop = origAvailTop ? origAvailTop.call(w.screen) : 0;
-              const h = w.screen.height;
-              const ah = w.screen.availHeight;
-              if (nativeAvailTop === 0 && h > ah) {
-                // macOS top menu bar is 25–38 pt; any remaining vertical inset belongs
-                // to the bottom Dock (producing authentic [menuBar, rightDock, bottomDock, leftDock]).
-                return Math.min(38, h - ah);
-              }
-              return nativeAvailTop;
-            }),
+            get: availTopGetter,
             enumerable: availTopDesc ? availTopDesc.enumerable : true,
             configurable: true,
           });
@@ -533,11 +552,23 @@ enum CuriumDesktopParityExtension {
         const availLeftDesc = Object.getOwnPropertyDescriptor(screenProto, 'availLeft');
         if (!availLeftDesc || availLeftDesc.configurable !== false) {
           const origAvailLeft = availLeftDesc?.get;
+          const availLeftGetter = typeof origAvailLeft === 'function'
+            ? wrapNativeMethod(w, origAvailLeft, (target, thisArg, args) => {
+                const nativeAvailLeft = Reflect.apply(target, thisArg, args);
+                const width = thisArg.width;
+                const aw = thisArg.availWidth;
+                if (nativeAvailLeft === 0 && DOCK_ON_LEFT && width > aw) {
+                  return width - aw;
+                }
+                return typeof nativeAvailLeft === 'number' ? nativeAvailLeft : 0;
+              })
+            : makeNativeFn('get availLeft', 0, () => {
+                const width = w.screen.width;
+                const aw = w.screen.availWidth;
+                return (DOCK_ON_LEFT && width > aw) ? (width - aw) : 0;
+              });
           Object.defineProperty(screenProto, 'availLeft', {
-            get: makeNativeFn('get availLeft', 0, () => {
-              const val = origAvailLeft ? origAvailLeft.call(w.screen) : 0;
-              return typeof val === 'number' ? val : 0;
-            }),
+            get: availLeftGetter,
             enumerable: availLeftDesc ? availLeftDesc.enumerable : true,
             configurable: true,
           });
@@ -545,13 +576,14 @@ enum CuriumDesktopParityExtension {
       }
     } catch (_) {}
 
-    // 6. window.devicePixelRatio (normalize 3x iPhone Retina to 2x macOS Retina only when 3).
+    // 6. window.devicePixelRatio (normalize 3x iPhone Retina to 2x macOS Retina; preserve [Replaceable] setter).
     try {
       if (w.devicePixelRatio === 3) {
         const dprDesc = Object.getOwnPropertyDescriptor(w, 'devicePixelRatio');
         if (!dprDesc || dprDesc.configurable !== false) {
           Object.defineProperty(w, 'devicePixelRatio', {
             get: makeNativeFn('get devicePixelRatio', 0, () => 2),
+            set: dprDesc?.set,
             enumerable: dprDesc ? dprDesc.enumerable : true,
             configurable: true,
           });
@@ -599,8 +631,8 @@ enum CuriumDesktopParityExtension {
       if (w.Keyboard && w.Keyboard.prototype &&
           typeof w.Keyboard.prototype.getLayoutMap === 'function') {
         const origGetLayoutMap = w.Keyboard.prototype.getLayoutMap;
-        const wrappedGetLayoutMap = makeNativeFn('getLayoutMap', 0, () => {
-          return origGetLayoutMap.call(w.navigator.keyboard).then((realMap) => {
+        const wrappedGetLayoutMap = wrapNativeMethod(w, origGetLayoutMap, (target, thisArg, args) => {
+          return Reflect.apply(target, thisArg, args).then((realMap) => {
             if (realMap && realMap.size > 0) return realMap;
             return buildMacKeyboardLayoutMap(w);
           });
@@ -689,8 +721,8 @@ enum CuriumDesktopParityExtension {
           return cachedVoices;
         };
 
-        const wrappedGetVoices = makeNativeFn('getVoices', 0, () => {
-          const real = origGetVoices.call(w.speechSynthesis);
+        const wrappedGetVoices = wrapNativeMethod(w, origGetVoices, (target, thisArg, args) => {
+          const real = Reflect.apply(target, thisArg, args);
           if (real && real.length > 0) return real;
           return w.Array.prototype.slice.call(getFallbackVoices());
         });
@@ -708,8 +740,8 @@ enum CuriumDesktopParityExtension {
       if (w.MediaCapabilities && w.MediaCapabilities.prototype &&
           typeof w.MediaCapabilities.prototype.decodingInfo === 'function') {
         const origDecodingInfo = w.MediaCapabilities.prototype.decodingInfo;
-        const wrappedDecodingInfo = makeNativeFn('decodingInfo', 1, (...args) => {
-          const p = origDecodingInfo.apply(w.navigator.mediaCapabilities, args);
+        const wrappedDecodingInfo = wrapNativeMethod(w, origDecodingInfo, (target, thisArg, args) => {
+          const p = Reflect.apply(target, thisArg, args);
           const cfg = args[0];
           if (!cfg || cfg.type !== 'file' || cfg.keySystemConfiguration) return p;
           const hasVideo = Boolean(cfg.video && typeof cfg.video.contentType === 'string');
@@ -870,14 +902,23 @@ enum CuriumDesktopParityExtension {
     @discardableResult
     static func materialize(
         into trustedUnpackedRoot: URL,
-        profileSeed: String? = nil
+        profileSeed: String? = nil,
+        menuBarHeight: Int = 38,
+        dockOnLeft: Bool = false
     ) throws -> URL {
-        try materializeWithChangeStatus(into: trustedUnpackedRoot, profileSeed: profileSeed).directory
+        try materializeWithChangeStatus(
+            into: trustedUnpackedRoot,
+            profileSeed: profileSeed,
+            menuBarHeight: menuBarHeight,
+            dockOnLeft: dockOnLeft
+        ).directory
     }
 
     static func materializeWithChangeStatus(
         into trustedUnpackedRoot: URL,
-        profileSeed: String? = nil
+        profileSeed: String? = nil,
+        menuBarHeight: Int = 38,
+        dockOnLeft: Bool = false
     ) throws -> (directory: URL, didChange: Bool) {
         let fm = FileManager.default
         try fm.createDirectory(at: trustedUnpackedRoot, withIntermediateDirectories: true)
@@ -887,7 +928,11 @@ enum CuriumDesktopParityExtension {
         let scriptURL = targetDir.appending(path: "desktop_parity.js", directoryHint: .notDirectory)
         let stampURL = targetDir.appending(path: versionStampFileName, directoryHint: .notDirectory)
 
-        let renderedScript = parityScript(profileSeed: profileSeed)
+        let renderedScript = parityScript(
+            profileSeed: profileSeed,
+            menuBarHeight: menuBarHeight,
+            dockOnLeft: dockOnLeft
+        )
         let manifestData = Data(manifestJSON.utf8)
         let scriptData = Data(renderedScript.utf8)
         let signature = contentSignature(for: renderedScript)
@@ -950,7 +995,9 @@ enum CuriumDesktopParityExtension {
     static func ensureInstalled(
         using manager: any CrIOSExtensionManagingV1,
         enabled: Bool = true,
-        profileSeed: String? = nil
+        profileSeed: String? = nil,
+        menuBarHeight: Int = 38,
+        dockOnLeft: Bool = false
     ) async {
         let managerObj = manager as AnyObject
         completedManagers.removeAll { $0.box.value == nil }
@@ -973,7 +1020,13 @@ enum CuriumDesktopParityExtension {
         }
 
         let task = Task<Void, Never> { @MainActor in
-            let done = await installWithRetry(using: manager, enabled: enabled, profileSeed: profileSeed)
+            let done = await installWithRetry(
+                using: manager,
+                enabled: enabled,
+                profileSeed: profileSeed,
+                menuBarHeight: menuBarHeight,
+                dockOnLeft: dockOnLeft
+            )
             if done {
                 completedManagers.removeAll { $0.box.value == nil || $0.box.value === managerObj }
                 completedManagers.append((WeakManagerBox(managerObj), enabled))
@@ -988,7 +1041,9 @@ enum CuriumDesktopParityExtension {
     private static func installWithRetry(
         using manager: any CrIOSExtensionManagingV1,
         enabled: Bool,
-        profileSeed: String?
+        profileSeed: String?,
+        menuBarHeight: Int,
+        dockOnLeft: Bool
     ) async -> Bool {
         let totalAttempts = retryBackoffs.count + 1
         for attempt in 0..<totalAttempts {
@@ -1012,7 +1067,9 @@ enum CuriumDesktopParityExtension {
             do {
                 let materialized = try materializeWithChangeStatus(
                     into: URL(fileURLWithPath: rootPath, isDirectory: true),
-                    profileSeed: profileSeed
+                    profileSeed: profileSeed,
+                    menuBarHeight: menuBarHeight,
+                    dockOnLeft: dockOnLeft
                 )
                 extDir = materialized.directory
                 didChange = materialized.didChange

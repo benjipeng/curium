@@ -3,9 +3,9 @@ import Foundation
 /// Current full Stable Google Chrome release baseline anchored across all verified templates.
 enum CuriumChromeStableBaseline {
     static let majorVersion = "158"
-    static let fullVersion = "158.0.8127.37"
+    static let fullVersion = "158.0.8127.89"
     static let productVersion = "Chrome/158.0.0.0"
-    static let macOSPlatformVersion = "26.3.1"
+    static let macOSPlatformVersion = "26.7.3"
     static let androidPlatformVersion = "15.0.0"
 }
 
@@ -134,7 +134,7 @@ enum CuriumFingerprintPresets {
         enableGlobalPrivacyControl: false,
         hardware: CuriumHardwareOverrides(
             hardwareConcurrency: 8,
-            deviceMemoryGB: 16,
+            deviceMemoryGB: 8,
             timezone: nil
         ),
         fontProfile: .apple,
@@ -209,7 +209,7 @@ enum CuriumFingerprintPresets {
         enableGlobalPrivacyControl: true,
         hardware: CuriumHardwareOverrides(
             hardwareConcurrency: 8,
-            deviceMemoryGB: 16,
+            deviceMemoryGB: 8,
             timezone: nil
         ),
         fingerprintSeed: nil,
@@ -218,25 +218,23 @@ enum CuriumFingerprintPresets {
         hideSpeechVoices: false
     )
 
-    /// Rolls a coherent hardware/GPU/screen variant for `profile` from its matching
-    /// device pool, selecting a variant distinct from `profile`'s current hardware/GPU
-    /// signature and preferring variants unused by `existingProfiles`.
-    /// Returns `nil` for legacy/custom archetypes without a verified hardware variant pool.
+    /// Rolls a coherent hardware/GPU/screen/OS/Chrome variant for `profile` from the
+    /// continuous real-Mac Apple Silicon manifold (`CuriumMacOSManifold`), avoiding
+    /// `profile`'s current hardware/display and active `existingProfiles`.
+    /// Returns `nil` for legacy/custom archetypes without a verified macOS pool.
     /// Never mutates `id`, `displayName`, `proxy`, `timezone`, `languages`, or `fingerprintSeed`.
     static func rollCoherentHardwareVariant(
         for profile: CuriumFingerprintProfile,
         avoiding existingProfiles: [CuriumFingerprintProfile] = []
     ) -> CuriumFingerprintProfile? {
-        guard let poolID = CuriumFingerprintDevicePools.poolID(for: profile),
-              let variant = CuriumFingerprintDevicePools.selectVariant(
-                  forPoolID: poolID,
-                  avoiding: existingProfiles,
-                  excluding: profile
-              )
-        else {
+        guard CuriumFingerprintDevicePools.poolID(for: profile) != nil else {
             return nil
         }
-        return variant.apply(to: profile)
+        let sampled = CuriumMacOSManifold.sampleIdentity(
+            avoiding: existingProfiles,
+            excluding: profile
+        )
+        return CuriumMacOSManifold.apply(sampled, to: profile)
     }
 }
 
@@ -447,20 +445,20 @@ struct CuriumHardwareProfileVariant: Identifiable, Equatable, Sendable {
 
 /// Curated coherent hardware/GPU/screen pools for verified fingerprint templates.
 enum CuriumFingerprintDevicePools {
-    /// Apple Silicon M1–M5 Max tiers spanning 8–18 CPU cores, 8 / 16 / 32 GB RAM
-    /// (matching real macOS Chrome `navigator.deviceMemory` buckets), distinct authentic
-    /// macOS point releases, recent Chrome stable releases, Dock frames, and 30-bit P3 displays.
+    /// Apple Silicon M1–M5 Max tiers spanning 8–18 CPU cores and spec-capped 8 GB
+    /// `navigator.deviceMemory` (matching real macOS Chrome's W3C Device Memory cap),
+    /// verified Chrome Stable releases, real macOS point releases, Dock frames, and 30-bit P3 displays.
     private static func makeMacOSAppleSiliconVariants(poolID: String) -> [CuriumHardwareProfileVariant] {
         [
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-m1-8c-8g-1440x900",
                 poolID: poolID,
-                label: "Apple M1 · 8c · 8 GB · 1440×900",
+                label: "Apple M1 · 8c · 1440×900",
                 appliesToBothSlots: true,
                 majorVersion: "157",
-                fullVersion: "157.0.8054.92",
+                fullVersion: "157.0.8103.80",
                 productVersion: "Chrome/157.0.0.0",
-                platformVersion: "15.5.0",
+                platformVersion: "15.8.3",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -481,12 +479,12 @@ enum CuriumFingerprintDevicePools {
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-m2-8c-8g-1470x956",
                 poolID: poolID,
-                label: "Apple M2 · 8c · 8 GB · 1470×956",
+                label: "Apple M2 · 8c · 1470×956",
                 appliesToBothSlots: true,
                 majorVersion: CuriumChromeStableBaseline.majorVersion,
                 fullVersion: CuriumChromeStableBaseline.fullVersion,
                 productVersion: CuriumChromeStableBaseline.productVersion,
-                platformVersion: "26.2.0",
+                platformVersion: "26.6.2",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -507,7 +505,7 @@ enum CuriumFingerprintDevicePools {
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-m3-8c-16g-1512x982",
                 poolID: poolID,
-                label: "Apple M3 · 8c · 16 GB · 1512×982",
+                label: "Apple M3 · 8c · 1512×982",
                 appliesToBothSlots: true,
                 majorVersion: CuriumChromeStableBaseline.majorVersion,
                 fullVersion: CuriumChromeStableBaseline.fullVersion,
@@ -526,19 +524,19 @@ enum CuriumFingerprintDevicePools {
                 hoverType: .hover,
                 pdfViewerEnabled: true,
                 hardwareConcurrency: 8,
-                deviceMemoryGB: 16,
+                deviceMemoryGB: 8,
                 fontProfile: .apple,
                 hideSpeechVoices: false
             ),
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-m3pro-12c-16g-1728x1117",
                 poolID: poolID,
-                label: "Apple M3 Pro · 12c · 16 GB · 1728×1117",
+                label: "Apple M3 Pro · 12c · 1728×1117",
                 appliesToBothSlots: true,
                 majorVersion: CuriumChromeStableBaseline.majorVersion,
-                fullVersion: "158.0.8127.64",
+                fullVersion: "158.0.8127.37",
                 productVersion: CuriumChromeStableBaseline.productVersion,
-                platformVersion: "26.2.0",
+                platformVersion: "26.7.2",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -552,19 +550,19 @@ enum CuriumFingerprintDevicePools {
                 hoverType: .hover,
                 pdfViewerEnabled: true,
                 hardwareConcurrency: 12,
-                deviceMemoryGB: 16,
+                deviceMemoryGB: 8,
                 fontProfile: .apple,
                 hideSpeechVoices: false
             ),
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-m4-10c-16g-1680x1050",
                 poolID: poolID,
-                label: "Apple M4 · 10c · 16 GB · 1680×1050",
+                label: "Apple M4 · 10c · 1680×1050",
                 appliesToBothSlots: true,
                 majorVersion: "156",
-                fullVersion: "156.0.7980.105",
+                fullVersion: "156.0.8078.114",
                 productVersion: "Chrome/156.0.0.0",
-                platformVersion: "26.3.1",
+                platformVersion: "26.7.3",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -578,19 +576,19 @@ enum CuriumFingerprintDevicePools {
                 hoverType: .hover,
                 pdfViewerEnabled: true,
                 hardwareConcurrency: 10,
-                deviceMemoryGB: 16,
+                deviceMemoryGB: 8,
                 fontProfile: .apple,
                 hideSpeechVoices: false
             ),
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-m4pro-14c-32g-1728x1117",
                 poolID: poolID,
-                label: "Apple M4 Pro · 14c · 32 GB · 1728×1117",
+                label: "Apple M4 Pro · 14c · 1728×1117",
                 appliesToBothSlots: true,
                 majorVersion: CuriumChromeStableBaseline.majorVersion,
                 fullVersion: CuriumChromeStableBaseline.fullVersion,
                 productVersion: CuriumChromeStableBaseline.productVersion,
-                platformVersion: "15.6.1",
+                platformVersion: "15.8.3",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -604,19 +602,19 @@ enum CuriumFingerprintDevicePools {
                 hoverType: .hover,
                 pdfViewerEnabled: true,
                 hardwareConcurrency: 14,
-                deviceMemoryGB: 32,
+                deviceMemoryGB: 8,
                 fontProfile: .apple,
                 hideSpeechVoices: false
             ),
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-m4max-16c-32g-2560x1440",
                 poolID: poolID,
-                label: "Apple M4 Max · 16c · 32 GB · 2560×1440",
+                label: "Apple M4 Max · 16c · 2560×1440",
                 appliesToBothSlots: true,
                 majorVersion: "157",
-                fullVersion: "157.0.8054.118",
+                fullVersion: "157.0.8103.51",
                 productVersion: "Chrome/157.0.0.0",
-                platformVersion: "15.5.0",
+                platformVersion: "15.8.2",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -624,20 +622,20 @@ enum CuriumFingerprintDevicePools {
                 webglVendor: "Google Inc. (Apple)",
                 webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Max, Unspecified Version)",
                 webglProfile: .native,
-                screen: CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2500, availHeight: 1402, colorDepth: 30),
+                screen: CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2500, availHeight: 1415, colorDepth: 30),
                 maxTouchPoints: 0,
                 pointerType: .fine,
                 hoverType: .hover,
                 pdfViewerEnabled: true,
                 hardwareConcurrency: 16,
-                deviceMemoryGB: 32,
+                deviceMemoryGB: 8,
                 fontProfile: .apple,
                 hideSpeechVoices: false
             ),
             CuriumHardwareProfileVariant(
                 id: "\(poolID)-m5max-18c-32g-2560x1440",
                 poolID: poolID,
-                label: "Apple M5 Max · 18c · 32 GB · 2560×1440",
+                label: "Apple M5 Max · 18c · 2560×1440",
                 appliesToBothSlots: true,
                 majorVersion: CuriumChromeStableBaseline.majorVersion,
                 fullVersion: CuriumChromeStableBaseline.fullVersion,
@@ -656,7 +654,7 @@ enum CuriumFingerprintDevicePools {
                 hoverType: .hover,
                 pdfViewerEnabled: true,
                 hardwareConcurrency: 18,
-                deviceMemoryGB: 32,
+                deviceMemoryGB: 8,
                 fontProfile: .apple,
                 hideSpeechVoices: false
             ),
@@ -817,6 +815,13 @@ struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
         baseProfile.usesNativeHardwareAndGPU
     }
 
+    /// Privacy Hardened enables C++ farbling by default; standard macOS Desktop stays
+    /// zero-noise native (relying on `CuriumMacOSManifold` + CoreText fonts + TTS voices)
+    /// while leaving farbling opt-in.
+    var enablesFarblingByDefault: Bool {
+        id == CuriumFingerprintPresets.privacyHardened.id
+    }
+
     static func template(for id: String?) -> CuriumProfileTemplate? {
         guard let lowered = id?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               !lowered.isEmpty else {
@@ -832,7 +837,7 @@ struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
         palette: CuriumPalette? = nil,
         siteMode: CuriumSiteMode? = nil,
         searchEngine: CuriumSearchEngine? = nil,
-        enableFarbling: Bool = true,
+        enableFarbling: Bool? = nil,
         randomizeHardwareVariant: Bool = true,
         hardwareVariantID: String? = nil,
         avoidingExisting existingProfiles: [CuriumFingerprintProfile] = [],
@@ -862,17 +867,16 @@ struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
             variantID: hardwareVariantID
         ) {
             profile = explicitVariant.apply(to: profile)
-        } else if randomizeHardwareVariant,
-                  hasHardwareVariantPool,
-                  let variant = CuriumFingerprintDevicePools.selectVariant(
-                      forPoolID: self.id,
-                      avoiding: existingProfiles,
-                      excluding: nil
-                  ) {
-            profile = variant.apply(to: profile)
+        } else if randomizeHardwareVariant, hasHardwareVariantPool {
+            let sampled = CuriumMacOSManifold.sampleIdentity(
+                avoiding: existingProfiles,
+                excluding: nil
+            )
+            profile = CuriumMacOSManifold.apply(sampled, to: profile)
         }
 
-        if enableFarbling {
+        let resolvedEnableFarbling = enableFarbling ?? enablesFarblingByDefault
+        if resolvedEnableFarbling {
             profile.farbling = profile.farbling ?? .stealthSafe
             profile.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
         } else {

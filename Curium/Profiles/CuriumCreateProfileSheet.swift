@@ -97,7 +97,8 @@ struct CuriumCreateProfileSheet: View {
     @State private var selectedPalette: CuriumPalette = CuriumProfileTemplate.allTemplates.first?.defaultPalette ?? .neptunium
     @State private var userPickedSymbol = false
     @State private var userPickedPalette = false
-    @State private var enableFarbling = true
+    @State private var userToggledFarbling = false
+    @State private var enableFarbling = CuriumProfileTemplate.allTemplates.first?.enablesFarblingByDefault ?? false
     @State private var selectedHardwareChoice: String = CuriumCreateProfileSheet.autoDistinctVariantTag
     @State private var isNetworkLocaleExpanded = false
     @State private var proxyModeSelection: ProxyModeChoice = .system
@@ -368,6 +369,9 @@ struct CuriumCreateProfileSheet: View {
                     if !userPickedPalette {
                         selectedPalette = template.defaultPalette
                     }
+                    if !userToggledFarbling {
+                        enableFarbling = template.enablesFarblingByDefault
+                    }
                 } label: {
                     HStack(alignment: .top, spacing: 12) {
                         VStack(alignment: .leading, spacing: 3) {
@@ -431,8 +435,17 @@ struct CuriumCreateProfileSheet: View {
         let poolVariants = CuriumFingerprintDevicePools.variants(forTemplateID: selectedTemplate.id)
 
         return Section {
-            Toggle("Anti-Fingerprinting Protection", isOn: $enableFarbling)
-                .accessibilityIdentifier("curium.createProfile.farbling")
+            Toggle(
+                "Anti-Fingerprinting Protection",
+                isOn: Binding(
+                    get: { enableFarbling },
+                    set: { next in
+                        userToggledFarbling = true
+                        enableFarbling = next
+                    }
+                )
+            )
+            .accessibilityIdentifier("curium.createProfile.farbling")
 
             if !poolVariants.isEmpty {
                 Picker("Mac Hardware", selection: $selectedHardwareChoice) {
@@ -450,7 +463,7 @@ struct CuriumCreateProfileSheet: View {
             Text("Device & Protection")
         } footer: {
             Text(
-                "Auto assigns a distinct Apple Silicon chip, display, and macOS font profile. Anti-fingerprinting adds a unique per-site seed for Audio and WebGL (or all four surfaces on Privacy Hardened)."
+                "Auto assigns a distinct Apple Silicon chip, display, macOS release, and font profile. Optional farbling adds a unique per-site seed (enabled by default on Privacy Hardened)."
             )
         }
     }

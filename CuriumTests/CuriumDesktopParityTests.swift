@@ -577,29 +577,29 @@ struct CuriumDesktopParityTests {
         #expect(rotated.didChange == true)
     }
 
-    @Test("CuriumProfileFontManager assigns disjoint clean 4-6 font macOS suites across Apple Silicon tiers and clones valid SFNT binaries")
+    @Test("CuriumProfileFontManager exposes all 45 clean 5-6 font macOS suites and clones valid SFNT binaries")
     func profileFontManagerDisjointSuitesAndSFNTCloning() throws {
-        let tiers = [
-            "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
-            "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
-            "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)",
-            "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Pro, Unspecified Version)",
-            "ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)",
-            "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version)",
-        ]
-        var seenSuites: Set<[String]> = []
-        for (idx, renderer) in tiers.enumerated() {
+        #expect(CuriumProfileFontManager.macOSFontSuites.count == 45)
+        let uniqueSuites = Set(CuriumProfileFontManager.macOSFontSuites)
+        #expect(uniqueSuites.count == 45)
+        for suite in CuriumProfileFontManager.macOSFontSuites {
+            #expect(suite.count == 1 || suite.count == 2)
+            #expect(!suite.contains("Bitstream Vera Sans Mono"))
+        }
+
+        var reachedSuites: Set<[String]> = []
+        for idx in 0..<400 {
             let fonts = CuriumProfileFontManager.selectedFonts(
-                forProfileSeed: "p-tier-\(idx)|seed-\(idx)|1700000000000",
-                webglRenderer: renderer
+                forProfileSeed: "p-sample-\(idx)|seed-\(idx)|1700000000000",
+                webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M\((idx % 4) + 1), Unspecified Version)"
             )
             let names = fonts.map(\.familyName)
             #expect(names.contains("Arial Unicode MS"))
             #expect(names.count >= 2 && names.count <= 3) // +3 built-in iOS fonts => 5..6 total detected
             #expect(!names.contains("Bitstream Vera Sans Mono"))
-            seenSuites.insert(names)
+            reachedSuites.insert(names)
         }
-        #expect(seenSuites.count == tiers.count)
+        #expect(reachedSuites.count >= 40)
 
         // Verify cloned SFNT binary has valid sfnt magic and parses via CGDataProvider/CGFont.
         let sampleSpec = CuriumProfileFontManager.macOSBaselineFont
@@ -610,5 +610,226 @@ struct CuriumDesktopParityTests {
         let provider = try #require(CGDataProvider(data: sfnt as CFData))
         let cgFont = try #require(CGFont(provider))
         #expect((cgFont.postScriptName as String?) == sampleSpec.postScriptName)
+    }
+
+    @Test("parityScript v1.2.0 honors notched (38 pt) vs non-notched (25 pt) menu bar and Left/Right side Dock availLeft")
+    func parityScriptMenuBarAndSideDockPlacement() throws {
+        func evalScreen(
+            width: Int,
+            height: Int,
+            availWidth: Int,
+            availHeight: Int,
+            menuBarHeight: Int,
+            dockOnLeft: Bool
+        ) throws -> (availTop: Int, availLeft: Int) {
+            let ctx = try #require(JSContext())
+            var jsErr: String?
+            ctx.exceptionHandler = { _, exc in jsErr = exc?.toString() }
+            ctx.evaluateScript("""
+            globalThis.window = globalThis;
+            function Screen() {}
+            Object.defineProperty(Screen.prototype, 'availTop', { get() { return 0; }, configurable: true, enumerable: true });
+            Object.defineProperty(Screen.prototype, 'availLeft', { get() { return 0; }, configurable: true, enumerable: true });
+            globalThis.Screen = Screen;
+            globalThis.screen = Object.create(Screen.prototype, {
+              width: { value: \(width), configurable: true },
+              height: { value: \(height), configurable: true },
+              availWidth: { value: \(availWidth), configurable: true },
+              availHeight: { value: \(availHeight), configurable: true }
+            });
+            globalThis.navigator = { platform: 'MacIntel' };
+            """)
+            ctx.evaluateScript(
+                CuriumDesktopParityExtension.parityScript(
+                    profileSeed: "p-dock|seed|1700000000000",
+                    menuBarHeight: menuBarHeight,
+                    dockOnLeft: dockOnLeft
+                )
+            )
+            #expect(jsErr == nil)
+            let top = try #require(ctx.evaluateScript("window.screen.availTop")?.toInt32())
+            let left = try #require(ctx.evaluateScript("window.screen.availLeft")?.toInt32())
+            return (Int(top), Int(left))
+        }
+
+        // External/non-notch display with bottom Dock -> availTop == 25, availLeft == 0 even if dockOnLeft is true.
+        let externalBottom = try evalScreen(
+            width: 2560, height: 1440, availWidth: 2560, availHeight: 1355,
+            menuBarHeight: 25, dockOnLeft: true
+        )
+        #expect(externalBottom.availTop == 25)
+        #expect(externalBottom.availLeft == 0)
+
+        // Notched MacBook with left Dock (62 pt) -> availTop == 38, availLeft == 62.
+        let notchedLeft = try evalScreen(
+            width: 1728, height: 1117, availWidth: 1666, availHeight: 1079,
+            menuBarHeight: 38, dockOnLeft: true
+        )
+        #expect(notchedLeft.availTop == 38)
+        #expect(notchedLeft.availLeft == 62)
+
+        // Notched MacBook with right Dock (62 pt) -> availTop == 38, availLeft == 0.
+        let notchedRight = try evalScreen(
+            width: 1728, height: 1117, availWidth: 1666, availHeight: 1079,
+            menuBarHeight: 38, dockOnLeft: false
+        )
+        #expect(notchedRight.availTop == 38)
+        #expect(notchedRight.availLeft == 0)
+
+        // Prototype receiver brand check: invoking getter on invalid receiver throws TypeError (`Illegal invocation`).
+        let brandCtx = try #require(JSContext())
+        var brandErr: String?
+        brandCtx.exceptionHandler = { _, exc in brandErr = exc?.toString() }
+        brandCtx.evaluateScript("""
+        globalThis.window = globalThis;
+        function Screen() {}
+        Object.defineProperty(Screen.prototype, 'availTop', {
+          get() {
+            if (!(this instanceof Screen)) throw new TypeError('Illegal invocation');
+            return 0;
+          },
+          configurable: true,
+          enumerable: true
+        });
+        Object.defineProperty(Screen.prototype, 'availLeft', {
+          get() {
+            if (!(this instanceof Screen)) throw new TypeError('Illegal invocation');
+            return 0;
+          },
+          configurable: true,
+          enumerable: true
+        });
+        globalThis.Screen = Screen;
+        globalThis.screen = Object.create(Screen.prototype, {
+          width: { value: 1728, configurable: true },
+          height: { value: 1117, configurable: true },
+          availWidth: { value: 1728, configurable: true },
+          availHeight: { value: 1049, configurable: true }
+        });
+        globalThis.navigator = { platform: 'MacIntel' };
+        """)
+        brandCtx.evaluateScript(
+            CuriumDesktopParityExtension.parityScript(
+                profileSeed: "p-brand|seed|1700000000000",
+                menuBarHeight: 38,
+                dockOnLeft: false
+            )
+        )
+        #expect(brandErr == nil)
+        let brandResult = try #require(brandCtx.evaluateScript("""
+        (() => {
+          const desc = Object.getOwnPropertyDescriptor(Screen.prototype, 'availTop');
+          let threwOnBadThis = false;
+          try { Reflect.apply(desc.get, {}, []); } catch (e) { threwOnBadThis = e instanceof TypeError; }
+          return {
+            validTop: window.screen.availTop,
+            threwOnBadThis,
+            toStringStr: Function.prototype.toString.call(desc.get)
+          };
+        })()
+        """)?.toDictionary())
+        #expect((brandResult["validTop"] as? Int) == 38)
+        #expect((brandResult["threwOnBadThis"] as? Bool) == true)
+        #expect((brandResult["toStringStr"] as? String)?.contains("[native code]") == true)
+    }
+
+    @Test("CuriumMacOSManifold enforces 18 Apple Silicon SKUs (8 GB W3C cap), chip-era Nov-2026 macOS/Chrome releases, 11 mainstream @2x HiDPI displays >=960 availH, right/bottom visible Dock, and first-boot fail-closed persistence")
+    @MainActor
+    func macOSManifoldInvariantsAndFirstBootRandomization() throws {
+        #expect(CuriumMacOSManifold.appleSiliconSKUs.count == 18)
+        #expect(CuriumMacOSManifold.displayGeometries.count == 11)
+        #expect(CuriumMacOSManifold.chipDisplayName(fromWebGLRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Pro, Unspecified Version)") == "Apple M2 Pro")
+
+        let validChromePrefixes = ["156.0.8078.", "157.0.8103.", "158.0.8127."]
+        var seenSKUs: Set<String> = []
+        var seenDisplays: Set<String> = []
+        var seenDockPlacements: Set<CuriumMacOSManifold.DockPlacement> = []
+        for _ in 0..<240 {
+            let sampled = CuriumMacOSManifold.sampleIdentity()
+            seenSKUs.insert(sampled.sku.id)
+            seenDisplays.insert("\(sampled.display.width)x\(sampled.display.height)")
+            seenDockPlacements.insert(sampled.dockPlacement)
+
+            // W3C / Chromium hard cap: navigator.deviceMemory is always <= 8 GB on real macOS Chrome.
+            #expect(sampled.sku.memoryGB == 8)
+
+            // Chip-era macOS constraint: M4 / M4 Pro never pair with macOS 14.x.
+            #expect(sampled.macOS.major >= sampled.sku.minMacOSMajor)
+            #expect([14, 15, 26].contains(sampled.macOS.major))
+            #expect(["156", "157", "158"].contains(sampled.chrome.major))
+            #expect(validChromePrefixes.contains { sampled.chrome.fullVersion.hasPrefix($0) })
+            #expect(sampled.chrome.productVersion == "Chrome/\(sampled.chrome.major).0.0.0")
+
+            // M1 non-notched SKUs never pair with notched built-in panels.
+            if !sampled.sku.prefersNotchedBuiltIn {
+                #expect(!sampled.display.isNotchedBuiltIn)
+                #expect(sampled.display.menuBarHeight == 25)
+            }
+            #expect(CuriumMacOSManifold.inferredMenuBarHeight(for: sampled.screen) == sampled.display.menuBarHeight)
+            #expect(CuriumMacOSManifold.prefersLeftDock(forProfileSeed: "any-seed") == false)
+
+            // Visible Dock invariant + availHeight >= 960 (prevents 0110 viewport stretching on slab & duo Portrait).
+            let availW = try #require(sampled.screen.availWidth)
+            let availH = try #require(sampled.screen.availHeight)
+            #expect(availH >= 960)
+            switch sampled.dockPlacement {
+            case .bottom:
+                #expect(availW == sampled.display.width)
+                let dockH = sampled.display.height - sampled.display.menuBarHeight - availH
+                #expect((38...84).contains(dockH))
+            case .right:
+                #expect(availH == sampled.display.height - sampled.display.menuBarHeight)
+                let dockW = sampled.display.width - availW
+                #expect((44...78).contains(dockW))
+            }
+
+            let applied = CuriumMacOSManifold.apply(sampled, to: CuriumFingerprintPresets.macosDesktopFirst)
+            let report = CuriumFingerprintValidator.validate(applied)
+            #expect(report.errors.isEmpty)
+            #expect(report.warnings.isEmpty)
+            #expect(applied.desktop.osCpu == "Macintosh; Intel Mac OS X 10_15_7")
+            #expect(applied.desktop.webglProfile == .native)
+            #expect(applied.shortArchetypeSummary.contains(sampled.sku.chipName))
+        }
+        #expect(seenSKUs.count >= 15)
+        #expect(seenDisplays.count >= 9)
+        #expect(seenDockPlacements == [.bottom, .right])
+
+        // Two fresh zero-noise installs must never collapse onto a single hardcoded Personal identity
+        // and still derive distinct CoreText/voice seed strings without needing a farbling seed.
+        let installs = (0..<12).map { _ in CuriumFingerprintStore.makeDefaultPersonalProfile() }
+        let distinctCombos = Set(installs.map { "\($0.desktop.webglRenderer ?? "")|\($0.desktop.screen?.width ?? 0)x\($0.desktop.screen?.height ?? 0)|\($0.desktop.platformVersion ?? "")" })
+        #expect(distinctCombos.count >= 8)
+        let distinctProfileSeeds = Set(installs.map(CuriumProfileFontManager.profileSeedString(for:)))
+        #expect(distinctProfileSeeds.count >= 10)
+
+        // First-boot ENOENT store persists randomized Personal fail-closed inside prepareEngineLaunch before ChromeMain.
+        defer { CuriumFingerprintBootstrap.resetStateForTesting() }
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-firstboot-persist-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let storeURL = dir.appending(path: CuriumFingerprintStore.fileName)
+        let freshStore = CuriumFingerprintStore(fileURL: storeURL)
+        #expect(!FileManager.default.fileExists(atPath: storeURL.path))
+        let v2Caps = CuriumEngineFingerprintCapabilities(dictionary: [
+            "contractVersion": 2,
+            "supportedSchemaVersions": [1, 2],
+            "maxConfigBytes": 65536,
+        ])
+        var persistedBeforeEngineConfigure = false
+        let outcome = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: freshStore,
+            capabilitiesProvider: { v2Caps },
+            configureEngine: { _, _ in
+                persistedBeforeEngineConfigure = FileManager.default.fileExists(atPath: storeURL.path)
+                return true
+            }
+        )
+        #expect(outcome == .configured(profileID: "default", revision: 1, nativeHardware: false))
+        #expect(persistedBeforeEngineConfigure == true)
+        let reloaded = CuriumFingerprintStore(fileURL: storeURL)
+        #expect(reloaded.profile(id: "default")?.desktop == freshStore.profile(id: "default")?.desktop)
+        #expect(reloaded.profile(id: "default")?.fingerprintSeed == freshStore.profile(id: "default")?.fingerprintSeed)
     }
 }

@@ -252,11 +252,8 @@ enum CuriumFingerprintValidator {
     ) {
         checkSlotCoherence(profile.mobile, name: "mobile", into: &report)
         checkSlotCoherence(profile.desktop, name: "desktop", into: &report)
-        let defaultPlatform = profile.defaultSlot == .desktop
-            ? (profile.desktop.platform ?? "macOS")
-            : (profile.mobile.platform ?? "Android")
-        if defaultPlatform == "Android", let mem = profile.hardware.deviceMemoryGB, mem > 8 {
-            report.warnings.append("Android Chrome caps navigator.deviceMemory at 8 GB; overriding to \(Int(mem)) GB is anomalous.")
+        if let mem = profile.hardware.deviceMemoryGB, mem > 8 {
+            report.warnings.append("Chrome caps navigator.deviceMemory at 8 GB per the W3C Device Memory spec; overriding to \(Int(mem)) GB is anomalous.")
         }
         if case .fixed = profile.proxy,
            profile.webrtcIpHandlingPolicy != .disableNonProxiedUdp

@@ -89,22 +89,23 @@ enum CuriumProfileFontManager {
         ),
     ]
 
-    /// Twelve empirically clean 1–2 optional macOS font suites (5–6 detected fonts total
-    /// including iOS's built-in Gill Sans / Helvetica Neue / Menlo + Arial Unicode MS).
-    static let macOSFontSuites: [[String]] = [
-        ["Franklin Gothic"],               // 0: Office Editorial (5 fonts)
-        ["Minion Pro"],                    // 1: Adobe Publishing (5 fonts)
-        ["Calibri", "MYRIAD PRO"],         // 2: Office + Adobe (6 fonts)
-        ["GOTHAM"],                        // 3: Design Studio (5 fonts)
-        ["Century", "Lucida Bright"],      // 4: Serif Publishing (6 fonts)
-        ["MYRIAD PRO", "Franklin Gothic"], // 5: Creative Agency (6 fonts)
-        ["Calibri", "Century Gothic"],     // 6: Office Modern (6 fonts)
-        ["Lucida Sans", "Century"],        // 7: Productivity (6 fonts)
-        ["GOTHAM", "Lucida Sans"],         // 8: Editorial Design (6 fonts)
-        ["MYRIAD PRO"],                    // 9: Adobe Creative (5 fonts)
-        ["Calibri"],                       // 10: Office Classic (5 fonts)
-        ["Minion Pro", "Lucida Bright"],   // 11: Print Serif (6 fonts)
-    ]
+    /// All 45 empirically clean 1–2 optional macOS font suites (`C(9,1) + C(9,2) = 45`),
+    /// yielding strictly 5–6 detected fonts total (iOS's 3 built-ins + `Arial Unicode MS` + 1–2
+    /// mainstream Office/Adobe/Java/Design macOS families) with zero Linux or Windows-pack false positives.
+    static let macOSFontSuites: [[String]] = {
+        let names = macOSFontPool.map(\.familyName)
+        var suites: [[String]] = []
+        suites.reserveCapacity(names.count + (names.count * (names.count - 1)) / 2)
+        for i in names.indices {
+            suites.append([names[i]])
+        }
+        for i in names.indices {
+            for j in (i + 1)..<names.count {
+                suites.append([names[i], names[j]])
+            }
+        }
+        return suites
+    }()
 
     private static let poolByFamilyName: [String: FontAliasSpec] = Dictionary(
         uniqueKeysWithValues: macOSFontPool.map { ($0.familyName, $0) }
@@ -114,47 +115,27 @@ enum CuriumProfileFontManager {
     private static let log = Logger(subsystem: "com.appautomaton.curium", category: "profile-fonts")
 
     /// Stable seed string shared across per-profile CoreText font registration and
-    /// desktop parity voice selection.
+    /// desktop parity voice/Dock selection. Stays unique per install/profile even when
+    /// pixel/audio farbling (`fingerprintSeed`) is disabled.
     static func profileSeedString(for profile: CuriumFingerprintProfile) -> String {
-        let createdMs = Int64((profile.createdAt?.timeIntervalSince1970 ?? 0) * 1000)
-        return "\(profile.id)|\(profile.fingerprintSeed ?? "")|\(createdMs)"
+        let createdUs = Int64((profile.createdAt?.timeIntervalSince1970 ?? 0) * 1_000_000)
+        let screen = profile.desktop.screen
+        let screenKey = "\(screen?.width ?? 0)x\(screen?.height ?? 0)x\(screen?.availWidth ?? 0)x\(screen?.availHeight ?? 0)"
+        let osKey = profile.desktop.platformVersion ?? ""
+        return "\(profile.id)|\(profile.fingerprintSeed ?? "")|\(createdUs)|\(screenKey)|\(osKey)"
     }
 
-    /// Deterministically selects `Arial Unicode MS` plus 0–2 mainstream macOS optional
-    /// font families for `profileSeed` and optional hardware renderer hint.
-    /// Partitioning by Apple Silicon tier ensures consecutive auto-rolled profiles across
-    /// distinct chips select non-overlapping font suites by construction.
+    /// Deterministically selects `Arial Unicode MS` plus 1–2 mainstream macOS optional
+    /// font families across all 45 clean suites from `profileSeed`.
     static func selectedFonts(
         forProfileSeed profileSeed: String,
         webglRenderer: String? = nil
     ) -> [FontAliasSpec] {
         guard !profileSeed.isEmpty else { return [] }
-        let digest = Array(SHA256.hash(data: Data(("curium.profile.fonts.v3:" + profileSeed).utf8)))
+        let input = "curium.profile.fonts.v4:" + profileSeed + "|" + (webglRenderer ?? "")
+        let digest = Array(SHA256.hash(data: Data(input.utf8)))
         let hashWord = readLE64(digest, offset: 0)
-
-        let candidateSuiteIndices: [Int]
-        let rendererLower = (webglRenderer ?? "").lowercased()
-        if rendererLower.contains("apple m5 max") {
-            candidateSuiteIndices = [3, 2]
-        } else if rendererLower.contains("apple m4 max") {
-            candidateSuiteIndices = [5, 1]
-        } else if rendererLower.contains("apple m4 pro") {
-            candidateSuiteIndices = [5, 0]
-        } else if rendererLower.contains("apple m4") {
-            candidateSuiteIndices = [4, 7]
-        } else if rendererLower.contains("apple m3 pro") {
-            candidateSuiteIndices = [3, 8]
-        } else if rendererLower.contains("apple m3") {
-            candidateSuiteIndices = [1, 11]
-        } else if rendererLower.contains("apple m2") {
-            candidateSuiteIndices = [2, 9]
-        } else if rendererLower.contains("apple m1") {
-            candidateSuiteIndices = [6, 10]
-        } else {
-            candidateSuiteIndices = Array(macOSFontSuites.indices)
-        }
-
-        let suiteIdx = candidateSuiteIndices[Int(hashWord % UInt64(candidateSuiteIndices.count))]
+        let suiteIdx = Int(hashWord % UInt64(macOSFontSuites.count))
         let optionalNames = macOSFontSuites[suiteIdx]
         let optionalSpecs = optionalNames.compactMap { poolByFamilyName[$0] }
         return ([macOSBaselineFont] + optionalSpecs).sorted { $0.familyName < $1.familyName }

@@ -66,6 +66,7 @@ final class CuriumFingerprintStore {
     private let curiumSupportRoot: URL?
     let isProductionDefaultFile: Bool
     private var migratedSeedIDs: Set<String> = []
+    private var needsInitialPersist = false
 
     private(set) var selectedProfileID: String?
     private(set) var profiles: [CuriumFingerprintProfile]
@@ -106,14 +107,14 @@ final class CuriumFingerprintStore {
     var activeProfile: CuriumFingerprintProfile {
         profile(id: activeLaunchProfileID)
             ?? profiles.first(where: \.isPrimaryDefault)
-            ?? Self.makeDefaultPersonalProfile()
+            ?? Self.makeDefaultPersonalProfile(randomizeIdentity: false)
     }
 
     /// The profile scheduled for next cold launch.
     var nextLaunchProfile: CuriumFingerprintProfile {
         profile(id: nextLaunchProfileID)
             ?? profiles.first(where: \.isPrimaryDefault)
-            ?? Self.makeDefaultPersonalProfile()
+            ?? Self.makeDefaultPersonalProfile(randomizeIdentity: false)
     }
 
     /// True when the next launch will open a different profile slug than the active process.
@@ -136,7 +137,7 @@ final class CuriumFingerprintStore {
             selectedProfileID: selectedProfileID,
             candidate: nextLaunchProfile,
             effectiveBuild39Default: {
-                Self.makeDefaultPersonalProfile(preserveLegacyDefaults: isProductionDefaultFile)
+                CuriumFingerprintPresets.build39NativeBaseline
             }
         )
     }
@@ -225,6 +226,7 @@ final class CuriumFingerprintStore {
             self.profiles = [Self.makeDefaultPersonalProfile(preserveLegacyDefaults: isProdDefault)]
             self.retiredProfileIDs = []
             self.migratedSeedIDs = []
+            self.needsInitialPersist = true
             self.loadError = nil
             return
         }
@@ -342,9 +344,14 @@ final class CuriumFingerprintStore {
     nonisolated static func makeDefaultPersonalProfile(
         preserveLegacyDefaults: Bool = false,
         defaults: UserDefaults = .standard,
-        now: Date = .now
+        now: Date = .now,
+        randomizeIdentity: Bool = true
     ) -> CuriumFingerprintProfile {
         var profile = CuriumFingerprintPresets.macosDesktopFirst
+        if randomizeIdentity {
+            let sampled = CuriumMacOSManifold.sampleIdentity()
+            profile = CuriumMacOSManifold.apply(sampled, to: profile)
+        }
         profile.id = "default"
         profile.displayName = "Personal"
         profile.notes = ""
@@ -352,8 +359,8 @@ final class CuriumFingerprintStore {
         profile.revision = 1
         profile.symbolName = "person.crop.circle"
         profile.templateID = CuriumFingerprintPresets.macosDesktopFirst.id
-        profile.farbling = .stealthSafe
-        profile.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
+        profile.farbling = nil
+        profile.fingerprintSeed = nil
         profile.createdAt = now
         if preserveLegacyDefaults {
             let rawPalette = defaults.string(forKey: "curium.palette")
@@ -431,38 +438,23 @@ final class CuriumFingerprintStore {
             profile.fontProfile = profile.fontProfile ?? target.fontProfile
             profile.hideSpeechVoices = profile.hideSpeechVoices ?? target.hideSpeechVoices
             profile.templateID = profile.templateID ?? target.id
-            if profile.fingerprintSeed == nil && profile.farbling == nil {
-                profile.farbling = .stealthSafe
-                profile.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
-            }
             return true
         }
 
-        // Upgrade untouched 0.1.16-b29 Personal profiles (`revision == 1`, no farbling/seed)
-        // to stealth-safe Audio+WebGL farbling with a unique per-install 256-bit seed and
-        // mainstream macOS 26.3.1 platformVersion so independent installs never share the
-        // same default Visitor ID or trigger rare beta platformVersion ML penalties.
+        // Normalize untouched b29/b30 Personal profiles (`revision == 1`) that carried the
+        // hardcoded non-spec `deviceMemoryGB > 8` or legacy `.stealthSafe` audio/WebGL noise
+        // onto a clean freshly sampled zero-noise real-Mac manifold identity without altering
+        // user-edited (`revision > 1`) profiles.
         if profile.isPrimaryDefault,
            profile.revision == 1,
            profile.defaultSlot == .desktop,
            profile.desktop.platform == "macOS",
-           profile.fingerprintSeed == nil,
-           profile.farbling == nil
+           ((profile.hardware.deviceMemoryGB ?? 0) > 8 || profile.farbling == .stealthSafe)
         {
-            if profile.desktop.platformVersion == "27.2.1" {
-                profile.desktop.platformVersion = CuriumChromeStableBaseline.macOSPlatformVersion
-            }
-            if profile.mobile.platform == "macOS" && profile.mobile.platformVersion == "27.2.1" {
-                profile.mobile.platformVersion = CuriumChromeStableBaseline.macOSPlatformVersion
-            }
-            if profile.desktop.screen == CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 944, colorDepth: 30) {
-                profile.desktop.screen = target.desktop.screen
-            }
-            if profile.mobile.screen == CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 944, colorDepth: 30) {
-                profile.mobile.screen = target.mobile.screen
-            }
-            profile.farbling = .stealthSafe
-            profile.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
+            let sampled = CuriumMacOSManifold.sampleIdentity()
+            profile = CuriumMacOSManifold.apply(sampled, to: profile)
+            profile.farbling = nil
+            profile.fingerprintSeed = nil
             return true
         }
 
@@ -548,7 +540,7 @@ final class CuriumFingerprintStore {
         palette: CuriumPalette? = nil,
         siteMode: CuriumSiteMode? = nil,
         searchEngine: CuriumSearchEngine? = nil,
-        enableFarbling: Bool = true,
+        enableFarbling: Bool? = nil,
         randomizeHardwareVariant: Bool = true,
         hardwareVariantID: String? = nil,
         proxy: CuriumProxyConfig? = nil,
@@ -711,6 +703,7 @@ final class CuriumFingerprintStore {
         let previousProfiles = profiles
         let needsPersist = materializeFarblingSeedIfNeeded(at: idx)
             || migratedSeedIDs.contains(id.lowercased())
+            || needsInitialPersist
         guard needsPersist else { return true }
         if !persist() {
             profiles = previousProfiles
@@ -1110,6 +1103,7 @@ final class CuriumFingerprintStore {
 
             lastPersistError = nil
             migratedSeedIDs.removeAll()
+            needsInitialPersist = false
             return true
         } catch {
             lastPersistError = error.localizedDescription

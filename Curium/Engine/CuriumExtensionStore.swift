@@ -142,13 +142,18 @@ final class CuriumExtensionStore {
             observationBox = MainThreadObservationBox(token)
             Task { @MainActor in
                 await CuriumVideoPiPExtension.ensureInstalled(using: manager)
-                let active = CuriumFingerprintStore.shared.activeProfile
+                let active = CuriumFingerprintBootstrap.frozenLaunchProfile
+                    ?? CuriumFingerprintStore.shared.activeProfile
                 let desktopParityEnabled = active.defaultSlot == .desktop
                 let profileSeed = CuriumProfileFontManager.profileSeedString(for: active)
+                let menuBarHeight = CuriumMacOSManifold.inferredMenuBarHeight(for: active.desktop.screen)
+                let dockOnLeft = CuriumMacOSManifold.prefersLeftDock(forProfileSeed: profileSeed)
                 await CuriumDesktopParityExtension.ensureInstalled(
                     using: manager,
                     enabled: desktopParityEnabled,
-                    profileSeed: profileSeed
+                    profileSeed: profileSeed,
+                    menuBarHeight: menuBarHeight,
+                    dockOnLeft: dockOnLeft
                 )
             }
         }
