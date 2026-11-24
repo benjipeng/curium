@@ -82,6 +82,7 @@ static BOOL gCuriumExplicitFingerprintConfigured = NO;
 static BOOL gCuriumEnableGlobalPrivacyControl = NO;
 static BOOL gCuriumDisableWebTouchDetection = NO;
 static BOOL gCuriumEnableDesktopKeyboardAPI = NO;
+static BOOL gCuriumForceSRGBColorProfile = NO;
 
 // Adds a bare switch once.
 static BOOL CuriumAddSwitch(NSMutableArray<NSString *> *args, NSString *flag) {
@@ -247,6 +248,7 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
                                                  BOOL enableGlobalPrivacyControl,
                                                  BOOL disableWebTouchDetection,
                                                  BOOL enableDesktopKeyboardAPI,
+                                                 BOOL forceSRGBColorProfile,
                                                  NSString *_Nullable jitPref,
                                                  NSString *_Nullable uaBrandPref,
                                                  NSString *_Nullable mobileUAPref,
@@ -295,8 +297,11 @@ static NSArray<NSString *> *CuriumBuildArguments(NSArray<NSString *> *base,
         changed |= CuriumMergeListSwitch(args, @"--disable-blink-features", @",",
                                          @"TouchEventFeatureDetection");
         changed |= CuriumSetDefaultSwitchValue(args, @"--force-effective-connection-type", @"4G");
-        // Set native Display-P3 / extended-sRGB gamut, dynamic-range: high, and 30-bit colorDepth in C++.
-        changed |= CuriumSetDefaultSwitchValue(args, @"--force-color-profile", @"extended-srgb");
+        // Match color profile & dynamic-range to the profile's display depth:
+        // 24-bit sRGB external displays use "srgb" (SDR), while 30-bit wide-gamut
+        // Mac Retina displays use "extended-srgb" (Display-P3 + HDR).
+        changed |= CuriumSetDefaultSwitchValue(args, @"--force-color-profile",
+                                               forceSRGBColorProfile ? @"srgb" : @"extended-srgb");
         // Raise V8 old-space limit to ~2.2 GiB desktop Chrome bucket unless already specified.
         if (!CuriumHasSwitchValueToken(args, @"--js-flags", @"--max-old-space-size=")) {
             changed |= CuriumMergeListSwitch(args, @"--js-flags", @" ", @"--max-old-space-size=2048");
@@ -350,9 +355,10 @@ static void CuriumInstallCommandLineGuard(void) {
         BOOL enableGPC = gCuriumEnableGlobalPrivacyControl;
         BOOL disableTouchDetection = gCuriumDisableWebTouchDetection;
         BOOL enableDesktopKeyboard = gCuriumEnableDesktopKeyboardAPI;
+        BOOL forceSRGB = gCuriumForceSRGBColorProfile;
         gCuriumAugmentedArguments = CuriumBuildArguments(
             base, supportsDisableSync, hasExplicitConfig, enableGPC,
-            disableTouchDetection, enableDesktopKeyboard, jitPref,
+            disableTouchDetection, enableDesktopKeyboard, forceSRGB, jitPref,
             uaBrandPref, mobileUAPref, acceptLangPref, mobileModelPref);
 
         Class cls = object_getClass(processInfo);
@@ -613,10 +619,14 @@ BOOL CuriumConfigureLaunchFingerprint(NSData *_Nullable jsonData, NSError *_Null
                 && [maxTouchPoints integerValue] == 0;
             gCuriumDisableWebTouchDetection = desktopZeroTouch;
             gCuriumEnableDesktopKeyboardAPI = desktopZeroTouch;
+            NSDictionary *desktopScreen = [desktop[@"screen"] isKindOfClass:[NSDictionary class]] ? desktop[@"screen"] : nil;
+            NSNumber *colorDepth = [desktopScreen[@"colorDepth"] isKindOfClass:[NSNumber class]] ? desktopScreen[@"colorDepth"] : nil;
+            gCuriumForceSRGBColorProfile = desktopZeroTouch && colorDepth != nil && [colorDepth integerValue] == 24;
         } else {
             gCuriumEnableGlobalPrivacyControl = NO;
             gCuriumDisableWebTouchDetection = NO;
             gCuriumEnableDesktopKeyboardAPI = NO;
+            gCuriumForceSRGBColorProfile = NO;
         }
         NSDictionary<NSString *, id> *status = CuriumEngineActiveFingerprintStatusDict();
         NSString *profileId = [status[@"appliedProfileId"] isKindOfClass:[NSString class]]
@@ -633,6 +643,7 @@ BOOL CuriumConfigureLaunchFingerprint(NSData *_Nullable jsonData, NSError *_Null
         gCuriumEnableGlobalPrivacyControl = NO;
         gCuriumDisableWebTouchDetection = NO;
         gCuriumEnableDesktopKeyboardAPI = NO;
+        gCuriumForceSRGBColorProfile = NO;
         CuriumRecordHookStatus(@"Fingerprint Profile", @"active", @"default (Build 39 0105)");
     }
     return YES;

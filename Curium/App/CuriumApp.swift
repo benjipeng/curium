@@ -22,6 +22,9 @@ enum CuriumApp {
             )
             return
         case .defaultBuild39, .configured:
+            CuriumProfileFontManager.registerLaunchFontsIfNeeded(
+                for: CuriumFingerprintBootstrap.frozenLaunchProfile
+            )
             let activeProfileID = CuriumFingerprintBootstrap.activeProfileID
             if CuriumRegisterShell(CuriumShellBootstrap(activeProfileID: activeProfileID)) {
                 exit(ChromeMain(CommandLine.argc, CommandLine.unsafeArgv))

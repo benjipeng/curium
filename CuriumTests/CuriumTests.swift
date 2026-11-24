@@ -576,7 +576,7 @@ struct CuriumFingerprintTests {
             #expect(preset.desktop.webglRenderer == "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)")
             #expect(
                 preset.desktop.screen
-                    == CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 944, colorDepth: 30)
+                    == CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 914, colorDepth: 30)
             )
             #expect(preset.hardware.hardwareConcurrency == 8)
             #expect(preset.hardware.deviceMemoryGB == 16)
@@ -3329,7 +3329,7 @@ struct CuriumWave2MultiProfileAndDownloadsTests {
         #expect(upgradedMac.mobile == CuriumFingerprintPresets.stableMacOSDesktopSlot)
         #expect(upgradedMac.desktop.screen?.width == 1512)
         #expect(upgradedMac.desktop.screen?.height == 982)
-        #expect(upgradedMac.desktop.screen?.availHeight == 944)
+        #expect(upgradedMac.desktop.screen?.availHeight == 914)
         #expect(upgradedMac.desktop.screen?.colorDepth == 30)
         #expect(upgradedMac.hardware.hardwareConcurrency == 8)
         #expect(upgradedMac.hardware.deviceMemoryGB == 16)
@@ -3783,8 +3783,47 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
         #expect(personal.defaultSlot == .desktop)
         #expect(personal.mobile == CuriumFingerprintPresets.stableMacOSDesktopSlot)
         #expect(personal.desktop == CuriumFingerprintPresets.stableMacOSDesktopSlot)
-        #expect(personal.fingerprintSeed == nil)
-        #expect(!personal.isFarblingActive)
+        #expect(personal.farbling == .stealthSafe)
+        let personalSeed = try #require(personal.fingerprintSeed)
+        #expect(CuriumFingerprintSchema.isValidSeedHex(personalSeed))
+        #expect(personal.isFarblingActive)
+
+        // Untouched 0.1.16-b29 Personal profile (`revision == 1`, no seed/farbling) auto-upgrades
+        // to stealthSafe Audio+WebGL farbling + unique 256-bit seed on load, while user-edited
+        // profiles (`revision > 1`) with farbling explicitly disabled are preserved untouched.
+        let b29URL = rootDir.appending(path: "b29-upgrade-\(CuriumFingerprintStore.fileName)")
+        var b29Personal = personal
+        b29Personal.revision = 1
+        b29Personal.fingerprintSeed = nil
+        b29Personal.farbling = nil
+        try JSONEncoder().encode(
+            CuriumFingerprintStore.PersistedState(
+                version: 2,
+                selectedProfileID: nil,
+                profiles: [b29Personal],
+                retiredProfileIDs: []
+            )
+        ).write(to: b29URL)
+        let b29Store = CuriumFingerprintStore(fileURL: b29URL)
+        let b29Upgraded = try #require(b29Store.profile(id: "default"))
+        #expect(b29Upgraded.farbling == .stealthSafe)
+        #expect(b29Upgraded.fingerprintSeed.map(CuriumFingerprintSchema.isValidSeedHex) == true)
+
+        let explicitOffURL = rootDir.appending(path: "explicit-off-\(CuriumFingerprintStore.fileName)")
+        var editedOffPersonal = b29Personal
+        editedOffPersonal.revision = 2
+        try JSONEncoder().encode(
+            CuriumFingerprintStore.PersistedState(
+                version: 2,
+                selectedProfileID: nil,
+                profiles: [editedOffPersonal],
+                retiredProfileIDs: []
+            )
+        ).write(to: explicitOffURL)
+        let explicitOffStore = CuriumFingerprintStore(fileURL: explicitOffURL)
+        let explicitOffLoaded = try #require(explicitOffStore.profile(id: "default"))
+        #expect(explicitOffLoaded.fingerprintSeed == nil)
+        #expect(explicitOffLoaded.farbling == nil)
         let v2Caps = CuriumEngineFingerprintCapabilities(dictionary: [
             "contractVersion": 2,
             "supportedSchemaVersions": [1, 2],
@@ -3837,9 +3876,11 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
             let created = try #require(
                 store.createProfile(fromTemplate: template.id, displayName: "Farbled \(template.title)")
             )
+            let expectedFarbling: CuriumFarblingSettings =
+                template.id == CuriumFingerprintPresets.privacyHardened.id ? .allEnabled : .stealthSafe
             #expect(created.isFarblingActive)
             #expect(created.hasFarblingEnabled)
-            #expect(created.farbling == .allEnabled)
+            #expect(created.farbling == expectedFarbling)
             let seed = try #require(created.fingerprintSeed)
             #expect(CuriumFingerprintSchema.isValidSeedHex(seed))
             #expect(!CuriumFingerprintSchema.isRetiredStaticSeed(seed))
@@ -3856,7 +3897,12 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
             )
             #expect((wireObj["fingerprintSeed"] as? String) == seed)
             let farblingObj = try #require(wireObj["farbling"] as? [String: Bool])
-            #expect(farblingObj == ["canvas": true, "audio": true, "webgl": true, "textMetrics": true])
+            #expect(farblingObj == [
+                "canvas": expectedFarbling.canvas,
+                "audio": expectedFarbling.audio,
+                "webgl": expectedFarbling.webgl,
+                "textMetrics": expectedFarbling.textMetrics,
+            ])
         }
         #expect(mintedSeeds.count == CuriumProfileTemplate.allTemplates.count)
 
@@ -4105,7 +4151,7 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
         #expect(rolledPersonal.desktop.hasWebGLOverride)
         #expect(rolledPersonal.mobile == rolledPersonal.desktop)
         #expect(rolledPersonal.desktop.webglProfile == .native)
-        #expect(rolledPersonal.desktop.majorVersion == CuriumChromeStableBaseline.majorVersion)
+        #expect(["156", "157", "158"].contains(rolledPersonal.desktop.majorVersion ?? ""))
         #expect(rolledPersonal.fontProfile == .apple)
         #expect(rolledPersonal.hideSpeechVoices == false)
         #expect(CuriumFingerprintValidator.validate(rolledPersonal).errors.isEmpty)
@@ -6456,9 +6502,16 @@ struct CuriumMediaRadarAndDownloaderTests {
     @Test("Start Page: conciseStartPostureSummary emits at most 3 editorial tokens")
     func startPageConcisePostureSummary() throws {
         let personal = CuriumFingerprintStore.makeDefaultPersonalProfile(preserveLegacyDefaults: false)
-        #expect(personal.conciseStartPostureSummary == "macOS 158 · Custom HW")
+        #expect(personal.farbling == .stealthSafe)
+        #expect(personal.fingerprintSeed != nil)
+        #expect(personal.conciseStartPostureSummary == "macOS 158 · Farbled")
 
-        var nativeOverrideOff = personal
+        var unfarbledPersonal = personal
+        unfarbledPersonal.fingerprintSeed = nil
+        unfarbledPersonal.farbling = nil
+        #expect(unfarbledPersonal.conciseStartPostureSummary == "macOS 158 · Custom HW")
+
+        var nativeOverrideOff = unfarbledPersonal
         nativeOverrideOff.desktop.webglVendor = nil
         nativeOverrideOff.desktop.webglRenderer = nil
         nativeOverrideOff.mobile.webglVendor = nil
@@ -6471,6 +6524,7 @@ struct CuriumMediaRadarAndDownloaderTests {
             id: "p-mac01",
             displayName: "Work Mac",
             enableFarbling: true,
+            hardwareVariantID: "macos-desktop-m3-8c-16g-1512x982",
             proxy: .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: nil)
         )
         #expect(macProxied.conciseStartPostureSummary == "macOS 158 · Farbled · Proxy")

@@ -13,12 +13,7 @@ the pinned engine first, translate to `patches/` once proven.
   unstripped symbols artifact (`Chromium-Blink-160.0.8171.0-arm64-symbols`, ID
   `14793005935`). GHCR cache packages migrated to `ghcr.io/benjipeng/curium/*`.
 - **App / On `ac_duo`:** `Curium-0.1.16-b29-arm64.ipa` (Build 42, staged in LiveContainer `Documents/`).
-- **Local candidate:** `Curium-0.1.16-b29` on `feat/build-41-engine-wave`
-  (Build 42 pinned + pure Apple Silicon macOS profiles + streamlined Settings +
-  three-layer downstream desktop parity; verified live on `iphone_duo_27_2`
-  Simulator, `sdk 27.2`, `95/95` `CuriumTests` passing under
-  `-warnings-as-errors`, Release ARM64 IPA packaged at
-  `dist/Curium-0.1.16-b29-arm64.ipa`).
+- **Local candidate:** `feat/build-41-engine-wave` (Build 42 pinned + pure Apple Silicon macOS profiles + same-IP per-profile `Visitor ID` independence via native CoreText macOS font suites, stealth-safe Audio+WebGL farbling, seeded TTS voices, mainstream macOS 26.3.1 baseline, and color-profile coherence; verified live on `iphone_duo_27_2` Simulator, `sdk 27.2`, `97/97` `CuriumTests` passing under `-warnings-as-errors`).
 
 ## App (on the pinned engine)
 
@@ -132,6 +127,25 @@ the pinned engine first, translate to `patches/` once proven.
   `bot: not_detected`, `tampering: false` (`high` confidence, `anomaly_score: 0`,
   `anti_detect_browser: false`), `virtual_machine: false`, `suspect_score: 11`;
   both built-in extensions hidden in Extensions sheet).
+- [x] **Same-IP multi-profile `Visitor ID` independence (on Build 42).**
+  Root-caused cross-profile and cross-device `Visitor ID` collapse onto identical
+  high-weight signals (iOS's fixed 3-font `s20` list, identical unseeded `s52`
+  TTS voices, beta `27.2.1` `platformVersion`, and `0110` solid-rect `±1 LSB`
+  canvas pixel noise triggering `tampering_ml_score > 0.96`). Added
+  `CuriumProfileFontManager.swift` (pre-`ChromeMain` in-process SFNT cloning via
+  `CTFontManagerRegisterFontsForURL(.process)` registering hardware-tier-disjoint
+  4–6 font pure macOS/Office/Adobe/Design suites including `Arial Unicode MS`,
+  zero JS hooks), `CuriumFarblingSettings.stealthSafe` (Audio + WebGL farbling
+  by default on `Personal` and `macos-desktop`, keeping `Privacy Hardened` on
+  `.allEnabled`, with automatic untouched `b29` upgrade), seeded `s52` voices
+  and Dock-safe `availTop = min(38, height - availHeight)` in
+  `CuriumDesktopParityExtension` (`manifestVersion = "1.1.0"`, reload-on-change),
+  coherent `--force-color-profile=srgb|extended-srgb` in `CuriumRuntime.m`, and
+  mainstream `macOS 26.3.1` / `15.5`–`26.3.1` + Chrome `156`–`158` + Dock frame
+  diversity across the 8 Apple Silicon pool variants. Verified live on
+  `iphone_duo_27_2` Simulator (`sdk 27.2`, `97/97` `CuriumTests` passing under
+  `-warnings-as-errors`; 4/4 distinct `Visitor ID`s on the exact same IP, real
+  local timezone, and real language, all `bot: not_detected` and `tampering: false`).
 - [ ] **Optional Build 43+ upstream polish (non-urgent):** Move `RenderWidgetHostViewIOS::GetKeyboardLayoutMap()`, `Screen::availTop` macOS menu bar offset, and a `ContentJavaScriptFeatureManager` guard (`0008`) into C++ when the next engine wave is naturally cut so `CuriumDesktopParityExtension` shrinks further.
 - [ ] **Dysprosium-inspired media stream sniffer & multi-lane downloader (on Build 41).**
   Backed by `0108` `CuriumMediaRadar` (`didLoadResourceEvent:` +

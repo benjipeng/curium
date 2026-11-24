@@ -450,7 +450,7 @@ struct CuriumCreateProfileSheet: View {
             Text("Device & Protection")
         } footer: {
             Text(
-                "Auto assigns a distinct Apple Silicon chip, RAM tier, and display. Anti-fingerprinting adds a unique per-site seed for Canvas, Audio, WebGL, and TextMetrics."
+                "Auto assigns a distinct Apple Silicon chip, display, and macOS font profile. Anti-fingerprinting adds a unique per-site seed for Audio and WebGL (or all four surfaces on Privacy Hardened)."
             )
         }
     }

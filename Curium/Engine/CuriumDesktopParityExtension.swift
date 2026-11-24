@@ -11,7 +11,7 @@ import OSLog
 /// deltas only when `navigator.platform === 'MacIntel'`.
 enum CuriumDesktopParityExtension {
     static let directoryName = "curium_desktop_parity"
-    static let manifestVersion = "1.0.0"
+    static let manifestVersion = "1.1.0"
     static let versionStampFileName = ".curium_version"
 
     /// Static RSA-2048 SubjectPublicKeyInfo (DER, base64-encoded).
@@ -72,10 +72,32 @@ enum CuriumDesktopParityExtension {
         return text + "\n"
     }
 
-    static let parityScript: String = #"""
+    static var parityScript: String {
+        parityScript(profileSeed: nil)
+    }
+
+    /// Renders `desktop_parity.js` optionally seeded for a specific profile so each
+    /// profile emits a distinct, realistic subset of optional macOS system voices
+    /// while preserving the default voice and all 19 Google Chrome TTS voices.
+    static func parityScript(profileSeed: String?) -> String {
+        let voiceSeedHex: String
+        if let profileSeed, !profileSeed.isEmpty {
+            let digest = SHA256.hash(data: Data(("curium.desktop.parity.voices.v1:" + profileSeed).utf8))
+            voiceSeedHex = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        } else {
+            voiceSeedHex = ""
+        }
+        return parityScriptTemplate.replacingOccurrences(
+            of: "__CURIUM_VOICE_SEED_HEX__",
+            with: voiceSeedHex
+        )
+    }
+
+    private static let parityScriptTemplate: String = #"""
 (() => {
   'use strict';
 
+  const PROFILE_VOICE_SEED = '__CURIUM_VOICE_SEED_HEX__';
   const patched = new WeakSet();
 
   const IOS_LEAKS = [
@@ -497,7 +519,9 @@ enum CuriumDesktopParityExtension {
               const h = w.screen.height;
               const ah = w.screen.availHeight;
               if (nativeAvailTop === 0 && h > ah) {
-                return h - ah;
+                // macOS top menu bar is 25–38 pt; any remaining vertical inset belongs
+                // to the bottom Dock (producing authentic [menuBar, rightDock, bottomDock, leftDock]).
+                return Math.min(38, h - ah);
               }
               return nativeAvailTop;
             }),
@@ -598,7 +622,30 @@ enum CuriumDesktopParityExtension {
         let cachedVoices = null;
         const getFallbackVoices = () => {
           if (cachedVoices) return cachedVoices;
-          const rows = JSON.parse(VOICES_JSON);
+          const allRows = JSON.parse(VOICES_JSON);
+          let rows = allRows;
+          if (PROFILE_VOICE_SEED && PROFILE_VOICE_SEED.length >= 16) {
+            let s0 = (parseInt(PROFILE_VOICE_SEED.slice(0, 8), 16) >>> 0) || 0x9e3779b9;
+            let s1 = (parseInt(PROFILE_VOICE_SEED.slice(8, 16), 16) >>> 0) || 0x85ebca6b;
+            const nextRand = () => {
+              let x = s0;
+              const y = s1;
+              s0 = y;
+              x ^= (x << 23) >>> 0;
+              s1 = (x ^ y ^ (x >>> 17) ^ (y >>> 26)) >>> 0;
+              return ((s1 + y) >>> 0);
+            };
+            rows = [];
+            for (let i = 0; i < allRows.length; i++) {
+              const row = allRows[i];
+              const name = row[1];
+              const isDefault = row[4] === 1;
+              const isGoogle = typeof name === 'string' && name.startsWith('Google');
+              if (isDefault || isGoogle || (nextRand() % 100) < 72) {
+                rows.push(row);
+              }
+            }
+          }
           const voiceProto = w.SpeechSynthesisVoice?.prototype || w.Object.prototype;
           const list = new w.Array(rows.length);
           for (let i = 0; i < rows.length; i++) {
@@ -811,8 +858,8 @@ enum CuriumDesktopParityExtension {
 })();
 """#
 
-    private static var contentSignature: String {
-        let combined = Data((manifestJSON + "\n---\n" + parityScript).utf8)
+    private static func contentSignature(for script: String) -> String {
+        let combined = Data((manifestJSON + "\n---\n" + script).utf8)
         let digest = SHA256.hash(data: combined)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
@@ -821,7 +868,17 @@ enum CuriumDesktopParityExtension {
     /// `<trustedUnpackedRoot>/curium_desktop_parity/`. Skips disk writes when an
     /// existing directory already matches the current content signature and bytes.
     @discardableResult
-    static func materialize(into trustedUnpackedRoot: URL) throws -> URL {
+    static func materialize(
+        into trustedUnpackedRoot: URL,
+        profileSeed: String? = nil
+    ) throws -> URL {
+        try materializeWithChangeStatus(into: trustedUnpackedRoot, profileSeed: profileSeed).directory
+    }
+
+    static func materializeWithChangeStatus(
+        into trustedUnpackedRoot: URL,
+        profileSeed: String? = nil
+    ) throws -> (directory: URL, didChange: Bool) {
         let fm = FileManager.default
         try fm.createDirectory(at: trustedUnpackedRoot, withIntermediateDirectories: true)
 
@@ -830,9 +887,10 @@ enum CuriumDesktopParityExtension {
         let scriptURL = targetDir.appending(path: "desktop_parity.js", directoryHint: .notDirectory)
         let stampURL = targetDir.appending(path: versionStampFileName, directoryHint: .notDirectory)
 
+        let renderedScript = parityScript(profileSeed: profileSeed)
         let manifestData = Data(manifestJSON.utf8)
-        let scriptData = Data(parityScript.utf8)
-        let signature = contentSignature
+        let scriptData = Data(renderedScript.utf8)
+        let signature = contentSignature(for: renderedScript)
         if fm.fileExists(atPath: targetDir.path),
            let existingStamp = try? String(contentsOf: stampURL, encoding: .utf8),
            existingStamp == signature,
@@ -840,7 +898,7 @@ enum CuriumDesktopParityExtension {
            existingManifest == manifestData,
            let existingScript = try? Data(contentsOf: scriptURL),
            existingScript == scriptData {
-            return targetDir
+            return (targetDir, false)
         }
 
         let stagingDir = trustedUnpackedRoot.appending(
@@ -868,7 +926,7 @@ enum CuriumDesktopParityExtension {
         } else {
             try fm.moveItem(at: stagingDir, to: targetDir)
         }
-        return targetDir
+        return (targetDir, true)
     }
 
     // MARK: - Idempotent Runtime Bootstrap
@@ -891,7 +949,8 @@ enum CuriumDesktopParityExtension {
     @MainActor
     static func ensureInstalled(
         using manager: any CrIOSExtensionManagingV1,
-        enabled: Bool = true
+        enabled: Bool = true,
+        profileSeed: String? = nil
     ) async {
         let managerObj = manager as AnyObject
         completedManagers.removeAll { $0.box.value == nil }
@@ -914,7 +973,7 @@ enum CuriumDesktopParityExtension {
         }
 
         let task = Task<Void, Never> { @MainActor in
-            let done = await installWithRetry(using: manager, enabled: enabled)
+            let done = await installWithRetry(using: manager, enabled: enabled, profileSeed: profileSeed)
             if done {
                 completedManagers.removeAll { $0.box.value == nil || $0.box.value === managerObj }
                 completedManagers.append((WeakManagerBox(managerObj), enabled))
@@ -928,7 +987,8 @@ enum CuriumDesktopParityExtension {
     @MainActor
     private static func installWithRetry(
         using manager: any CrIOSExtensionManagingV1,
-        enabled: Bool
+        enabled: Bool,
+        profileSeed: String?
     ) async -> Bool {
         let totalAttempts = retryBackoffs.count + 1
         for attempt in 0..<totalAttempts {
@@ -948,14 +1008,21 @@ enum CuriumDesktopParityExtension {
             }
 
             let extDir: URL
+            let didChange: Bool
             do {
-                extDir = try materialize(into: URL(fileURLWithPath: rootPath, isDirectory: true))
+                let materialized = try materializeWithChangeStatus(
+                    into: URL(fileURLWithPath: rootPath, isDirectory: true),
+                    profileSeed: profileSeed
+                )
+                extDir = materialized.directory
+                didChange = materialized.didChange
             } catch {
                 log.error("CuriumDesktopParity materialize failed: \(error.localizedDescription, privacy: .public)")
                 return false
             }
 
-            if let existing = (try? manager.extensions())?.first(where: { ($0["id"] as? String) == extensionID }),
+            if !didChange,
+               let existing = (try? manager.extensions())?.first(where: { ($0["id"] as? String) == extensionID }),
                (existing["version"] as? String) == manifestVersion {
                 if (existing["enabled"] as? Bool) != enabled {
                     try? manager.setExtensionWithID(extensionID, enabled: enabled)

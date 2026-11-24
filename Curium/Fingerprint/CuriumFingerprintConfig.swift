@@ -160,6 +160,16 @@ struct CuriumFarblingSettings: Codable, Equatable, Sendable {
 
     static let allEnabled = CuriumFarblingSettings()
 
+    /// Stealth-balanced farbling preset for macOS desktop profiles: diversifies
+    /// per-site Audio and WebGL signatures while keeping Canvas and TextMetrics
+    /// free of solid-rect pixel noise that triggers anti-detect ML classifiers.
+    static let stealthSafe = CuriumFarblingSettings(
+        canvas: false,
+        audio: true,
+        webgl: true,
+        textMetrics: false
+    )
+
     var enabledCount: Int {
         [canvas, audio, webgl, textMetrics].filter { $0 }.count
     }

@@ -1,3 +1,4 @@
+import CoreGraphics
 import CuriumEngineContract
 import Foundation
 import JavaScriptCore
@@ -453,7 +454,7 @@ struct CuriumDesktopParityTests {
         let builtInOnlyManager = MockHiddenDesktopParityManager()
         builtInOnlyManager.entries = [
             ["id": pipID, "name": "Curium Video PiP", "version": "1.1.0", "enabled": true, "removable": false],
-            ["id": parityID, "name": "Curium Desktop Parity", "version": "1.0.0", "enabled": true, "removable": false],
+            ["id": parityID, "name": "Curium Desktop Parity", "version": CuriumDesktopParityExtension.manifestVersion, "enabled": true, "removable": false],
         ]
         builtInOnlyManager.actionSnapshots[pipID] = ["badgeText": "2", "isEnabled": true, "hasPopup": true]
         builtInOnlyManager.actionSnapshots[parityID] = ["badgeText": "8", "isEnabled": true, "hasPopup": true]
@@ -483,7 +484,7 @@ struct CuriumDesktopParityTests {
         let mixedManager = MockHiddenDesktopParityManager()
         mixedManager.entries = [
             ["id": pipID, "name": "Curium Video PiP", "version": "1.1.0", "enabled": true, "removable": false],
-            ["id": parityID, "name": "Curium Desktop Parity", "version": "1.0.0", "enabled": true, "removable": false],
+            ["id": parityID, "name": "Curium Desktop Parity", "version": CuriumDesktopParityExtension.manifestVersion, "enabled": true, "removable": false],
             ["id": userID, "name": "uBlock Origin Lite", "version": "2026.11", "enabled": true, "removable": true],
         ]
         mixedManager.actionSnapshots[parityID] = ["badgeText": "9", "isEnabled": true, "hasPopup": true]
@@ -503,5 +504,111 @@ struct CuriumDesktopParityTests {
         #expect(!mixedStore.isInstalled(parityID))
         #expect(mixedManager.actionCalls.map(\.0) == [userID])
         #expect(mixedManager.blockedCountCalls.map(\.0) == [userID])
+    }
+
+    @Test("Seeded parityScript diversifies macOS speech voices per profile while preserving Samantha + all 19 Google voices and clamping Dock availTop to 38 pt")
+    func seededSpeechVoicesAndDockAvailTop() throws {
+        func runSeed(_ seed: String, height: Int = 1107, availHeight: Int = 1001) throws -> (names: [String], googleCount: Int, availTop: Int) {
+            let ctx = try #require(JSContext())
+            var jsErr: String?
+            ctx.exceptionHandler = { _, exc in jsErr = exc?.toString() }
+            ctx.evaluateScript("""
+            globalThis.window = globalThis;
+            function SpeechSynthesis() {}
+            SpeechSynthesis.prototype.getVoices = function() { return []; };
+            function SpeechSynthesisVoice() {}
+            globalThis.SpeechSynthesis = SpeechSynthesis;
+            globalThis.SpeechSynthesisVoice = SpeechSynthesisVoice;
+            globalThis.speechSynthesis = new SpeechSynthesis();
+            function Screen() {}
+            Object.defineProperty(Screen.prototype, 'availTop', { get() { return 0; }, configurable: true, enumerable: true });
+            Object.defineProperty(Screen.prototype, 'availLeft', { get() { return 0; }, configurable: true, enumerable: true });
+            globalThis.Screen = Screen;
+            globalThis.screen = Object.create(Screen.prototype, {
+              width: { value: 1710, configurable: true },
+              height: { value: \(height), configurable: true },
+              availWidth: { value: 1710, configurable: true },
+              availHeight: { value: \(availHeight), configurable: true }
+            });
+            globalThis.navigator = { platform: 'MacIntel' };
+            """)
+            ctx.evaluateScript(CuriumDesktopParityExtension.parityScript(profileSeed: seed))
+            #expect(jsErr == nil)
+            let res = try #require(ctx.evaluateScript("""
+            (() => {
+              const voices = window.speechSynthesis.getVoices();
+              return {
+                names: voices.map(v => v.name),
+                googleCount: voices.filter(v => v.name.startsWith('Google')).length,
+                defaultFirst: voices[0]?.name === 'Samantha' && voices[0]?.default === true,
+                availTop: window.screen.availTop
+              };
+            })()
+            """)?.toDictionary())
+            #expect((res["defaultFirst"] as? Bool) == true)
+            let names = try #require(res["names"] as? [String])
+            let googleCount = try #require(res["googleCount"] as? Int)
+            let availTop = try #require(res["availTop"] as? Int)
+            return (names, googleCount, availTop)
+        }
+
+        let seedA = try runSeed("p-alpha|aaaa|1700000000000")
+        let seedB = try runSeed("p-beta|bbbb|1700000005000")
+        let seedARepeat = try runSeed("p-alpha|aaaa|1700000000000")
+
+        #expect(seedA.names == seedARepeat.names)
+        #expect(seedA.names != seedB.names)
+        #expect(seedA.googleCount == 19)
+        #expect(seedB.googleCount == 19)
+        #expect(seedA.names.count > 100 && seedA.names.count < 199)
+        #expect(seedB.names.count > 100 && seedB.names.count < 199)
+        #expect(seedA.availTop == 38)
+
+        // Materializing with a rotated seed reports didChange == true so Chromium reloads desktop_parity.js.
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "curium-parity-seed-reload-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let trustedRoot = root.appending(path: "TrustedUnpackedExtensions", directoryHint: .isDirectory)
+        let first = try CuriumDesktopParityExtension.materializeWithChangeStatus(into: trustedRoot, profileSeed: "seed-1")
+        let same = try CuriumDesktopParityExtension.materializeWithChangeStatus(into: trustedRoot, profileSeed: "seed-1")
+        let rotated = try CuriumDesktopParityExtension.materializeWithChangeStatus(into: trustedRoot, profileSeed: "seed-2")
+        #expect(first.didChange == true)
+        #expect(same.didChange == false)
+        #expect(rotated.didChange == true)
+    }
+
+    @Test("CuriumProfileFontManager assigns disjoint clean 4-6 font macOS suites across Apple Silicon tiers and clones valid SFNT binaries")
+    func profileFontManagerDisjointSuitesAndSFNTCloning() throws {
+        let tiers = [
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Pro, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version)",
+        ]
+        var seenSuites: Set<[String]> = []
+        for (idx, renderer) in tiers.enumerated() {
+            let fonts = CuriumProfileFontManager.selectedFonts(
+                forProfileSeed: "p-tier-\(idx)|seed-\(idx)|1700000000000",
+                webglRenderer: renderer
+            )
+            let names = fonts.map(\.familyName)
+            #expect(names.contains("Arial Unicode MS"))
+            #expect(names.count >= 2 && names.count <= 3) // +3 built-in iOS fonts => 5..6 total detected
+            #expect(!names.contains("Bitstream Vera Sans Mono"))
+            seenSuites.insert(names)
+        }
+        #expect(seenSuites.count == tiers.count)
+
+        // Verify cloned SFNT binary has valid sfnt magic and parses via CGDataProvider/CGFont.
+        let sampleSpec = CuriumProfileFontManager.macOSBaselineFont
+        let sfnt = try #require(CuriumProfileFontManager.buildClonedSFNT(for: sampleSpec))
+        #expect(sfnt.count > 4096)
+        let magic = sfnt.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        #expect(magic == 0x0001_0000 || magic == 0x4F54_544F)
+        let provider = try #require(CGDataProvider(data: sfnt as CFData))
+        let cgFont = try #require(CGFont(provider))
+        #expect((cgFont.postScriptName as String?) == sampleSpec.postScriptName)
     }
 }

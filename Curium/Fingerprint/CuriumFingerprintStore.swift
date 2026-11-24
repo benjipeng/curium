@@ -352,6 +352,8 @@ final class CuriumFingerprintStore {
         profile.revision = 1
         profile.symbolName = "person.crop.circle"
         profile.templateID = CuriumFingerprintPresets.macosDesktopFirst.id
+        profile.farbling = .stealthSafe
+        profile.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
         profile.createdAt = now
         if preserveLegacyDefaults {
             let rawPalette = defaults.string(forKey: "curium.palette")
@@ -429,6 +431,38 @@ final class CuriumFingerprintStore {
             profile.fontProfile = profile.fontProfile ?? target.fontProfile
             profile.hideSpeechVoices = profile.hideSpeechVoices ?? target.hideSpeechVoices
             profile.templateID = profile.templateID ?? target.id
+            if profile.fingerprintSeed == nil && profile.farbling == nil {
+                profile.farbling = .stealthSafe
+                profile.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
+            }
+            return true
+        }
+
+        // Upgrade untouched 0.1.16-b29 Personal profiles (`revision == 1`, no farbling/seed)
+        // to stealth-safe Audio+WebGL farbling with a unique per-install 256-bit seed and
+        // mainstream macOS 26.3.1 platformVersion so independent installs never share the
+        // same default Visitor ID or trigger rare beta platformVersion ML penalties.
+        if profile.isPrimaryDefault,
+           profile.revision == 1,
+           profile.defaultSlot == .desktop,
+           profile.desktop.platform == "macOS",
+           profile.fingerprintSeed == nil,
+           profile.farbling == nil
+        {
+            if profile.desktop.platformVersion == "27.2.1" {
+                profile.desktop.platformVersion = CuriumChromeStableBaseline.macOSPlatformVersion
+            }
+            if profile.mobile.platform == "macOS" && profile.mobile.platformVersion == "27.2.1" {
+                profile.mobile.platformVersion = CuriumChromeStableBaseline.macOSPlatformVersion
+            }
+            if profile.desktop.screen == CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 944, colorDepth: 30) {
+                profile.desktop.screen = target.desktop.screen
+            }
+            if profile.mobile.screen == CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 944, colorDepth: 30) {
+                profile.mobile.screen = target.mobile.screen
+            }
+            profile.farbling = .stealthSafe
+            profile.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
             return true
         }
 

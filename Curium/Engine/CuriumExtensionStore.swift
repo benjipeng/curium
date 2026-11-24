@@ -142,10 +142,13 @@ final class CuriumExtensionStore {
             observationBox = MainThreadObservationBox(token)
             Task { @MainActor in
                 await CuriumVideoPiPExtension.ensureInstalled(using: manager)
-                let desktopParityEnabled = CuriumFingerprintStore.shared.activeProfile.defaultSlot == .desktop
+                let active = CuriumFingerprintStore.shared.activeProfile
+                let desktopParityEnabled = active.defaultSlot == .desktop
+                let profileSeed = CuriumProfileFontManager.profileSeedString(for: active)
                 await CuriumDesktopParityExtension.ensureInstalled(
                     using: manager,
-                    enabled: desktopParityEnabled
+                    enabled: desktopParityEnabled,
+                    profileSeed: profileSeed
                 )
             }
         }

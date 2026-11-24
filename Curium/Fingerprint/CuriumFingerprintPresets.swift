@@ -5,7 +5,7 @@ enum CuriumChromeStableBaseline {
     static let majorVersion = "158"
     static let fullVersion = "158.0.8127.37"
     static let productVersion = "Chrome/158.0.0.0"
-    static let macOSPlatformVersion = "27.2.1"
+    static let macOSPlatformVersion = "26.3.1"
     static let androidPlatformVersion = "15.0.0"
 }
 
@@ -109,7 +109,7 @@ enum CuriumFingerprintPresets {
             width: 1512,
             height: 982,
             availWidth: 1512,
-            availHeight: 944,
+            availHeight: 914,
             colorDepth: 30
         ),
         webglProfile: .native,
@@ -448,7 +448,8 @@ struct CuriumHardwareProfileVariant: Identifiable, Equatable, Sendable {
 /// Curated coherent hardware/GPU/screen pools for verified fingerprint templates.
 enum CuriumFingerprintDevicePools {
     /// Apple Silicon M1–M5 Max tiers spanning 8–18 CPU cores, 8 / 16 / 32 GB RAM
-    /// (matching real macOS Chrome 158 `navigator.deviceMemory` buckets), and 30-bit wide-gamut P3 Mac displays.
+    /// (matching real macOS Chrome `navigator.deviceMemory` buckets), distinct authentic
+    /// macOS point releases, recent Chrome stable releases, Dock frames, and 30-bit P3 displays.
     private static func makeMacOSAppleSiliconVariants(poolID: String) -> [CuriumHardwareProfileVariant] {
         [
             CuriumHardwareProfileVariant(
@@ -456,7 +457,10 @@ enum CuriumFingerprintDevicePools {
                 poolID: poolID,
                 label: "Apple M1 · 8c · 8 GB · 1440×900",
                 appliesToBothSlots: true,
-                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                majorVersion: "157",
+                fullVersion: "157.0.8054.92",
+                productVersion: "Chrome/157.0.0.0",
+                platformVersion: "15.5.0",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -464,7 +468,7 @@ enum CuriumFingerprintDevicePools {
                 webglVendor: "Google Inc. (Apple)",
                 webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
                 webglProfile: .native,
-                screen: CuriumScreenOverride(width: 1440, height: 900, availWidth: 1440, availHeight: 875, colorDepth: 30),
+                screen: CuriumScreenOverride(width: 1440, height: 900, availWidth: 1440, availHeight: 836, colorDepth: 30),
                 maxTouchPoints: 0,
                 pointerType: .fine,
                 hoverType: .hover,
@@ -479,7 +483,10 @@ enum CuriumFingerprintDevicePools {
                 poolID: poolID,
                 label: "Apple M2 · 8c · 8 GB · 1470×956",
                 appliesToBothSlots: true,
-                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                majorVersion: CuriumChromeStableBaseline.majorVersion,
+                fullVersion: CuriumChromeStableBaseline.fullVersion,
+                productVersion: CuriumChromeStableBaseline.productVersion,
+                platformVersion: "26.2.0",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -487,7 +494,7 @@ enum CuriumFingerprintDevicePools {
                 webglVendor: "Google Inc. (Apple)",
                 webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
                 webglProfile: .native,
-                screen: CuriumScreenOverride(width: 1470, height: 956, availWidth: 1470, availHeight: 919, colorDepth: 30),
+                screen: CuriumScreenOverride(width: 1470, height: 956, availWidth: 1470, availHeight: 890, colorDepth: 30),
                 maxTouchPoints: 0,
                 pointerType: .fine,
                 hoverType: .hover,
@@ -502,6 +509,9 @@ enum CuriumFingerprintDevicePools {
                 poolID: poolID,
                 label: "Apple M3 · 8c · 16 GB · 1512×982",
                 appliesToBothSlots: true,
+                majorVersion: CuriumChromeStableBaseline.majorVersion,
+                fullVersion: CuriumChromeStableBaseline.fullVersion,
+                productVersion: CuriumChromeStableBaseline.productVersion,
                 platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
                 model: "",
                 architecture: "arm",
@@ -510,7 +520,7 @@ enum CuriumFingerprintDevicePools {
                 webglVendor: "Google Inc. (Apple)",
                 webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)",
                 webglProfile: .native,
-                screen: CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 944, colorDepth: 30),
+                screen: CuriumScreenOverride(width: 1512, height: 982, availWidth: 1512, availHeight: 914, colorDepth: 30),
                 maxTouchPoints: 0,
                 pointerType: .fine,
                 hoverType: .hover,
@@ -525,7 +535,10 @@ enum CuriumFingerprintDevicePools {
                 poolID: poolID,
                 label: "Apple M3 Pro · 12c · 16 GB · 1728×1117",
                 appliesToBothSlots: true,
-                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                majorVersion: CuriumChromeStableBaseline.majorVersion,
+                fullVersion: "158.0.8127.64",
+                productVersion: CuriumChromeStableBaseline.productVersion,
+                platformVersion: "26.2.0",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -533,7 +546,7 @@ enum CuriumFingerprintDevicePools {
                 webglVendor: "Google Inc. (Apple)",
                 webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Pro, Unspecified Version)",
                 webglProfile: .native,
-                screen: CuriumScreenOverride(width: 1728, height: 1117, availWidth: 1728, availHeight: 1079, colorDepth: 30),
+                screen: CuriumScreenOverride(width: 1728, height: 1117, availWidth: 1728, availHeight: 1049, colorDepth: 30),
                 maxTouchPoints: 0,
                 pointerType: .fine,
                 hoverType: .hover,
@@ -548,7 +561,10 @@ enum CuriumFingerprintDevicePools {
                 poolID: poolID,
                 label: "Apple M4 · 10c · 16 GB · 1680×1050",
                 appliesToBothSlots: true,
-                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                majorVersion: "156",
+                fullVersion: "156.0.7980.105",
+                productVersion: "Chrome/156.0.0.0",
+                platformVersion: "26.3.1",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -556,7 +572,7 @@ enum CuriumFingerprintDevicePools {
                 webglVendor: "Google Inc. (Apple)",
                 webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)",
                 webglProfile: .native,
-                screen: CuriumScreenOverride(width: 1680, height: 1050, availWidth: 1680, availHeight: 1012, colorDepth: 30),
+                screen: CuriumScreenOverride(width: 1680, height: 1050, availWidth: 1680, availHeight: 982, colorDepth: 30),
                 maxTouchPoints: 0,
                 pointerType: .fine,
                 hoverType: .hover,
@@ -571,7 +587,10 @@ enum CuriumFingerprintDevicePools {
                 poolID: poolID,
                 label: "Apple M4 Pro · 14c · 32 GB · 1728×1117",
                 appliesToBothSlots: true,
-                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                majorVersion: CuriumChromeStableBaseline.majorVersion,
+                fullVersion: CuriumChromeStableBaseline.fullVersion,
+                productVersion: CuriumChromeStableBaseline.productVersion,
+                platformVersion: "15.6.1",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -579,7 +598,7 @@ enum CuriumFingerprintDevicePools {
                 webglVendor: "Google Inc. (Apple)",
                 webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version)",
                 webglProfile: .native,
-                screen: CuriumScreenOverride(width: 1728, height: 1117, availWidth: 1728, availHeight: 1079, colorDepth: 30),
+                screen: CuriumScreenOverride(width: 1728, height: 1117, availWidth: 1668, availHeight: 1079, colorDepth: 30),
                 maxTouchPoints: 0,
                 pointerType: .fine,
                 hoverType: .hover,
@@ -594,7 +613,10 @@ enum CuriumFingerprintDevicePools {
                 poolID: poolID,
                 label: "Apple M4 Max · 16c · 32 GB · 2560×1440",
                 appliesToBothSlots: true,
-                platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
+                majorVersion: "157",
+                fullVersion: "157.0.8054.118",
+                productVersion: "Chrome/157.0.0.0",
+                platformVersion: "15.5.0",
                 model: "",
                 architecture: "arm",
                 bitness: "64",
@@ -602,7 +624,7 @@ enum CuriumFingerprintDevicePools {
                 webglVendor: "Google Inc. (Apple)",
                 webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Max, Unspecified Version)",
                 webglProfile: .native,
-                screen: CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2560, availHeight: 1409, colorDepth: 30),
+                screen: CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2500, availHeight: 1402, colorDepth: 30),
                 maxTouchPoints: 0,
                 pointerType: .fine,
                 hoverType: .hover,
@@ -617,6 +639,9 @@ enum CuriumFingerprintDevicePools {
                 poolID: poolID,
                 label: "Apple M5 Max · 18c · 32 GB · 2560×1440",
                 appliesToBothSlots: true,
+                majorVersion: CuriumChromeStableBaseline.majorVersion,
+                fullVersion: CuriumChromeStableBaseline.fullVersion,
+                productVersion: CuriumChromeStableBaseline.productVersion,
                 platformVersion: CuriumChromeStableBaseline.macOSPlatformVersion,
                 model: "",
                 architecture: "arm",
@@ -625,7 +650,7 @@ enum CuriumFingerprintDevicePools {
                 webglVendor: "Google Inc. (Apple)",
                 webglRenderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Max, Unspecified Version)",
                 webglProfile: .native,
-                screen: CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2560, availHeight: 1409, colorDepth: 30),
+                screen: CuriumScreenOverride(width: 2560, height: 1440, availWidth: 2560, availHeight: 1372, colorDepth: 30),
                 maxTouchPoints: 0,
                 pointerType: .fine,
                 hoverType: .hover,
@@ -848,7 +873,7 @@ struct CuriumProfileTemplate: Identifiable, Equatable, Sendable {
         }
 
         if enableFarbling {
-            profile.farbling = profile.farbling ?? .allEnabled
+            profile.farbling = profile.farbling ?? .stealthSafe
             profile.fingerprintSeed = CuriumFingerprintSchema.generateRandomSeedHex()
         } else {
             profile.farbling = nil
