@@ -152,3 +152,11 @@ Pipeline 1 plans before compiling and reuses write-once GHCR checkpoints for cod
 | `patches/`, `args/`, `version.lock` | Upstream Chromium revision pin, ordered patch series (`0001`–`0106`), and GN configuration. |
 | `scripts/`, `ci/`, `.github/workflows/` | Dual-pipeline CI orchestration, GHCR checkpoint planner, local engine sync, and IPA packager. |
 | `docs/`, `tools/simulator/` | App icon assets, simulator diagnostics, and historical research memos. |
+
+---
+
+## Acknowledgments
+
+⚫⚪🟡 Thanks to the vibrant community at **[Linux.do](https://linux.do)** for the inspiration, technical exchange, and open spirit that helped shape Curium.
+
+Curium also stands on the shoulders of the [Chromium](https://www.chromium.org/) and [LiveContainer](https://github.com/LiveContainer/LiveContainer) projects.
