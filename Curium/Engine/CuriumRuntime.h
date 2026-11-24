@@ -15,6 +15,27 @@ BOOL CuriumConfigureLaunchFingerprint(NSData *_Nullable jsonData, NSError *_Null
 NSDictionary<NSString *, id> *_Nullable CuriumEngineActiveFingerprintStatusDict(void);
 BOOL CuriumApplyRuntimePrivacyPolicy(NSData *jsonData, NSError *_Nullable *_Nullable error);
 NSDictionary<NSString *, id> *_Nullable CuriumEngineActiveRuntimePolicyStatusDict(void);
+BOOL CuriumSupportsProfileHotSwap(void);
+void CuriumSwitchToProfile(
+    NSData *jsonData,
+    void (^NS_SWIFT_UI_ACTOR _Nullable beforeProfileCreate)(void),
+    void (^NS_SWIFT_UI_ACTOR completion)(
+        id<CrIOSBrowserHostV1> _Nullable browserHost,
+        id<CrIOSExtensionManagingV1> _Nullable extensionManager,
+        NSError *_Nullable error));
+BOOL CuriumHostSupportsNetworkFetch(id<CrIOSBrowserHostV1> host);
+id<CrIOSNetworkFetchTaskV1> _Nullable CuriumStartNetworkFetch(
+    id<CrIOSBrowserHostV1> host,
+    NSURL *url,
+    NSString *httpMethod,
+    NSDictionary<NSString *, NSString *> *_Nullable headers,
+    NSURL *_Nullable isolationTopFrameURL,
+    BOOL includeCookies,
+    BOOL blockPrivateNetworkTargets,
+    NSTimeInterval timeoutInterval,
+    id<CrIOSNetworkFetchDelegateV1> delegate,
+    dispatch_queue_t callbackQueue);
+BOOL CuriumDiscardTab(id<CrIOSBrowserHostV1> host, NSString *tabID);
 BOOL CuriumRegisterShell(id<CrIOSShellBootstrapDelegate> delegate);
 id<CrIOSExtensionManagingV1> _Nullable CuriumSharedExtensionManager(void);
 

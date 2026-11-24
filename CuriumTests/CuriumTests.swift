@@ -7277,3 +7277,203 @@ struct CuriumBuild43ContractTests {
         #expect(fixedProxyProfile.webrtcIpHandlingPolicy == .disableNonProxiedUdp)
     }
 }
+
+@Suite("Build 44 EngineContract v4 Integration", .serialized)
+struct CuriumBuild44ContractV4Tests {
+    @Test("EngineContract v4 capabilities expose profileHotSwap, networkFetchBridge, and tabDiscard")
+    func v4CapabilitiesParsing() {
+        let v3 = CuriumEngineFingerprintCapabilities(dictionary: [
+            "contractVersion": 3,
+            "features": [
+                "hotRuntimePrivacyPolicy": true,
+                "nativeDesktopParityV1": true,
+            ],
+        ])
+        #expect(!v3.supportsProfileHotSwap)
+        #expect(!v3.supportsNetworkFetchBridge)
+        #expect(!v3.supportsTabDiscard)
+
+        let v4 = CuriumEngineFingerprintCapabilities(dictionary: [
+            "contractVersion": 4,
+            "features": [
+                "profileHotSwap": true,
+                "networkFetchBridge": true,
+                "tabDiscard": true,
+            ],
+        ])
+        #expect(v4.supportsProfileHotSwap)
+        #expect(v4.supportsNetworkFetchBridge)
+        #expect(v4.supportsTabDiscard)
+    }
+
+    @Test("Zero-restart profile hot-swap flushes outgoing session, swaps CoreText hook, rebinds host & restores target session")
+    @MainActor
+    func zeroRestartProfileHotSwap() async throws {
+        defer { CuriumFingerprintBootstrap.resetStateForTesting() }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-b44-hotswap-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let supportRoot = dir.appending(path: "Application Support", directoryHint: .isDirectory)
+        let cachesRoot = dir.appending(path: "Caches", directoryHint: .isDirectory)
+        let curiumRoot = dir.appending(path: "SharedCurium", directoryHint: .isDirectory)
+        let sessionDir = dir.appending(path: "Sessions", directoryHint: .isDirectory)
+        let fileURL = curiumRoot.appending(path: CuriumFingerprintStore.fileName, directoryHint: .notDirectory)
+
+        let fpStore = CuriumFingerprintStore(
+            fileURL: fileURL,
+            applicationSupportRoot: supportRoot,
+            cachesRoot: cachesRoot,
+            curiumSupportRoot: curiumRoot
+        )
+        let workProfile = try #require(fpStore.createProfile(
+            fromTemplate: CuriumFingerprintPresets.macosDesktopFirst.id,
+            displayName: "Work",
+            proxy: .direct
+        ))
+
+        // Pre-seed a saved session for the target profile so hot-swap restores it.
+        CuriumSessionStorage.save(
+            urls: [URL(string: "https://work.example.com/dashboard")!],
+            activeIndex: 0,
+            forProfile: workProfile.id,
+            directory: sessionDir.appending(path: "Profiles/\(workProfile.id)", directoryHint: .isDirectory)
+        )
+
+        let initialLaunch = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: fpStore,
+            capabilitiesProvider: {
+                CuriumEngineFingerprintCapabilities(dictionary: ["contractVersion": 4])
+            },
+            configureEngine: { _, _ in true }
+        )
+        if case .configured(let id, _, _) = initialLaunch {
+            #expect(id == "default")
+        } else {
+            Issue.record("Expected configured default launch, got \(initialLaunch)")
+        }
+
+        let outgoingHost = MockBrowserHost()
+        let outgoingTab = MockTabHost(tabID: "default-tab-1", url: URL(string: "https://personal.example.com/"))
+        outgoingHost.tabs = [outgoingTab]
+        outgoingHost.activeTab = outgoingTab
+
+        var beforeProfileCreateCount = 0
+        var receivedPayloadProfileID: String?
+        let incomingHost = MockBrowserHost()
+        let freshTab = MockTabHost(tabID: "work-blank-1", url: nil)
+
+        let browserStore = CuriumBrowserStore(
+            host: outgoingHost,
+            activeProfileID: "default",
+            fingerprintStore: fpStore,
+            sessionDirectoryOverride: sessionDir,
+            restoreSession: false,
+            profileHotSwapExecutor: { jsonData, beforeProfileCreate in
+                if let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                    receivedPayloadProfileID = obj["profileId"] as? String
+                }
+                beforeProfileCreate()
+                beforeProfileCreateCount += 1
+                incomingHost.tabs = [freshTab]
+                incomingHost.activeTab = freshTab
+                return (incomingHost, nil, nil)
+            }
+        )
+
+        #expect(browserStore.canHotSwapProfile)
+        #expect(browserStore.activeProfileID == "default")
+
+        // Unknown target fails closed without detaching the outgoing host.
+        let invalidOK = await browserStore.hotSwapProfile(to: "p-doesnotexist")
+        #expect(!invalidOK)
+        #expect(browserStore.activeProfileID == "default")
+        #expect(browserStore.tabs.first?.id == "default-tab-1")
+
+        // Valid zero-restart hot-swap into Work profile.
+        let swapped = await browserStore.switchProfile(to: workProfile.id)
+        #expect(swapped)
+        #expect(beforeProfileCreateCount == 1)
+        #expect(receivedPayloadProfileID == workProfile.id)
+        #expect(browserStore.activeProfileID == workProfile.id)
+        #expect(CuriumFingerprintBootstrap.activeProfileID == workProfile.id)
+        #expect(CuriumFingerprintBootstrap.activeLaunchProxy == .direct)
+        #expect(!fpStore.hasPendingProfileSwitch)
+        #expect(outgoingHost.delegate == nil)
+        #expect(incomingHost.delegate === browserStore)
+        #expect(freshTab.loadedURLs == [URL(string: "https://work.example.com/dashboard")!])
+
+        // Outgoing default profile's open tab was persisted before teardown.
+        let savedDefault = CuriumSessionStorage.load(forProfile: "default", directory: sessionDir)
+        #expect(savedDefault?.openTabURLs == ["https://personal.example.com/"])
+    }
+
+    @Test("handleMemoryWarning discards oldest inactive background tabs while protecting active, playing, PiP, and loading tabs")
+    @MainActor
+    func memoryWarningDiscardsOldestEligibleBackgroundTabs() {
+        let host = MockBrowserHost()
+        let oldestIdle = MockTabHost(tabID: "tab-oldest", url: URL(string: "https://a.example.com"))
+        let newerIdle = MockTabHost(tabID: "tab-newer", url: URL(string: "https://b.example.com"))
+        let playingTab = MockTabHost(tabID: "tab-playing", url: URL(string: "https://video.example.com"))
+        playingTab.hasPlayingVideo = true
+        let pipTab = MockTabHost(tabID: "tab-pip", url: URL(string: "https://pip.example.com"))
+        pipTab.isPictureInPictureActive = true
+        let loadingTab = MockTabHost(tabID: "tab-loading", url: URL(string: "https://slow.example.com"))
+        loadingTab.isLoading = true
+        let activeTab = MockTabHost(tabID: "tab-active", url: URL(string: "https://active.example.com"))
+
+        host.tabs = [oldestIdle, newerIdle, playingTab, pipTab, loadingTab, activeTab]
+        host.activeTab = oldestIdle
+
+        var discardedOrder: [String] = []
+        let store = CuriumBrowserStore(
+            host: host,
+            restoreSession: false,
+            tabDiscarder: { _, tabID in
+                discardedOrder.append(tabID)
+                return true
+            }
+        )
+
+        // Activate newerIdle after oldestIdle, then activeTab last so oldestIdle is LRU.
+        store.select(store.tabs.first { $0.id == "tab-newer" }!)
+        store.select(store.tabs.first { $0.id == "tab-active" }!)
+
+        store.handleMemoryWarning()
+
+        #expect(discardedOrder == ["tab-oldest", "tab-newer"])
+    }
+
+    @Test("Build 44 Media Radar drops non-zero netError events and backfills size from totalReceivedBytes")
+    func build44MediaRadarEnrichment() {
+        let failed = CuriumMediaResourceEvent.parse(from: [
+            "url": URL(string: "https://cdn.example.com/aborted.mp4")!,
+            "mimeType": "video/mp4",
+            "httpMethod": "GET",
+            "httpStatusCode": 0,
+            "netError": -3,
+            "contentLength": -1,
+        ])
+        #expect(failed == nil)
+
+        let enriched = CuriumMediaResourceEvent.parse(from: [
+            "url": URL(string: "https://cdn.example.com/final.mp4")!,
+            "originalURL": URL(string: "https://edge.example.com/redir.mp4")!,
+            "mimeType": "video/mp4",
+            "httpMethod": "GET",
+            "httpStatusCode": 200,
+            "netError": 0,
+            "contentLength": -1,
+            "totalReceivedBytes": 4_194_304,
+            "wasCached": true,
+            "redirectChain": [
+                URL(string: "https://edge.example.com/redir.mp4")!,
+                URL(string: "https://cdn.example.com/final.mp4")!,
+            ],
+        ])
+        #expect(enriched != nil)
+        #expect(enriched?.contentLength == 4_194_304)
+        #expect(enriched?.wasCached == true)
+        #expect(enriched?.redirectChain.count == 2)
+    }
+}

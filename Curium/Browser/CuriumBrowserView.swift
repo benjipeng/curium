@@ -1027,19 +1027,30 @@ private struct CuriumPendingProfileSwitchPill: View {
     @State private var isRelaunching = false
 
     private var promptTitle: String {
-        isActiveEngineRestart
+        if store.canHotSwapProfile {
+            return isActiveEngineRestart
+                ? "Apply changes now"
+                : "Switch to \(nextProfile.displayName)"
+        }
+        return isActiveEngineRestart
             ? "Restart to apply changes"
             : "Switch to \(nextProfile.displayName)"
     }
 
     private var shortActionTitle: String {
-        isActiveEngineRestart
+        if store.canHotSwapProfile {
+            return isActiveEngineRestart ? "Apply Now" : "Switch Now"
+        }
+        return isActiveEngineRestart
             ? CuriumProfileRelauncher.shortApplyButtonTitle
             : CuriumProfileRelauncher.shortActionButtonTitle
     }
 
     private var primaryActionAccessibilityLabel: String {
-        isActiveEngineRestart
+        if store.canHotSwapProfile {
+            return isActiveEngineRestart ? "Apply Changes Now" : "Switch Profile Now"
+        }
+        return isActiveEngineRestart
             ? CuriumProfileRelauncher.primaryApplyButtonTitle
             : CuriumProfileRelauncher.primaryRelaunchButtonTitle
     }
@@ -1068,9 +1079,10 @@ private struct CuriumPendingProfileSwitchPill: View {
             Button {
                 guard !isRelaunching else { return }
                 isRelaunching = true
+                let usedHotSwap = store.canHotSwapProfile
                 Task {
-                    let ok = await store.prepareForProfileSwitchAndRelaunch(to: nextProfile.id)
-                    if !ok {
+                    let ok = await store.switchProfile(to: nextProfile.id)
+                    if !ok || usedHotSwap {
                         isRelaunching = false
                     }
                 }

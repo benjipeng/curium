@@ -90,6 +90,10 @@ struct CuriumProfileSwitcherSheet: View {
         !hasPendingProfileIDSwitch && fingerprintStore.hasPendingActiveProfileEngineChanges
     }
 
+    private var supportsHotSwap: Bool {
+        browserStore?.canHotSwapProfile == true
+    }
+
     private var hasPendingSwitch: Bool {
         hasPendingProfileIDSwitch || hasPendingActiveEngineRestart
     }
@@ -255,17 +259,19 @@ struct CuriumProfileSwitcherSheet: View {
         ) { dialog in
             switch dialog {
             case .switchHandoff(let profile):
-                Button(CuriumProfileRelauncher.primaryRelaunchButtonTitle) {
+                Button(supportsHotSwap ? "Switch Now" : CuriumProfileRelauncher.primaryRelaunchButtonTitle) {
                     Task {
                         await performSwitchAndRelaunch(to: profile.id)
                     }
                 }
                 .disabled(isWiping || isRelaunching)
 
-                Button("Switch on Next Launch") {
-                    selectForNextLaunch(profile)
+                if !supportsHotSwap {
+                    Button("Switch on Next Launch") {
+                        selectForNextLaunch(profile)
+                    }
+                    .disabled(isWiping || isRelaunching)
                 }
-                .disabled(isWiping || isRelaunching)
 
                 Button("Cancel", role: .cancel) {}
 
@@ -288,12 +294,18 @@ struct CuriumProfileSwitcherSheet: View {
         } message: { dialog in
             switch dialog {
             case .switchHandoff(let profile):
-                Text(
-                    CuriumProfileRelauncher.switchHandoffDescription(
-                        activeProfileName: activeProfile.displayName,
-                        targetProfileName: profile.displayName
+                if supportsHotSwap {
+                    Text(
+                        "Saves open tabs and library for \(activeProfile.displayName), pauses active downloads, and switches straight to \(profile.displayName) without restarting Curium."
                     )
-                )
+                } else {
+                    Text(
+                        CuriumProfileRelauncher.switchHandoffDescription(
+                            activeProfileName: activeProfile.displayName,
+                            targetProfileName: profile.displayName
+                        )
+                    )
+                }
 
             case .wipeProfile(let profile):
                 Text(
@@ -453,15 +465,19 @@ struct CuriumProfileSwitcherSheet: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(
                             isActiveEngineRestart
-                                ? "Restart to Apply Changes"
+                                ? (supportsHotSwap ? "Apply Updated Settings" : "Restart to Apply Changes")
                                 : "Pending Switch: \(nextLaunchProfile.displayName)"
                         )
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
                         Text(
                             isActiveEngineRestart
-                                ? "Reopen Curium to apply updated settings for \(activeProfile.displayName). Tabs and library are saved before closing."
-                                : "Tabs and library are saved before closing. Reopen Curium to switch into \(nextLaunchProfile.displayName)."
+                                ? (supportsHotSwap
+                                    ? "Apply updated settings for \(activeProfile.displayName) now without closing Curium."
+                                    : "Reopen Curium to apply updated settings for \(activeProfile.displayName). Tabs and library are saved before closing.")
+                                : (supportsHotSwap
+                                    ? "Switch directly to \(nextLaunchProfile.displayName) without closing Curium."
+                                    : "Tabs and library are saved before closing. Reopen Curium to switch into \(nextLaunchProfile.displayName).")
                         )
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -481,8 +497,8 @@ struct CuriumProfileSwitcherSheet: View {
                             }
                             Text(
                                 isActiveEngineRestart
-                                    ? CuriumProfileRelauncher.primaryApplyButtonTitle
-                                    : CuriumProfileRelauncher.primaryRelaunchButtonTitle
+                                    ? (supportsHotSwap ? "Apply Now" : CuriumProfileRelauncher.primaryApplyButtonTitle)
+                                    : (supportsHotSwap ? "Switch Now" : CuriumProfileRelauncher.primaryRelaunchButtonTitle)
                             )
                         }
                     }
@@ -866,12 +882,17 @@ struct CuriumProfileSwitcherSheet: View {
         guard !isRelaunching, !isWiping else { return }
         isRelaunching = true
         if let browserStore {
-            let ok = await browserStore.prepareForProfileSwitchAndRelaunch(to: profileID)
+            let usedHotSwap = browserStore.canHotSwapProfile
+            let ok = await browserStore.switchProfile(to: profileID)
             if ok {
                 onSelectionChanged?()
+                if usedHotSwap {
+                    isRelaunching = false
+                    dismiss()
+                }
             } else {
                 isRelaunching = false
-                alertMessage = fingerprintStore.lastPersistError ?? "Unable to switch profile."
+                alertMessage = browserStore.errorMessage ?? fingerprintStore.lastPersistError ?? "Unable to switch profile."
             }
         } else {
             let targetProfile = fingerprintStore.profile(id: profileID)

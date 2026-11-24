@@ -480,11 +480,27 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         var title: String
     }
 
-    private let host: (any CrIOSBrowserHostV1)?
-    private let reportsNavigationCommits: Bool
-    let activeProfileID: String
-    let extensions: CuriumExtensionStore
-    let library: CuriumLibrary
+    private struct HotSwapEngineResult: @unchecked Sendable {
+        let browserHost: (any CrIOSBrowserHostV1)?
+        let extensionManager: (any CrIOSExtensionManagingV1)?
+        let error: NSError?
+    }
+
+    typealias ProfileHotSwapExecutor = @MainActor (
+        _ configJSON: Data,
+        _ beforeProfileCreate: @escaping @MainActor () -> Void
+    ) async -> (
+        browserHost: (any CrIOSBrowserHostV1)?,
+        extensionManager: (any CrIOSExtensionManagingV1)?,
+        error: NSError?
+    )
+
+    private var host: (any CrIOSBrowserHostV1)?
+    private var reportsNavigationCommits: Bool
+    private(set) var activeProfileID: String
+    private(set) var extensions: CuriumExtensionStore
+    private(set) var library: CuriumLibrary
+    private(set) var isHotSwappingProfile = false
     let mediaRadar = CuriumMediaRadar()
     private(set) var tabs: [CuriumTabModel] = []
     private(set) var activeTab: CuriumTabModel?
@@ -513,6 +529,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     private(set) var deletedDownloadIDs: Set<String> = []
 
     @ObservationIgnored private var tabsByID: [String: CuriumTabModel] = [:]
+    @ObservationIgnored private var tabLastActivatedAt: [String: ContinuousClock.Instant] = [:]
     @ObservationIgnored private var historyByTabID: [String: ObservedVisit] = [:]
     @ObservationIgnored private var committedHistoryByTabID: [String: CommittedHistory] = [:]
     @ObservationIgnored private var snapshotLRU: [String] = []
@@ -537,10 +554,12 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     @ObservationIgnored private var cachedHLSInspections: [URL: CuriumHLSMasterInspection] = [:]
     @ObservationIgnored private var lastMediaNavigationURLByTabID: [String: URL] = [:]
     @ObservationIgnored private let fingerprintStore: CuriumFingerprintStore
-    @ObservationIgnored private let initialLaunchProxy: CuriumProxyConfig
+    @ObservationIgnored private var initialLaunchProxy: CuriumProxyConfig
     @ObservationIgnored private let downloadsRootOverride: URL?
-    @ObservationIgnored private let pdfPreviewCacheRootOverride: URL?
+    @ObservationIgnored private var pdfPreviewCacheRootOverride: URL?
     @ObservationIgnored private let sessionDirectoryOverride: URL?
+    @ObservationIgnored private let profileHotSwapExecutor: ProfileHotSwapExecutor?
+    @ObservationIgnored private let tabDiscarder: (@MainActor (any CrIOSBrowserHostV1, String) -> Bool)?
     @ObservationIgnored private(set) var viewportWidth: CGFloat = 669
 
     private static var isRunningTests: Bool {
@@ -554,6 +573,14 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     var downloadsRoot: URL? { downloadsRootOverride }
     var isEngineReady: Bool { host != nil }
+    var canHotSwapProfile: Bool {
+        guard host != nil else { return false }
+        if profileHotSwapExecutor != nil {
+            return true
+        }
+        return CuriumSupportsProfileHotSwap()
+            && CuriumFingerprintBootstrap.engineCapabilities().supportsProfileHotSwap
+    }
     var activeTabMediaCount: Int { currentMediaSnapshot().candidates.count }
     var pendingOrActiveDownloadCount: Int {
         downloads.reduce(into: 0) { count, item in
@@ -605,7 +632,9 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         transferStagingRoot: URL? = nil,
         transferRangeEngine: CuriumRangeTransferEngine? = nil,
         transferHLSEngine: CuriumHLSTransferEngine? = nil,
-        transferRangeConfiguration: CuriumRangeEngineConfiguration? = nil
+        transferRangeConfiguration: CuriumRangeEngineConfiguration? = nil,
+        profileHotSwapExecutor: ProfileHotSwapExecutor? = nil,
+        tabDiscarder: (@MainActor (any CrIOSBrowserHostV1, String) -> Bool)? = nil
     ) {
         let trimmedProfileID = activeProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedProfileID = trimmedProfileID.isEmpty ? "default" : trimmedProfileID
@@ -621,6 +650,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         self.pdfPreviewCacheRootOverride = pdfPreviewCacheRoot
             ?? (try? CuriumDownloadStorage.pdfPreviewCacheRoot(profileID: resolvedProfileID))
         self.sessionDirectoryOverride = sessionDirectoryOverride
+        self.profileHotSwapExecutor = profileHotSwapExecutor
+        self.tabDiscarder = tabDiscarder
         let ephemeralStaging: URL? = (transferStagingRoot == nil && Self.isRunningTests)
             ? FileManager.default.temporaryDirectory
                 .appending(path: "curium-test-staging-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -639,12 +670,36 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         })
         let enableTransferPersistence = transferDatabaseURL != nil || !Self.isRunningTests
         let resolvedTransferStagingRoot = transferStagingRoot ?? ephemeralStaging
+        let resolvedRangeEngine = transferRangeEngine ?? CuriumRangeTransferEngine(
+            chromiumFetchStarter: { [weak self] url, method, headers, topFrameURL, includeCookies, blockPrivate, timeout, delegateHandle, queue in
+                await MainActor.run { [weak self] in
+                    guard let self, let currentHost = self.host, CuriumHostSupportsNetworkFetch(currentHost) else {
+                        return nil
+                    }
+                    guard let task = CuriumStartNetworkFetch(
+                        currentHost,
+                        url,
+                        method,
+                        headers.isEmpty ? nil : headers,
+                        topFrameURL,
+                        includeCookies,
+                        blockPrivate,
+                        timeout,
+                        delegateHandle.delegate,
+                        queue
+                    ) else {
+                        return nil
+                    }
+                    return CuriumNetworkFetchTaskHandle(task: task)
+                }
+            }
+        )
         transferCoordinator = CuriumTransferCoordinator(
             environment: CuriumTransferCoordinator.Environment(
                 downloadsRootOverride: downloadsRoot,
                 stagingRootOverride: resolvedTransferStagingRoot,
                 databaseURLOverride: transferDatabaseURL,
-                rangeEngine: transferRangeEngine ?? CuriumRangeTransferEngine(),
+                rangeEngine: resolvedRangeEngine,
                 hlsEngine: transferHLSEngine ?? CuriumHLSTransferEngine(),
                 rangeConfiguration: transferRangeConfiguration ?? CuriumRangeEngineConfiguration(),
                 installStoreLifecycleObservers: false,
@@ -782,6 +837,33 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         for tab in tabs {
             tab.clearSnapshot()
         }
+        guard let host else { return }
+        let discard = tabDiscarder ?? CuriumDiscardTab
+        let candidates = tabs.filter { tab in
+            tab.id != activeTab?.id
+                && !tab.hasPlayingVideo
+                && !tab.isPictureInPictureActive
+                && !tab.isLoading
+                && !tab.isShowingPDF
+        }
+        .sorted { lhs, rhs in
+            let leftTime = tabLastActivatedAt[lhs.id]
+            let rightTime = tabLastActivatedAt[rhs.id]
+            switch (leftTime, rightTime) {
+            case (nil, nil): return false
+            case (nil, _): return true
+            case (_, nil): return false
+            case let (l?, r?): return l < r
+            }
+        }
+
+        var discardedCount = 0
+        for tab in candidates where discard(host, tab.id) {
+            discardedCount += 1
+        }
+        if discardedCount > 0 {
+            CuriumDiagnostics.shared.record("memory-warning", "discardedTabs=\(discardedCount)")
+        }
     }
 
     func handleSceneWillDeactivate() {
@@ -813,6 +895,15 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     // MARK: - Per-Profile Session & Profile Switching
 
+    private func resolvedSessionDirectory(for profileID: String) -> URL? {
+        guard let root = sessionDirectoryOverride else { return nil }
+        let normalized = profileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.isEmpty || normalized.lowercased() == "default" {
+            return root
+        }
+        return root.appending(path: "Profiles/\(normalized)", directoryHint: .isDirectory)
+    }
+
     func saveOpenTabsSession() {
         sessionSaveTask?.cancel()
         sessionSaveTask = nil
@@ -837,7 +928,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             urls: urls,
             activeIndex: mappedActiveIndex,
             forProfile: activeProfileID,
-            directory: sessionDirectoryOverride
+            directory: resolvedSessionDirectory(for: activeProfileID)
         )
     }
 
@@ -861,7 +952,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         guard shouldPersistSession,
               let saved = CuriumSessionStorage.load(
                   forProfile: activeProfileID,
-                  directory: sessionDirectoryOverride
+                  directory: resolvedSessionDirectory(for: activeProfileID)
               ) else {
             return false
         }
@@ -928,6 +1019,140 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             errorMessage = fingerprintStore.lastPersistError ?? "Unable to select profile \"\(trimmed)\"."
             return false
         }
+        return true
+    }
+
+    @discardableResult
+    func switchProfile(
+        to profileID: String,
+        relaunchHandler: (@MainActor () -> Void)? = nil
+    ) async -> Bool {
+        if canHotSwapProfile {
+            return await hotSwapProfile(to: profileID)
+        }
+        return await prepareForProfileSwitchAndRelaunch(to: profileID, relaunchHandler: relaunchHandler)
+    }
+
+    @discardableResult
+    func hotSwapProfile(to profileID: String) async -> Bool {
+        guard !isHotSwappingProfile, canHotSwapProfile else {
+            return false
+        }
+        let trimmed = profileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let target = fingerprintStore.profile(id: trimmed) else {
+            errorMessage = "Profile \"\(profileID)\" was not found."
+            return false
+        }
+
+        let previousSelection = fingerprintStore.selectedProfileID
+        let selectionValue: String? = target.isPrimaryDefault ? nil : target.id
+        guard fingerprintStore.selectProfile(id: selectionValue) else {
+            errorMessage = fingerprintStore.lastPersistError ?? "Unable to select profile \"\(target.displayName)\"."
+            return false
+        }
+
+        let prepared: CuriumFingerprintBootstrap.PreparedHotSwap
+        switch CuriumFingerprintBootstrap.prepareHotSwapPayload(
+            for: target.id,
+            store: fingerprintStore
+        ) {
+        case .success(let value):
+            prepared = value
+        case .failure(let error):
+            _ = fingerprintStore.selectProfile(id: previousSelection)
+            errorMessage = error.localizedDescription
+            return false
+        }
+
+        isHotSwappingProfile = true
+        defer { isHotSwappingProfile = false }
+
+        // Quiesce outgoing transfers, open-tab session, SQLite WAL, and diagnostics.
+        await transferCoordinator.pauseAllActiveTransfersForRelaunch()
+        syncBackgroundKeepAlive()
+        saveOpenTabsSession()
+        await library.checkpointAsync()
+        CuriumDiagnostics.shared.flushSync()
+
+        // Detach outgoing host, observers, per-tab caches, and extension manager before teardown.
+        cancelAllSnapshotCaptures()
+        snapshotLRU.removeAll()
+        tabLastActivatedAt.removeAll()
+        cachedDOMScanByTabID.removeAll()
+        cachedHLSInspections.removeAll()
+        lastMediaNavigationURLByTabID.removeAll()
+        historyByTabID.removeAll()
+        committedHistoryByTabID.removeAll()
+        for tab in tabs {
+            mediaPermissions.invalidate(tabID: tab.id)
+            mediaRadar.clear(tabID: tab.id)
+            tab.invalidate()
+        }
+        tabs = []
+        tabsByID.removeAll()
+        activeTab = nil
+        lastExtensionTabID = -1
+        extensions.shutdown()
+        host?.delegate = nil
+        host = nil
+
+        let targetProfile = prepared.profile
+        let beforeProfileCreate: @MainActor () -> Void = {
+            CuriumProfileFontManager.swapRegisteredFontsForHotSwap(to: targetProfile)
+        }
+
+        let result: HotSwapEngineResult
+        if let customExecutor = profileHotSwapExecutor {
+            let custom = await customExecutor(prepared.jsonData, beforeProfileCreate)
+            result = HotSwapEngineResult(
+                browserHost: custom.browserHost,
+                extensionManager: custom.extensionManager,
+                error: custom.error
+            )
+        } else {
+            result = await withCheckedContinuation { continuation in
+                CuriumSwitchToProfile(prepared.jsonData, beforeProfileCreate) { newHost, newExtManager, error in
+                    continuation.resume(returning: HotSwapEngineResult(
+                        browserHost: newHost,
+                        extensionManager: newExtManager,
+                        error: error as NSError?
+                    ))
+                }
+            }
+        }
+
+        guard let newHost = result.browserHost, result.error == nil else {
+            CuriumFingerprintBootstrap.abortHotSwapLock(prepared)
+            let reason = result.error?.localizedDescription ?? "Blink engine failed to switch profile."
+            errorMessage = reason
+            CuriumDiagnostics.shared.record("profile-hotswap", "failed target=\(targetProfile.id) err=\(reason)")
+            return false
+        }
+
+        CuriumFingerprintBootstrap.commitHotSwapState(prepared, store: fingerprintStore)
+        activeProfileID = targetProfile.id
+        initialLaunchProxy = targetProfile.proxy
+        pdfPreviewCacheRootOverride = try? CuriumDownloadStorage.pdfPreviewCacheRoot(profileID: targetProfile.id)
+        library = CuriumLibrary(profileID: targetProfile.id, fingerprintStore: fingerprintStore)
+        reportsNavigationCommits = newHost.responds(to: NSSelectorFromString(
+            "tabHost:didCommitNavigationToURL:navigationID:isSameDocument:isReload:"
+        ))
+        extensions = CuriumExtensionStore(manager: result.extensionManager ?? CuriumSharedExtensionManager())
+        host = newHost
+        newHost.delegate = self
+
+        updateTabs(from: newHost)
+        let canRestoreIntoHost = tabs.isEmpty || (tabs.count == 1 && tabs[0].url == nil && !tabs[0].isLoading)
+        if canRestoreIntoHost {
+            _ = restoreSavedSessionIfAvailable()
+        }
+        if tabs.isEmpty {
+            newTab()
+        }
+        syncDefaultSiteModeForBlankTabs()
+        syncBackgroundKeepAlive()
+        CuriumDiagnostics.shared.record("profile-hotswap", "ok profile=\(targetProfile.id) rev=\(targetProfile.revision)")
         return true
     }
 
@@ -1112,6 +1337,9 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         }
         cancelIdleSnapshotCapture()
         activeTab = tab
+        if let tab {
+            tabLastActivatedAt[tab.id] = .now
+        }
         scheduleSessionSave()
     }
 
@@ -1213,6 +1441,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     func close(_ tab: CuriumTabModel) {
         onDemandSnapshotTasks.removeValue(forKey: tab.id)?.cancel()
         onDemandSnapshotTokens.removeValue(forKey: tab.id)
+        tabLastActivatedAt.removeValue(forKey: tab.id)
         mediaPermissions.invalidate(tabID: tab.id)
         clearMediaCaches(for: tab.id)
         lastMediaNavigationURLByTabID.removeValue(forKey: tab.id)
@@ -2012,6 +2241,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             evictedAny = true
             onDemandSnapshotTasks.removeValue(forKey: evictedID)?.cancel()
             onDemandSnapshotTokens.removeValue(forKey: evictedID)
+            tabLastActivatedAt.removeValue(forKey: evictedID)
             mediaPermissions.invalidate(tabID: evictedID)
             clearMediaCaches(for: evictedID)
             lastMediaNavigationURLByTabID.removeValue(forKey: evictedID)

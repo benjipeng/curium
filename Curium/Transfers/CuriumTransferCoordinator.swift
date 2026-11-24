@@ -336,10 +336,12 @@ final class CuriumTransferCoordinator {
             transportKind: .blinkNativeStream,
             phase: .pendingConfirmation,
             sourceURL: item.originalURL,
-            resolvedURL: nil,
+            resolvedURL: (task.finalURL ?? nil) ?? item.originalURL,
             pageURL: tabCtx.pageURL,
             filename: item.filename,
             mimeType: item.mimeType,
+            eTag: task.eTag ?? nil,
+            lastModified: task.lastModified ?? nil,
             receivedBytes: item.receivedBytes,
             totalBytes: item.knownTotalBytes,
             configuredLanes: CuriumTransferRecord.defaultLanes,
@@ -838,6 +840,7 @@ final class CuriumTransferCoordinator {
                 headers: probeHeaders,
                 proxy: proxy,
                 originatingURL: originatingURL,
+                includeCookies: useActiveTabAuth,
                 cookieResolver: probeCookieResolver,
                 timeoutSeconds: environment.rangeConfiguration.probeTimeoutSeconds
             )
@@ -1670,39 +1673,75 @@ final class CuriumTransferCoordinator {
             && item.originalURL.map(CuriumHLSParser.isAllowedHTTPURL) == true
 
         if canConsiderRangeUpgrade, let url = item.originalURL {
-            item.setPhase(.probing)
-            if var record = recordsByID[id] {
-                record.phase = .probing
-                record.updatedAt = Date()
-                recordsByID[id] = record
-                persistImmediate(record)
-            }
-
             let proxy = host.effectiveProxy()
             let tabCtx = host.tabContext(item.sourceTabID)
             let pageURL = tabCtx.pageURL ?? item.pageURL
-            let initialCookie = await host.resolveCookieHeader(url, item.sourceTabID)
-            let headers = buildHTTPHeaders(
-                userAgent: tabCtx.userAgent,
-                referer: Self.safeRefererString(from: pageURL, targetURL: url),
-                origin: Self.originString(for: pageURL),
-                cookie: initialCookie
-            )
-            let cookieResolver = makeCookieResolver(
-                transferID: id,
-                sourceTabID: item.sourceTabID,
-                includeTabCookies: true,
-                primaryURL: url
-            )
 
-            let probeResult = try? await environment.rangeEngine.probe(
-                url: url,
-                headers: headers,
-                proxy: proxy,
-                originatingURL: pageURL,
-                cookieResolver: cookieResolver,
-                timeoutSeconds: environment.rangeConfiguration.probeTimeoutSeconds
-            )
+            // Build 44+ (0114) zero-probe fast path: when Blink's initial response already
+            // proved Accept-Ranges: bytes and a known >= threshold payload size, upgrade
+            // straight to multi-lane Range without burning a second GET on single-use links.
+            let blinkAcceptsRanges = blinkTask.acceptRanges ?? false
+            let blinkFinalURL = (blinkTask.finalURL ?? nil) ?? url
+            let normalizedBlinkMime = item.mimeType?.split(separator: ";", maxSplits: 1).first
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            let isBlinkHTML = normalizedBlinkMime == "text/html" || normalizedBlinkMime == "application/xhtml+xml"
+
+            let probeResult: CuriumRangeProbeResult?
+            let initialCookie: String?
+            if blinkAcceptsRanges,
+               initialTotal >= threshold,
+               !isBlinkHTML,
+               CuriumHLSParser.isAllowedHTTPURL(blinkFinalURL),
+               CuriumHLSParser.isAllowedTargetURL(blinkFinalURL, originatingURL: pageURL) {
+                initialCookie = await host.resolveCookieHeader(blinkFinalURL, item.sourceTabID)
+                let cdFilename = CuriumRangeTransferEngine.parseContentDispositionFilename(
+                    blinkTask.contentDisposition ?? nil
+                )
+                probeResult = CuriumRangeProbeResult(
+                    finalURL: blinkFinalURL,
+                    statusCode: 206,
+                    supportsByteRanges: true,
+                    totalBytes: initialTotal,
+                    eTag: blinkTask.eTag ?? nil,
+                    lastModified: blinkTask.lastModified ?? nil,
+                    suggestedFilename: cdFilename,
+                    mimeType: normalizedBlinkMime,
+                    isHTMLResponse: false
+                )
+            } else {
+                item.setPhase(.probing)
+                if var record = recordsByID[id] {
+                    record.phase = .probing
+                    record.updatedAt = Date()
+                    recordsByID[id] = record
+                    persistImmediate(record)
+                }
+
+                let resolvedCookie = await host.resolveCookieHeader(url, item.sourceTabID)
+                initialCookie = resolvedCookie
+                let headers = buildHTTPHeaders(
+                    userAgent: tabCtx.userAgent,
+                    referer: Self.safeRefererString(from: pageURL, targetURL: url),
+                    origin: Self.originString(for: pageURL),
+                    cookie: resolvedCookie
+                )
+                let cookieResolver = makeCookieResolver(
+                    transferID: id,
+                    sourceTabID: item.sourceTabID,
+                    includeTabCookies: true,
+                    primaryURL: url
+                )
+
+                probeResult = try? await environment.rangeEngine.probe(
+                    url: url,
+                    headers: headers,
+                    proxy: proxy,
+                    originatingURL: pageURL,
+                    includeCookies: true,
+                    cookieResolver: cookieResolver,
+                    timeoutSeconds: environment.rangeConfiguration.probeTimeoutSeconds
+                )
+            }
 
             // Honor user cancel/pause that arrived while probing.
             if let intent = stopIntentsByID[id] ?? (Task.isCancelled ? .cancel : nil) {
@@ -2048,6 +2087,7 @@ final class CuriumTransferCoordinator {
                     headers: baseHeaders,
                     proxy: proxy,
                     originatingURL: record.pageURL,
+                    includeCookies: record.includeTabCookies,
                     cookieResolver: cookieResolver,
                     timeoutSeconds: environment.rangeConfiguration.probeTimeoutSeconds
                 )
@@ -2124,6 +2164,7 @@ final class CuriumTransferCoordinator {
                 supportsRangesHint: supportsRangesHint,
                 existingSlices: existingSlices,
                 ifRangeValidator: ifRangeValidator,
+                includeCookies: record.includeTabCookies,
                 cookieResolver: cookieResolver,
                 configuration: config,
                 onProgress: { [weak self, weak item] update in

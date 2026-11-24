@@ -443,6 +443,11 @@ private final class RoutingMockDownloadTask: NSObject, CrIOSDownloadTaskV1 {
     var isExplicitDownload: Bool
     var isMainFrame: Bool
     var httpMethod: String
+    var finalURL: URL?
+    var acceptRanges: Bool
+    var eTag: String?
+    var lastModified: String?
+    var contentDisposition: String?
     var totalBytes: Int64
     var receivedBytes: Int64 = 0
     var state: CrIOSDownloadState = .pending
@@ -466,6 +471,11 @@ private final class RoutingMockDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         isExplicitDownload: Bool = true,
         isMainFrame: Bool = true,
         httpMethod: String = "GET",
+        finalURL: URL? = nil,
+        acceptRanges: Bool = false,
+        eTag: String? = nil,
+        lastModified: String? = nil,
+        contentDisposition: String? = nil,
         totalBytes: Int64 = -1,
         payloadToWrite: Data = Data("blink-fallback-bytes".utf8),
         simulatedChunkCount: Int = 1,
@@ -480,6 +490,11 @@ private final class RoutingMockDownloadTask: NSObject, CrIOSDownloadTaskV1 {
         self.isExplicitDownload = isExplicitDownload
         self.isMainFrame = isMainFrame
         self.httpMethod = httpMethod
+        self.finalURL = finalURL
+        self.acceptRanges = acceptRanges
+        self.eTag = eTag
+        self.lastModified = lastModified
+        self.contentDisposition = contentDisposition
         self.totalBytes = totalBytes
         self.payloadToWrite = payloadToWrite
         self.simulatedChunkCount = max(1, simulatedChunkCount)
@@ -2317,5 +2332,194 @@ struct CuriumTransferRoutingTests {
             )
         }
         store.cancelDownload(postItem)
+    }
+
+    @Test("Build 44 zero-probe Blink download skips bytes=0-0 probe and upgrades directly via finalURL + ETag + Content-Disposition")
+    @MainActor
+    func build44ZeroProbeBlinkDownloadSkipsRangeProbe() async throws {
+        let payload = makeSyntheticPayload(bytes: 1024 * 1024)
+        let expectedSHA = sha256Hex(payload)
+        let server = try RoutingLoopbackServer(behavior: .range206(
+            payload: payload,
+            eTag: "\"b44-zero-probe-v1\"",
+            contentDisposition: "attachment; filename=\"resolved-archive.bin\"",
+            uniformDelayMicrosPer64K: 0
+        ))
+        defer { server.stop() }
+
+        let tempDir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-b44-zeroprobe-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let host = RoutingMockBrowserHost()
+        let tab = RoutingMockTabHost(tabID: "zp-tab", url: server.url(path: "/downloads"))
+        host.tabs = [tab]
+        host.activeTab = tab
+
+        let store = CuriumBrowserStore(
+            host: host,
+            downloadsRoot: tempDir.appending(path: "Downloads", directoryHint: .isDirectory),
+            restoreSession: false,
+            transferDatabaseURL: tempDir.appending(path: "transfers.sqlite", directoryHint: .notDirectory),
+            transferStagingRoot: tempDir.appending(path: "Staging", directoryHint: .isDirectory),
+            transferRangeConfiguration: CuriumRangeEngineConfiguration(
+                maxLanes: 4,
+                maxWindowBytes: 256 * 1024,
+                minimumStealBytes: 128 * 1024,
+                multiLaneThresholdBytes: 512 * 1024
+            )
+        )
+
+        let task = RoutingMockDownloadTask(
+            downloadID: "b44-zero-probe-1",
+            sourceTabID: "zp-tab",
+            originalURL: server.url(path: "/redirect-token-burned-on-first-get"),
+            suggestedFilename: "Download",
+            mimeType: "application/octet-stream",
+            isExplicitDownload: true,
+            isMainFrame: true,
+            httpMethod: "GET",
+            finalURL: server.url(path: "/cdn/actual-payload.bin"),
+            acceptRanges: true,
+            eTag: "\"b44-zero-probe-v1\"",
+            lastModified: "Tue, 24 Nov 2026 12:00:00 GMT",
+            contentDisposition: "attachment; filename=\"resolved-archive.bin\"",
+            totalBytes: Int64(payload.count)
+        )
+
+        store.browserHost(host, didCreateDownload: task)
+        let item = try #require(store.downloads.first { $0.id == "b44-zero-probe-1" })
+        #expect(item.resolvedURL == server.url(path: "/cdn/actual-payload.bin"))
+        #expect(item.eTag == "\"b44-zero-probe-v1\"")
+
+        await store.startDownload(item)
+
+        #expect(item.phase == .completed)
+        #expect(item.transportKind == .multiLaneRange)
+        #expect(item.filename == "resolved-archive.bin")
+        #expect(task.cancelCount == 1)
+        #expect(task.startCallCount == 0)
+
+        let savedURL = try #require(item.savedURL)
+        #expect(sha256Hex(try Data(contentsOf: savedURL)) == expectedSHA)
+
+        // Zero bytes=0-0 probe requests hit the server; every request went straight to multi-lane Range on finalURL.
+        let stats = server.snapshotStats()
+        #expect(stats.probeRequests == 0)
+        #expect(stats.rangeRequests >= 2)
+        #expect(stats.receivedPaths.allSatisfy { $0 == "/cdn/actual-payload.bin" })
+    }
+
+    @Test("Build 44 CrIOSNetworkFetchV1 adapter streams multi-lane Range windows with backpressure and SSRF redirect blocking")
+    func build44ChromiumNetworkFetchAdapterRangeAndSSRF() async throws {
+        final class MockChromiumFetchTask: NSObject, CrIOSNetworkFetchTaskV1, @unchecked Sendable {
+            private let lock = OSAllocatedUnfairLock<(cancelled: Bool, suspendCalls: Int)>(initialState: (false, 0))
+            var isCancelled: Bool { lock.withLock { $0.cancelled } }
+            func setSuspended(_ suspended: Bool) {
+                lock.withLock { if suspended { $0.suspendCalls += 1 } }
+            }
+            func cancel() {
+                lock.withLock { $0.cancelled = true }
+            }
+        }
+
+        let payload = makeSyntheticPayload(bytes: 768 * 1024)
+        let expectedSHA = sha256Hex(payload)
+        let requestLog = OSAllocatedUnfairLock<[(url: URL, includeCookies: Bool, blockPrivate: Bool, cookieHeaderSent: Bool)]>(initialState: [])
+
+        let starter: CuriumChromiumFetchStarter = { url, _, headers, _, includeCookies, blockPrivate, _, delegateHandle, queue in
+            let hasManualCookie = headers.keys.contains { $0.lowercased() == "cookie" }
+            requestLog.withLock { $0.append((url, includeCookies, blockPrivate, hasManualCookie)) }
+            let task = MockChromiumFetchTask()
+
+            queue.async {
+                if url.path == "/redirect-to-private" {
+                    delegateHandle.delegate.networkFetchTask(
+                        task,
+                        willPerformRedirect: URL(string: "http://127.0.0.1/secret")!,
+                        statusCode: 302,
+                        responseHeaders: ["location": "http://127.0.0.1/secret"]
+                    ) { allow, _ in
+                        if !allow {
+                            delegateHandle.delegate.networkFetchTask(
+                                task,
+                                didCompleteWithError: NSError(
+                                    domain: NSURLErrorDomain,
+                                    code: NSURLErrorCancelled
+                                )
+                            )
+                        }
+                    }
+                    return
+                }
+
+                let rangeHeader = headers.first(where: { $0.key.lowercased() == "range" })?.value ?? ""
+                let stripped = rangeHeader.replacingOccurrences(of: "bytes=", with: "")
+                let parts = stripped.split(separator: "-")
+                let start = Int(parts.first ?? "0") ?? 0
+                let end = min(payload.count - 1, Int(parts.last ?? "\(payload.count - 1)") ?? (payload.count - 1))
+                let slice = payload[start...end]
+
+                delegateHandle.delegate.networkFetchTask(
+                    task,
+                    didReceiveResponse: 206,
+                    finalURL: url,
+                    expectedLength: Int64(slice.count),
+                    responseHeaders: [
+                        "content-range": "bytes \(start)-\(end)/\(payload.count)",
+                        "etag": "\"chromium-bridge-v1\"",
+                        "content-type": "application/octet-stream",
+                    ]
+                )
+                // Deliver in 64 KiB chunks matching Mojo pipe chunking.
+                var cursor = start
+                while cursor <= end, !task.isCancelled {
+                    let chunkEnd = min(end, cursor + 65_535)
+                    delegateHandle.delegate.networkFetchTask(task, didReceive: Data(payload[cursor...chunkEnd]))
+                    cursor = chunkEnd + 1
+                }
+                delegateHandle.delegate.networkFetchTask(task, didCompleteWithError: nil)
+            }
+            return CuriumNetworkFetchTaskHandle(task: task)
+        }
+
+        let engine = CuriumRangeTransferEngine(chromiumFetchStarter: starter)
+        let tempDir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-b44-netfetch-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dest = tempDir.appending(path: "chromium-fetched.bin", directoryHint: .notDirectory)
+        let result = try await engine.download(
+            url: URL(string: "https://cdn.example.com/archive.bin")!,
+            headers: ["Cookie": "stale=1", "User-Agent": "CuriumTest/1.0"],
+            destinationURL: dest,
+            originatingURL: URL(string: "https://example.com/downloads")!,
+            includeCookies: true,
+            configuration: CuriumRangeEngineConfiguration(
+                maxLanes: 4,
+                maxWindowBytes: 256 * 1024,
+                minimumStealBytes: 128 * 1024,
+                multiLaneThresholdBytes: 512 * 1024
+            ),
+            onProgress: { _ in }
+        )
+
+        #expect(result.receivedBytes == Int64(payload.count))
+        #expect(sha256Hex(try Data(contentsOf: dest)) == expectedSHA)
+
+        let recorded = requestLog.withLock { $0 }
+        #expect(recorded.count >= 4)
+        // Chromium CookieMonster handles cookies natively (manual Cookie stripped) & public origin enables SSRF guard.
+        #expect(recorded.allSatisfy { $0.includeCookies && $0.blockPrivate && !$0.cookieHeaderSent })
+
+        // Redirect from public origin to 127.0.0.1 must fail closed with blockedPrivateNetworkHost.
+        await #expect(throws: CuriumRangeTransferError.blockedPrivateNetworkHost("127.0.0.1")) {
+            _ = try await engine.probe(
+                url: URL(string: "https://cdn.example.com/redirect-to-private")!,
+                originatingURL: URL(string: "https://example.com/page")!
+            )
+        }
     }
 }

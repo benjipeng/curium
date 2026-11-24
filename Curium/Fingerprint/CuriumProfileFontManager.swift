@@ -3,6 +3,7 @@ import CoreText
 import CryptoKit
 import Foundation
 import OSLog
+import os
 
 /// Registers a deterministic, per-profile subset of authentic macOS / Office-for-Mac /
 /// Adobe-for-Mac / developer font families into the current process's CoreText registry
@@ -113,6 +114,7 @@ enum CuriumProfileFontManager {
 
     private static let tempDirPrefix = "curium-profile-fonts-"
     private static let log = Logger(subsystem: "com.appautomaton.curium", category: "profile-fonts")
+    private static let registeredFontURLsLock = OSAllocatedUnfairLock<[URL]>(initialState: [])
 
     /// Stable seed string shared across per-profile CoreText font registration and
     /// desktop parity voice/Dock selection. Stays unique per install/profile even when
@@ -175,6 +177,7 @@ enum CuriumProfileFontManager {
         }
 
         var registered: [String] = []
+        var newlyRegisteredURLs: [URL] = []
         for spec in specs {
             if isFamilyAlreadyInstalled(spec.familyName) {
                 registered.append(spec.familyName)
@@ -187,6 +190,7 @@ enum CuriumProfileFontManager {
                 var cfError: Unmanaged<CFError>?
                 if CTFontManagerRegisterFontsForURL(fileURL as CFURL, .process, &cfError) {
                     registered.append(spec.familyName)
+                    newlyRegisteredURLs.append(fileURL)
                 } else {
                     let msg = cfError?.takeRetainedValue().localizedDescription ?? "unknown error"
                     log.debug("font register skipped for \(spec.familyName, privacy: .public): \(msg, privacy: .public)")
@@ -195,8 +199,31 @@ enum CuriumProfileFontManager {
                 log.debug("font write failed for \(spec.familyName, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
         }
+        if !newlyRegisteredURLs.isEmpty {
+            let urlsToRecord = newlyRegisteredURLs
+            registeredFontURLsLock.withLock { $0.append(contentsOf: urlsToRecord) }
+        }
         log.notice("registered \(registered.count) profile CoreText fonts for \(profile.id, privacy: .public)")
         return registered
+    }
+
+    /// Unregisters the outgoing profile's process-scoped CoreText fonts and registers
+    /// `profile`'s deterministic font subset during Build 44's `beforeProfileCreate`
+    /// hot-swap window (after Blink's FontCache/SkFontMgr purge and before target boot).
+    @discardableResult
+    static func swapRegisteredFontsForHotSwap(to profile: CuriumFingerprintProfile?) -> [String] {
+        let previousURLs: [URL] = registeredFontURLsLock.withLock { urls in
+            let snapshot = urls
+            urls.removeAll(keepingCapacity: false)
+            return snapshot
+        }
+        let fm = FileManager.default
+        for url in previousURLs {
+            var cfError: Unmanaged<CFError>?
+            _ = CTFontManagerUnregisterFontsForURL(url as CFURL, .process, &cfError)
+            try? fm.removeItem(at: url)
+        }
+        return registerLaunchFontsIfNeeded(for: profile)
     }
 
     /// Rebuilds a valid SFNT (`.ttf` / `.otf`) binary from a built-in system CoreText font

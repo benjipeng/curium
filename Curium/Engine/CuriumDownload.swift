@@ -127,6 +127,8 @@ final class CuriumDownload: Identifiable {
         self.id = task.downloadID
         self.sourceTabID = task.sourceTabID
         self.originalURL = task.originalURL
+        self.resolvedURL = (task.finalURL ?? nil) ?? task.originalURL
+        self.eTag = (task.eTag ?? nil).flatMap(CuriumTransferRecord.strongETag(from:))
         self.filename = CuriumDownloadStorage.sanitizedFilename(task.suggestedFilename)
         self.mimeType = task.mimeType
         self.isExplicitDownload = task.isExplicitDownload ?? false

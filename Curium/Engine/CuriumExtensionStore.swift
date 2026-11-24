@@ -176,6 +176,15 @@ final class CuriumExtensionStore {
         }
     }
 
+    func shutdown() {
+        coalescedRefreshTask?.cancel()
+        coalescedRefreshTask = nil
+        pendingFullRefresh = false
+        pendingActionIDs.removeAll()
+        observationBox = nil
+        Self.windows.remove(self)
+    }
+
     func scheduleContextRefresh(tabID: Int32) {
         self.tabID = tabID
         contextGeneration += 1

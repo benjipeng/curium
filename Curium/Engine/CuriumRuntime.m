@@ -709,6 +709,112 @@ NSDictionary<NSString *, id> *_Nullable CuriumEngineActiveRuntimePolicyStatusDic
     return [(id)bootstrap activeRuntimePolicyStatus];
 }
 
+BOOL CuriumSupportsProfileHotSwap(void) {
+    Class bootstrap = NSClassFromString(@"CrIOSEngineBootstrap");
+    return [bootstrap respondsToSelector:@selector(switchToProfileWithConfigJSON:beforeProfileCreate:completion:)];
+}
+
+void CuriumSwitchToProfile(
+    NSData *jsonData,
+    void (^NS_SWIFT_UI_ACTOR _Nullable beforeProfileCreate)(void),
+    void (^NS_SWIFT_UI_ACTOR completion)(
+        id<CrIOSBrowserHostV1> _Nullable browserHost,
+        id<CrIOSExtensionManagingV1> _Nullable extensionManager,
+        NSError *_Nullable error)) {
+    if (!completion) {
+        return;
+    }
+    Class bootstrap = NSClassFromString(@"CrIOSEngineBootstrap");
+    if (![bootstrap respondsToSelector:@selector(switchToProfileWithConfigJSON:beforeProfileCreate:completion:)]) {
+        NSError *unsupported = [NSError errorWithDomain:CrIOSFingerprintErrorDomain
+                                                   code:CrIOSFingerprintErrorHotSwapUnsupported
+                                               userInfo:@{NSLocalizedDescriptionKey:
+                                                              @"Zero-restart profile hot-swap requires Build 44 or newer."}];
+        CuriumRunOnMain(^{
+            completion(nil, nil, unsupported);
+        });
+        return;
+    }
+
+    [(id)bootstrap switchToProfileWithConfigJSON:(jsonData ?: [NSData data])
+                             beforeProfileCreate:beforeProfileCreate
+                                      completion:^(id<CrIOSBrowserHostV1> _Nullable browserHost,
+                                                   id<CrIOSExtensionManagingV1> _Nullable extensionManager,
+                                                   NSError *_Nullable error) {
+        CuriumRunOnMain(^{
+            if (browserHost && !error) {
+                gCuriumExplicitFingerprintConfigured = YES;
+                NSDictionary<NSString *, id> *status = CuriumEngineActiveFingerprintStatusDict();
+                NSString *profileId = [status[@"appliedProfileId"] isKindOfClass:[NSString class]]
+                    ? status[@"appliedProfileId"] : @"unknown";
+                NSNumber *rev = [status[@"appliedConfigRevision"] isKindOfClass:[NSNumber class]]
+                    ? status[@"appliedConfigRevision"] : @0;
+                CuriumRecordHookStatus(@"Fingerprint Profile", @"active",
+                                       [NSString stringWithFormat:@"profile=%@ rev=%llu (hot-swap)",
+                                        profileId, rev.unsignedLongLongValue]);
+            } else if (error) {
+                CuriumRecordHookStatus(@"Profile Hot-Swap", @"failed",
+                                       error.localizedDescription ?: @"Profile hot-swap failed");
+            }
+            completion(browserHost, extensionManager, error);
+        });
+    }];
+}
+
+BOOL CuriumHostSupportsNetworkFetch(id<CrIOSBrowserHostV1> host) {
+    if (!host) {
+        return NO;
+    }
+    return [host respondsToSelector:@selector(startFetchRequest:delegate:callbackQueue:)] &&
+           NSClassFromString(@"CrIOSNetworkFetchRequestV1") != nil;
+}
+
+id<CrIOSNetworkFetchTaskV1> _Nullable CuriumStartNetworkFetch(
+    id<CrIOSBrowserHostV1> host,
+    NSURL *url,
+    NSString *httpMethod,
+    NSDictionary<NSString *, NSString *> *_Nullable headers,
+    NSURL *_Nullable isolationTopFrameURL,
+    BOOL includeCookies,
+    BOOL blockPrivateNetworkTargets,
+    NSTimeInterval timeoutInterval,
+    id<CrIOSNetworkFetchDelegateV1> delegate,
+    dispatch_queue_t callbackQueue) {
+    if (!host || !url || !delegate || !callbackQueue) {
+        return nil;
+    }
+    if (![host respondsToSelector:@selector(startFetchRequest:delegate:callbackQueue:)]) {
+        return nil;
+    }
+    Class requestClass = NSClassFromString(@"CrIOSNetworkFetchRequestV1");
+    if (!requestClass) {
+        return nil;
+    }
+    id rawRequest = [[requestClass alloc] init];
+    if (!rawRequest) {
+        return nil;
+    }
+    CrIOSNetworkFetchRequestV1 *request = (CrIOSNetworkFetchRequestV1 *)rawRequest;
+    request.URL = url;
+    request.HTTPMethod = httpMethod.length > 0 ? httpMethod : @"GET";
+    request.headers = headers;
+    request.isolationTopFrameURL = isolationTopFrameURL;
+    request.includeCookies = includeCookies;
+    request.blockPrivateNetworkTargets = blockPrivateNetworkTargets;
+    request.timeoutInterval = timeoutInterval;
+    return [host startFetchRequest:request delegate:delegate callbackQueue:callbackQueue];
+}
+
+BOOL CuriumDiscardTab(id<CrIOSBrowserHostV1> host, NSString *tabID) {
+    if (!host || tabID.length == 0) {
+        return NO;
+    }
+    if (![host respondsToSelector:@selector(discardTabWithID:)]) {
+        return NO;
+    }
+    return [host discardTabWithID:tabID];
+}
+
 BOOL CuriumRegisterShell(id<CrIOSShellBootstrapDelegate> delegate) {
     Class bootstrap = NSClassFromString(@"CrIOSEngineBootstrap");
     if (![bootstrap respondsToSelector:@selector(registerShellBootstrapDelegate:)]) {

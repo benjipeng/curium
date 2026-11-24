@@ -1,5 +1,31 @@
+import CuriumEngineContract
 import Foundation
 import os
+
+/// Sendable wrapper for ObjC `CrIOSNetworkFetchTaskV1` (guaranteed thread-safe by EngineContract v4).
+struct CuriumNetworkFetchTaskHandle: @unchecked Sendable {
+    let task: any CrIOSNetworkFetchTaskV1
+}
+
+/// Sendable wrapper for ObjC `CrIOSNetworkFetchDelegateV1` passed across the `@MainActor` start hop.
+struct CuriumNetworkFetchDelegateHandle: @unchecked Sendable {
+    let delegate: any CrIOSNetworkFetchDelegateV1
+}
+
+/// Off-`@MainActor` Chromium `SharedURLLoaderFactory` streaming fetch starter (Build 44+, EngineContract v4).
+/// Returns `nil` when running on Build <= 43 or without an active engine host so `CuriumRangeTransferEngine`
+/// seamlessly falls back to `URLSession`.
+typealias CuriumChromiumFetchStarter = @Sendable (
+    _ url: URL,
+    _ method: String,
+    _ headers: [String: String],
+    _ isolationTopFrameURL: URL?,
+    _ includeCookies: Bool,
+    _ blockPrivateNetworkTargets: Bool,
+    _ timeoutInterval: TimeInterval,
+    _ delegate: CuriumNetworkFetchDelegateHandle,
+    _ callbackQueue: DispatchQueue
+) async -> CuriumNetworkFetchTaskHandle?
 
 /// Tuning parameters for `CuriumRangeTransferEngine`.
 struct CuriumRangeEngineConfiguration: Sendable, Equatable {
@@ -297,10 +323,21 @@ final class CuriumSliceCoordinator: @unchecked Sendable {
 /// bounded TCP backpressure, lock-free `Darwin.pwrite`, per-window transient auto-retry,
 /// 1-shot auth cookie refresh on `401`/`403`, and single-stream fallback.
 struct CuriumRangeTransferEngine: Sendable {
-    private let customSession: URLSession?
+    private static let chromiumCallbackQueue = DispatchQueue(
+        label: "com.appautomaton.curium.transfers.chromium-fetch",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
 
-    init(session: URLSession? = nil) {
+    private let customSession: URLSession?
+    private let chromiumFetchStarter: CuriumChromiumFetchStarter?
+
+    init(
+        session: URLSession? = nil,
+        chromiumFetchStarter: CuriumChromiumFetchStarter? = nil
+    ) {
         self.customSession = session
+        self.chromiumFetchStarter = chromiumFetchStarter
     }
 
     // MARK: - Probe
@@ -312,6 +349,7 @@ struct CuriumRangeTransferEngine: Sendable {
         headers: [String: String] = [:],
         proxy: CuriumProxyConfig = .system,
         originatingURL: URL? = nil,
+        includeCookies: Bool = false,
         cookieResolver: (@Sendable (URL) async -> String?)? = nil,
         timeoutSeconds: TimeInterval = 3.5
     ) async throws -> CuriumRangeProbeResult {
@@ -323,6 +361,7 @@ struct CuriumRangeTransferEngine: Sendable {
             headers: headers,
             session: lease.session,
             originatingURL: originatingURL,
+            includeCookies: includeCookies,
             cookieResolver: cookieResolver,
             timeoutSeconds: timeoutSeconds
         )
@@ -333,6 +372,7 @@ struct CuriumRangeTransferEngine: Sendable {
         headers: [String: String],
         session: URLSession,
         originatingURL: URL?,
+        includeCookies: Bool,
         cookieResolver: (@Sendable (URL) async -> String?)?,
         timeoutSeconds: TimeInterval
     ) async throws -> CuriumRangeProbeResult {
@@ -344,6 +384,7 @@ struct CuriumRangeTransferEngine: Sendable {
             effectiveHeaders["Cookie"] = cookie
         }
 
+        let effectiveIncludeCookies = includeCookies || cookieResolver != nil || Self.hasHeader("cookie", in: effectiveHeaders)
         var didRefreshAuth = false
         while true {
             try Task.checkCancellation()
@@ -355,17 +396,13 @@ struct CuriumRangeTransferEngine: Sendable {
             }
             req.setValue("bytes=0-0", forHTTPHeaderField: "Range")
 
-            let redirectGuard = CrossOriginRedirectAuthStripper(
-                originatingURL: originatingURL,
-                cookieResolver: cookieResolver
-            )
-            let receiver = BulkChunkReceiver(redirectStripper: redirectGuard)
-
-            let response = try await startWithHeaderTimeout(
-                receiver: receiver,
+            let (response, receiver) = try await startStream(
                 request: req,
                 via: session,
-                timeoutSeconds: timeoutSeconds
+                originatingURL: originatingURL,
+                includeCookies: effectiveIncludeCookies,
+                cookieResolver: cookieResolver,
+                headerTimeoutSeconds: timeoutSeconds
             )
             defer { receiver.cancelFromConsumer() }
 
@@ -452,6 +489,7 @@ struct CuriumRangeTransferEngine: Sendable {
         supportsRangesHint: Bool? = nil,
         existingSlices: [CuriumByteRangeSlice]? = nil,
         ifRangeValidator: String? = nil,
+        includeCookies: Bool = false,
         cookieResolver: (@Sendable (URL) async -> String?)? = nil,
         configuration: CuriumRangeEngineConfiguration = CuriumRangeEngineConfiguration(),
         onProgress: @escaping @Sendable (CuriumRangeProgressUpdate) -> Void
@@ -469,6 +507,7 @@ struct CuriumRangeTransferEngine: Sendable {
                 supportsRangesHint: supportsRangesHint,
                 existingSlices: existingSlices,
                 ifRangeValidator: ifRangeValidator,
+                includeCookies: includeCookies,
                 cookieResolver: cookieResolver,
                 configuration: configuration,
                 onProgress: onProgress
@@ -485,6 +524,7 @@ struct CuriumRangeTransferEngine: Sendable {
                 supportsRangesHint: nil,
                 existingSlices: nil,
                 ifRangeValidator: nil,
+                includeCookies: includeCookies,
                 cookieResolver: cookieResolver,
                 configuration: configuration,
                 onProgress: onProgress
@@ -502,6 +542,7 @@ struct CuriumRangeTransferEngine: Sendable {
         supportsRangesHint: Bool?,
         existingSlices: [CuriumByteRangeSlice]?,
         ifRangeValidator: String?,
+        includeCookies: Bool,
         cookieResolver: (@Sendable (URL) async -> String?)?,
         configuration: CuriumRangeEngineConfiguration,
         onProgress: @escaping @Sendable (CuriumRangeProgressUpdate) -> Void
@@ -525,6 +566,7 @@ struct CuriumRangeTransferEngine: Sendable {
                 headers: headers,
                 session: lease.session,
                 originatingURL: originatingURL,
+                includeCookies: includeCookies,
                 cookieResolver: cookieResolver,
                 timeoutSeconds: configuration.probeTimeoutSeconds
             )
@@ -555,6 +597,7 @@ struct CuriumRangeTransferEngine: Sendable {
            !refreshed.isEmpty {
             effectiveHeaders["Cookie"] = refreshed
         }
+        let effectiveIncludeCookies = includeCookies || cookieResolver != nil || Self.hasHeader("cookie", in: effectiveHeaders)
 
         guard supportsRanges,
               let totalBytes,
@@ -566,6 +609,7 @@ struct CuriumRangeTransferEngine: Sendable {
                 destinationURL: destinationURL,
                 originatingURL: originatingURL,
                 expectedBytes: totalBytes,
+                includeCookies: effectiveIncludeCookies,
                 cookieResolver: cookieResolver,
                 configuration: configuration,
                 onProgress: onProgress
@@ -613,6 +657,7 @@ struct CuriumRangeTransferEngine: Sendable {
                             session: activeSession,
                             originatingURL: originatingURL,
                             ifRangeValidator: effectiveIfRange,
+                            includeCookies: effectiveIncludeCookies,
                             cookieResolver: cookieResolver,
                             writer: writer,
                             coordinator: coordinator,
@@ -646,6 +691,7 @@ struct CuriumRangeTransferEngine: Sendable {
         session: URLSession,
         originatingURL: URL?,
         ifRangeValidator: String?,
+        includeCookies: Bool,
         cookieResolver: (@Sendable (URL) async -> String?)?,
         writer: CuriumPreallocatedFileWriter,
         coordinator: CuriumSliceCoordinator,
@@ -667,6 +713,7 @@ struct CuriumRangeTransferEngine: Sendable {
                         session: session,
                         originatingURL: originatingURL,
                         ifRangeValidator: ifRangeValidator,
+                        includeCookies: includeCookies,
                         cookieResolver: cookieResolver,
                         sliceID: sliceID,
                         writer: writer,
@@ -691,6 +738,7 @@ struct CuriumRangeTransferEngine: Sendable {
         session: URLSession,
         originatingURL: URL?,
         ifRangeValidator: String?,
+        includeCookies: Bool,
         cookieResolver: (@Sendable (URL) async -> String?)?,
         sliceID: Int,
         writer: CuriumPreallocatedFileWriter,
@@ -716,6 +764,7 @@ struct CuriumRangeTransferEngine: Sendable {
                     session: session,
                     originatingURL: originatingURL,
                     ifRangeValidator: ifRangeValidator,
+                    includeCookies: includeCookies,
                     cookieResolver: cookieResolver,
                     sliceID: sliceID,
                     windowStart: window.start,
@@ -786,6 +835,7 @@ struct CuriumRangeTransferEngine: Sendable {
         session: URLSession,
         originatingURL: URL?,
         ifRangeValidator: String?,
+        includeCookies: Bool,
         cookieResolver: (@Sendable (URL) async -> String?)?,
         sliceID: Int,
         windowStart: Int64,
@@ -806,12 +856,14 @@ struct CuriumRangeTransferEngine: Sendable {
             req.setValue(ifRangeValidator, forHTTPHeaderField: "If-Range")
         }
 
-        let redirectGuard = CrossOriginRedirectAuthStripper(
+        let (response, receiver) = try await startStream(
+            request: req,
+            via: session,
             originatingURL: originatingURL,
-            cookieResolver: cookieResolver
+            includeCookies: includeCookies,
+            cookieResolver: cookieResolver,
+            headerTimeoutSeconds: nil
         )
-        let receiver = BulkChunkReceiver(redirectStripper: redirectGuard)
-        let response = try await receiver.start(request: req, via: session)
         defer { receiver.cancelFromConsumer() }
 
         guard let http = response as? HTTPURLResponse else {
@@ -915,6 +967,7 @@ struct CuriumRangeTransferEngine: Sendable {
         destinationURL: URL,
         originatingURL: URL?,
         expectedBytes: Int64?,
+        includeCookies: Bool,
         cookieResolver: (@Sendable (URL) async -> String?)?,
         configuration: CuriumRangeEngineConfiguration,
         onProgress: @escaping @Sendable (CuriumRangeProgressUpdate) -> Void
@@ -923,7 +976,7 @@ struct CuriumRangeTransferEngine: Sendable {
         var didRefreshAuth = false
         var attempt = 0
 
-        let responseAndReceiver: (HTTPURLResponse, BulkChunkReceiver)
+        let responseAndReceiver: (HTTPURLResponse, any ChunkStreamReceiver)
         while true {
             try Task.checkCancellation()
             attempt += 1
@@ -934,14 +987,17 @@ struct CuriumRangeTransferEngine: Sendable {
                 req.setValue(v, forHTTPHeaderField: k)
             }
 
-            let redirectGuard = CrossOriginRedirectAuthStripper(
-                originatingURL: originatingURL,
-                cookieResolver: cookieResolver
-            )
-            let receiver = BulkChunkReceiver(redirectStripper: redirectGuard)
-
+            var activeReceiver: (any ChunkStreamReceiver)?
             do {
-                let response = try await receiver.start(request: req, via: session)
+                let (response, receiver) = try await startStream(
+                    request: req,
+                    via: session,
+                    originatingURL: originatingURL,
+                    includeCookies: includeCookies,
+                    cookieResolver: cookieResolver,
+                    headerTimeoutSeconds: nil
+                )
+                activeReceiver = receiver
                 guard let http = response as? HTTPURLResponse else {
                     receiver.cancelFromConsumer()
                     throw CuriumRangeTransferError.invalidHTTPResponse
@@ -978,7 +1034,7 @@ struct CuriumRangeTransferEngine: Sendable {
                 responseAndReceiver = (http, receiver)
                 break
             } catch {
-                receiver.cancelFromConsumer()
+                activeReceiver?.cancelFromConsumer()
                 if error is CancellationError {
                     throw error
                 }
@@ -1089,12 +1145,408 @@ struct CuriumRangeTransferEngine: Sendable {
         }
     }
 
-    // MARK: - Bounded Backpressure Receiver
+    // MARK: - Bounded Backpressure Receivers (URLSession & Chromium CrIOSNetworkFetchV1)
+
+    private protocol ChunkStreamReceiver: Sendable {
+        func nextChunk() async throws -> Data?
+        func cancelFromConsumer()
+    }
+
+    private func startStream(
+        request: URLRequest,
+        via session: URLSession,
+        originatingURL: URL?,
+        includeCookies: Bool,
+        cookieResolver: (@Sendable (URL) async -> String?)?,
+        headerTimeoutSeconds: TimeInterval?
+    ) async throws -> (URLResponse, any ChunkStreamReceiver) {
+        if let starter = chromiumFetchStarter,
+           customSession == nil,
+           let url = request.url {
+            var filteredHeaders: [String: String] = [:]
+            if let allHeaders = request.allHTTPHeaderFields {
+                for (k, v) in allHeaders {
+                    // When Chromium's CookieMonster manages cookies + CHIPS natively, avoid
+                    // duplicating a stale manual Cookie header from the snapshot path.
+                    if includeCookies && k.lowercased() == "cookie" {
+                        continue
+                    }
+                    filteredHeaders[k] = v
+                }
+            }
+            let blockPrivate = originatingURL.map {
+                !CuriumHLSParser.isAllowedTargetURL(URL(string: "http://127.0.0.1/")!, originatingURL: $0)
+            } ?? false
+            let receiver = ChromiumChunkReceiver(originatingURL: originatingURL)
+            let started = await receiver.begin(
+                starter: starter,
+                url: url,
+                method: request.httpMethod ?? "GET",
+                headers: filteredHeaders,
+                isolationTopFrameURL: originatingURL,
+                includeCookies: includeCookies,
+                blockPrivateNetworkTargets: blockPrivate,
+                timeoutInterval: headerTimeoutSeconds ?? request.timeoutInterval,
+                callbackQueue: Self.chromiumCallbackQueue
+            )
+            if started {
+                let response: URLResponse
+                if let headerTimeoutSeconds {
+                    response = try await awaitHeaderWithTimeout(
+                        receiver: receiver,
+                        timeoutSeconds: headerTimeoutSeconds
+                    ) {
+                        try await receiver.awaitResponse()
+                    }
+                } else {
+                    response = try await receiver.awaitResponse()
+                }
+                return (response, receiver)
+            }
+        }
+
+        let redirectGuard = CrossOriginRedirectAuthStripper(
+            originatingURL: originatingURL,
+            cookieResolver: cookieResolver
+        )
+        let receiver = BulkChunkReceiver(redirectStripper: redirectGuard)
+        let response: URLResponse
+        if let headerTimeoutSeconds {
+            response = try await awaitHeaderWithTimeout(
+                receiver: receiver,
+                timeoutSeconds: headerTimeoutSeconds
+            ) {
+                try await receiver.start(request: request, via: session)
+            }
+        } else {
+            response = try await receiver.start(request: request, via: session)
+        }
+        return (response, receiver)
+    }
+
+    private func awaitHeaderWithTimeout(
+        receiver: any ChunkStreamReceiver,
+        timeoutSeconds: TimeInterval,
+        operation: @escaping @Sendable () async throws -> URLResponse
+    ) async throws -> URLResponse {
+        try await withThrowingTaskGroup(of: URLResponse?.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(timeoutSeconds))
+                return nil
+            }
+            guard let first = try await group.next() else {
+                throw CuriumRangeTransferError.probeTimedOut
+            }
+            group.cancelAll()
+            if let result = first {
+                return result
+            }
+            receiver.cancelFromConsumer()
+            throw CuriumRangeTransferError.probeTimedOut
+        }
+    }
+
+    /// Bounded chunk-level HTTP body reader backed by Build 44's off-`@MainActor`
+    /// `CrIOSNetworkFetchV1` (`SharedURLLoaderFactory` + `mojo::SimpleWatcher` credit pipe).
+    private final class ChromiumChunkReceiver: NSObject, CrIOSNetworkFetchDelegateV1, ChunkStreamReceiver, @unchecked Sendable {
+        private static let highWaterBytes = 2 * 1024 * 1024
+        private static let lowWaterBytes = 512 * 1024
+
+        private let originatingURL: URL?
+        private let lock = NSLock()
+        private var activeTask: (any CrIOSNetworkFetchTaskV1)?
+        private var headerContinuation: CheckedContinuation<URLResponse, any Error>?
+        private var chunkContinuation: CheckedContinuation<Data?, any Error>?
+        private var pendingResponse: URLResponse?
+        private var bufferedChunks: [Data] = []
+        private var headIndex: Int = 0
+        private var bufferedBytes: Int = 0
+        private var isSuspendedForBackpressure: Bool = false
+        private var streamCompleted: Bool = false
+        private var streamError: (any Error)?
+        private var blockedRedirectError: CuriumRangeTransferError?
+
+        init(originatingURL: URL?) {
+            self.originatingURL = originatingURL
+            super.init()
+        }
+
+        func begin(
+            starter: CuriumChromiumFetchStarter,
+            url: URL,
+            method: String,
+            headers: [String: String],
+            isolationTopFrameURL: URL?,
+            includeCookies: Bool,
+            blockPrivateNetworkTargets: Bool,
+            timeoutInterval: TimeInterval,
+            callbackQueue: DispatchQueue
+        ) async -> Bool {
+            guard let handle = await starter(
+                url,
+                method,
+                headers,
+                isolationTopFrameURL,
+                includeCookies,
+                blockPrivateNetworkTargets,
+                timeoutInterval,
+                CuriumNetworkFetchDelegateHandle(delegate: self),
+                callbackQueue
+            ) else {
+                return false
+            }
+            let task = handle.task
+            let shouldCancelImmediately: Bool = lock.withLock {
+                if streamCompleted {
+                    return true
+                }
+                activeTask = task
+                return false
+            }
+            if shouldCancelImmediately {
+                task.cancel()
+            }
+            return true
+        }
+
+        func awaitResponse() async throws -> URLResponse {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { cont in
+                    enum Action {
+                        case returnResponse(URLResponse)
+                        case throwError(any Error)
+                        case wait
+                    }
+                    let action: Action = lock.withLock {
+                        if let resp = pendingResponse {
+                            return .returnResponse(resp)
+                        }
+                        if let err = streamError {
+                            return .throwError(err)
+                        }
+                        if streamCompleted {
+                            return .throwError(CuriumRangeTransferError.invalidHTTPResponse)
+                        }
+                        headerContinuation = cont
+                        return .wait
+                    }
+                    switch action {
+                    case .returnResponse(let resp):
+                        cont.resume(returning: resp)
+                    case .throwError(let err):
+                        cont.resume(throwing: err)
+                    case .wait:
+                        break
+                    }
+                }
+            } onCancel: {
+                self.cancelFromConsumer()
+            }
+        }
+
+        func nextChunk() async throws -> Data? {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data?, any Error>) in
+                    enum NextAction {
+                        case deliver(Data, (any CrIOSNetworkFetchTaskV1)?)
+                        case finish
+                        case fail(any Error)
+                        case wait
+                    }
+                    let action: NextAction = lock.withLock {
+                        if let err = streamError {
+                            return .fail(err)
+                        }
+                        if headIndex < bufferedChunks.count {
+                            let chunk = bufferedChunks[headIndex]
+                            bufferedChunks[headIndex] = Data()
+                            headIndex += 1
+                            bufferedBytes = max(0, bufferedBytes - chunk.count)
+                            if headIndex >= 32, headIndex * 2 >= bufferedChunks.count {
+                                bufferedChunks.removeFirst(headIndex)
+                                headIndex = 0
+                            }
+                            var taskToResume: (any CrIOSNetworkFetchTaskV1)?
+                            if isSuspendedForBackpressure && bufferedBytes <= Self.lowWaterBytes {
+                                isSuspendedForBackpressure = false
+                                taskToResume = activeTask
+                            }
+                            return .deliver(chunk, taskToResume)
+                        }
+                        if streamCompleted {
+                            return .finish
+                        }
+                        chunkContinuation = cont
+                        return .wait
+                    }
+                    switch action {
+                    case .deliver(let data, let taskToResume):
+                        taskToResume?.setSuspended(false)
+                        cont.resume(returning: data)
+                    case .finish:
+                        cont.resume(returning: nil)
+                    case .fail(let err):
+                        cont.resume(throwing: err)
+                    case .wait:
+                        break
+                    }
+                }
+            } onCancel: {
+                self.cancelFromConsumer()
+            }
+        }
+
+        func cancelFromConsumer() {
+            let (hCont, cCont, task): (
+                CheckedContinuation<URLResponse, any Error>?,
+                CheckedContinuation<Data?, any Error>?,
+                (any CrIOSNetworkFetchTaskV1)?
+            ) = lock.withLock {
+                if streamError == nil {
+                    streamError = CancellationError()
+                }
+                streamCompleted = true
+                bufferedChunks.removeAll(keepingCapacity: false)
+                headIndex = 0
+                bufferedBytes = 0
+                isSuspendedForBackpressure = false
+                let h = headerContinuation
+                headerContinuation = nil
+                let c = chunkContinuation
+                chunkContinuation = nil
+                let t = activeTask
+                activeTask = nil
+                return (h, c, t)
+            }
+            task?.cancel()
+            hCont?.resume(throwing: CancellationError())
+            cCont?.resume(throwing: CancellationError())
+        }
+
+        func networkFetchTask(
+            _ task: any CrIOSNetworkFetchTaskV1,
+            willPerformRedirect newURL: URL,
+            statusCode: Int,
+            responseHeaders headers: [String: String],
+            decisionHandler: @escaping (Bool, [String: String]?) -> Void
+        ) {
+            guard CuriumHLSParser.isAllowedHTTPURL(newURL) else {
+                lock.withLock {
+                    blockedRedirectError = .disallowedURLScheme(newURL.scheme ?? "unknown")
+                }
+                decisionHandler(false, nil)
+                return
+            }
+            guard CuriumHLSParser.isAllowedTargetURL(newURL, originatingURL: originatingURL) else {
+                lock.withLock {
+                    blockedRedirectError = .blockedPrivateNetworkHost(newURL.host ?? "private")
+                }
+                decisionHandler(false, nil)
+                return
+            }
+            decisionHandler(true, nil)
+        }
+
+        func networkFetchTask(
+            _ task: any CrIOSNetworkFetchTaskV1,
+            didReceiveResponse statusCode: Int,
+            finalURL: URL,
+            expectedLength: Int64,
+            responseHeaders headers: [String: String]
+        ) {
+            var synthesizedHeaders = headers
+            if expectedLength > 0,
+               !synthesizedHeaders.keys.contains(where: { $0.lowercased() == "content-length" }) {
+                synthesizedHeaders["content-length"] = String(expectedLength)
+            }
+            guard let response = HTTPURLResponse(
+                url: finalURL,
+                statusCode: statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: synthesizedHeaders
+            ) else {
+                networkFetchTask(task, didCompleteWithError: CuriumRangeTransferError.invalidHTTPResponse)
+                return
+            }
+            let cont: CheckedContinuation<URLResponse, any Error>? = lock.withLock {
+                guard !streamCompleted else { return nil }
+                pendingResponse = response
+                let c = headerContinuation
+                headerContinuation = nil
+                return c
+            }
+            cont?.resume(returning: response)
+        }
+
+        func networkFetchTask(_ task: any CrIOSNetworkFetchTaskV1, didReceive chunk: Data) {
+            guard !chunk.isEmpty else { return }
+            let (directCont, shouldSuspend): (CheckedContinuation<Data?, any Error>?, Bool) = lock.withLock {
+                guard !streamCompleted else { return (nil, false) }
+                if let waiting = chunkContinuation {
+                    chunkContinuation = nil
+                    return (waiting, false)
+                }
+                bufferedChunks.append(chunk)
+                bufferedBytes += chunk.count
+                if bufferedBytes >= Self.highWaterBytes && !isSuspendedForBackpressure {
+                    isSuspendedForBackpressure = true
+                    return (nil, true)
+                }
+                return (nil, false)
+            }
+            if let directCont {
+                directCont.resume(returning: chunk)
+            } else if shouldSuspend {
+                task.setSuspended(true)
+            }
+        }
+
+        func networkFetchTask(_ task: any CrIOSNetworkFetchTaskV1, didCompleteWithError error: (any Error)?) {
+            let (hCont, cCont, finalError): (
+                CheckedContinuation<URLResponse, any Error>?,
+                CheckedContinuation<Data?, any Error>?,
+                (any Error)?
+            ) = lock.withLock {
+                streamCompleted = true
+                activeTask = nil
+                if let blocked = blockedRedirectError {
+                    streamError = blocked
+                } else if let error, streamError == nil {
+                    let nsError = error as NSError
+                    if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+                        streamError = CancellationError()
+                    } else if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorTimedOut {
+                        streamError = URLError(.timedOut)
+                    } else if nsError.domain == "CuriumNetworkFetchErrorDomain" && nsError.code == -20 {
+                        streamError = CuriumRangeTransferError.blockedPrivateNetworkHost("private")
+                    } else {
+                        streamError = error
+                    }
+                }
+                let h = headerContinuation
+                headerContinuation = nil
+                let c = chunkContinuation
+                chunkContinuation = nil
+                return (h, c, streamError)
+            }
+
+            if let finalError {
+                hCont?.resume(throwing: finalError)
+                cCont?.resume(throwing: finalError)
+            } else {
+                hCont?.resume(throwing: CuriumRangeTransferError.invalidHTTPResponse)
+                cCont?.resume(returning: nil)
+            }
+        }
+    }
 
     /// Bounded bulk chunk-level HTTP body reader applying true TCP backpressure
     /// (`dataTask.suspend()` at `2 MiB` / `resume()` at `512 KiB`) and delegating 3xx redirects
     /// through `CrossOriginRedirectAuthStripper`.
-    private final class BulkChunkReceiver: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private final class BulkChunkReceiver: NSObject, URLSessionDataDelegate, ChunkStreamReceiver, @unchecked Sendable {
         private static let highWaterBytes = 2 * 1024 * 1024
         private static let lowWaterBytes = 512 * 1024
 
@@ -1413,32 +1865,6 @@ struct CuriumRangeTransferEngine: Sendable {
         return CuriumProxySessionPool.acquireSessionLease(for: profile, proxy: proxy, targetURL: targetURL)
     }
 
-    private func startWithHeaderTimeout(
-        receiver: BulkChunkReceiver,
-        request: URLRequest,
-        via session: URLSession,
-        timeoutSeconds: TimeInterval
-    ) async throws -> URLResponse {
-        try await withThrowingTaskGroup(of: URLResponse?.self) { group in
-            group.addTask {
-                try await receiver.start(request: request, via: session)
-            }
-            group.addTask {
-                try await Task.sleep(for: .seconds(timeoutSeconds))
-                return nil
-            }
-            guard let first = try await group.next() else {
-                throw CuriumRangeTransferError.probeTimedOut
-            }
-            group.cancelAll()
-            if let result = first {
-                return result
-            }
-            receiver.cancelFromConsumer()
-            throw CuriumRangeTransferError.probeTimedOut
-        }
-    }
-
     static func sanitizedIfRangeValidator(_ raw: String?) -> String? {
         CuriumTransferRecord.strongETag(from: raw)
     }
@@ -1582,6 +2008,15 @@ struct CuriumRangeTransferEngine: Sendable {
             }
         }
         let nsError = error as NSError
+        if nsError.domain == "CuriumNetworkFetchErrorDomain" {
+            // Chromium net::Error codes for transient transport disruptions.
+            switch nsError.code {
+            case -7, -21, -100, -101, -103, -105, -106, -118, -337:
+                return true
+            default:
+                return false
+            }
+        }
         if nsError.domain == NSPOSIXErrorDomain {
             switch Int32(nsError.code) {
             case ECONNRESET, EPIPE, ETIMEDOUT, ENETRESET, ECONNABORTED:

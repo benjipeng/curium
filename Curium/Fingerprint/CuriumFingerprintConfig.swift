@@ -966,6 +966,27 @@ struct CuriumEngineFingerprintCapabilities: Equatable, Sendable {
         features["profileCachePurgeHook"] == true
     }
 
+    var supportsProfileHotSwap: Bool {
+        if let explicit = features["profileHotSwap"] {
+            return explicit
+        }
+        return contractVersion >= 4
+    }
+
+    var supportsNetworkFetchBridge: Bool {
+        if let explicit = features["networkFetchBridge"] {
+            return explicit
+        }
+        return contractVersion >= 4
+    }
+
+    var supportsTabDiscard: Bool {
+        if let explicit = features["tabDiscard"] {
+            return explicit
+        }
+        return contractVersion >= 4
+    }
+
     init(dictionary: [String: Any]?) {
         guard let dictionary else {
             contractVersion = 0

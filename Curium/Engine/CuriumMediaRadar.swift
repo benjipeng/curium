@@ -24,8 +24,46 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
     let frameURL: URL?
     let frameOrigin: String?
     let effectiveUserAgent: String?
+    let redirectChain: [URL]
+    let wasCached: Bool
     let kind: StreamKind
     let capturedAt: Date
+
+    init(
+        id: String,
+        url: URL,
+        originalURL: URL?,
+        mimeType: String?,
+        httpMethod: String?,
+        httpStatusCode: Int,
+        contentLength: Int64,
+        requestDestination: String,
+        referrer: URL?,
+        frameURL: URL?,
+        frameOrigin: String?,
+        effectiveUserAgent: String?,
+        redirectChain: [URL] = [],
+        wasCached: Bool = false,
+        kind: StreamKind,
+        capturedAt: Date
+    ) {
+        self.id = id
+        self.url = url
+        self.originalURL = originalURL
+        self.mimeType = mimeType
+        self.httpMethod = httpMethod
+        self.httpStatusCode = httpStatusCode
+        self.contentLength = contentLength
+        self.requestDestination = requestDestination
+        self.referrer = referrer
+        self.frameURL = frameURL
+        self.frameOrigin = frameOrigin
+        self.effectiveUserAgent = effectiveUserAgent
+        self.redirectChain = redirectChain
+        self.wasCached = wasCached
+        self.kind = kind
+        self.capturedAt = capturedAt
+    }
 
     static func parse(
         from raw: [String: Any],
@@ -35,6 +73,11 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
         guard let url = raw["url"] as? URL,
               let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
+            return nil
+        }
+
+        // Build 44+ (0115): drop failed/aborted subresource fetches that report a non-zero netError.
+        if let netError = (raw["netError"] as? NSNumber)?.intValue, netError != 0 {
             return nil
         }
 
@@ -56,7 +99,9 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
             .first
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
         let dest = ((raw["requestDestination"] as? String) ?? "").lowercased()
-        let contentLength = (raw["contentLength"] as? NSNumber)?.int64Value ?? -1
+        let rawContentLength = (raw["contentLength"] as? NSNumber)?.int64Value ?? -1
+        let receivedBytes = (raw["totalReceivedBytes"] as? NSNumber)?.int64Value ?? -1
+        let contentLength = rawContentLength > 0 ? rawContentLength : (receivedBytes > 0 ? receivedBytes : -1)
 
         guard let kind = classify(url: url, mimeType: mime, destination: dest) else {
             return nil
@@ -67,6 +112,8 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
         let frameURL = raw["frameURL"] as? URL
         let frameOrigin = raw["frameOrigin"] as? String
         let ua = effectiveUserAgent?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let redirectChain = (raw["redirectChain"] as? [URL]) ?? []
+        let wasCached = (raw["wasCached"] as? NSNumber)?.boolValue ?? false
 
         return CuriumMediaResourceEvent(
             id: url.absoluteString,
@@ -81,6 +128,8 @@ struct CuriumMediaResourceEvent: Identifiable, Equatable, Sendable {
             frameURL: frameURL,
             frameOrigin: frameOrigin,
             effectiveUserAgent: ua?.isEmpty == false ? ua : nil,
+            redirectChain: redirectChain,
+            wasCached: wasCached,
             kind: kind,
             capturedAt: now
         )
@@ -173,6 +222,8 @@ final class CuriumMediaRadar {
                 frameURL: parsed.frameURL ?? existing.frameURL,
                 frameOrigin: parsed.frameOrigin ?? existing.frameOrigin,
                 effectiveUserAgent: parsed.effectiveUserAgent ?? existing.effectiveUserAgent,
+                redirectChain: parsed.redirectChain.isEmpty ? existing.redirectChain : parsed.redirectChain,
+                wasCached: parsed.wasCached || existing.wasCached,
                 kind: parsed.kind,
                 capturedAt: preservedDate
             )

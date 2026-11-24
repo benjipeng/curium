@@ -2069,6 +2069,115 @@ enum CuriumFingerprintBootstrap {
         )
         return outcome
     }
+
+    struct PreparedHotSwap {
+        let profile: CuriumFingerprintProfile
+        let jsonData: Data
+        let stagedLockFD: Int32
+    }
+
+    /// Validates, materializes farbling seeds, serializes engine launch JSON, and acquires
+    /// the target profile's shared companion lock (reusing the held lock on same-profile swaps)
+    /// before invoking Build 44's `CrIOSEngineBootstrap.switchToProfile(...)`.
+    @MainActor
+    static func prepareHotSwapPayload(
+        for targetProfileID: String,
+        store: CuriumFingerprintStore = .shared,
+        capabilitiesProvider: (() -> CuriumEngineFingerprintCapabilities)? = nil
+    ) -> Result<PreparedHotSwap, NSError> {
+        func makeError(_ code: Int, _ message: String) -> NSError {
+            NSError(
+                domain: "com.appautomaton.curium.fingerprint",
+                code: code,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        }
+
+        if let loadError = store.loadError {
+            return .failure(makeError(6, "Profile store failed to load safely: \(loadError)"))
+        }
+        let trimmed = targetProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let stored = store.profile(id: trimmed) else {
+            return .failure(makeError(5, "Profile \"\(targetProfileID)\" was not found in the profile store."))
+        }
+        guard store.ensureMaterializedSeedPersisted(for: stored.id) else {
+            return .failure(makeError(
+                6,
+                store.lastPersistError ?? "Failed to persist farbling seed for profile \"\(stored.id)\"."
+            ))
+        }
+        let materialized = store.profile(id: stored.id) ?? stored
+        let validation = CuriumFingerprintValidator.validate(materialized)
+        guard validation.isValid else {
+            return .failure(makeError(4, validation.errors.joined(separator: " ")))
+        }
+
+        let caps = (capabilitiesProvider ?? engineCapabilities)()
+        let negotiatedVersion = min(
+            CuriumFingerprintSchema.version,
+            max(CuriumFingerprintSchema.minSupportedVersion, caps.contractVersion)
+        )
+        let jsonData: Data
+        do {
+            jsonData = try materialized.makeEngineLaunchJSON(schemaVersion: negotiatedVersion)
+        } catch {
+            return .failure(makeError(1, "Failed to encode profile JSON: \(error.localizedDescription)"))
+        }
+
+        let currentID = activeProfileID
+        let heldFD = stateLock.withLock { $0.sharedLockFD }
+        let sameProfile = currentID.caseInsensitiveCompare(materialized.id) == .orderedSame
+        let stagedLockFD: Int32
+        if sameProfile && heldFD >= 0 {
+            stagedLockFD = heldFD
+        } else {
+            do {
+                stagedLockFD = try CuriumFingerprintProfileStorage.acquireSharedProfileLock(
+                    for: materialized.id,
+                    curiumSupportRoot: store.effectiveCuriumSupportRoot
+                )
+            } catch {
+                return .failure(makeError(7, error.localizedDescription))
+            }
+        }
+
+        return .success(PreparedHotSwap(
+            profile: materialized,
+            jsonData: jsonData,
+            stagedLockFD: stagedLockFD
+        ))
+    }
+
+    /// Commits launch snapshot, active profile ID, proxy, and shared companion lock after
+    /// Build 44's `switchToProfile(...)` completes cleanly.
+    @MainActor
+    static func commitHotSwapState(
+        _ prepared: PreparedHotSwap,
+        store: CuriumFingerprintStore = .shared
+    ) {
+        _ = store.markProfileUsed(prepared.profile.id)
+        let outcome = LaunchOutcome.configured(
+            profileID: prepared.profile.id,
+            revision: prepared.profile.revision,
+            nativeHardware: prepared.profile.usesNativeHardwareAndGPU
+        )
+        let snapshot = EngineLaunchSnapshot(from: prepared.profile, wasUnconfiguredBuild39: false)
+        recordLaunchState(
+            outcome: outcome,
+            proxy: prepared.profile.proxy,
+            snapshot: snapshot,
+            profile: prepared.profile,
+            sharedLockFD: prepared.stagedLockFD
+        )
+    }
+
+    /// Releases a staged hot-swap lock without touching the currently active profile's lock.
+    nonisolated static func abortHotSwapLock(_ prepared: PreparedHotSwap) {
+        let heldFD = stateLock.withLock { $0.sharedLockFD }
+        if prepared.stagedLockFD >= 0 && prepared.stagedLockFD != heldFD {
+            close(prepared.stagedLockFD)
+        }
+    }
 }
 
 extension CuriumFingerprintProfile {
