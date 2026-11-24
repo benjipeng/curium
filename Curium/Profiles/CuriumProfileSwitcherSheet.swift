@@ -113,6 +113,8 @@ struct CuriumProfileSwitcherSheet: View {
             List {
                 if let loadError = fingerprintStore.loadError {
                     corruptStoreSection(loadError)
+                } else {
+                    livePrivacySection
                 }
 
                 profilesSection
@@ -321,6 +323,47 @@ struct CuriumProfileSwitcherSheet: View {
     }
 
     // MARK: - Sections
+
+    private var livePrivacySection: some View {
+        let hardened = activeProfile.isPrivacyHardeningEnabled
+        let hotSupported = engineCapabilities?.supportsHotRuntimePrivacyPolicy
+            ?? CuriumFingerprintBootstrap.engineCapabilities().supportsHotRuntimePrivacyPolicy
+        return Section {
+            Toggle(isOn: Binding(
+                get: { activeProfile.isPrivacyHardeningEnabled },
+                set: { enabled in
+                    if fingerprintStore.setActiveProfilePrivacyHardening(enabled) {
+                        onSelectionChanged?()
+                        refreshEngineInfo()
+                    }
+                }
+            )) {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Privacy Hardening")
+                        Text(
+                            hardened
+                                ? "Active on \(activeProfile.displayName) · Farbling, Sec-GPC & WebRTC shield"
+                                : "Farbling, Sec-GPC & non-proxied WebRTC UDP off"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: hardened ? "checkmark.shield.fill" : "shield")
+                        .foregroundStyle(hardened ? Color.accentColor : Color.secondary)
+                }
+            }
+            .disabled(isWiping || isRelaunching || fingerprintStore.loadError != nil)
+            .accessibilityIdentifier("curium.profiles.privacyHardening")
+        } footer: {
+            Text(
+                hotSupported
+                    ? "Applies immediately to \(activeProfile.displayName) without restarting. Cookies remain scoped to the active profile."
+                    : "Applies to \(activeProfile.displayName) on the next relaunch."
+            )
+        }
+    }
 
     private func corruptStoreSection(_ loadError: String) -> some View {
         Section {

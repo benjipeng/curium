@@ -879,6 +879,23 @@ final class CuriumFingerprintStore {
         return true
     }
 
+    /// One-tap live toggle for the active running profile's Privacy Hardening bundle
+    /// (full stealth farbling, `Sec-GPC`, and non-proxied WebRTC UDP off). Persists
+    /// atomically and hot-applies into Build 43+ engines with zero restart.
+    @discardableResult
+    func setActiveProfilePrivacyHardening(_ enabled: Bool) -> Bool {
+        guard loadError == nil else {
+            return false
+        }
+        var updated = profile(id: activeLaunchProfileID) ?? activeProfile
+        guard updated.isPrivacyHardeningEnabled != enabled else {
+            return true
+        }
+        updated.setPrivacyHardeningEnabled(enabled)
+        let report = upsert(updated)
+        return report.isValid
+    }
+
     @discardableResult
     func deleteProfile(id: String, allowActiveDeleteForTesting: Bool = false) -> Bool {
         guard loadError == nil else {

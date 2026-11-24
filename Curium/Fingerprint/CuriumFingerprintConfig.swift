@@ -557,6 +557,42 @@ struct CuriumFingerprintProfile: Codable, Equatable, Identifiable, Sendable {
             && (hideSpeechVoices == nil || hideSpeechVoices == false)
     }
 
+    /// Whether the consumer one-tap Privacy Hardening bundle (full stealth farbling,
+    /// `Sec-GPC: 1` + `navigator.globalPrivacyControl`, and non-proxied WebRTC UDP off)
+    /// is active on this profile.
+    var isPrivacyHardeningEnabled: Bool {
+        fingerprintSeed != nil
+            && (farbling ?? .allEnabled) == .allEnabled
+            && enableGlobalPrivacyControl
+            && webrtcIpHandlingPolicy == .disableNonProxiedUdp
+    }
+
+    /// Toggles the Privacy Hardening bundle atomically. Disabling preserves
+    /// `.disableNonProxiedUdp` whenever the profile uses an explicit `.fixed` proxy.
+    mutating func setPrivacyHardeningEnabled(
+        _ enabled: Bool,
+        proxyOverride: CuriumProxyConfig? = nil
+    ) {
+        if enabled {
+            farbling = .allEnabled
+            fingerprintSeed = CuriumFingerprintStore.mintFreshSeed(
+                differentFrom: fingerprintSeed
+            )
+            enableGlobalPrivacyControl = true
+            webrtcIpHandlingPolicy = .disableNonProxiedUdp
+        } else {
+            farbling = nil
+            fingerprintSeed = nil
+            enableGlobalPrivacyControl = false
+            let effectiveProxy = proxyOverride ?? proxy
+            if case .fixed = effectiveProxy {
+                webrtcIpHandlingPolicy = .disableNonProxiedUdp
+            } else {
+                webrtcIpHandlingPolicy = .default
+            }
+        }
+    }
+
     var shortArchetypeSummary: String {
         let primarySlot = defaultSlot == .desktop ? desktop : mobile
         let platformLabel: String

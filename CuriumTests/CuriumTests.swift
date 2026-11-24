@@ -7193,7 +7193,7 @@ struct CuriumBuild43ContractTests {
         #expect(store.hasPendingActiveProfileEngineChanges)
         #expect(store.hasPendingProfileSwitch)
 
-        // 7. ObjC bridge fails closed cleanly against the currently linked Build 42 engine.
+        // 7. ObjC bridge fails closed cleanly against older engines without v3 runtime policy.
         var bridgeError: NSError?
         let bridgeData = try v2Hardened.makeRuntimePrivacyPolicyJSON(policyRevision: 1)
         let applied = CuriumApplyRuntimePrivacyPolicy(bridgeData, &bridgeError)
@@ -7203,5 +7203,77 @@ struct CuriumBuild43ContractTests {
             #expect(bridgeError?.code == CrIOSFingerprintErrorCode.unsupportedSchema.rawValue)
             #expect(CuriumEngineActiveRuntimePolicyStatusDict() == nil)
         }
+    }
+
+    @Test("One-tap setActiveProfilePrivacyHardening hot-toggles ON/OFF with zero restart and preserves fixed-proxy WebRTC UDP protection")
+    @MainActor
+    func oneTapActiveProfilePrivacyHardeningToggle() throws {
+        defer { CuriumFingerprintBootstrap.resetStateForTesting() }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "curium-onetap-hardening-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        var appliedPayloads: [Data] = []
+        let store = CuriumFingerprintStore(
+            fileURL: dir.appending(path: CuriumFingerprintStore.fileName),
+            capabilitiesProvider: { Self.build43Caps },
+            runtimePolicyApplier: { data, _ in
+                appliedPayloads.append(data)
+                return true
+            }
+        )
+
+        let launch = CuriumFingerprintBootstrap.prepareEngineLaunch(
+            store: store,
+            capabilitiesProvider: { Self.build43Caps },
+            configureEngine: { _, _ in true }
+        )
+        if case .configured(let id, _, _) = launch {
+            #expect(id == "default")
+        } else {
+            Issue.record("Expected configured launch, got \(launch)")
+        }
+
+        // Start OFF by default.
+        #expect(!store.activeProfile.isPrivacyHardeningEnabled)
+        #expect(appliedPayloads.isEmpty)
+
+        // 1. One-tap ON -> full farbling, Sec-GPC, WebRTC UDP off, zero restart banner.
+        #expect(store.setActiveProfilePrivacyHardening(true))
+        let onProfile = try #require(store.profile(id: "default"))
+        #expect(onProfile.isPrivacyHardeningEnabled)
+        #expect(onProfile.farbling == .allEnabled)
+        #expect(onProfile.fingerprintSeed != nil)
+        #expect(onProfile.enableGlobalPrivacyControl)
+        #expect(onProfile.webrtcIpHandlingPolicy == .disableNonProxiedUdp)
+        #expect(appliedPayloads.count == 1)
+        #expect(!store.hasPendingActiveProfileEngineChanges)
+        #expect(!store.hasPendingProfileSwitch)
+
+        // Idempotent repeat ON is a no-op.
+        #expect(store.setActiveProfilePrivacyHardening(true))
+        #expect(appliedPayloads.count == 1)
+
+        // 2. One-tap OFF -> clears farbling, seed, Sec-GPC, restores WebRTC default on system proxy, zero restart.
+        #expect(store.setActiveProfilePrivacyHardening(false))
+        let offProfile = try #require(store.profile(id: "default"))
+        #expect(!offProfile.isPrivacyHardeningEnabled)
+        #expect(offProfile.farbling == nil)
+        #expect(offProfile.fingerprintSeed == nil)
+        #expect(!offProfile.enableGlobalPrivacyControl)
+        #expect(offProfile.webrtcIpHandlingPolicy == .default)
+        #expect(appliedPayloads.count == 2)
+        #expect(!store.hasPendingActiveProfileEngineChanges)
+
+        // 3. Fixed-proxy profile disabling Privacy Hardening keeps non-proxied WebRTC UDP off.
+        var fixedProxyProfile = offProfile
+        fixedProxyProfile.proxy = .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: nil)
+        fixedProxyProfile.setPrivacyHardeningEnabled(true)
+        #expect(fixedProxyProfile.isPrivacyHardeningEnabled)
+        fixedProxyProfile.setPrivacyHardeningEnabled(false)
+        #expect(!fixedProxyProfile.isPrivacyHardeningEnabled)
+        #expect(fixedProxyProfile.webrtcIpHandlingPolicy == .disableNonProxiedUdp)
     }
 }

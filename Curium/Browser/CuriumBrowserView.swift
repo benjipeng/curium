@@ -668,7 +668,10 @@ private struct CuriumOverflowToolbarMenu: View {
     }
 
     var body: some View {
-        let activeProfile = CuriumFingerprintStore.shared.activeProfile
+        let fingerprintStore = CuriumFingerprintStore.shared
+        let activeProfile = fingerprintStore.profile(id: store.activeProfileID)
+            ?? fingerprintStore.activeProfile
+        let isHardened = activeProfile.isPrivacyHardeningEnabled
 
         Menu {
             pageScaleControls
@@ -677,6 +680,20 @@ private struct CuriumOverflowToolbarMenu: View {
                 Label("Profile: \(activeProfile.displayName)", systemImage: activeProfile.resolvedSymbolName)
             }
             .accessibilityIdentifier("curium.menu.profiles")
+
+            Toggle(isOn: Binding(
+                get: { isHardened },
+                set: { enabled in
+                    _ = fingerprintStore.setActiveProfilePrivacyHardening(enabled)
+                }
+            )) {
+                Label(
+                    "Privacy Hardening",
+                    systemImage: isHardened ? "checkmark.shield.fill" : "shield"
+                )
+            }
+            .disabled(fingerprintStore.loadError != nil)
+            .accessibilityIdentifier("curium.menu.privacyHardening")
             Divider()
             Button {
                 beforeAction()

@@ -797,35 +797,19 @@ struct CuriumFingerprintEditorView: View {
     // MARK: - Bindings & Helpers
 
     private var isPrivacyHardeningEnabled: Bool {
-        draft.fingerprintSeed != nil
-            && (draft.farbling ?? .allEnabled) == .allEnabled
-            && draft.enableGlobalPrivacyControl
-            && draft.webrtcIpHandlingPolicy == .disableNonProxiedUdp
+        draft.isPrivacyHardeningEnabled
     }
 
     private var privacyHardeningBinding: Binding<Bool> {
         Binding(
             get: { isPrivacyHardeningEnabled },
             set: { enabled in
-                if enabled {
-                    draft.farbling = .allEnabled
-                    draft.fingerprintSeed = CuriumFingerprintStore.mintFreshSeed(
-                        differentFrom: draft.fingerprintSeed
-                    )
-                    draft.enableGlobalPrivacyControl = true
-                    draft.webrtcIpHandlingPolicy = .disableNonProxiedUdp
-                } else {
-                    draft.farbling = nil
-                    draft.fingerprintSeed = nil
-                    draft.enableGlobalPrivacyControl = false
-                    if proxyModeSelection == .fixed {
-                        draft.webrtcIpHandlingPolicy = .disableNonProxiedUdp
-                    } else if case .fixed = draft.proxy {
-                        draft.webrtcIpHandlingPolicy = .disableNonProxiedUdp
-                    } else {
-                        draft.webrtcIpHandlingPolicy = .default
-                    }
+                let proxyOverride: CuriumProxyConfig = switch proxyModeSelection {
+                case .fixed: .fixed(rules: fixedProxyRules, bypassRules: nil)
+                case .direct: .direct
+                case .system: .system
                 }
+                draft.setPrivacyHardeningEnabled(enabled, proxyOverride: proxyOverride)
             }
         )
     }
