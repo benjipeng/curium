@@ -1,0 +1,584 @@
+diff --git a/ios/chrome/browser/curium/curium_tab_host.mm b/ios/chrome/browser/curium/curium_tab_host.mm
+index 914f4ef..0c65216 100644
+--- a/ios/chrome/browser/curium/curium_tab_host.mm
++++ b/ios/chrome/browser/curium/curium_tab_host.mm
+@@ -82,6 +82,7 @@ - (void)handleMainFrameCommit:(content::NavigationHandle*)navigation;
+ - (void)updateTopControlsShownRatio:(CGFloat)ratio;
+ - (void)handleWebStateDestroyed;
+ - (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info
++               originalURL:(const GURL&)originalURL
+            renderFrameHost:(nullable content::RenderFrameHost*)renderFrameHost;
+ @end
+ 
+@@ -123,6 +124,7 @@ void ResourceLoadComplete(
+       const GURL& original_url,
+       const blink::mojom::ResourceLoadInfo& resource_load_info) override {
+     [owner_ handleResourceLoad:resource_load_info
++                   originalURL:original_url
+                renderFrameHost:render_frame_host];
+   }
+ 
+@@ -1069,13 +1071,16 @@ - (void)handleWebStateDestroyed {
+ }
+ 
+ - (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info
++               originalURL:(const GURL&)originalURL
+            renderFrameHost:(nullable content::RenderFrameHost*)renderFrameHost {
+   CuriumBrowserHost* browserHost = _browserHost;
+   if (!browserHost || ![browserHost observesResourceLoads]) {
+     return;
+   }
++  const GURL& resolved_original_url =
++      originalURL.is_valid() ? originalURL : info.original_url;
+   const GURL& effective_url =
+-      info.final_url.is_valid() ? info.final_url : info.original_url;
++      info.final_url.is_valid() ? info.final_url : resolved_original_url;
+   const BOOL wantsLegacy = [browserHost observesLegacyResourceLoads];
+   const BOOL wantsEvent =
+       [browserHost observesResourceEvents] &&
+@@ -1098,12 +1103,23 @@ - (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info
+   NSDictionary<NSString*, id>* event = nil;
+   if (wantsEvent) {
+     NSMutableDictionary<NSString*, id>* dict =
+-        [NSMutableDictionary dictionaryWithCapacity:10];
++        [NSMutableDictionary dictionaryWithCapacity:16];
+     dict[@"url"] = ns_url;
+     dict[@"httpStatusCode"] = @(status);
+     dict[@"contentLength"] = @(content_length);
+     dict[@"requestDestination"] =
+         RequestDestinationName(info.request_destination);
++    dict[@"wasCached"] = @(info.was_cached);
++    dict[@"netError"] = @(info.net_error);
++    dict[@"didUseServerHTTPAuth"] = @(info.did_use_server_http_auth);
++    const int64_t received_bytes =
++        static_cast<int64_t>(info.total_received_bytes.InBytes());
++    if (received_bytes > 0) {
++      dict[@"totalReceivedBytes"] = @(received_bytes);
++    }
++    if (info.network_info) {
++      dict[@"networkAccessed"] = @(info.network_info->network_accessed);
++    }
+     if (!info.method.empty()) {
+       if (NSString* http_method = base::SysUTF8ToNSString(info.method)) {
+         dict[@"httpMethod"] = http_method;
+@@ -1112,11 +1128,29 @@ - (void)handleResourceLoad:(const blink::mojom::ResourceLoadInfo&)info
+     if (mime_type) {
+       dict[@"mimeType"] = mime_type;
+     }
+-    if (info.original_url.is_valid() && info.original_url != effective_url) {
+-      if (NSURL* orig = net::NSURLWithGURL(info.original_url)) {
++    if (resolved_original_url.is_valid() &&
++        resolved_original_url != effective_url) {
++      if (NSURL* orig = net::NSURLWithGURL(resolved_original_url)) {
+         dict[@"originalURL"] = orig;
+       }
+     }
++    if (!info.redirect_info_chain.empty()) {
++      NSMutableArray<NSString*>* redirect_chain =
++          [NSMutableArray arrayWithCapacity:info.redirect_info_chain.size()];
++      for (const blink::mojom::RedirectInfoPtr& redirect :
++           info.redirect_info_chain) {
++        if (!redirect || redirect->origin_of_new_url.opaque()) {
++          continue;
++        }
++        if (NSString* origin_str = base::SysUTF8ToNSString(
++                redirect->origin_of_new_url.Serialize())) {
++          [redirect_chain addObject:origin_str];
++        }
++      }
++      if (redirect_chain.count > 0) {
++        dict[@"redirectChain"] = [redirect_chain copy];
++      }
++    }
+     if (info.referrer.is_valid()) {
+       if (NSURL* ref = net::NSURLWithGURL(info.referrer)) {
+         dict[@"referrer"] = ref;
+diff --git a/ios/web/content/DEPS b/ios/web/content/DEPS
+index db937fc..b722998 100644
+--- a/ios/web/content/DEPS
++++ b/ios/web/content/DEPS
+@@ -17,6 +17,7 @@ specific_include_rules = {
+     "+components/embedder_support/user_agent_utils.h",
+     "+services/network/public/cpp/is_potentially_trustworthy.h",
+     "+third_party/blink/public/common/client_hints/enabled_client_hints.h",
++    "+third_party/blink/public/common/curium/curium_fingerprint_config.h",
+     "+third_party/blink/public/common/user_agent/user_agent_metadata.h",
+   ],
+   "content_permission_manager\\.mm": [
+diff --git a/ios/web/content/content_browser_context.mm b/ios/web/content/content_browser_context.mm
+index 00639cd..ec7077c 100644
+--- a/ios/web/content/content_browser_context.mm
++++ b/ios/web/content/content_browser_context.mm
+@@ -6,19 +6,26 @@
+ 
+ #import <Foundation/Foundation.h>
+ 
++#import <cstdint>
+ #import <map>
++#import <string>
+ #import <utility>
+ #import <vector>
+ 
+ #import "base/strings/sys_string_conversions.h"
++#import "base/time/time.h"
+ #import "components/embedder_support/user_agent_utils.h"
+ #import "content/public/browser/client_hints_controller_delegate.h"
+ #import "ios/web/content/content_permission_manager.h"
+ #import "ios/web/content/download/content_download_manager_delegate.h"
+ #import "ios/web/public/thread/web_task_traits.h"
+ #import "ios/web/public/thread/web_thread.h"
++#import "net/base/network_change_notifier.h"
++#import "net/nqe/effective_connection_type.h"
+ #import "services/network/public/cpp/is_potentially_trustworthy.h"
++#import "services/network/public/cpp/network_quality_tracker.h"
+ #import "third_party/blink/public/common/client_hints/enabled_client_hints.h"
++#import "third_party/blink/public/common/curium/curium_fingerprint_config.h"
+ #import "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+ #import "ui/gfx/geometry/size.h"
+ #import "url/origin.h"
+@@ -29,25 +36,69 @@
+ 
+ constexpr size_t kMaxPersistedClientHintOrigins = 1024;
+ 
++// [ios-blink-sideload] Coherent in-process NetworkQualityTracker so Client
++// Hints (RTT / Downlink / ECT) report 50 ms / 10 Mbps / 4G while online
++// instead of leaking 0 ms / 0 Mbps from a null tracker.
++class CoherentNetworkQualityTracker final
++    : public network::NetworkQualityTracker {
++ public:
++  CoherentNetworkQualityTracker() = default;
++  ~CoherentNetworkQualityTracker() override = default;
++
++  net::EffectiveConnectionType GetEffectiveConnectionType() const override {
++    if (net::NetworkChangeNotifier::IsOffline()) {
++      return net::EFFECTIVE_CONNECTION_TYPE_OFFLINE;
++    }
++    return net::EFFECTIVE_CONNECTION_TYPE_4G;
++  }
++
++  base::TimeDelta GetHttpRTT() const override {
++    if (net::NetworkChangeNotifier::IsOffline()) {
++      return base::TimeDelta();
++    }
++    return base::Milliseconds(50);
++  }
++
++  base::TimeDelta GetTransportRTT() const override {
++    if (net::NetworkChangeNotifier::IsOffline()) {
++      return base::TimeDelta();
++    }
++    return base::Milliseconds(50);
++  }
++
++  int32_t GetDownstreamThroughputKbps() const override {
++    if (net::NetworkChangeNotifier::IsOffline()) {
++      return 0;
++    }
++    // 12 Mbps raw ensures client_hints::RoundKbpsToMbps (0.90..1.10 noise,
++    // clamped at 10.0 Mbps) consistently emits 10 Mbps across all hosts.
++    return 12000;
++  }
++};
++
+ }  // namespace
+ 
+ // [ios-blink-sideload] Lightweight in-memory ClientHintsControllerDelegate so
+ // content's NavigationRequest sends Sec-CH-UA* low-entropy headers on HTTPS
+ // navigations and persists Accept-CH / Critical-CH high-entropy opt-ins per
+-// trustworthy origin.
++// trustworthy origin. Tracks the active LaunchConfig epoch so Build 44
++// cross-profile hot-swaps automatically invalidate persisted origin hints.
+ class ContentClientHintsControllerDelegate final
+     : public content::ClientHintsControllerDelegate {
+  public:
+-  ContentClientHintsControllerDelegate() = default;
++  ContentClientHintsControllerDelegate() {
++    InvalidateOriginHintsIfProfileChanged();
++  }
+   ~ContentClientHintsControllerDelegate() override = default;
+ 
+   network::NetworkQualityTracker* GetNetworkQualityTracker() override {
+-    return nullptr;
++    return &network_quality_tracker_;
+   }
+ 
+   void GetAllowedClientHintsFromSource(
+       const url::Origin& origin,
+       blink::EnabledClientHints* client_hints) override {
++    InvalidateOriginHintsIfProfileChanged();
+     if (!client_hints) {
+       return;
+     }
+@@ -69,6 +120,9 @@ bool IsJavaScriptAllowed(const GURL& url,
+   }
+ 
+   blink::UserAgentMetadata GetUserAgentMetadata() override {
++    InvalidateOriginHintsIfProfileChanged();
++    // embedder_support::GetUserAgentMetadata() reads blink::curium::
++    // GetLaunchConfig() dynamically on each call for the active default slot.
+     return embedder_support::GetUserAgentMetadata();
+   }
+ 
+@@ -77,6 +131,7 @@ void PersistClientHints(
+       content::RenderFrameHost* parent_rfh,
+       const std::vector<network::mojom::WebClientHintsType>& client_hints)
+       override {
++    InvalidateOriginHintsIfProfileChanged();
+     if (!network::IsOriginPotentiallyTrustworthy(primary_origin)) {
+       return;
+     }
+@@ -98,6 +153,7 @@ void PersistClientHints(
+   void ResetForTesting() override {
+     origin_hints_.clear();
+     additional_hints_.clear();
++    has_profile_epoch_ = false;
+   }
+ 
+   void SetAdditionalClientHints(
+@@ -117,6 +173,53 @@ void SetMostRecentMainFrameViewportSize(
+   }
+ 
+  private:
++  struct ProfileEpoch {
++    uintptr_t config_identity = 0;
++    uint64_t config_revision = 0;
++    std::string profile_id;
++    blink::curium::DefaultSlot default_slot =
++        blink::curium::DefaultSlot::kMobile;
++    std::string default_platform;
++    bool default_mobile = true;
++
++    bool operator==(const ProfileEpoch&) const = default;
++  };
++
++  static ProfileEpoch CurrentProfileEpoch() {
++    ProfileEpoch epoch;
++    if (const blink::curium::LaunchConfig* cfg =
++            blink::curium::GetLaunchConfig()) {
++      epoch.config_identity = reinterpret_cast<uintptr_t>(cfg);
++      epoch.config_revision = cfg->revision;
++      epoch.profile_id = cfg->profile_id;
++      epoch.default_slot = cfg->default_slot;
++      const blink::curium::IdentitySlotConfig& identity =
++          cfg->DefaultIdentity();
++      const bool is_desktop_default =
++          cfg->default_slot == blink::curium::DefaultSlot::kDesktop;
++      epoch.default_platform =
++          identity.platform.value_or(is_desktop_default ? "macOS" : "Android");
++      epoch.default_mobile = identity.mobile.value_or(!is_desktop_default);
++    }
++    return epoch;
++  }
++
++  void InvalidateOriginHintsIfProfileChanged() {
++    ProfileEpoch current = CurrentProfileEpoch();
++    if (!has_profile_epoch_) {
++      profile_epoch_ = std::move(current);
++      has_profile_epoch_ = true;
++      return;
++    }
++    if (current != profile_epoch_) {
++      origin_hints_.clear();
++      profile_epoch_ = std::move(current);
++    }
++  }
++
++  CoherentNetworkQualityTracker network_quality_tracker_;
++  ProfileEpoch profile_epoch_;
++  bool has_profile_epoch_ = false;
+   std::map<url::Origin, blink::EnabledClientHints> origin_hints_;
+   std::vector<network::mojom::WebClientHintsType> additional_hints_;
+   gfx::Size viewport_size_;
+diff --git a/ios/web/content/picture_in_picture/ios_video_overlay_window.mm b/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
+index 5d64de7..54362c2 100644
+--- a/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
++++ b/ios/web/content/picture_in_picture/ios_video_overlay_window.mm
+@@ -157,24 +157,73 @@ CMTimeRange ComputePlayableTimeRange(double duration_seconds,
+                          CMTimeMakeWithSeconds(std::max(span, 0.001), 1000000));
+ }
+ 
+-void EnsurePlaybackAudioSession(bool muted) {
++std::atomic<int> g_active_pip_audio_session_owners{0};
++
++bool AcquirePlaybackAudioSession(bool muted, bool already_owned) {
+   AVAudioSession* session = [AVAudioSession sharedInstance];
+   AVAudioSessionCategory cat = session.category;
+   if ([cat isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
+-    return;
++    return already_owned;
+   }
+   const AVAudioSessionCategoryOptions desired_options =
+       muted ? AVAudioSessionCategoryOptionMixWithOthers : 0;
++  bool touched_session = false;
+   if (![cat isEqualToString:AVAudioSessionCategoryPlayback] ||
+       session.categoryOptions != desired_options) {
+     NSError* err = nil;
++    if ([session setCategory:AVAudioSessionCategoryPlayback
++                        mode:AVAudioSessionModeDefault
++                     options:desired_options
++                       error:&err]) {
++      touched_session = true;
++    }
++  }
++  NSError* active_err = nil;
++  if ([session setActive:YES error:&active_err]) {
++    touched_session = true;
++  }
++  if (!already_owned && touched_session) {
++    g_active_pip_audio_session_owners.fetch_add(1, std::memory_order_acq_rel);
++    return true;
++  }
++  return already_owned;
++}
++
++bool TryRestoreAndDeactivatePlaybackAudioSessionIfIdle() {
++  if (g_active_pip_audio_session_owners.load(std::memory_order_acquire) > 0) {
++    return false;
++  }
++  AVAudioSession* session = [AVAudioSession sharedInstance];
++  AVAudioSessionCategory cat = session.category;
++  if ([cat isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
++    return false;
++  }
++  if ([cat isEqualToString:AVAudioSessionCategoryPlayback] &&
++      (session.categoryOptions & AVAudioSessionCategoryOptionMixWithOthers) ==
++          0) {
++    NSError* cat_err = nil;
+     [session setCategory:AVAudioSessionCategoryPlayback
+                     mode:AVAudioSessionModeDefault
+-                 options:desired_options
+-                   error:&err];
++                 options:AVAudioSessionCategoryOptionMixWithOthers
++                   error:&cat_err];
++  }
++  NSError* deact_err = nil;
++  return [session
++        setActive:NO
++      withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
++            error:&deact_err];
++}
++
++bool ReleasePlaybackAudioSessionOwnership() {
++  const int prev =
++      g_active_pip_audio_session_owners.fetch_sub(1, std::memory_order_acq_rel);
++  if (prev <= 1) {
++    if (prev < 1) {
++      g_active_pip_audio_session_owners.store(0, std::memory_order_release);
++    }
++    return TryRestoreAndDeactivatePlaybackAudioSessionIfIdle();
+   }
+-  NSError* active_err = nil;
+-  [session setActive:YES error:&active_err];
++  return false;
+ }
+ 
+ enum class RenderFrameAction {
+@@ -958,6 +1007,8 @@ @implementation CuriumPiPBridge {
+   BOOL _observingPossible;
+   BOOL _waitingForPossible;
+   BOOL _pipActive;
++  BOOL _ownsPlaybackAudioSession;
++  BOOL _pendingAudioDeactivateOnAVKitStop;
+   BOOL _startAttemptActive;
+   uint64_t _startAttemptGeneration;
+   CFTimeInterval _pipControllerCreatedAt;
+@@ -1014,6 +1065,12 @@ - (instancetype)initWithOwner:(base::WeakPtr<web::IOSVideoOverlayWindow>)owner
+ // deallocating object releases freed memory when it is disposed.
+ - (void)dealloc {
+   [self detachObservers];
++  if (_ownsPlaybackAudioSession) {
++    _ownsPlaybackAudioSession = NO;
++    dispatch_async(dispatch_get_main_queue(), ^{
++      ReleasePlaybackAudioSessionOwnership();
++    });
++  }
+   if (UIView* hostView = _hostView) {
+     dispatch_async(dispatch_get_main_queue(), ^{
+       [hostView removeFromSuperview];
+@@ -1047,11 +1104,26 @@ - (void)detachObservers {
+   }
+ }
+ 
++- (void)releasePlaybackAudioSessionIfOwned {
++  if (!_ownsPlaybackAudioSession) {
++    return;
++  }
++  _ownsPlaybackAudioSession = NO;
++  const bool deactivated = ReleasePlaybackAudioSessionOwnership();
++  if (!deactivated && _pipController &&
++      _pipController.isPictureInPictureActive) {
++    _pendingAudioDeactivateOnAVKitStop = YES;
++  }
++}
++
+ // UI sequence only, and never from dealloc: the render-state reset retains self.
+ - (void)teardownObserversAndViews {
+   [self detachObservers];
+   _waitingForPossible = NO;
+   _startAttemptActive = NO;
++  [self releasePlaybackAudioSessionIfOwned];
++  const BOOL hadPendingDeactivate = _pendingAudioDeactivateOnAVKitStop;
++  _pendingAudioDeactivateOnAVKitStop = NO;
+   _pipControllerCreatedAt = 0;
+   _startRetryCount = 0;
+   _startRetryPending = NO;
+@@ -1060,6 +1132,11 @@ - (void)teardownObserversAndViews {
+   _displayLayer = nil;
+   [_hostView removeFromSuperview];
+   _hostView = nil;
++  if (hadPendingDeactivate) {
++    dispatch_async(dispatch_get_main_queue(), ^{
++      TryRestoreAndDeactivatePlaybackAudioSessionIfIdle();
++    });
++  }
+   dispatch_queue_t q = _renderQueue;
+   if (q) {
+     dispatch_async(q, ^{
+@@ -1271,7 +1348,9 @@ - (void)startPiPForGeneration:(uint64_t)generation {
+   _startRetryGeneration = generation;
+   _startRetryCount = 0;
+   _startRetryPending = NO;
+-  EnsurePlaybackAudioSession(_mediaMuted);
++  _pendingAudioDeactivateOnAVKitStop = NO;
++  _ownsPlaybackAudioSession =
++      AcquirePlaybackAudioSession(_mediaMuted, _ownsPlaybackAudioSession);
+ 
+   __weak CuriumPiPBridge* weakSelf = self;
+   dispatch_after(
+@@ -1342,6 +1421,7 @@ - (void)stopPiPAndDetach:(BOOL)removeImage {
+   if (_pipController && _pipController.isPictureInPictureActive) {
+     [_pipController stopPictureInPicture];
+   }
++  [self releasePlaybackAudioSessionIfOwned];
+ 
+   dispatch_async(_renderQueue, ^{
+     self->_renderTimebasePrimed = NO;
+@@ -1359,7 +1439,8 @@ - (void)stopPiPAndDetach:(BOOL)removeImage {
+ - (void)setMediaMuted:(BOOL)muted {
+   _mediaMuted = muted;
+   if (_pipActive || _startAttemptActive) {
+-    EnsurePlaybackAudioSession(muted);
++    _ownsPlaybackAudioSession =
++        AcquirePlaybackAudioSession(muted, _ownsPlaybackAudioSession);
+   }
+ }
+ 
+@@ -1620,6 +1701,7 @@ - (void)notifyDidStartForGeneration:(uint64_t)generation {
+ - (void)notifyFailedToStartForGeneration:(uint64_t)generation {
+   _pipActive = NO;
+   _waitingForPossible = NO;
++  [self releasePlaybackAudioSessionIfOwned];
+   auto owner = _owner;
+   _uiRunner->PostTask(
+       FROM_HERE,
+@@ -1715,6 +1797,12 @@ - (void)pictureInPictureControllerDidStopPictureInPicture:
+   const uint64_t gen = _activeGeneration;
+   _startAttemptActive = NO;
+   _pipActive = NO;
++  if (_ownsPlaybackAudioSession) {
++    [self releasePlaybackAudioSessionIfOwned];
++  } else if (_pendingAudioDeactivateOnAVKitStop) {
++    _pendingAudioDeactivateOnAVKitStop = NO;
++    TryRestoreAndDeactivatePlaybackAudioSessionIfIdle();
++  }
+   auto owner = _owner;
+   _uiRunner->PostTask(
+       FROM_HERE,
+diff --git a/third_party/blink/renderer/core/css/media_values.cc b/third_party/blink/renderer/core/css/media_values.cc
+index 7fb6f65..40b2bee 100644
+--- a/third_party/blink/renderer/core/css/media_values.cc
++++ b/third_party/blink/renderer/core/css/media_values.cc
+@@ -39,6 +39,32 @@
+ 
+ namespace blink {
+ 
++#if BUILDFLAG(IS_IOS)
++namespace {
++
++std::optional<int> ResolveCuriumColorDepth(LocalFrame* frame) {
++  if (!frame || frame->IsInFencedFrameTree()) {
++    return std::nullopt;
++  }
++  const curium::LaunchConfig* cfg = curium::GetLaunchConfig();
++  if (!cfg) {
++    return std::nullopt;
++  }
++  LocalDOMWindow* window = frame->DomWindow();
++  if (!window) {
++    return std::nullopt;
++  }
++  const curium::IdentitySlotConfig& slot =
++      cfg->SelectSlotForMetadata(window->GetUserAgentMetadata());
++  if (!slot.screen.has_value()) {
++    return std::nullopt;
++  }
++  return slot.screen->color_depth;
++}
++
++}  // namespace
++#endif
++
+ ForcedColors CSSValueIDToForcedColors(CSSValueID id) {
+   switch (id) {
+     case CSSValueID::kActive:
+@@ -238,6 +264,11 @@ float MediaValues::CalculateDevicePixelRatio(LocalFrame* frame) {
+ bool MediaValues::CalculateDeviceSupportsHDR(LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetPage());
++#if BUILDFLAG(IS_IOS)
++  if (std::optional<int> color_depth = ResolveCuriumColorDepth(frame)) {
++    return *color_depth == 30;
++  }
++#endif
+   return frame->GetPage()
+       ->GetChromeClient()
+       .GetScreenInfo(*frame)
+@@ -247,6 +278,11 @@ bool MediaValues::CalculateDeviceSupportsHDR(LocalFrame* frame) {
+ int MediaValues::CalculateColorBitsPerComponent(LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetPage());
++#if BUILDFLAG(IS_IOS)
++  if (std::optional<int> color_depth = ResolveCuriumColorDepth(frame)) {
++    return *color_depth == 30 ? 10 : 8;
++  }
++#endif
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   if (screen_info.is_monochrome) {
+@@ -428,8 +464,16 @@ ColorSpaceGamut MediaValues::CalculateColorGamut(LocalFrame* frame) {
+       frame->GetPage()->GetMediaFeatureOverrides();
+   std::optional<ColorSpaceGamut> override_value =
+       overrides ? overrides->GetColorGamut() : std::nullopt;
+-  return override_value.value_or(color_space_utilities::GetColorSpaceGamut(
+-      frame->GetPage()->GetChromeClient().GetScreenInfo(*frame)));
++  if (override_value.has_value()) {
++    return override_value.value();
++  }
++#if BUILDFLAG(IS_IOS)
++  if (std::optional<int> color_depth = ResolveCuriumColorDepth(frame)) {
++    return *color_depth == 30 ? ColorSpaceGamut::P3 : ColorSpaceGamut::SRGB;
++  }
++#endif
++  return color_space_utilities::GetColorSpaceGamut(
++      frame->GetPage()->GetChromeClient().GetScreenInfo(*frame));
+ }
+ 
+ mojom::blink::PreferredColorScheme MediaValues::CalculatePreferredColorScheme(
+diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.cc b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+index af0db36..d1b440f 100644
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.cc
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+@@ -3781,6 +3781,13 @@ bool WebMediaPlayerImpl::ShouldPausePlaybackWhenHidden() const {
+       (IsInVideoPictureInPicture() || ios_pip_session_token_.has_value())) {
+     return false;
+   }
++  // Exempt actively playing, audible audio-only streams (e.g. <audio>) from
++  // pausing when hidden so background audio continues under LiveContainer
++  // keep-alive without altering muted, paused, or video behavior.
++  if (!HasVideo() && HasAudio() && !Paused() && !IsEnded() && volume_ > 0.0 &&
++      volume_multiplier_ > 0.0) {
++    return false;
++  }
+ #endif
+ 
+   if (should_pause_when_frame_is_hidden_ && IsFrameHidden()) {

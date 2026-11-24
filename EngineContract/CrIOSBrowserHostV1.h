@@ -29,6 +29,9 @@ typedef NS_ENUM(NSInteger, CrIOSDownloadState) {
 };
 
 @protocol CrIOSBrowserHostV1;
+@class CrIOSNetworkFetchRequestV1;
+@protocol CrIOSNetworkFetchTaskV1;
+@protocol CrIOSNetworkFetchDelegateV1;
 
 NS_SWIFT_UI_ACTOR
 @protocol CrIOSTabHostingV1 <NSObject>
@@ -124,6 +127,16 @@ NS_SWIFT_UI_ACTOR
 @property (nonatomic, readonly) BOOL isMainFrame;
 /// HTTP method ("GET" or "POST") that initiated the download.
 @property (nonatomic, copy, readonly) NSString *httpMethod;
+/// Final URL after HTTP redirects (Build 44+).
+@property (nonatomic, copy, readonly, nullable) NSURL *finalURL;
+/// YES when the initial HTTP response advertised Accept-Ranges: bytes (Build 44+).
+@property (nonatomic, readonly) BOOL acceptRanges;
+/// Initial response ETag header, if present (Build 44+).
+@property (nonatomic, copy, readonly, nullable) NSString *eTag;
+/// Initial response Last-Modified header, if present (Build 44+).
+@property (nonatomic, copy, readonly, nullable) NSString *lastModified;
+/// Initial response Content-Disposition header, if present (Build 44+).
+@property (nonatomic, copy, readonly, nullable) NSString *contentDisposition;
 
 @end
 
@@ -215,6 +228,17 @@ NS_SWIFT_UI_ACTOR
 - (void)cookieHeaderForURL:(NSURL *)url
               inTabWithID:(NSString *)tabID
                completion:(void (^NS_SWIFT_UI_ACTOR)(NSString *_Nullable cookieHeader))completion;
+
+@optional
+/// Starts an off-@MainActor streaming fetch through the active ProfileIOS's SharedURLLoaderFactory
+/// (BoringSSL TLS/HTTP2/HTTP3, CookieMonster + CHIPS, Chromium proxy rules, post-DNS SSRF guard).
+/// Delegate callbacks run strictly on callbackQueue (Build 44+).
+- (nullable id<CrIOSNetworkFetchTaskV1>)startFetchRequest:(CrIOSNetworkFetchRequestV1 *)request
+                                                 delegate:(id<CrIOSNetworkFetchDelegateV1>)delegate
+                                            callbackQueue:(dispatch_queue_t)callbackQueue;
+/// Discards an inactive, non-audible, non-PiP background tab's WebContents to reclaim Jetsam
+/// memory while preserving its NavigationManager history (Build 44+).
+- (BOOL)discardTabWithID:(NSString *)tabID;
 
 @end
 

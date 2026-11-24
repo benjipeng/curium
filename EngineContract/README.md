@@ -128,3 +128,33 @@ the process:
   `webrtcIpHandlingPolicy`, `enableDoNotTrack`, `enableGlobalPrivacyControl`,
   and `hideSpeechVoices`. On Build 43+, `GlobalPrivacyControlApi` is toggled
   dynamically by the runtime policy rather than via a launch command-line flag.
+
+#### Build 44 Additions (`contractVersion: 4`, Backward-Compatible with v1–v3)
+
+All Build 44 selectors and properties are strictly additive and `@optional` (or
+probed via `respondsToSelector:` / `NSClassFromString`):
+
+- **Zero-Restart Cross-Profile Hot-Swap (`CuriumEngineMain.h`):**
+  - `fingerprintCapabilities` advertises `contractVersion: 4`,
+    `supportedSchemaVersions: [1, 2, 3, 4]`, `activationScopes.profileHotSwap = "runtime_hot"`,
+    and `features.zeroRestartProfileHotSwap = YES` (`jitMode` remains `"launch"`).
+  - `+switchToProfileWithConfigJSON:beforeProfileCreate:completion:` atomically
+    quiesces outgoing tabs/fetches/extensions, detaches the single-process
+    `RenderProcessHost`, tears down the outgoing `ProfileIOS`, purges renderer/V8/font
+    caches, invokes `beforeProfileCreate` on `@MainActor` for CoreText `.process` font
+    swap, boots the target `ProfileIOS` and rebinds the renderer before services/extensions
+    start, and delivers fresh `browserHost` + `extensionManager`.
+  - Additive `CrIOSFingerprintErrorCode`: `HotSwapUnsupported = 9`,
+    `HotSwapInProgress = 10`, `TeardownIncomplete = 11`.
+- **Chromium-Native Streaming Fetch & Download Metadata (`CrIOSNetworkFetchV1.h`, `CrIOSBrowserHostV1.h`):**
+  - `@optional` `CrIOSDownloadTaskV1` properties: `finalURL`, `acceptRanges`,
+    `eTag`, `lastModified`, `contentDisposition` (enabling zero-probe multi-lane
+    upgrade without burning single-use tokens).
+  - `@optional` `CrIOSBrowserHostV1` `-startFetchRequest:delegate:callbackQueue:`
+    exposes an off-`@MainActor` `SharedURLLoaderFactory` + `mojo::SimpleWatcher`
+    credit-window streaming pipe (BoringSSL TLS/HTTP2/HTTP3, `CookieMonster` + CHIPS
+    via `isolationTopFrameURL`, Chromium proxy rules, post-DNS SSRF guard). Always
+    resolve `CrIOSNetworkFetchRequestV1` via `NSClassFromString` when linking against
+    pre-Build-44 frameworks.
+  - `@optional` `CrIOSBrowserHostV1` `-discardTabWithID:` discards inactive,
+    non-audible, non-PiP background tabs while preserving `NavigationManager` history.

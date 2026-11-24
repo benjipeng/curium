@@ -1,0 +1,3198 @@
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 60ed51f..fb907d3 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -93,6 +93,10 @@
+ #include "components/vrp_flags/buildflags.h"
+ #include "content/browser/bad_message.h"
+ #include "content/browser/blob_storage/blob_registry_wrapper.h"
++#if BUILDFLAG(IS_IOS)
++#include "content/browser/blob_storage/chrome_blob_storage_context.h"
++#include "third_party/blink/public/mojom/blob/blob_registry.mojom.h"
++#endif
+ #include "content/browser/blob_storage/file_backed_blob_factory_worker_impl.h"
+ #include "content/browser/browser_child_process_host_impl.h"
+ #include "content/browser/browser_context_impl.h"
+@@ -870,6 +874,18 @@ class SiteProcessCountTracker : public base::SupportsUserData::Data,
+     }
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  void DetachHostForHotSwap(RenderProcessHost* host) {
++    if (!host) {
++      return;
++    }
++    ClearProcessForAllSites(host->GetID());
++#ifndef NDEBUG
++    host->RemoveObserver(this);
++#endif
++  }
++#endif
++
+   // Returns a string containing formatted data from
+   // GetHostIdToSiteMapForDebugging().
+   std::string GetDebugString() const {
+@@ -1117,6 +1133,34 @@ class UnmatchedServiceWorkerProcessTracker
+     host->RemoveObserver(this);
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  static void DetachHostForHotSwap(BrowserContext* browser_context,
++                                   RenderProcessHost* host) {
++    if (!browser_context || !host) {
++      return;
++    }
++    auto* tracker = static_cast<UnmatchedServiceWorkerProcessTracker*>(
++        browser_context->GetUserData(kUnmatchedServiceWorkerProcessTrackerKey));
++    if (!tracker) {
++      return;
++    }
++    const ChildProcessId process_id = host->GetID();
++    bool removed = false;
++    for (auto it = tracker->site_process_set_.begin();
++         it != tracker->site_process_set_.end();) {
++      if (it->second == process_id) {
++        it = tracker->site_process_set_.erase(it);
++        removed = true;
++      } else {
++        ++it;
++      }
++    }
++    if (removed) {
++      host->RemoveObserver(tracker);
++    }
++  }
++#endif
++
+  private:
+   using SiteProcessIDPair = std::pair<SiteInfo, ChildProcessId>;
+   using SiteProcessIDPairSet = std::set<SiteProcessIDPair>;
+@@ -1497,6 +1541,139 @@ void RenderProcessHostImpl::IOThreadHostImpl::GetInterfacesForTesting(
+   binders_->GetInterfacesForTesting(out);  // IN-TEST
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++void RenderProcessHostImpl::IOThreadHostImpl::ClearBlobRegistryForHotSwap() {
++  if (binders_) {
++    binders_->RemoveInterface<blink::mojom::BlobRegistry>();
++  }
++}
++
++void RenderProcessHostImpl::IOThreadHostImpl::SetBlobRegistryForHotSwap(
++    scoped_refptr<BlobRegistryWrapper> blob_registry) {
++  if (!binders_) {
++    return;
++  }
++  binders_->RemoveInterface<blink::mojom::BlobRegistry>();
++  if (blob_registry) {
++    binders_->AddInterface(base::BindRepeating(&BlobRegistryWrapper::Bind,
++                                               std::move(blob_registry),
++                                               render_process_id_));
++  }
++}
++
++// Single-process DOM Storage proxy keeping Blink's singleton StorageController
++// Mojo pipe alive across Build 44 profile hot-swaps while swapping the backend
++// StoragePartitionImpl binding and invalidating cached areas.
++class RenderProcessHostImpl::HotSwapDomStorageForwarder final
++    : public blink::mojom::DomStorage,
++      public blink::mojom::DomStorageClient {
++ public:
++  explicit HotSwapDomStorageForwarder(ChildProcessId process_id)
++      : process_id_(process_id) {}
++  ~HotSwapDomStorageForwarder() override = default;
++
++  void AddFrontendBinding(
++      StoragePartitionImpl* partition,
++      mojo::PendingReceiver<blink::mojom::DomStorage> receiver,
++      mojo::PendingRemote<blink::mojom::DomStorageClient> client) {
++    frontend_receivers_.Add(this, std::move(receiver));
++    if (client.is_valid()) {
++      mojo::Remote<blink::mojom::DomStorageClient> remote;
++      remote.Bind(std::move(client));
++      remote.reset_on_disconnect();
++      frontend_clients_.push_back(std::move(remote));
++    }
++    if (partition && !backend_dom_storage_.is_bound()) {
++      BindBackend(partition);
++    }
++  }
++
++  void DetachFromStoragePartition(StoragePartitionImpl* partition) {
++    if (partition && backend_receiver_id_.has_value()) {
++      partition->UnbindDomStorage(*backend_receiver_id_);
++      backend_receiver_id_.reset();
++    }
++    backend_dom_storage_.reset();
++    backend_client_receiver_.reset();
++    ResetLocalStorageConnections();
++    ResetSessionStorageConnections();
++  }
++
++  void RebindToStoragePartition(StoragePartitionImpl* partition) {
++    if (!partition || frontend_receivers_.empty()) {
++      return;
++    }
++    BindBackend(partition);
++  }
++
++  // blink::mojom::DomStorage:
++  void OpenLocalStorage(
++      const blink::StorageKey& storage_key,
++      const blink::LocalFrameToken& local_frame_token,
++      mojo::PendingReceiver<blink::mojom::StorageArea> receiver) override {
++    if (backend_dom_storage_.is_bound()) {
++      backend_dom_storage_->OpenLocalStorage(storage_key, local_frame_token,
++                                             std::move(receiver));
++    }
++  }
++
++  void BindSessionStorageNamespace(
++      const std::string& namespace_id,
++      mojo::PendingReceiver<blink::mojom::SessionStorageNamespace> receiver)
++      override {
++    if (backend_dom_storage_.is_bound()) {
++      backend_dom_storage_->BindSessionStorageNamespace(namespace_id,
++                                                        std::move(receiver));
++    }
++  }
++
++  void BindSessionStorageArea(
++      const blink::StorageKey& storage_key,
++      const blink::LocalFrameToken& local_frame_token,
++      const std::string& namespace_id,
++      mojo::PendingReceiver<blink::mojom::StorageArea> receiver) override {
++    if (backend_dom_storage_.is_bound()) {
++      backend_dom_storage_->BindSessionStorageArea(
++          storage_key, local_frame_token, namespace_id, std::move(receiver));
++    }
++  }
++
++  // blink::mojom::DomStorageClient:
++  void ResetSessionStorageConnections() override {
++    for (auto& client : frontend_clients_) {
++      if (client.is_bound()) {
++        client->ResetSessionStorageConnections();
++      }
++    }
++  }
++
++  void ResetLocalStorageConnections() override {
++    for (auto& client : frontend_clients_) {
++      if (client.is_bound()) {
++        client->ResetLocalStorageConnections();
++      }
++    }
++  }
++
++ private:
++  void BindBackend(StoragePartitionImpl* partition) {
++    backend_dom_storage_.reset();
++    backend_client_receiver_.reset();
++    backend_receiver_id_ = partition->BindDomStorage(
++        process_id_.GetUnsafeValue(),
++        backend_dom_storage_.BindNewPipeAndPassReceiver(),
++        backend_client_receiver_.BindNewPipeAndPassRemote());
++  }
++
++  const ChildProcessId process_id_;
++  mojo::ReceiverSet<blink::mojom::DomStorage> frontend_receivers_;
++  std::vector<mojo::Remote<blink::mojom::DomStorageClient>> frontend_clients_;
++  mojo::Remote<blink::mojom::DomStorage> backend_dom_storage_;
++  mojo::Receiver<blink::mojom::DomStorageClient> backend_client_receiver_{this};
++  std::optional<mojo::ReceiverId> backend_receiver_id_;
++};
++#endif
++
+ void RenderProcessHostImpl::IOThreadHostImpl::Ping(PingCallback callback) {
+   std::move(callback).Run();
+ }
+@@ -1882,7 +2059,13 @@ RenderProcessHostImpl::~RenderProcessHostImpl() {
+   in_process_renderer_.reset();
+   g_in_process_thread = nullptr;
+ 
++#if BUILDFLAG(IS_IOS)
++  if (!is_hotswap_detached_) {
++    ChildProcessSecurityPolicyImpl::GetInstance()->Remove(GetID());
++  }
++#else
+   ChildProcessSecurityPolicyImpl::GetInstance()->Remove(GetID());
++#endif
+ 
+   is_dead_ = true;
+ 
+@@ -2946,6 +3129,19 @@ void RenderProcessHostImpl::BindDomStorage(
+     return;
+   }
+ 
++#if BUILDFLAG(IS_IOS)
++  if (run_renderer_in_process()) {
++    if (!hot_swap_dom_storage_forwarder_) {
++      hot_swap_dom_storage_forwarder_ =
++          std::make_unique<HotSwapDomStorageForwarder>(id_);
++    }
++    hot_swap_dom_storage_forwarder_->AddFrontendBinding(
++        storage_partition_impl_, std::move(receiver), std::move(client));
++    dom_storage_provider_receiver_.reset();
++    return;
++  }
++#endif
++
+   dom_storage_receiver_ids_.insert(storage_partition_impl_->BindDomStorage(
+       id_.GetUnsafeValue(), std::move(receiver), std::move(client)));
+ 
+@@ -4891,30 +5087,31 @@ void RenderProcessHostImpl::UnregisterHost(ChildProcessId host_id) {
+ 
+   GetAllHosts().Remove(host_id);
+ 
+-  // Log after updating the GetAllHosts() list but before deleting the host.
+-  MAYBEVLOG(3) << __func__ << "(" << host_id << ")" << std::endl
+-               << GetCurrentHostMapDebugString(
+-                      static_cast<SiteProcessCountTracker*>(
+-                          host->GetBrowserContext()->GetUserData(
+-                              kCommittedSiteProcessCountTrackerKey)));
+-
+-  if (IsEmptyRendererProcessesReuseAllowed()) {
+-    // Remove this host from the tracker of empty processes. This guarantees
+-    // the tracker is cleaned up if the process is destroyed if the standard
+-    // RenderProcessHostImpl::Cleanup() path is bypassed (e.g.
+-    // MockRenderProcessHost in unit tests).
+-    SiteProcessCountTracker::GetInstance(host->GetBrowserContext(),
+-                                         kEmptySiteProcessCountTrackerKey)
+-        ->ClearProcessForAllSites(host_id);
+-  }
++  if (BrowserContext* browser_context = host->GetBrowserContext()) {
++    // Log after updating the GetAllHosts() list but before deleting the host.
++    MAYBEVLOG(3) << __func__ << "(" << host_id << ")" << std::endl
++                 << GetCurrentHostMapDebugString(
++                        static_cast<SiteProcessCountTracker*>(
++                            browser_context->GetUserData(
++                                kCommittedSiteProcessCountTrackerKey)));
++
++    if (IsEmptyRendererProcessesReuseAllowed()) {
++      // Remove this host from the tracker of empty processes. This guarantees
++      // the tracker is cleaned up if the process is destroyed if the standard
++      // RenderProcessHostImpl::Cleanup() path is bypassed (e.g.
++      // MockRenderProcessHost in unit tests).
++      SiteProcessCountTracker::GetInstance(browser_context,
++                                           kEmptySiteProcessCountTrackerKey)
++          ->ClearProcessForAllSites(host_id);
++    }
+ 
+-  // Look up the map of site to process for the given browser_context,
+-  // in case we need to remove this process from it.  It will be registered
+-  // under any sites it rendered that use process-per-site mode.
+-  SiteProcessMap* map =
+-      GetSiteProcessMapForBrowserContext(host->GetBrowserContext());
++    // Look up the map of site to process for the given browser_context,
++    // in case we need to remove this process from it.  It will be registered
++    // under any sites it rendered that use process-per-site mode.
++    SiteProcessMap* map = GetSiteProcessMapForBrowserContext(browser_context);
+ 
+-  map->RemoveProcess(host);
++    map->RemoveProcess(host);
++  }
+ }
+ 
+ // static
+@@ -5305,6 +5502,239 @@ void RenderProcessHost::ShutDownInProcessRenderer() {
+   RenderProcessHostImpl::ShutDownInProcessRenderer();
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++bool RenderProcessHostImpl::DetachFromBrowserContextForHotSwap() {
++  CHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!run_renderer_in_process() || deleting_soon_ || is_dead_) {
++    return false;
++  }
++  if (GetRenderFrameHostCount() != 0) {
++    return false;
++  }
++  if (!browser_context_ && !storage_partition_impl_) {
++    is_hotswap_detached_ = true;
++    return true;
++  }
++
++  is_hotswap_detached_ = true;
++
++  if (browser_context_) {
++    if (auto* map = static_cast<SiteProcessMap*>(
++            browser_context_->GetUserData(kSiteProcessMapKeyName))) {
++      map->RemoveProcess(this);
++    }
++    constexpr const void* kTrackerKeys[] = {
++        kCommittedSiteProcessCountTrackerKey,
++        kPendingSiteProcessCountTrackerKey,
++        kDelayedShutdownSiteProcessCountTrackerKey,
++        kEmptySiteProcessCountTrackerKey,
++    };
++    for (const void* key : kTrackerKeys) {
++      if (auto* tracker = static_cast<SiteProcessCountTracker*>(
++              browser_context_->GetUserData(key))) {
++        tracker->DetachHostForHotSwap(this);
++      }
++    }
++    UnmatchedServiceWorkerProcessTracker::DetachHostForHotSwap(browser_context_,
++                                                               this);
++  }
++
++  StopTrackingProcessForShutdownDelay();
++
++  if (hot_swap_dom_storage_forwarder_ && storage_partition_impl_) {
++    hot_swap_dom_storage_forwarder_->DetachFromStoragePartition(
++        storage_partition_impl_);
++  }
++  if (storage_partition_impl_) {
++    for (auto receiver_id : dom_storage_receiver_ids_) {
++      storage_partition_impl_->UnbindDomStorage(receiver_id);
++    }
++  }
++  dom_storage_receiver_ids_.clear();
++
++  push_messaging_manager_.reset();
++  file_backed_blob_factory_.reset();
++  permission_service_context_.reset();
++  media_interface_proxy_.reset();
++  file_system_manager_impl_.reset();
++
++  if (io_thread_host_impl_) {
++    io_thread_host_impl_->AsyncCall(
++        &IOThreadHostImpl::ClearBlobRegistryForHotSwap);
++  }
++
++  if (features::IsShaderDiskCacheEnabled(
++          base::CommandLine::ForCurrentProcess())) {
++    if (GetGpuDiskCacheFactorySingleton() && gpu_client_) {
++      gpu_client_->RemoveDiskCacheHandles();
++    }
++  }
++
++  ChildProcessSecurityPolicyImpl::GetInstance()->Remove(GetID());
++
++  did_update_renderer_locked_state_ = false;
++  are_ref_counts_disabled_ = false;
++  keep_alive_ref_count_ = 0;
++  keep_alive_start_times_.clear();
++  worker_ref_count_ = 0;
++  shutdown_delay_ref_count_ = 0;
++  pending_reuse_ref_count_ = 0;
++  navigation_state_keepalive_count_ = 0;
++
++  browser_context_ = nullptr;
++  storage_partition_impl_ = nullptr;
++  return true;
++}
++
++bool RenderProcessHostImpl::RebindToBrowserContextForHotSwap(
++    BrowserContext* browser_context,
++    StoragePartitionImpl* storage_partition_impl) {
++  CHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!run_renderer_in_process() || deleting_soon_ || is_dead_ ||
++      !browser_context || !storage_partition_impl) {
++    return false;
++  }
++  if (!is_hotswap_detached_ && browser_context_ == browser_context &&
++      storage_partition_impl_ == storage_partition_impl) {
++    return true;
++  }
++  CHECK(!browser_context->ShutdownStarted());
++
++  browser_context_ = browser_context;
++  storage_partition_impl_ = storage_partition_impl;
++  is_hotswap_detached_ = false;
++  did_update_renderer_locked_state_ = false;
++
++  ChildProcessSecurityPolicyImpl::GetInstance()->Add(GetID());
++
++  push_messaging_manager_ = std::make_unique<PushMessagingManager>(
++      *this,
++      /* render_frame_id= */ ChildProcessHost::kInvalidUniqueID,
++      base::WrapRefCounted(storage_partition_impl_->GetServiceWorkerContext()));
++
++  if (is_initialized_) {
++    file_system_manager_impl_.reset(new FileSystemManagerImpl(
++        ChildProcessSecurityPolicyImpl::GetInstance()->CreateHandle(GetID()),
++        storage_partition_impl_->GetFileSystemContext(),
++        ChromeBlobStorageContext::GetFor(browser_context_)));
++  }
++
++  if (io_thread_host_impl_) {
++    io_thread_host_impl_->AsyncCall(
++        &IOThreadHostImpl::SetBlobRegistryForHotSwap,
++        base::WrapRefCounted(storage_partition_impl_->GetBlobRegistry()));
++  }
++
++  if (hot_swap_dom_storage_forwarder_) {
++    hot_swap_dom_storage_forwarder_->RebindToStoragePartition(
++        storage_partition_impl_);
++  }
++
++  if (!browser_context_->IsOffTheRecord() &&
++      features::IsShaderDiskCacheEnabled(
++          base::CommandLine::ForCurrentProcess())) {
++    if (auto* cache_factory = GetGpuDiskCacheFactorySingleton();
++        cache_factory && gpu_client_) {
++      for (const gpu::GpuDiskCacheType type : gpu::kGpuDiskCacheTypes) {
++        auto handle = cache_factory->GetCacheHandle(
++            type, storage_partition_impl_->GetPath().Append(
++                      gpu::GetGpuDiskCacheSubdir(type)));
++        gpu_client_->SetDiskCacheHandle(handle);
++      }
++    }
++  }
++
++  storage_partition_impl_->ResetURLLoaderFactories();
++
++  if (renderer_interface_.is_bound()) {
++    content::cpu_performance::Tier cpu_tier;
++    if (std::optional<int> override =
++            GetContentClient()->browser()->GetCpuPerformanceTierOverride(
++                browser_context_)) {
++      cpu_tier = content::cpu_performance::TierFromInt(*override).value_or(
++          content::cpu_performance::Tier::kUnknown);
++    } else {
++      cpu_tier = content::cpu_performance::GetTier();
++    }
++    const uint64_t trace_id = base::Token::CreateRandom().high();
++    GetRendererInterface()->InitializeRenderer(
++        GetContentClient()->browser()->GetUserAgent(),
++        GetContentClient()->browser()->GetUserAgentMetadata(),
++        storage_partition_impl_->cors_exempt_header_list(),
++        GetContentClient()->browser()->GetOriginTrialsSettings(), cpu_tier,
++        trace_id);
++  }
++
++  return true;
++}
++
++// static
++bool RenderProcessHost::DetachSingleProcessRendererForHotSwap(
++    BrowserContext* outgoing_context) {
++  CHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!run_renderer_in_process()) {
++    for (iterator it = AllHostsIterator(); !it.IsAtEnd(); it.Advance()) {
++      RenderProcessHost* host = it.GetCurrentValue();
++      if (host->GetBrowserContext() == outgoing_context) {
++        if (host->GetRenderFrameHostCount() != 0) {
++          return false;
++        }
++        host->DisableRefCounts();
++      }
++    }
++    return true;
++  }
++
++  if (RenderProcessHostImpl::GetCount() == 0) {
++    return true;
++  }
++  for (iterator it = AllHostsIterator(); !it.IsAtEnd(); it.Advance()) {
++    RenderProcessHostImpl* host =
++        To<RenderProcessHostImpl>(it.GetCurrentValue());
++    if (host->GetBrowserContext() == outgoing_context ||
++        host->GetBrowserContext() == nullptr) {
++      if (!host->DetachFromBrowserContextForHotSwap()) {
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
++// static
++bool RenderProcessHost::RebindSingleProcessRendererForHotSwap(
++    BrowserContext* new_context,
++    StoragePartition* new_storage_partition) {
++  CHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (!run_renderer_in_process() || RenderProcessHostImpl::GetCount() == 0) {
++    return true;
++  }
++  if (!new_context || !new_storage_partition) {
++    return false;
++  }
++  auto* partition_impl =
++      static_cast<StoragePartitionImpl*>(new_storage_partition);
++  for (iterator it = AllHostsIterator(); !it.IsAtEnd(); it.Advance()) {
++    RenderProcessHostImpl* host =
++        To<RenderProcessHostImpl>(it.GetCurrentValue());
++    if (!host->RebindToBrowserContextForHotSwap(new_context, partition_impl)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// static
++int RenderProcessHost::GetTotalRenderFrameHostCountForHotSwap() {
++  CHECK_CURRENTLY_ON(BrowserThread::UI);
++  int total = 0;
++  for (iterator it = AllHostsIterator(); !it.IsAtEnd(); it.Advance()) {
++    total += it.GetCurrentValue()->GetRenderFrameHostCount();
++  }
++  return total;
++}
++#endif
++
+ // static
+ RenderProcessHost::iterator RenderProcessHost::AllHostsIterator() {
+   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M152);
+@@ -5872,8 +6302,20 @@ void RenderProcessHostImpl::ResetIPC() {
+   embedded_frame_sink_provider_.reset();
+ 
+   dom_storage_provider_receiver_.reset();
+-  for (auto receiver_id : dom_storage_receiver_ids_)
+-    storage_partition_impl_->UnbindDomStorage(receiver_id);
++#if BUILDFLAG(IS_IOS)
++  if (hot_swap_dom_storage_forwarder_) {
++    if (storage_partition_impl_) {
++      hot_swap_dom_storage_forwarder_->DetachFromStoragePartition(
++          storage_partition_impl_);
++    }
++    hot_swap_dom_storage_forwarder_.reset();
++  }
++#endif
++  if (storage_partition_impl_) {
++    for (auto receiver_id : dom_storage_receiver_ids_)
++      storage_partition_impl_->UnbindDomStorage(receiver_id);
++  }
++  dom_storage_receiver_ids_.clear();
+ 
+   instance_weak_factory_.InvalidateWeakPtrs();
+ 
+diff --git a/content/browser/renderer_host/render_process_host_impl.h b/content/browser/renderer_host/render_process_host_impl.h
+index da0267e..fa4afd8 100644
+--- a/content/browser/renderer_host/render_process_host_impl.h
++++ b/content/browser/renderer_host/render_process_host_impl.h
+@@ -68,6 +68,7 @@
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "mojo/public/cpp/bindings/unique_receiver_set.h"
+ #include "mojo/public/cpp/system/invitation.h"
+@@ -154,6 +155,7 @@ class GpuClient;
+ 
+ namespace content {
+ class AgentSchedulingGroupHost;
++class BlobRegistryWrapper;
+ class BucketContext;
+ class EmbeddedFrameSinkProviderImpl;
+ class FileSystemManagerImpl;
+@@ -672,6 +674,16 @@ class CONTENT_EXPORT RenderProcessHostImpl
+   // This forces a renderer that is running "in process" to shut down.
+   static void ShutDownInProcessRenderer();
+ 
++#if BUILDFLAG(IS_IOS)
++  // Build 44 single-process hot-swap: detaches from the outgoing
++  // BrowserContext/StoragePartition while keeping InProcessRendererThread and
++  // its IPC channel alive, then rebinds to the target profile's context.
++  bool DetachFromBrowserContextForHotSwap();
++  bool RebindToBrowserContextForHotSwap(
++      BrowserContext* browser_context,
++      StoragePartitionImpl* storage_partition_impl);
++#endif
++
+   static void RegisterRendererMainThreadFactory(
+       RendererMainThreadFactoryFunction create);
+ 
+@@ -1038,6 +1050,12 @@ class CONTENT_EXPORT RenderProcessHostImpl
+ 
+     void GetInterfacesForTesting(std::vector<std::string>& out);
+ 
++#if BUILDFLAG(IS_IOS)
++    void ClearBlobRegistryForHotSwap();
++    void SetBlobRegistryForHotSwap(
++        scoped_refptr<BlobRegistryWrapper> blob_registry);
++#endif
++
+    private:
+     // mojom::ChildProcessHost implementation:
+     void Ping(PingCallback callback) override;
+@@ -1484,6 +1502,12 @@ class CONTENT_EXPORT RenderProcessHostImpl
+   // cleanup.
+   std::set<mojo::ReceiverId> dom_storage_receiver_ids_;
+ 
++#if BUILDFLAG(IS_IOS)
++  class HotSwapDomStorageForwarder;
++  std::unique_ptr<HotSwapDomStorageForwarder> hot_swap_dom_storage_forwarder_;
++  bool is_hotswap_detached_ = false;
++#endif
++
+   std::set<GlobalRenderFrameHostId> render_frame_host_id_set_;
+ 
+   std::set<GlobalRenderFrameHostId> prerendering_frame_host_id_set_;
+diff --git a/content/public/browser/render_process_host.h b/content/public/browser/render_process_host.h
+index d7d5c04..8183a07 100644
+--- a/content/public/browser/render_process_host.h
++++ b/content/public/browser/render_process_host.h
+@@ -918,6 +918,23 @@ class CONTENT_EXPORT RenderProcessHost : public IPC::Listener,
+   // This forces a renderer that is running "in process" to shut down.
+   static void ShutDownInProcessRenderer();
+ 
++#if BUILDFLAG(IS_IOS)
++  // Build 44 zero-restart single-process profile hot-swap lifecycle helpers.
++  // Detaches the live in-process RenderProcessHost from `outgoing_context`
++  // without closing the IPC channel (avoiding OnChannelError() -> _exit(0) and
++  // MiraclePtr DanglingPtr checks during ~BrowserContext()).
++  static bool DetachSingleProcessRendererForHotSwap(
++      BrowserContext* outgoing_context);
++  // Rebinds the detached in-process RenderProcessHost to `new_context` and
++  // `new_storage_partition`, re-establishing per-context bindings and pushing
++  // updated renderer configuration.
++  static bool RebindSingleProcessRendererForHotSwap(
++      BrowserContext* new_context,
++      StoragePartition* new_storage_partition);
++  // Returns total live RenderFrameHost count across all RenderProcessHosts.
++  static int GetTotalRenderFrameHostCountForHotSwap();
++#endif
++
+   // Allows iteration over all the RenderProcessHosts in the browser. Note
+   // that each host may not be active, and therefore may have nullptr channels.
+   static iterator AllHostsIterator();
+diff --git a/content/renderer/render_thread_impl.cc b/content/renderer/render_thread_impl.cc
+index fc9e3c0..b4bf2b9 100644
+--- a/content/renderer/render_thread_impl.cc
++++ b/content/renderer/render_thread_impl.cc
+@@ -865,7 +865,11 @@ void RenderThreadImpl::InitializeRenderer(
+     uint64_t trace_id) {
+   TRACE_EVENT("navigation", "RenderThreadImpl::InitializeRenderer",
+               perfetto::TerminatingFlow::Global(trace_id));
++#if !BUILDFLAG(IS_IOS)
+   DCHECK(user_agent_.IsNull());
++#else
++  DCHECK(user_agent_.IsNull() || IsSingleProcess());
++#endif
+ 
+   user_agent_ = WebString::FromUtf8(user_agent);
+   GetContentClient()->renderer()->DidSetUserAgent(user_agent);
+diff --git a/extensions/renderer/dispatcher.cc b/extensions/renderer/dispatcher.cc
+index 27280d7..00bc283 100644
+--- a/extensions/renderer/dispatcher.cc
++++ b/extensions/renderer/dispatcher.cc
+@@ -961,12 +961,22 @@ void Dispatcher::UnregisterMojoInterfaces(
+ 
+ void Dispatcher::OnRendererAssociatedRequest(
+     mojo::PendingAssociatedReceiver<mojom::Renderer> receiver) {
++#if BUILDFLAG(IS_IOS)
++  receiver_.reset();
+   receiver_.Bind(std::move(receiver));
++  receiver_.reset_on_disconnect();
++#else
++  receiver_.Bind(std::move(receiver));
++#endif
+ }
+ 
+ void Dispatcher::OnEventDispatcherRequest(
+     mojo::PendingAssociatedReceiver<mojom::EventDispatcher> dispatcher) {
++#if BUILDFLAG(IS_IOS)
++  dispatcher_.reset();
++#else
+   CHECK(!dispatcher_.is_bound());
++#endif
+   dispatcher_.Bind(std::move(dispatcher));
+   dispatcher_.reset_on_disconnect();
+ }
+diff --git a/ios/chrome/app/profile/profile_controller.mm b/ios/chrome/app/profile/profile_controller.mm
+index 6acbc30..ef52115 100644
+--- a/ios/chrome/app/profile/profile_controller.mm
++++ b/ios/chrome/app/profile/profile_controller.mm
+@@ -6,6 +6,7 @@
+ 
+ #import <algorithm>
+ #import <memory>
++#import <string>
+ #import <utility>
+ 
+ #import "base/callback_list.h"
+@@ -206,6 +207,9 @@ void RemoveSessionsFromSessionsToDiscard(const SessionIds& session_ids,
+ }  // namespace
+ 
+ @interface ProfileController () <ProfileStateObserver, SceneStateObserver>
++- (BOOL)detachProfileForCuriumHotSwap;
++- (void)recreateProfileForCuriumHotSwapWithCompletion:
++    (void (^)(BOOL success))completion;
+ @end
+ 
+ @implementation ProfileController {
+@@ -232,6 +236,11 @@ @implementation ProfileController {
+   // Subscription waiting for ExtensionService to be ready before continuing
+   // initialization.
+   base::CallbackListSubscription _extensionReadySubscription;
++
++  // Retained for Build 44 Curium zero-restart profile hot-swap teardown and
++  // recreation (cleared in -shutdown).
++  raw_ptr<ProfileManagerIOS> _curiumHotSwapProfileManager;
++  std::string _curiumLoadedProfileName;
+ }
+ 
+ - (instancetype)initWithAppState:(AppState*)appState
+@@ -253,6 +262,33 @@ - (void)loadProfileNamed:(std::string_view)profileName
+ 
+   // Store the pointer to the profile manager.
+   _profileManager = manager;
++  _curiumHotSwapProfileManager = manager;
++  _curiumLoadedProfileName = std::string(profileName);
++
++  if ([CrIOSEngineBootstrap shellBootstrapDelegate]) {
++    __weak ProfileController* weakSelf = self;
++    [CrIOSEngineBootstrap
++        registerCuriumProfileControllerForState:_state
++                                    detachBlock:^BOOL {
++                                      ProfileController* strongSelf = weakSelf;
++                                      if (!strongSelf) {
++                                        return NO;
++                                      }
++                                      return [strongSelf
++                                          detachProfileForCuriumHotSwap];
++                                    }
++                                  recreateBlock:^(
++                                      void (^onProfileReady)(BOOL)) {
++                                    ProfileController* strongSelf = weakSelf;
++                                    if (!strongSelf) {
++                                      onProfileReady(NO);
++                                      return;
++                                    }
++                                    [strongSelf
++                                        recreateProfileForCuriumHotSwapWithCompletion:
++                                            onProfileReady];
++                                  }];
++  }
+ 
+   // Transition to the next init stage before loading the profile as the
+   // load may be synchronous (if the profile has already been loaded for
+@@ -267,6 +303,10 @@ - (void)loadProfileNamed:(std::string_view)profileName
+ }
+ 
+ - (void)shutdown {
++  [CrIOSEngineBootstrap unregisterCuriumProfileControllerForState:_state];
++  _curiumHotSwapProfileManager = nullptr;
++  _curiumLoadedProfileName.clear();
++
+   // Stop and destroy the profile specific service helpers (SpotlightManager,
+   // ExtensionSearchEngineDataUpdater, ...) if they have been created.
+   _searchEngineDataUpdater.reset();
+@@ -428,8 +468,8 @@ - (void)applicationWillResignActive:(UIApplication*)application {
+ }
+ 
+ - (void)applicationWillTerminate:(UIApplication*)application {
+-  // Nothing to do if the profile is not yet fully loaded.
+-  if (_state.initStage < ProfileInitStage::kPrepareUI) {
++  // Nothing to do if the profile is not yet fully loaded or is mid hot-swap.
++  if (_state.initStage < ProfileInitStage::kPrepareUI || !_state.profile) {
+     return;
+   }
+ 
+@@ -448,8 +488,8 @@ - (void)applicationWillTerminate:(UIApplication*)application {
+ 
+ - (void)applicationDidEnterBackground:(UIApplication*)application
+                          memoryHelper:(MemoryWarningHelper*)memoryHelper {
+-  // Nothing to do if the profile is not yet fully loaded.
+-  if (_state.initStage < ProfileInitStage::kPrepareUI) {
++  // Nothing to do if the profile is not yet fully loaded or is mid hot-swap.
++  if (_state.initStage < ProfileInitStage::kPrepareUI || !_state.profile) {
+     return;
+   }
+ 
+@@ -489,8 +529,8 @@ - (void)applicationDidEnterBackground:(UIApplication*)application
+ 
+ - (void)applicationWillEnterForeground:(UIApplication*)application
+                           memoryHelper:(MemoryWarningHelper*)memoryHelper {
+-  // Nothing to do if the profile is not yet fully loaded.
+-  if (_state.initStage < ProfileInitStage::kPrepareUI) {
++  // Nothing to do if the profile is not yet fully loaded or is mid hot-swap.
++  if (_state.initStage < ProfileInitStage::kPrepareUI || !_state.profile) {
+     return;
+   }
+ 
+@@ -531,6 +571,55 @@ - (void)profileLoaded:(ScopedProfileKeepAliveIOS)keepAlive {
+   [_state queueTransitionToNextInitStage];
+ }
+ 
++- (BOOL)detachProfileForCuriumHotSwap {
++  if (!_curiumHotSwapProfileManager || _curiumLoadedProfileName.empty()) {
++    return NO;
++  }
++
++  // Cancel deferred blocks and tear down profile-bound helpers before
++  // dropping the final ScopedProfileKeepAliveIOS.
++  [_state.deferredRunner cancelAllBlocks];
++  _searchEngineDataUpdater.reset();
++  [_spotlightManager shutdown];
++  _spotlightManager = nil;
++  _extensionReadySubscription = {};
++
++  [_state setProfile:nullptr];
++  _scopedProfileKeepAlive.Reset();
++
++  return _curiumHotSwapProfileManager->GetProfileWithName(
++             _curiumLoadedProfileName) == nullptr;
++}
++
++- (void)recreateProfileForCuriumHotSwapWithCompletion:
++    (void (^)(BOOL success))completion {
++  void (^copiedCompletion)(BOOL) = [completion copy];
++  if (!_curiumHotSwapProfileManager || _curiumLoadedProfileName.empty()) {
++    copiedCompletion(NO);
++    return;
++  }
++
++  __weak ProfileController* weakSelf = self;
++  const bool started = _curiumHotSwapProfileManager->CreateProfileAsync(
++      _curiumLoadedProfileName,
++      base::BindOnce(^(ScopedProfileKeepAliveIOS keepAlive) {
++        ProfileController* strongSelf = weakSelf;
++        ProfileIOS* newProfile = keepAlive.profile();
++        if (!strongSelf || !newProfile) {
++          copiedCompletion(NO);
++          return;
++        }
++        strongSelf->_scopedProfileKeepAlive = std::move(keepAlive);
++        [strongSelf->_state setProfile:newProfile];
++        strongSelf->_spotlightManager =
++            [SpotlightManager spotlightManagerWithProfile:newProfile];
++        copiedCompletion(YES);
++      }));
++  if (!started) {
++    copiedCompletion(NO);
++  }
++}
++
+ - (void)purgeDiscardedSessionsData {
+   DCHECK(_state.profile);
+   DCHECK(_profileManager);
+@@ -606,13 +695,14 @@ - (void)startUpBrowserBackgroundInitialization {
+ }
+ 
+ - (void)attachProfileAgents {
+-  [_state addAgent:[[OTRPRofileDestroyerProfileAgent alloc] init]];
+-  [_state addAgent:[[CertificatePolicyProfileAgent alloc] init]];
+-  [_state addAgent:[[FirstRunProfileAgent alloc] init]];
+   if ([CrIOSEngineBootstrap shellBootstrapDelegate]) {
++    [_state addAgent:[[FirstRunProfileAgent alloc] init]];
+     [_state addAgent:[[SearchEngineChoiceProfileAgent alloc] init]];
+     return;
+   }
++  [_state addAgent:[[OTRPRofileDestroyerProfileAgent alloc] init]];
++  [_state addAgent:[[CertificatePolicyProfileAgent alloc] init]];
++  [_state addAgent:[[FirstRunProfileAgent alloc] init]];
+   [_state addAgent:[[MultiProfileForcedMigrationProfileAgent alloc] init]];
+   [_state addAgent:[[IdentityConfirmationProfileAgent alloc] init]];
+   [_state addAgent:[[ProfileActivityProfileAgent alloc] init]];
+diff --git a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.h b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.h
+index 6f98ff6..beee232 100644
+--- a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.h
++++ b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.h
+@@ -7,4 +7,46 @@
+ 
+ #import "ios/chrome/browser/curium/curium_engine_contract_internal.h"
+ 
++NS_ASSUME_NONNULL_BEGIN
++
++typedef void (^CrIOSProfileHotSwapCompletion)(
++    id<CrIOSBrowserHostV1> _Nullable browserHost,
++    id<CrIOSExtensionManagingV1> _Nullable extensionManager,
++    NSError* _Nullable error);
++
++typedef void (^CrIOSProfileHotSwapHandler)(
++    NSString* targetStatePath,
++    void (^_Nullable beforeProfileCreate)(void),
++    CrIOSProfileHotSwapCompletion completion);
++
++typedef BOOL (^CrIOSProfileControllerDetachBlock)(void);
++typedef void (^CrIOSProfileControllerRecreateBlock)(
++    void (^onProfileReady)(BOOL success));
++
++// Internal Build 44 wiring between CrIOSEngineBootstrap, SceneController, and
++// ProfileController without introducing circular GN dependencies.
++@interface CrIOSEngineBootstrap (CuriumHotSwapInternal)
++
+++ (void)registerProfileHotSwapHandler:
++    (nullable CrIOSProfileHotSwapHandler)handler;
++
+++ (void)registerCuriumProfileControllerForState:(id)profileState
++                                    detachBlock:
++                                        (CrIOSProfileControllerDetachBlock)
++                                            detachBlock
++                                  recreateBlock:
++                                      (CrIOSProfileControllerRecreateBlock)
++                                          recreateBlock;
+++ (void)unregisterCuriumProfileControllerForState:(id)profileState;
+++ (BOOL)detachCuriumProfileControllerForState:(id)profileState;
+++ (void)recreateCuriumProfileControllerForState:(id)profileState
++                                     completion:
++                                         (void (^)(BOOL success))completion;
++
+++ (BOOL)commitStagedHotSwapLaunchConfig;
++
++@end
++
++NS_ASSUME_NONNULL_END
++
+ #endif  // IOS_CHROME_BROWSER_CURIUM_CR_IOS_ENGINE_BOOTSTRAP_H_
+diff --git a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+index 4590561..2f91f1b 100644
+--- a/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
++++ b/ios/chrome/browser/curium/cr_ios_engine_bootstrap.mm
+@@ -4,11 +4,15 @@
+ 
+ #import "ios/chrome/browser/curium/cr_ios_engine_bootstrap.h"
+ 
++#import <optional>
+ #import <string>
+ #import <string_view>
++#import <utility>
+ 
+ #import "base/apple/foundation_util.h"
+ #import "base/check.h"
++#import "base/files/file_path.h"
++#import "base/no_destructor.h"
+ #import "base/strings/string_view_util.h"
+ #import "base/strings/sys_string_conversions.h"
+ #import "build/blink_buildflags.h"
+@@ -19,8 +23,33 @@
+ #import "third_party/blink/public/common/curium/curium_runtime_policy.h"
+ #endif
+ 
++@interface CuriumProfileControllerHooks : NSObject
++@property(nonatomic, copy) CrIOSProfileControllerDetachBlock detachBlock;
++@property(nonatomic, copy) CrIOSProfileControllerRecreateBlock recreateBlock;
++@end
++
++@implementation CuriumProfileControllerHooks
++@end
++
+ namespace {
+ id<CrIOSShellBootstrapDelegate> g_shell_bootstrap_delegate = nil;
++CrIOSProfileHotSwapHandler g_profile_hotswap_handler = nil;
++BOOL g_profile_hotswap_in_progress = NO;
++
++NSMapTable<id, CuriumProfileControllerHooks*>* GetProfileControllerHooksMap() {
++  static NSMapTable<id, CuriumProfileControllerHooks*>* map = nil;
++  if (!map) {
++    map = [NSMapTable weakToStrongObjectsMapTable];
++  }
++  return map;
++}
++
++#if BUILDFLAG(USE_BLINK)
++std::optional<blink::curium::LaunchConfig>& GetStagedHotSwapLaunchConfig() {
++  static base::NoDestructor<std::optional<blink::curium::LaunchConfig>> staged;
++  return *staged;
++}
++#endif
+ 
+ NSError* MakeFingerprintError(NSInteger code, const std::string& message) {
+   NSString* description =
+@@ -42,6 +71,9 @@
+   if (code == "already_opened") {
+     return blink::curium::ErrorCode::kAlreadyFrozen;
+   }
++  if (code == "hotswap_in_progress") {
++    return blink::curium::ErrorCode::kHotSwapInProgress;
++  }
+   return blink::curium::ErrorCode::kProfileUnavailable;
+ }
+ 
+@@ -92,7 +124,7 @@ + (void)registerShellBootstrapDelegate:
+ #if BUILDFLAG(USE_BLINK)
+   return @{
+     @"contractVersion" : @(blink::curium::kLaunchConfigSchemaVersion),
+-    @"supportedSchemaVersions" : @[ @1, @2, @3 ],
++    @"supportedSchemaVersions" : @[ @1, @2, @3, @4 ],
+     @"maxConfigBytes" : @(blink::curium::kMaxLaunchConfigBytes),
+     @"runtimePolicyVersion" : @(blink::curium::kRuntimePolicySchemaVersion),
+     @"maxRuntimePolicyBytes" : @(blink::curium::kMaxRuntimePolicyBytes),
+@@ -113,7 +145,7 @@ + (void)registerShellBootstrapDelegate:
+       @"fontProfile" : @"launch",
+       @"screen" : @"launch_per_slot_web_only",
+       @"speechVoiceHiding" : @"runtime_hot",
+-      @"profileHotSwap" : @"planned_build_44",
++      @"profileHotSwap" : @"runtime_hot",
+     },
+     @"features" : @{
+       @"zstdBaseline" : @YES,
+@@ -142,6 +174,7 @@ + (void)registerShellBootstrapDelegate:
+       @"nativeSpeechSynthesisVoices" : @YES,
+       @"nativeWindowChromeSurface" : @YES,
+       @"profileCachePurgeHook" : @YES,
++      @"zeroRestartProfileHotSwap" : @YES,
+     },
+   };
+ #else
+@@ -336,4 +369,175 @@ + (BOOL)applyRuntimePolicyJSON:(NSData*)jsonData
+ #endif
+ }
+ 
+++ (void)switchToProfileWithConfigJSON:(NSData*)jsonData
++                  beforeProfileCreate:
++                      (nullable void (^NS_SWIFT_UI_ACTOR)(void))
++                          beforeProfileCreate
++                           completion:
++                               (void (^NS_SWIFT_UI_ACTOR)(
++                                   id<CrIOSBrowserHostV1> _Nullable browserHost,
++                                   id<CrIOSExtensionManagingV1> _Nullable
++                                       extensionManager,
++                                   NSError* _Nullable error))completion {
++  CHECK([NSThread isMainThread]);
++  void (^copiedCompletion)(id<CrIOSBrowserHostV1> _Nullable,
++                           id<CrIOSExtensionManagingV1> _Nullable,
++                           NSError* _Nullable) = [completion copy];
++#if BUILDFLAG(USE_BLINK)
++  if (!g_profile_hotswap_handler) {
++    copiedCompletion(
++        nil, nil,
++        MakeFingerprintError(
++            CrIOSFingerprintErrorHotSwapUnsupported,
++            "Headless Curium browser host is not ready for profile hot-swap"));
++    return;
++  }
++  if (g_profile_hotswap_in_progress) {
++    copiedCompletion(
++        nil, nil,
++        MakeFingerprintError(CrIOSFingerprintErrorHotSwapInProgress,
++                             "Another profile hot-swap is already in progress"));
++    return;
++  }
++  if (!jsonData || jsonData.length == 0) {
++    copiedCompletion(
++        nil, nil,
++        MakeFingerprintError(CrIOSFingerprintErrorInvalidJSON,
++                             "Profile hot-swap config JSON must not be empty"));
++    return;
++  }
++
++  // Step 1: Non-destructive preflight (parse, validate, acquire target flock)
++  // while the currently active profile remains live and untouched.
++  std::string_view json_view =
++      base::as_string_view(base::apple::NSDataToSpan(jsonData));
++  blink::curium::LaunchConfig parsed_config;
++  blink::curium::ConfigError cfg_error;
++  if (!blink::curium::ParseAndValidateLaunchConfigJSON(
++          json_view, &parsed_config, &cfg_error)) {
++    copiedCompletion(
++        nil, nil,
++        MakeFingerprintError(static_cast<NSInteger>(cfg_error.code),
++                             cfg_error.message));
++    return;
++  }
++
++  base::FilePath target_root;
++  base::FilePath target_state_path;
++  std::string path_err_code;
++  std::string path_err_message;
++  if (!ios::PrepareHotSwapCuriumProfileDirectory(
++          parsed_config.profile_id, &target_root, &target_state_path,
++          &path_err_code, &path_err_message)) {
++    const blink::curium::ErrorCode mapped = MapPathErrorCode(path_err_code);
++    copiedCompletion(
++        nil, nil,
++        MakeFingerprintError(static_cast<NSInteger>(mapped), path_err_message));
++    return;
++  }
++
++  NSString* targetStatePathNS =
++      base::SysUTF8ToNSString(target_state_path.value()) ?: @"";
++
++  g_profile_hotswap_in_progress = YES;
++  GetStagedHotSwapLaunchConfig().emplace(std::move(parsed_config));
++
++  CrIOSProfileHotSwapHandler handler = g_profile_hotswap_handler;
++  void (^copiedBeforeCreate)(void) = [beforeProfileCreate copy];
++  handler(targetStatePathNS, copiedBeforeCreate,
++          ^(id<CrIOSBrowserHostV1> _Nullable browserHost,
++            id<CrIOSExtensionManagingV1> _Nullable extensionManager,
++            NSError* _Nullable error) {
++            CHECK([NSThread isMainThread]);
++            GetStagedHotSwapLaunchConfig().reset();
++            g_profile_hotswap_in_progress = NO;
++            copiedCompletion(browserHost, extensionManager, error);
++          });
++#else
++  (void)jsonData;
++  (void)beforeProfileCreate;
++  copiedCompletion(
++      nil, nil,
++      MakeFingerprintError(CrIOSFingerprintErrorHotSwapUnsupported,
++                           "Blink engine is unavailable for profile hot-swap"));
++#endif
++}
++
++@end
++
++@implementation CrIOSEngineBootstrap (CuriumHotSwapInternal)
++
+++ (void)registerProfileHotSwapHandler:
++    (nullable CrIOSProfileHotSwapHandler)handler {
++  CHECK([NSThread isMainThread]);
++  g_profile_hotswap_handler = [handler copy];
++}
++
+++ (void)registerCuriumProfileControllerForState:(id)profileState
++                                    detachBlock:
++                                        (CrIOSProfileControllerDetachBlock)
++                                            detachBlock
++                                  recreateBlock:
++                                      (CrIOSProfileControllerRecreateBlock)
++                                          recreateBlock {
++  CHECK([NSThread isMainThread]);
++  if (!profileState) {
++    return;
++  }
++  CuriumProfileControllerHooks* hooks =
++      [[CuriumProfileControllerHooks alloc] init];
++  hooks.detachBlock = detachBlock;
++  hooks.recreateBlock = recreateBlock;
++  [GetProfileControllerHooksMap() setObject:hooks forKey:profileState];
++}
++
+++ (void)unregisterCuriumProfileControllerForState:(id)profileState {
++  CHECK([NSThread isMainThread]);
++  if (!profileState) {
++    return;
++  }
++  [GetProfileControllerHooksMap() removeObjectForKey:profileState];
++}
++
+++ (BOOL)detachCuriumProfileControllerForState:(id)profileState {
++  CHECK([NSThread isMainThread]);
++  CuriumProfileControllerHooks* hooks =
++      profileState ? [GetProfileControllerHooksMap() objectForKey:profileState]
++                   : nil;
++  if (!hooks || !hooks.detachBlock) {
++    return NO;
++  }
++  return hooks.detachBlock();
++}
++
+++ (void)recreateCuriumProfileControllerForState:(id)profileState
++                                     completion:
++                                         (void (^)(BOOL success))completion {
++  CHECK([NSThread isMainThread]);
++  void (^copiedCompletion)(BOOL) = [completion copy];
++  CuriumProfileControllerHooks* hooks =
++      profileState ? [GetProfileControllerHooksMap() objectForKey:profileState]
++                   : nil;
++  if (!hooks || !hooks.recreateBlock) {
++    copiedCompletion(NO);
++    return;
++  }
++  hooks.recreateBlock(copiedCompletion);
++}
++
+++ (BOOL)commitStagedHotSwapLaunchConfig {
++  CHECK([NSThread isMainThread]);
++#if BUILDFLAG(USE_BLINK)
++  auto& staged = GetStagedHotSwapLaunchConfig();
++  if (!staged.has_value()) {
++    return NO;
++  }
++  blink::curium::HotSwapLaunchConfig(std::move(*staged));
++  staged.reset();
++  return YES;
++#else
++  return NO;
++#endif
++}
++
+ @end
+diff --git a/ios/chrome/browser/curium/curium_browser_provider.h b/ios/chrome/browser/curium/curium_browser_provider.h
+index 44cc6c4..6ee42e7 100644
+--- a/ios/chrome/browser/curium/curium_browser_provider.h
++++ b/ios/chrome/browser/curium/curium_browser_provider.h
+@@ -5,9 +5,11 @@
+ #ifndef IOS_CHROME_BROWSER_CURIUM_CURIUM_BROWSER_PROVIDER_H_
+ #define IOS_CHROME_BROWSER_CURIUM_CURIUM_BROWSER_PROVIDER_H_
+ 
++#import "base/functional/callback_forward.h"
+ #import "ios/chrome/browser/shared/model/browser/browser_provider_interface.h"
+ 
+ class Browser;
++class ProfileIOS;
+ 
+ NS_ASSUME_NONNULL_BEGIN
+ 
+@@ -18,4 +20,13 @@ NS_ASSUME_NONNULL_BEGIN
+ 
+ NS_ASSUME_NONNULL_END
+ 
++// Build 44 zero-restart profile hot-swap content/Blink bridge helpers.
++void CuriumStopServiceWorkersAndDrainForHotSwap(ProfileIOS* _Nullable profile,
++                                                base::OnceClosure on_drained);
++int CuriumCountLiveRenderFrameHostsForHotSwap();
++bool CuriumDetachSingleProcessRendererForHotSwap(ProfileIOS* _Nullable profile);
++void CuriumFlushIOThreadBarriersForHotSwap(base::OnceClosure on_flushed);
++void CuriumPurgeRendererCachesForHotSwap(base::OnceClosure on_purged);
++bool CuriumRebindSingleProcessRendererForHotSwap(ProfileIOS* _Nullable profile);
++
+ #endif  // IOS_CHROME_BROWSER_CURIUM_CURIUM_BROWSER_PROVIDER_H_
+diff --git a/ios/chrome/browser/curium/curium_browser_provider.mm b/ios/chrome/browser/curium/curium_browser_provider.mm
+index ad5cda3..3314b3c 100644
+--- a/ios/chrome/browser/curium/curium_browser_provider.mm
++++ b/ios/chrome/browser/curium/curium_browser_provider.mm
+@@ -4,8 +4,24 @@
+ 
+ #import "ios/chrome/browser/curium/curium_browser_provider.h"
+ 
++#import <utility>
++
++#import "base/functional/bind.h"
++#import "base/functional/callback.h"
++#import "base/functional/callback_helpers.h"
++#import "base/location.h"
+ #import "base/memory/weak_ptr.h"
++#import "base/task/sequenced_task_runner.h"
++#import "content/public/browser/browser_context.h"
++#import "content/public/browser/browser_task_traits.h"
++#import "content/public/browser/browser_thread.h"
++#import "content/public/browser/render_process_host.h"
++#import "content/public/browser/service_worker_context.h"
++#import "content/public/browser/storage_partition.h"
+ #import "ios/chrome/browser/shared/model/browser/browser.h"
++#import "ios/chrome/browser/shared/model/profile/profile_ios.h"
++#import "ios/web/content/content_browser_context.h"
++#import "third_party/blink/public/common/curium/curium_runtime_policy.h"
+ 
+ @implementation CuriumBrowserProvider {
+   base::WeakPtr<Browser> _browser;
+@@ -36,3 +52,78 @@ - (BOOL)hasIncognitoBrowser {
+ }
+ 
+ @end
++
++void CuriumFlushIOThreadBarriersForHotSwap(base::OnceClosure on_flushed) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  // Two sequential UI -> IO -> UI round-trips guarantee that IO-thread
++  // deletions (such as FileSystemManagerImpl and BlobRegistry unbinding) AND
++  // secondary IO-thread cleanup tasks posted by them (such as
++  // ChildProcessSecurityPolicyImpl::CompletePendingStateRemoval) have all
++  // finished before ~ProfileIOSImpl() or RebindToBrowserContextForHotSwap().
++  content::GetIOThreadTaskRunner({})->PostTaskAndReply(
++      FROM_HERE, base::DoNothing(),
++      base::BindOnce(
++          [](base::OnceClosure done) {
++            content::GetIOThreadTaskRunner({})->PostTaskAndReply(
++                FROM_HERE, base::DoNothing(), std::move(done));
++          },
++          std::move(on_flushed)));
++}
++
++void CuriumStopServiceWorkersAndDrainForHotSwap(ProfileIOS* profile,
++                                                base::OnceClosure on_drained) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  auto drain_after_sw = base::BindOnce(
++      [](base::OnceClosure done) {
++        CuriumFlushIOThreadBarriersForHotSwap(base::BindOnce(
++            [](base::OnceClosure final_done) {
++              base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++                  FROM_HERE, std::move(final_done));
++            },
++            std::move(done)));
++      },
++      std::move(on_drained));
++
++  content::BrowserContext* context =
++      profile ? web::ContentBrowserContext::FromBrowserState(profile) : nullptr;
++  content::StoragePartition* partition =
++      context ? context->GetDefaultStoragePartition() : nullptr;
++  content::ServiceWorkerContext* sw_context =
++      partition ? partition->GetServiceWorkerContext() : nullptr;
++  if (!sw_context) {
++    std::move(drain_after_sw).Run();
++    return;
++  }
++  sw_context->StopAllServiceWorkers(std::move(drain_after_sw));
++}
++
++int CuriumCountLiveRenderFrameHostsForHotSwap() {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  return content::RenderProcessHost::GetTotalRenderFrameHostCountForHotSwap();
++}
++
++bool CuriumDetachSingleProcessRendererForHotSwap(ProfileIOS* profile) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  content::BrowserContext* context =
++      profile ? web::ContentBrowserContext::FromBrowserState(profile) : nullptr;
++  return content::RenderProcessHost::DetachSingleProcessRendererForHotSwap(
++      context);
++}
++
++void CuriumPurgeRendererCachesForHotSwap(base::OnceClosure on_purged) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  blink::curium::PurgeProfileRuntimeCaches(std::move(on_purged));
++}
++
++bool CuriumRebindSingleProcessRendererForHotSwap(ProfileIOS* profile) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (!profile) {
++    return false;
++  }
++  content::BrowserContext* context =
++      web::ContentBrowserContext::FromBrowserState(profile);
++  content::StoragePartition* partition =
++      context ? context->GetDefaultStoragePartition() : nullptr;
++  return content::RenderProcessHost::RebindSingleProcessRendererForHotSwap(
++      context, partition);
++}
+diff --git a/ios/chrome/browser/curium/curium_engine_contract_internal.h b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+index 30b1bf5..53c5373 100644
+--- a/ios/chrome/browser/curium/curium_engine_contract_internal.h
++++ b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+@@ -42,6 +42,9 @@ typedef NS_ENUM(NSInteger, CrIOSFingerprintErrorCode) {
+   CrIOSFingerprintErrorProfileUnavailable = 6,
+   CrIOSFingerprintErrorProfileLocked = 7,
+   CrIOSFingerprintErrorAlreadyFrozen = 8,
++  CrIOSFingerprintErrorHotSwapUnsupported = 9,
++  CrIOSFingerprintErrorHotSwapInProgress = 10,
++  CrIOSFingerprintErrorTeardownIncomplete = 11,
+ };
+ 
+ __attribute__((unused)) static NSString* const CrIOSFingerprintErrorDomain =
+@@ -71,6 +74,17 @@ __attribute__((visibility("default")))
+ + (BOOL)applyRuntimePolicyJSON:(NSData*)jsonData
+                          error:(NSError* _Nullable* _Nullable)error;
+ + (NSDictionary<NSString*, id>*)activeRuntimePolicyStatus;
+++ (void)switchToProfileWithConfigJSON:(NSData*)jsonData
++                  beforeProfileCreate:
++                      (nullable void (^NS_SWIFT_UI_ACTOR)(void))
++                          beforeProfileCreate
++                           completion:
++                               (void (^NS_SWIFT_UI_ACTOR)(
++                                   id<CrIOSBrowserHostV1> _Nullable browserHost,
++                                   id<CrIOSExtensionManagingV1> _Nullable
++                                       extensionManager,
++                                   NSError* _Nullable error))completion
++    NS_SWIFT_NAME(switchToProfile(configJSON:beforeProfileCreate:completion:));
+ @end
+ 
+ @protocol CrIOSTabHostingV1 <NSObject>
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+index fa92cdc..2e7e391 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.h
+@@ -54,6 +54,16 @@ void InitializeIOSExtensionsForProfile(ProfileIOS* profile);
+ // `web::ContentBrowserContext` before `ProfileIOSImpl` tears down `prefs_`.
+ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile);
+ 
++// Build 44 hot-swap helpers: closes live extension popup WebStates, resets
++// in-flight signed imports, unloads outgoing extensions from the live
++// single-process renderer (without mutating prefs), and clears ProcessMap
++// entries prior to renderer detach.
++void PrepareIOSExtensionsForProfileHotSwap(ProfileIOS* profile);
++
++// Notifies the newly booted target profile's RendererStartupHelper that the
++// reused single-process RenderProcessHost has rebound to `profile`.
++void NotifyIOSExtensionsRendererReboundForHotSwap(ProfileIOS* profile);
++
+ // Returns the fixed framework bundle path (`base::DIR_ASSETS/Extensions/iOSProbe`)
+ // from which the initial bundled unpacked content-script fixture is loaded.
+ base::FilePath GetIOSBundledExtensionDirectory();
+diff --git a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+index 6a8bdd0..45f197a 100644
+--- a/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
++++ b/ios/chrome/browser/extensions/model/ios_extensions_browser_client.mm
+@@ -49,6 +49,7 @@
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_delegate.h"
+@@ -80,6 +81,8 @@
+ #include "extensions/browser/management_policy.h"
+ #include "extensions/browser/permissions_manager.h"
+ #include "extensions/browser/pref_names.h"
++#include "extensions/browser/process_map.h"
++#include "extensions/browser/renderer_startup_helper.h"
+ #include "extensions/browser/service_worker/service_worker_task_queue.h"
+ #include "extensions/browser/unpacked_installer.h"
+ #include "extensions/browser/url_request_util.h"
+@@ -136,6 +139,16 @@ @protocol CrIOSExtensionPopupHostingV1 <NSObject>
+ - (void)close;
+ @end
+ 
++@class CrIOSExtensionPopupHost;
++
++static NSHashTable<CrIOSExtensionPopupHost*>* GetLiveExtensionPopupHosts() {
++  static NSHashTable<CrIOSExtensionPopupHost*>* hosts = nil;
++  if (!hosts) {
++    hosts = [NSHashTable weakObjectsHashTable];
++  }
++  return hosts;
++}
++
+ // Required V1 selectors remain stable; the UI probes optional capabilities.
+ @protocol CrIOSExtensionManagingV1 <NSObject>
+ - (NSArray<NSDictionary<NSString*, id>*>*)extensionsWithError:
+@@ -920,6 +933,10 @@ void InitializeIOSExtensionsForProfile(ProfileIOS* profile) {
+   client->RegisterBrowserContext(browser_context, profile);
+   BrowserContextDependencyManager::GetInstance()->CreateBrowserContextServices(
+       browser_context);
++  // During Build 44 single-process hot-swap, the reused RenderProcessHost has
++  // already been rebound to `profile` in PrefsInitStage3; register it with
++  // RendererStartupHelper before InitForRegularProfile loads extensions.
++  NotifyIOSExtensionsRendererReboundForHotSwap(profile);
+   extensions::ExtensionSystem::Get(browser_context)
+       ->InitForRegularProfile(/*extensions_enabled=*/true);
+ }
+@@ -943,6 +960,73 @@ void ShutdownIOSExtensionsForProfile(ProfileIOS* profile) {
+   client->UnregisterBrowserContext(browser_context);
+ }
+ 
++void PrepareIOSExtensionsForProfileHotSwap(ProfileIOS* profile) {
++  if (content::BrowserThread::CurrentlyOn(content::BrowserThread::UI)) {
++    NSArray<CrIOSExtensionPopupHost*>* live_popups =
++        [GetLiveExtensionPopupHosts() allObjects];
++    for (CrIOSExtensionPopupHost* popup in live_popups) {
++      [popup close];
++    }
++    ResetSignedImports();
++  }
++
++  if (!profile || profile->IsOffTheRecord()) {
++    return;
++  }
++  auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
++  content::BrowserContext* browser_context =
++      web::ContentBrowserContext::FromBrowserState(profile);
++  if (!client || !browser_context || !client->IsValidContext(browser_context)) {
++    return;
++  }
++
++  if (auto* registry = extensions::ExtensionRegistry::Get(browser_context)) {
++    if (auto* startup_helper =
++            extensions::RendererStartupHelperFactory::GetForBrowserContext(
++                browser_context)) {
++      std::vector<scoped_refptr<const extensions::Extension>> enabled;
++      for (const auto& ext : registry->enabled_extensions()) {
++        enabled.push_back(ext);
++      }
++      for (const auto& ext : enabled) {
++        startup_helper->OnExtensionUnloaded(*ext);
++      }
++    }
++  }
++
++  if (auto* process_map = extensions::ProcessMap::Get(browser_context)) {
++    for (auto it = content::RenderProcessHost::AllHostsIterator();
++         !it.IsAtEnd(); it.Advance()) {
++      process_map->Remove(it.GetCurrentValue()->GetID());
++    }
++  }
++}
++
++void NotifyIOSExtensionsRendererReboundForHotSwap(ProfileIOS* profile) {
++  if (!profile || profile->IsOffTheRecord()) {
++    return;
++  }
++  auto* client = extensions::IOSExtensionsBrowserClient::GetInstance();
++  content::BrowserContext* browser_context =
++      web::ContentBrowserContext::FromBrowserState(profile);
++  if (!client || !browser_context || !client->IsValidContext(browser_context)) {
++    return;
++  }
++  auto* startup_helper =
++      extensions::RendererStartupHelperFactory::GetForBrowserContext(
++          browser_context);
++  if (!startup_helper) {
++    return;
++  }
++  for (auto it = content::RenderProcessHost::AllHostsIterator(); !it.IsAtEnd();
++       it.Advance()) {
++    content::RenderProcessHost* host = it.GetCurrentValue();
++    if (host->GetBrowserContext() == browser_context) {
++      startup_helper->OnRenderProcessHostCreated(host);
++    }
++  }
++}
++
+ namespace extensions {
+ 
+ // static
+@@ -2835,6 +2919,7 @@ - (instancetype)initWithExtensionID:(NSString*)extensionID
+       }
+     });
+     _webState->SetDelegate(_delegate.get());
++    [GetLiveExtensionPopupHosts() addObject:self];
+   }
+   return self;
+ }
+@@ -2870,6 +2955,7 @@ - (void)close {
+     return;
+   }
+   _closed = YES;
++  [GetLiveExtensionPopupHosts() removeObject:self];
+   _onRequestClose = nil;
+   if (_webState) {
+     _webState->SetDelegate(nullptr);
+diff --git a/ios/chrome/browser/profile/model/profile_ios_impl.mm b/ios/chrome/browser/profile/model/profile_ios_impl.mm
+index 1ee671f..ee80b24 100644
+--- a/ios/chrome/browser/profile/model/profile_ios_impl.mm
++++ b/ios/chrome/browser/profile/model/profile_ios_impl.mm
+@@ -523,7 +523,12 @@ static Result CreateDirectories(const base::FilePath& state_path,
+   // DO NOT ADD ANY INITIALISATION AFTER THIS LINE.
+ 
+   // The initialisation of the ProfileIOS is now complete and the services
+-  // can be safely created.
++  // can be safely created. Notify delegate before creating services so a
++  // Build 44 single-process hot-swap can rebind the detached RenderProcessHost
++  // before any service or extension allocates a SiteInstance.
++  if (delegate_) {
++    delegate_->OnProfileBeforeServicesCreated(this);
++  }
+   ProfileDependencyManagerIOS::GetInstance()->CreateProfileServices(this);
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+   InitializeIOSExtensionsForProfile(this);
+diff --git a/ios/chrome/browser/profile/model/profile_manager_ios_impl.h b/ios/chrome/browser/profile/model/profile_manager_ios_impl.h
+index c8364e5..34dd4bd 100644
+--- a/ios/chrome/browser/profile/model/profile_manager_ios_impl.h
++++ b/ios/chrome/browser/profile/model/profile_manager_ios_impl.h
+@@ -11,7 +11,7 @@
+ #include <string_view>
+ 
+ #include "base/files/file_path.h"
+-#include "base/functional/callback_forward.h"
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/observer_list.h"
+@@ -63,10 +63,18 @@ class ProfileManagerIOSImpl : public ProfileManagerIOS,
+   void PurgeProfilesMarkedForDeletion(base::OnceClosure callback) override;
+   ProfileAttributesStorageIOS* GetProfileAttributesStorage() override;
+   base::FilePath GetProfilePath(std::string_view name) override;
++  void SetCuriumHotSwapStatePathForProfile(
++      std::string_view name,
++      const base::FilePath& state_path) override;
++  void SetCuriumHotSwapRebindCallback(
++      base::RepeatingCallback<void(ProfileIOS*)> callback) override;
++  void PrepareProfileForCuriumHotSwap(ProfileIOS* profile) override;
++  void NotifyProfileReboundForCuriumHotSwap(ProfileIOS* profile) override;
+ 
+   // ProfileIOS::Delegate:
+   void OnProfileCreationStarted(ProfileIOS* profile,
+                                 CreationMode creation_mode) override;
++  void OnProfileBeforeServicesCreated(ProfileIOS* profile) override;
+   void OnProfileCreationFinished(ProfileIOS* profile,
+                                  CreationMode creation_mode,
+                                  bool is_new_profile,
+@@ -119,6 +127,13 @@ class ProfileManagerIOSImpl : public ProfileManagerIOS,
+   // The path to the directory where the Profiles' data are stored.
+   const base::FilePath profile_data_dir_;
+ 
++  // Explicit state-path overrides applied by Build 44 Curium profile hot-swap
++  // while keeping ApplicationContextImpl::local_state_ anchored at its launch
++  // path.
++  std::map<std::string, base::FilePath, std::less<>>
++      curium_hotswap_state_paths_;
++  base::RepeatingCallback<void(ProfileIOS*)> curium_hotswap_rebind_callback_;
++
+   // Holds the Profile instances that this instance has created.
+   std::map<std::string, ProfileInfo, std::less<>> profiles_map_;
+ 
+diff --git a/ios/chrome/browser/profile/model/profile_manager_ios_impl.mm b/ios/chrome/browser/profile/model/profile_manager_ios_impl.mm
+index d7ab856..f5ebc77 100644
+--- a/ios/chrome/browser/profile/model/profile_manager_ios_impl.mm
++++ b/ios/chrome/browser/profile/model/profile_manager_ios_impl.mm
+@@ -25,6 +25,10 @@
+ #import "components/prefs/pref_service.h"
+ #import "components/prefs/scoped_user_pref_update.h"
+ #import "components/signin/public/identity_manager/identity_manager.h"
++#import "extensions/buildflags/buildflags.h"
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#import "ios/chrome/browser/extensions/model/ios_extensions_browser_client.h"
++#endif
+ #import "ios/chrome/browser/profile/model/off_the_record_profile_ios_impl.h"
+ #import "ios/chrome/browser/profile/model/profile_deleter_ios.h"
+ #import "ios/chrome/browser/profile/model/profile_ios_impl.h"
+@@ -375,9 +379,50 @@ uint32_t DecrementKeepAliveCounter() {
+ base::FilePath ProfileManagerIOSImpl::GetProfilePath(std::string_view name) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   CHECK(profile_attributes_storage_.HasProfileWithName(name));
++  auto iter = curium_hotswap_state_paths_.find(name);
++  if (iter != curium_hotswap_state_paths_.end() && !iter->second.empty()) {
++    return iter->second;
++  }
+   return profile_data_dir_.Append(name);
+ }
+ 
++void ProfileManagerIOSImpl::SetCuriumHotSwapStatePathForProfile(
++    std::string_view name,
++    const base::FilePath& state_path) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (state_path.empty()) {
++    curium_hotswap_state_paths_.erase(std::string(name));
++  } else {
++    curium_hotswap_state_paths_[std::string(name)] = state_path;
++  }
++}
++
++void ProfileManagerIOSImpl::SetCuriumHotSwapRebindCallback(
++    base::RepeatingCallback<void(ProfileIOS*)> callback) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  curium_hotswap_rebind_callback_ = std::move(callback);
++}
++
++void ProfileManagerIOSImpl::PrepareProfileForCuriumHotSwap(
++    ProfileIOS* profile) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  PrepareIOSExtensionsForProfileHotSwap(profile);
++#else
++  (void)profile;
++#endif
++}
++
++void ProfileManagerIOSImpl::NotifyProfileReboundForCuriumHotSwap(
++    ProfileIOS* profile) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  NotifyIOSExtensionsRendererReboundForHotSwap(profile);
++#else
++  (void)profile;
++#endif
++}
++
+ void ProfileManagerIOSImpl::OnProfileCreationStarted(
+     ProfileIOS* profile,
+     CreationMode creation_mode) {
+@@ -390,6 +435,15 @@ uint32_t DecrementKeepAliveCounter() {
+   }
+ }
+ 
++void ProfileManagerIOSImpl::OnProfileBeforeServicesCreated(
++    ProfileIOS* profile) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  CHECK(profile);
++  if (curium_hotswap_rebind_callback_) {
++    curium_hotswap_rebind_callback_.Run(profile);
++  }
++}
++
+ void ProfileManagerIOSImpl::OnProfileCreationFinished(
+     ProfileIOS* profile,
+     CreationMode creation_mode,
+@@ -504,8 +558,15 @@ uint32_t DecrementKeepAliveCounter() {
+       CHECK(HasProfileWithName(name));
+     }
+ 
++    base::FilePath state_path = profile_data_dir_.Append(name);
++    if (auto path_iter = curium_hotswap_state_paths_.find(name);
++        path_iter != curium_hotswap_state_paths_.end() &&
++        !path_iter->second.empty()) {
++      state_path = path_iter->second;
++    }
++
+     std::tie(iter, inserted) = profiles_map_.emplace(
+-        name, ProfileIOS::CreateProfile(profile_data_dir_.Append(name), name,
++        name, ProfileIOS::CreateProfile(state_path, name,
+                                         CreationMode::kAsynchronous, this));
+ 
+     CHECK(inserted);
+diff --git a/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm b/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
+index 0014336..355bb91 100644
+--- a/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
++++ b/ios/chrome/browser/shared/coordinator/scene/scene_controller.mm
+@@ -5,17 +5,22 @@
+ #import "ios/chrome/browser/shared/coordinator/scene/scene_controller.h"
+ 
+ #import <optional>
++#import <string>
+ #import <utility>
+ 
+ #import "base/check.h"
+ #import "base/feature_list.h"
++#import "base/files/file_path.h"
++#import "base/functional/bind.h"
+ #import "base/functional/callback_helpers.h"
+ #import "base/i18n/message_formatter.h"
+ #import "base/ios/ios_util.h"
++#import "base/location.h"
+ #import "base/logging.h"
+ #import "base/metrics/histogram_functions.h"
+ #import "base/notreached.h"
+ #import "base/strings/sys_string_conversions.h"
++#import "base/task/sequenced_task_runner.h"
+ #import "base/time/time.h"
+ #import "base/trace_event/trace_event.h"
+ #import "base/types/expected_macros.h"
+@@ -132,6 +137,7 @@
+ #import "ios/chrome/browser/curium/curium_browser_host.h"
+ #import "ios/chrome/browser/curium/curium_browser_provider.h"
+ #import "ios/chrome/browser/shared/model/browser/browser_list.h"
++#import "ios/chrome/browser/shared/model/paths/paths.h"
+ #import "ios/chrome/browser/web/model/web_state_delegate_browser_agent.h"
+ #endif
+ #import "ios/chrome/browser/shared/model/browser/browser_list_factory.h"
+@@ -1574,18 +1580,28 @@ - (void)initializeUI {
+ }
+ 
+ #if BUILDFLAG(USE_BLINK)
+-- (void)startUpCuriumShellUI:(id<CrIOSShellBootstrapDelegate>)bootstrapDelegate {
+-  TRACE_EVENT("ui", "-[SceneController startUpCuriumShellUI:]");
++- (id<CrIOSExtensionManagingV1>)curiumExtensionManager {
++  id<CrIOSExtensionManagingV1> extensionManager = nil;
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  Class managerClass = NSClassFromString(@"CrIOSExtensionManagerV1");
++  if ([managerClass respondsToSelector:@selector(sharedManager)]) {
++    extensionManager =
++        [(Class<CuriumExtensionManagerLookup>)managerClass sharedManager];
++  }
++#endif
++  return extensionManager;
++}
++
++- (void)attachCuriumBrowserHostForProfile:(ProfileIOS*)profile {
++  DCHECK(profile);
+   DCHECK(!_headlessBrowser);
+   DCHECK(!_curiumBrowserHost);
+-  DCHECK(self.profile);
+-
+-  ProfileIOS* profile = self.profile;
+   SceneState* sceneState = self.sceneState;
+ 
+   _headlessBrowser = Browser::Create(profile, sceneState);
+   _headlessBrowser->RemoveUserData(WebStateDelegateBrowserAgent::UserDataKey());
+-  BrowserListFactory::GetForProfile(profile)->AddBrowser(_headlessBrowser.get());
++  BrowserListFactory::GetForProfile(profile)->AddBrowser(
++      _headlessBrowser.get());
+   WebUsageEnablerBrowserAgent::FromBrowser(_headlessBrowser.get())
+       ->SetWebUsageEnabled(true);
+ 
+@@ -1594,22 +1610,388 @@ - (void)startUpCuriumShellUI:(id<CrIOSShellBootstrapDelegate>)bootstrapDelegate
+   _curiumBrowserHost =
+       [[CuriumBrowserHost alloc] initWithBrowser:_headlessBrowser.get()
+                                       sceneState:sceneState];
++}
+ 
+-  id<CrIOSExtensionManagingV1> extensionManager = nil;
+-#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+-  Class managerClass = NSClassFromString(@"CrIOSExtensionManagerV1");
+-  if ([managerClass respondsToSelector:@selector(sharedManager)]) {
+-    extensionManager =
+-        [(Class<CuriumExtensionManagerLookup>)managerClass sharedManager];
++- (void)drainCuriumHeadlessBrowser {
++  [_curiumBrowserHost shutdown];
++  _curiumBrowserHost = nil;
++  _headlessBrowserProvider = nil;
++  if (_headlessBrowser) {
++    ProfileIOS* profile = _headlessBrowser->GetProfile();
++    if (BrowserList* browserList =
++            BrowserListFactory::GetForProfileIfExists(profile)) {
++      browserList->RemoveBrowser(_headlessBrowser.get());
++    }
++    @autoreleasepool {
++      CloseAllWebStates(*_headlessBrowser->GetWebStateList(),
++                        WebStateList::ClosingReason::kDefault);
++    }
++    _headlessBrowser.reset();
++  }
++}
++
++- (void)startUpCuriumShellUI:(id<CrIOSShellBootstrapDelegate>)bootstrapDelegate {
++  TRACE_EVENT("ui", "-[SceneController startUpCuriumShellUI:]");
++  DCHECK(!_headlessBrowser);
++  DCHECK(!_curiumBrowserHost);
++  DCHECK(self.profile);
++
++  [self attachCuriumBrowserHostForProfile:self.profile];
++
++  __weak SceneController* weakSelf = self;
++  [CrIOSEngineBootstrap
++      registerProfileHotSwapHandler:^(NSString* targetStatePath,
++                                      void (^beforeProfileCreate)(void),
++                                      CrIOSProfileHotSwapCompletion completion) {
++        SceneController* strongSelf = weakSelf;
++        if (!strongSelf) {
++          ios::AbortHotSwapCuriumProfileDirectory();
++          NSError* error = [NSError
++              errorWithDomain:CrIOSFingerprintErrorDomain
++                         code:CrIOSFingerprintErrorHotSwapUnsupported
++                     userInfo:@{
++                       NSLocalizedDescriptionKey :
++                           @"SceneController is no longer active."
++                     }];
++          completion(nil, nil, error);
++          return;
++        }
++        [strongSelf
++            performCuriumProfileHotSwapToStatePath:targetStatePath
++                               beforeProfileCreate:beforeProfileCreate
++                                        completion:completion];
++      }];
++
++  UIViewController* rootViewController = [bootstrapDelegate
++      makeRootViewControllerForScene:self.sceneState.scene
++                         browserHost:_curiumBrowserHost
++                    extensionManager:[self curiumExtensionManager]];
++  self.sceneState.window.rootViewController = rootViewController;
++  [self.sceneState.window makeKeyAndVisible];
++}
++
++- (void)performCuriumProfileHotSwapToStatePath:(NSString*)targetStatePath
++                           beforeProfileCreate:(void (^)(void))beforeProfileCreate
++                                    completion:(CrIOSProfileHotSwapCompletion)
++                                                   completion {
++  CHECK([NSThread isMainThread]);
++  ProfileIOS* outgoingProfile = self.profile;
++  ProfileState* profileState = self.sceneState.profileState;
++  ProfileManagerIOS* profileManager =
++      GetApplicationContext() ? GetApplicationContext()->GetProfileManager()
++                              : nullptr;
++  if (!outgoingProfile || !profileState || !profileManager) {
++    ios::AbortHotSwapCuriumProfileDirectory();
++    NSError* error = [NSError
++        errorWithDomain:CrIOSFingerprintErrorDomain
++                   code:CrIOSFingerprintErrorHotSwapUnsupported
++               userInfo:@{
++                 NSLocalizedDescriptionKey :
++                     @"Active profile or ProfileManager is unavailable."
++               }];
++    completion(nil, nil, error);
++    return;
+   }
+-#endif
+ 
+-  UIViewController* rootViewController =
+-      [bootstrapDelegate makeRootViewControllerForScene:sceneState.scene
+-                                            browserHost:_curiumBrowserHost
+-                                       extensionManager:extensionManager];
+-  sceneState.window.rootViewController = rootViewController;
+-  [sceneState.window makeKeyAndVisible];
++  // Step 2: Browser Drain — close extension popups, unload extensions from the
++  // live renderer, shut down CuriumBrowserHost (cancelling downloads and
++  // fetches), close all WebStates, and stop Service Workers.
++  profileManager->PrepareProfileForCuriumHotSwap(outgoingProfile);
++  [self drainCuriumHeadlessBrowser];
++
++  const std::string activeProfileName = outgoingProfile->GetProfileName();
++  const base::FilePath resolvedTargetStatePath(
++      base::SysNSStringToUTF8(targetStatePath));
++
++  __weak SceneController* weakSelf = self;
++  void (^copiedBeforeCreate)(void) = [beforeProfileCreate copy];
++  CrIOSProfileHotSwapCompletion copiedCompletion = [completion copy];
++
++  CuriumStopServiceWorkersAndDrainForHotSwap(
++      outgoingProfile,
++      base::BindOnce(^{
++        SceneController* strongSelf = weakSelf;
++        if (!strongSelf) {
++          ios::AbortHotSwapCuriumProfileDirectory();
++          NSError* error = [NSError
++              errorWithDomain:CrIOSFingerprintErrorDomain
++                         code:CrIOSFingerprintErrorTeardownIncomplete
++                     userInfo:@{
++                       NSLocalizedDescriptionKey :
++                           @"SceneController deallocated during drain."
++                     }];
++          copiedCompletion(nil, nil, error);
++          return;
++        }
++        [strongSelf
++            continueCuriumHotSwapAfterDrainAttempt:0
++                                 activeProfileName:activeProfileName
++                                   targetStatePath:resolvedTargetStatePath
++                               beforeProfileCreate:copiedBeforeCreate
++                                        completion:copiedCompletion];
++      }));
++}
++
++- (void)continueCuriumHotSwapAfterDrainAttempt:(int)attempt
++                             activeProfileName:
++                                 (const std::string&)activeProfileName
++                               targetStatePath:
++                                   (const base::FilePath&)targetStatePath
++                           beforeProfileCreate:(void (^)(void))beforeProfileCreate
++                                    completion:(CrIOSProfileHotSwapCompletion)
++                                                   completion {
++  CHECK([NSThread isMainThread]);
++  constexpr int kMaxDrainAttempts = 5;
++  if (CuriumCountLiveRenderFrameHostsForHotSwap() > 0) {
++    if (attempt < kMaxDrainAttempts) {
++      __weak SceneController* weakSelf = self;
++      const std::string profileNameCopy = activeProfileName;
++      const base::FilePath statePathCopy = targetStatePath;
++      CuriumFlushIOThreadBarriersForHotSwap(base::BindOnce(^{
++        base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++            FROM_HERE, base::BindOnce(^{
++              SceneController* strongSelf = weakSelf;
++              if (!strongSelf) {
++                ios::AbortHotSwapCuriumProfileDirectory();
++                NSError* error = [NSError
++                    errorWithDomain:CrIOSFingerprintErrorDomain
++                               code:CrIOSFingerprintErrorTeardownIncomplete
++                           userInfo:@{
++                             NSLocalizedDescriptionKey :
++                                 @"SceneController deallocated during drain."
++                           }];
++                completion(nil, nil, error);
++                return;
++              }
++              [strongSelf
++                  continueCuriumHotSwapAfterDrainAttempt:attempt + 1
++                                       activeProfileName:profileNameCopy
++                                         targetStatePath:statePathCopy
++                                     beforeProfileCreate:beforeProfileCreate
++                                              completion:completion];
++            }));
++      }));
++      return;
++    }
++
++    // Fail closed while keeping outgoing profile usable.
++    ios::AbortHotSwapCuriumProfileDirectory();
++    if (ProfileIOS* outgoingProfile = self.profile) {
++      [self attachCuriumBrowserHostForProfile:outgoingProfile];
++    }
++    NSError* error = [NSError
++        errorWithDomain:CrIOSFingerprintErrorDomain
++                   code:CrIOSFingerprintErrorTeardownIncomplete
++               userInfo:@{
++                 NSLocalizedDescriptionKey :
++                     @"RenderFrameHost teardown did not reach zero."
++               }];
++    completion(nil, nil, error);
++    return;
++  }
++
++  // Step 3: Detach the single-process RenderProcessHostImpl from outgoing
++  // BrowserContext/StoragePartition while keeping InProcessRendererThread
++  // alive, then flush IO-thread barriers so FileSystemManagerImpl, BlobRegistry
++  // refs, and ChildProcessSecurityPolicyImpl pending state complete cleanly.
++  ProfileIOS* outgoingProfile = self.profile;
++  if (!CuriumDetachSingleProcessRendererForHotSwap(outgoingProfile)) {
++    ios::AbortHotSwapCuriumProfileDirectory();
++    if (outgoingProfile) {
++      [self attachCuriumBrowserHostForProfile:outgoingProfile];
++    }
++    NSError* error = [NSError
++        errorWithDomain:CrIOSFingerprintErrorDomain
++                   code:CrIOSFingerprintErrorTeardownIncomplete
++               userInfo:@{
++                 NSLocalizedDescriptionKey :
++                     @"Failed to detach single-process RenderProcessHost."
++               }];
++    completion(nil, nil, error);
++    return;
++  }
++
++  __weak SceneController* weakSelf = self;
++  const std::string profileNameCopy = activeProfileName;
++  const base::FilePath statePathCopy = targetStatePath;
++  CuriumFlushIOThreadBarriersForHotSwap(base::BindOnce(^{
++    SceneController* strongSelf = weakSelf;
++    if (!strongSelf) {
++      ios::AbortHotSwapCuriumProfileDirectory();
++      NSError* error = [NSError
++          errorWithDomain:CrIOSFingerprintErrorDomain
++                     code:CrIOSFingerprintErrorTeardownIncomplete
++                 userInfo:@{
++                   NSLocalizedDescriptionKey :
++                       @"SceneController deallocated after renderer detach."
++                 }];
++      completion(nil, nil, error);
++      return;
++    }
++    [strongSelf finishCuriumHotSwapTeardownAndBoot:profileNameCopy
++                                   targetStatePath:statePathCopy
++                               beforeProfileCreate:beforeProfileCreate
++                                        completion:completion];
++  }));
++}
++
++- (void)finishCuriumHotSwapTeardownAndBoot:(const std::string&)activeProfileName
++                           targetStatePath:(const base::FilePath&)targetStatePath
++                       beforeProfileCreate:(void (^)(void))beforeProfileCreate
++                                completion:
++                                    (CrIOSProfileHotSwapCompletion)completion {
++  CHECK([NSThread isMainThread]);
++  ProfileState* profileState = self.sceneState.profileState;
++  ProfileManagerIOS* profileManager =
++      GetApplicationContext() ? GetApplicationContext()->GetProfileManager()
++                              : nullptr;
++
++  // Step 4: Tear down outgoing ProfileIOSImpl (extensions -> profile services
++  // -> ~ContentBrowserContext -> ~StoragePartitionImpl) and commit the new
++  // profile root / flock.
++  if (!profileState || !profileManager ||
++      ![CrIOSEngineBootstrap
++          detachCuriumProfileControllerForState:profileState]) {
++    ios::AbortHotSwapCuriumProfileDirectory();
++    if (ProfileIOS* stillLive = self.profile) {
++      CuriumRebindSingleProcessRendererForHotSwap(stillLive);
++      if (profileManager) {
++        profileManager->NotifyProfileReboundForCuriumHotSwap(stillLive);
++      }
++      [self attachCuriumBrowserHostForProfile:stillLive];
++    }
++    NSError* error = [NSError
++        errorWithDomain:CrIOSFingerprintErrorDomain
++                   code:CrIOSFingerprintErrorTeardownIncomplete
++               userInfo:@{
++                 NSLocalizedDescriptionKey :
++                     @"Outgoing ProfileIOSImpl teardown did not complete."
++               }];
++    completion(nil, nil, error);
++    return;
++  }
++
++  if (!ios::CommitHotSwapCuriumProfileDirectory() ||
++      ![CrIOSEngineBootstrap commitStagedHotSwapLaunchConfig]) {
++    NSError* error = [NSError
++        errorWithDomain:CrIOSFingerprintErrorDomain
++                   code:CrIOSFingerprintErrorTeardownIncomplete
++               userInfo:@{
++                 NSLocalizedDescriptionKey :
++                     @"Failed to commit hot-swap profile directory or config."
++               }];
++    completion(nil, nil, error);
++    return;
++  }
++
++  // Step 5: Purge InProcessRendererThread caches (WebCache, MemoryCache,
++  // FontCache, SkGraphics, WebRuntimeFeatures, TimeZone + ICU Locale, V8),
++  // then invoke beforeProfileCreate() synchronously on @MainActor for
++  // CoreText font swap strictly at 0-WebContents / invalidated FontCache.
++  __weak SceneController* weakSelf = self;
++  const std::string profileNameCopy = activeProfileName;
++  const base::FilePath statePathCopy = targetStatePath;
++  CuriumPurgeRendererCachesForHotSwap(base::BindOnce(^{
++    CHECK([NSThread isMainThread]);
++    SceneController* strongSelf = weakSelf;
++    if (!strongSelf) {
++      NSError* error = [NSError
++          errorWithDomain:CrIOSFingerprintErrorDomain
++                     code:CrIOSFingerprintErrorTeardownIncomplete
++                 userInfo:@{
++                   NSLocalizedDescriptionKey :
++                       @"SceneController deallocated during renderer purge."
++                 }];
++      completion(nil, nil, error);
++      return;
++    }
++
++    if (beforeProfileCreate) {
++      beforeProfileCreate();
++    }
++
++    // Step 6: Boot target ProfileIOSImpl at explicit resolved state path,
++    // rebind RenderProcessHostImpl, re-attach extensions & CuriumBrowserHost.
++    ProfileManagerIOS* manager =
++        GetApplicationContext() ? GetApplicationContext()->GetProfileManager()
++                                : nullptr;
++    ProfileState* state = strongSelf.sceneState.profileState;
++    if (!manager || !state) {
++      NSError* error = [NSError
++          errorWithDomain:CrIOSFingerprintErrorDomain
++                     code:CrIOSFingerprintErrorProfileUnavailable
++                 userInfo:@{
++                   NSLocalizedDescriptionKey :
++                       @"ProfileManager unavailable when booting target profile."
++                 }];
++      completion(nil, nil, error);
++      return;
++    }
++
++    manager->SetCuriumHotSwapStatePathForProfile(profileNameCopy, statePathCopy);
++    manager->SetCuriumHotSwapRebindCallback(
++        base::BindRepeating([](ProfileIOS* profile) {
++          CuriumRebindSingleProcessRendererForHotSwap(profile);
++        }));
++    [CrIOSEngineBootstrap
++        recreateCuriumProfileControllerForState:state
++                                     completion:^(BOOL recreated) {
++                                       CHECK([NSThread isMainThread]);
++                                       SceneController* innerSelf = weakSelf;
++                                       ProfileIOS* newProfile =
++                                           innerSelf ? innerSelf.profile
++                                                     : nullptr;
++                                       if (!innerSelf || !recreated ||
++                                           !newProfile) {
++                                         NSError* error = [NSError
++                                             errorWithDomain:
++                                                 CrIOSFingerprintErrorDomain
++                                                        code:
++                                                            CrIOSFingerprintErrorProfileUnavailable
++                                                    userInfo:@{
++                                                      NSLocalizedDescriptionKey :
++                                                          @"Failed to create "
++                                                          @"target ProfileIOS."
++                                                    }];
++                                         completion(nil, nil, error);
++                                         return;
++                                       }
++
++                                       if (!CuriumRebindSingleProcessRendererForHotSwap(
++                                               newProfile)) {
++                                         NSError* error = [NSError
++                                             errorWithDomain:
++                                                 CrIOSFingerprintErrorDomain
++                                                        code:
++                                                            CrIOSFingerprintErrorTeardownIncomplete
++                                                    userInfo:@{
++                                                      NSLocalizedDescriptionKey :
++                                                          @"Failed to rebind "
++                                                          @"single-process "
++                                                          @"RenderProcessHost."
++                                                    }];
++                                         completion(nil, nil, error);
++                                         return;
++                                       }
++
++                                       if (ProfileManagerIOS* pm =
++                                               GetApplicationContext()
++                                                   ? GetApplicationContext()
++                                                         ->GetProfileManager()
++                                                   : nullptr) {
++                                         pm->NotifyProfileReboundForCuriumHotSwap(
++                                             newProfile);
++                                       }
++
++                                       [innerSelf
++                                           attachCuriumBrowserHostForProfile:
++                                               newProfile];
++                                       completion(
++                                           innerSelf->_curiumBrowserHost,
++                                           [innerSelf curiumExtensionManager],
++                                           nil);
++                                     }];
++  }));
+ }
+ #endif
+ 
+@@ -1809,23 +2191,18 @@ - (void)setProfileState:(ProfileState*)profileState {
+ 
+ - (void)teardownUI {
+ #if BUILDFLAG(USE_BLINK)
+-  if (_curiumBrowserHost || _headlessBrowser) {
+-    [_curiumBrowserHost shutdown];
+-    _curiumBrowserHost = nil;
+-    _headlessBrowserProvider = nil;
+-    self.sceneState.UIEnabled = NO;
+-    if (_headlessBrowser) {
+-      ProfileIOS* profile = _headlessBrowser->GetProfile();
+-      if (BrowserList* browserList =
+-              BrowserListFactory::GetForProfileIfExists(profile)) {
+-        browserList->RemoveBrowser(_headlessBrowser.get());
+-      }
+-      @autoreleasepool {
+-        CloseAllWebStates(*_headlessBrowser->GetWebStateList(),
+-                          WebStateList::ClosingReason::kDefault);
++  if (_curiumBrowserHost || _headlessBrowser ||
++      [CrIOSEngineBootstrap shellBootstrapDelegate]) {
++    [CrIOSEngineBootstrap registerProfileHotSwapHandler:nil];
++    if (ApplicationContext* appContext = GetApplicationContext()) {
++      if (ProfileManagerIOS* manager = appContext->GetProfileManager()) {
++        manager->SetCuriumHotSwapRebindCallback({});
+       }
+-      _headlessBrowser.reset();
+     }
++  }
++  if (_curiumBrowserHost || _headlessBrowser) {
++    [self drainCuriumHeadlessBrowser];
++    self.sceneState.UIEnabled = NO;
+     [self.sceneState.profileState removeObserver:self];
+     [_sceneState.uiBlockerState removeObserver:self];
+     _sceneURLLoadingService.reset();
+diff --git a/ios/chrome/browser/shared/model/paths/paths.h b/ios/chrome/browser/shared/model/paths/paths.h
+index ce96316..7ce4bb8 100644
+--- a/ios/chrome/browser/shared/model/paths/paths.h
++++ b/ios/chrome/browser/shared/model/paths/paths.h
+@@ -8,6 +8,10 @@
+ #include <string>
+ #include <string_view>
+ 
++namespace base {
++class FilePath;
++}  // namespace base
++
+ // This file declares path keys for the Chrome on iOS application.  These can be
+ // used with the PathService to access various special directories and files.
+ 
+@@ -46,6 +50,26 @@ bool ConfigureCuriumProfileDirectory(std::string_view profile_id,
+ std::string GetAppliedCuriumProfileId();
+ bool IsCuriumProfileDirectoryOpened();
+ 
++// [ios-blink-sideload] Build 44 zero-restart profile hot-swap directory and
++// advisory flock lifecycle.
++// Pre-validates `profile_id`, ensures target directory safety, and acquires
++// the target `.curium_profile.lock` (reusing the held fd on same-profile
++// swaps) without mutating active state. Resolves the disk-compatible profile
++// state directory (`target_state_path_out`) under `target_root_out`.
++bool PrepareHotSwapCuriumProfileDirectory(
++    std::string_view profile_id,
++    base::FilePath* target_root_out,
++    base::FilePath* target_state_path_out,
++    std::string* error_code_out,
++    std::string* error_message_out);
++// Commits the staged hot-swap after outgoing ProfileIOSImpl teardown:
++// closes any outgoing lock_fd, updates active profile_id and PathService
++// DIR_USER_DATA, and keeps FILE_LOCAL_STATE anchored at its launch path.
++bool CommitHotSwapCuriumProfileDirectory();
++// Releases any staged lock_fd and clears pending hot-swap state while keeping
++// the currently active profile untouched.
++void AbortHotSwapCuriumProfileDirectory();
++
+ }  // namespace ios
+ 
+ #endif  // IOS_CHROME_BROWSER_SHARED_MODEL_PATHS_PATHS_H_
+diff --git a/ios/chrome/browser/shared/model/paths/paths.mm b/ios/chrome/browser/shared/model/paths/paths.mm
+index 6c13c5f..30bcb0f 100644
+--- a/ios/chrome/browser/shared/model/paths/paths.mm
++++ b/ios/chrome/browser/shared/model/paths/paths.mm
+@@ -17,12 +17,14 @@
+ #import "base/command_line.h"
+ #import "base/files/file_path.h"
+ #import "base/files/file_util.h"
++#import "base/json/json_reader.h"
+ #import "base/no_destructor.h"
+ #import "base/notreached.h"
+ #import "base/path_service.h"
+ #import "base/strings/string_util.h"
+ #import "base/synchronization/lock.h"
+ #import "base/threading/thread_restrictions.h"
++#import "base/values.h"
+ #import "build/branding_buildflags.h"
+ #import "components/gcm_driver/gcm_driver_constants.h"
+ #import "ios/chrome/browser/shared/model/paths/paths_internal.h"
+@@ -48,8 +50,65 @@
+   bool configured = false;
+   bool opened = false;
+   int lock_fd = -1;
++
++  // Anchors FILE_LOCAL_STATE to the launch user-data root so ApplicationContext
++  // local_state_ never drifts during zero-restart profile hot-swaps.
++  base::FilePath initial_local_state_dir;
++
++  // Staged state for an in-flight Build 44 hot-swap.
++  bool hotswap_prepared = false;
++  std::string staged_profile_id;
++  bool staged_use_custom_profile = false;
++  bool staged_same_profile = false;
++  base::FilePath staged_profile_root;
++  base::FilePath staged_state_path;
++  int staged_lock_fd = -1;
+ };
+ 
++bool IsSafeSinglePathComponent(std::string_view name) {
++  if (name.empty() || name.size() > 128 || name == "." || name == "..") {
++    return false;
++  }
++  for (unsigned char c : name) {
++    if (c == '/' || c == '\\' || c == '\0' || c < 0x20 || c == 0x7F) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// Resolves the on-disk profile state directory under `profile_root` while
++// maintaining full disk compatibility with profiles previously opened by cold
++// launch (whose `Local State` may point to a UUID subdirectory or "Default").
++base::FilePath ResolveProfileStatePathForRoot(
++    const base::FilePath& profile_root) {
++  const base::FilePath local_state_path =
++      profile_root.Append(FILE_PATH_LITERAL("Local State"));
++  std::string contents;
++  constexpr size_t kMaxLocalStateReadBytes = 4 * 1024 * 1024;
++  if (base::ReadFileToStringWithMaxSize(local_state_path, &contents,
++                                        kMaxLocalStateReadBytes)) {
++    auto parsed = base::JSONReader::ReadAndReturnValueWithError(
++        contents, base::JSON_PARSE_RFC);
++    if (parsed.has_value()) {
++      if (const base::DictValue* root = parsed->GetIfDict()) {
++        if (const base::DictValue* profile_dict = root->FindDict("profile")) {
++          const std::string* personal =
++              profile_dict->FindString("personal_profile_name");
++          if (personal && IsSafeSinglePathComponent(*personal)) {
++            return profile_root.Append(*personal);
++          }
++          const std::string* last_used = profile_dict->FindString("last_used");
++          if (last_used && IsSafeSinglePathComponent(*last_used)) {
++            return profile_root.Append(*last_used);
++          }
++        }
++      }
++    }
++  }
++  return profile_root.Append(FILE_PATH_LITERAL("Default"));
++}
++
+ CuriumProfileState& GetCuriumProfileState() {
+   static base::NoDestructor<CuriumProfileState> state;
+   return *state;
+@@ -227,12 +286,28 @@ bool PathProvider(int key, base::FilePath* result) {
+       cur = cur.Append(gcm_driver::kGCMStoreDirname);
+       break;
+ 
+-    case FILE_LOCAL_STATE:
++    case FILE_LOCAL_STATE: {
++      CuriumProfileState& state = GetCuriumProfileState();
++      {
++        base::AutoLock locker(state.lock);
++        if (!state.initial_local_state_dir.empty()) {
++          cur = state.initial_local_state_dir.Append(
++              FILE_PATH_LITERAL("Local State"));
++          break;
++        }
++      }
+       if (!base::PathService::Get(DIR_USER_DATA, &cur)) {
+         return false;
+       }
++      {
++        base::AutoLock locker(state.lock);
++        if (state.initial_local_state_dir.empty()) {
++          state.initial_local_state_dir = cur;
++        }
++      }
+       cur = cur.Append(FILE_PATH_LITERAL("Local State"));
+       break;
++    }
+ 
+     case FILE_RESOURCES_PACK:
+       // Catalyst builds are packaged like macOS, with the binary and resource
+@@ -334,6 +409,184 @@ bool IsCuriumProfileDirectoryOpened() {
+   return state.opened;
+ }
+ 
++bool PrepareHotSwapCuriumProfileDirectory(
++    std::string_view profile_id,
++    base::FilePath* target_root_out,
++    base::FilePath* target_state_path_out,
++    std::string* error_code_out,
++    std::string* error_message_out) {
++  base::ScopedAllowBlocking allow_blocking;
++  const std::string normalized_id =
++      profile_id.empty() ? std::string("default") : std::string(profile_id);
++  const bool use_custom = (normalized_id != "default");
++  if (use_custom && !IsValidProfileSlug(normalized_id)) {
++    return SetProfileError(
++        error_code_out, error_message_out, "invalid_profile_id",
++        "Profile ID must be \"default\" or [A-Za-z0-9][A-Za-z0-9_-]{0,31}");
++  }
++
++  base::FilePath app_data_dir;
++  if (!base::apple::GetUserDirectory(NSApplicationSupportDirectory,
++                                     &app_data_dir) ||
++      app_data_dir.empty()) {
++    return SetProfileError(error_code_out, error_message_out,
++                           "profile_unavailable",
++                           "Application Support directory is unavailable");
++  }
++  if (!EnsureSafeDirectory(app_data_dir)) {
++    return SetProfileError(error_code_out, error_message_out,
++                           "profile_unavailable",
++                           "Application Support directory is not writable");
++  }
++
++  base::FilePath target_root;
++  if (use_custom) {
++    const base::FilePath profiles_root =
++        app_data_dir.Append(kProfilesRootDirName);
++    target_root = profiles_root.Append(normalized_id);
++    if (!EnsureSafeDirectory(profiles_root) ||
++        !EnsureSafeDirectory(target_root)) {
++      return SetProfileError(error_code_out, error_message_out,
++                             "profile_unavailable",
++                             "Unable to prepare isolated profile directory");
++    }
++  } else {
++    target_root = app_data_dir.Append(kProductDirName);
++    if (!EnsureSafeDirectory(target_root)) {
++      return SetProfileError(error_code_out, error_message_out,
++                             "profile_unavailable",
++                             "Unable to prepare default profile directory");
++    }
++  }
++
++  CuriumProfileState& state = GetCuriumProfileState();
++  base::AutoLock locker(state.lock);
++  if (state.hotswap_prepared) {
++    return SetProfileError(error_code_out, error_message_out,
++                           "hotswap_in_progress",
++                           "Another profile hot-swap is already in progress");
++  }
++
++  const bool same_profile = (normalized_id == state.profile_id);
++  int staged_fd = -1;
++  // On POSIX/Darwin, flock() is per open file description; re-opening and
++  // locking the same .curium_profile.lock while already holding state.lock_fd
++  // would fail with EWOULDBLOCK. Reuse the held fd on same-profile swaps.
++  if (!same_profile || state.lock_fd < 0) {
++    if (!AcquireProfileLock(target_root, &staged_fd, error_code_out,
++                            error_message_out)) {
++      return false;
++    }
++  }
++
++  const base::FilePath target_state_path =
++      ResolveProfileStatePathForRoot(target_root);
++
++  state.hotswap_prepared = true;
++  state.staged_profile_id = normalized_id;
++  state.staged_use_custom_profile = use_custom;
++  state.staged_same_profile = same_profile;
++  state.staged_profile_root = target_root;
++  state.staged_state_path = target_state_path;
++  state.staged_lock_fd = staged_fd;
++
++  if (target_root_out) {
++    *target_root_out = target_root;
++  }
++  if (target_state_path_out) {
++    *target_state_path_out = target_state_path;
++  }
++  return true;
++}
++
++bool CommitHotSwapCuriumProfileDirectory() {
++  base::ScopedAllowBlocking allow_blocking;
++  base::FilePath new_root;
++  base::FilePath new_state_path;
++  {
++    CuriumProfileState& state = GetCuriumProfileState();
++    base::AutoLock locker(state.lock);
++    if (!state.hotswap_prepared) {
++      return false;
++    }
++
++    // Preserve the launch Local State anchor before mutating profile_id.
++    if (state.initial_local_state_dir.empty()) {
++      base::FilePath app_data_dir;
++      if (base::apple::GetUserDirectory(NSApplicationSupportDirectory,
++                                        &app_data_dir) &&
++          !app_data_dir.empty()) {
++        state.initial_local_state_dir =
++            state.use_custom_profile
++                ? app_data_dir.Append(kProfilesRootDirName)
++                      .Append(state.profile_id)
++                : app_data_dir.Append(kProductDirName);
++      }
++    }
++
++    if (state.staged_same_profile) {
++      if (state.lock_fd < 0 && state.staged_lock_fd >= 0) {
++        state.lock_fd = state.staged_lock_fd;
++      } else if (state.staged_lock_fd >= 0) {
++        close(state.staged_lock_fd);
++      }
++    } else {
++      if (state.lock_fd >= 0) {
++        close(state.lock_fd);
++      }
++      state.lock_fd = state.staged_lock_fd;
++    }
++
++    state.profile_id = std::move(state.staged_profile_id);
++    state.use_custom_profile = state.staged_use_custom_profile;
++    state.configured = true;
++    state.opened = true;
++    new_root = std::move(state.staged_profile_root);
++    new_state_path = std::move(state.staged_state_path);
++
++    state.staged_profile_id.clear();
++    state.staged_use_custom_profile = false;
++    state.staged_same_profile = false;
++    state.staged_lock_fd = -1;
++    state.hotswap_prepared = false;
++  }
++
++  // Seed a minimal Local State for brand-new profile roots so a future cold
++  // launch into this profile opens the exact same "Default" state directory.
++  const base::FilePath target_local_state =
++      new_root.Append(FILE_PATH_LITERAL("Local State"));
++  if (!base::PathExists(target_local_state) &&
++      new_state_path.BaseName().value() == FILE_PATH_LITERAL("Default")) {
++    constexpr std::string_view kSeedLocalState =
++        R"({"profile":{"info_cache":{"Default":{}},"last_used":"Default","personal_profile_name":"Default"}})";
++    (void)base::WriteFile(target_local_state, kSeedLocalState);
++  }
++
++  if (!new_root.empty()) {
++    (void)base::PathService::OverrideAndCreateIfNeeded(
++        DIR_USER_DATA, new_root, /*is_absolute=*/true, /*create=*/true);
++  }
++  return true;
++}
++
++void AbortHotSwapCuriumProfileDirectory() {
++  CuriumProfileState& state = GetCuriumProfileState();
++  base::AutoLock locker(state.lock);
++  if (!state.hotswap_prepared) {
++    return;
++  }
++  if (state.staged_lock_fd >= 0) {
++    close(state.staged_lock_fd);
++    state.staged_lock_fd = -1;
++  }
++  state.staged_profile_id.clear();
++  state.staged_use_custom_profile = false;
++  state.staged_same_profile = false;
++  state.staged_profile_root.clear();
++  state.staged_state_path.clear();
++  state.hotswap_prepared = false;
++}
++
+ void GetUserCacheDirectory(const base::FilePath& profile_dir,
+                            base::FilePath* result) {
+   // If the profile directory is under ~/Library/Application Support,
+diff --git a/ios/chrome/browser/shared/model/profile/profile_ios.h b/ios/chrome/browser/shared/model/profile/profile_ios.h
+index c9cc423..b1374b4 100644
+--- a/ios/chrome/browser/shared/model/profile/profile_ios.h
++++ b/ios/chrome/browser/shared/model/profile/profile_ios.h
+@@ -68,6 +68,11 @@ class ProfileIOS : public web::BrowserState {
+     virtual void OnProfileCreationStarted(ProfileIOS* profile,
+                                           CreationMode creation_mode) = 0;
+ 
++    // Called in PrefsInitStage3 immediately before profile services and
++    // extensions are created so single-process hot-swap can rebind the
++    // detached RenderProcessHost prior to any SiteInstance allocation.
++    virtual void OnProfileBeforeServicesCreated(ProfileIOS* profile) {}
++
+     // Called when creation of the Profile is finished.
+     virtual void OnProfileCreationFinished(ProfileIOS* profile,
+                                            CreationMode creation_mode,
+diff --git a/ios/chrome/browser/shared/model/profile/profile_manager_ios.h b/ios/chrome/browser/shared/model/profile/profile_manager_ios.h
+index dbe2b44..da68f03 100644
+--- a/ios/chrome/browser/shared/model/profile/profile_manager_ios.h
++++ b/ios/chrome/browser/shared/model/profile/profile_manager_ios.h
+@@ -9,6 +9,7 @@
+ #import <string_view>
+ #import <vector>
+ 
++#import "base/files/file_path.h"
+ #import "base/functional/callback.h"
+ #import "base/types/pass_key.h"
+ 
+@@ -119,6 +120,16 @@ class ProfileManagerIOS {
+   // this method for a non-existent profile.
+   virtual base::FilePath GetProfilePath(std::string_view name) = 0;
+ 
++  // Build 44 Curium zero-restart profile hot-swap hooks (no-op defaults for
++  // test fakes).
++  virtual void SetCuriumHotSwapStatePathForProfile(
++      std::string_view name,
++      const base::FilePath& state_path) {}
++  virtual void SetCuriumHotSwapRebindCallback(
++      base::RepeatingCallback<void(ProfileIOS*)> callback) {}
++  virtual void PrepareProfileForCuriumHotSwap(ProfileIOS* profile) {}
++  virtual void NotifyProfileReboundForCuriumHotSwap(ProfileIOS* profile) {}
++
+  protected:
+   ProfileManagerIOS() {}
+ 
+diff --git a/ios/web/content/init/ios_content_renderer_client.cc b/ios/web/content/init/ios_content_renderer_client.cc
+index 13c951a..23b33d9 100644
+--- a/ios/web/content/init/ios_content_renderer_client.cc
++++ b/ios/web/content/init/ios_content_renderer_client.cc
+@@ -202,6 +202,16 @@ class CuriumRuntimePolicyFrameObserver final
+ 
+ void PurgeCuriumRendererCaches() {
+   blink::WebCache::Clear();
++  const bool enable_desktop_ai = blink::curium::IsDesktopMacLaunchProfile();
++  blink::WebRuntimeFeatures::EnableFeatureFromString("LanguageDetectionAPI",
++                                                     enable_desktop_ai);
++  blink::WebRuntimeFeatures::EnableFeatureFromString("AISummarizationAPI",
++                                                     enable_desktop_ai);
++  if (v8::Isolate* isolate = v8::Isolate::GetCurrent()) {
++    isolate->DateTimeConfigurationChangeNotification();
++    isolate->LocaleConfigurationChangeNotification();
++    isolate->MemoryPressureNotification(v8::MemoryPressureLevel::kCritical);
++  }
+ }
+ 
+ constexpr int kCSITransitionLink = 0;
+diff --git a/third_party/blink/common/curium/curium_fingerprint_config.cc b/third_party/blink/common/curium/curium_fingerprint_config.cc
+index e20f7f1..e9ef3ce 100644
+--- a/third_party/blink/common/curium/curium_fingerprint_config.cc
++++ b/third_party/blink/common/curium/curium_fingerprint_config.cc
+@@ -9,6 +9,7 @@
+ #include <array>
+ #include <atomic>
+ #include <cmath>
++#include <memory>
+ #include <set>
+ #include <utility>
+ 
+@@ -17,6 +18,7 @@
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
++#include "base/synchronization/lock.h"
+ #include "base/values.h"
+ #include "crypto/hash.h"
+ #include "net/http/http_util.h"
+@@ -740,9 +742,13 @@ std::string DefaultNavigatorPlatformForUAPlatform(std::string_view platform) {
+ }
+ 
+ struct LaunchConfigStorage {
++  base::Lock write_lock;
+   std::atomic<int> state{static_cast<int>(ConfigState::kUnconfigured)};
+   std::atomic<const LaunchConfig*> active{nullptr};
+-  std::optional<LaunchConfig> owned_config;
++  std::atomic<uint64_t> hot_swap_revision{0};
++  // Append-only storage for published configs so lock-free readers holding
++  // pointers returned by GetLaunchConfig() remain valid across hot-swaps.
++  std::vector<std::unique_ptr<LaunchConfig>> config_history;
+   ConfigError last_error;
+ };
+ 
+@@ -1284,23 +1290,52 @@ bool ParseAndValidateLaunchConfigJSON(std::string_view json,
+ 
+ bool FreezeLaunchConfig(LaunchConfig config, ConfigError* out_error) {
+   LaunchConfigStorage& storage = GetStorage();
+-  const int current = storage.state.load(std::memory_order_acquire);
+-  if (current == static_cast<int>(ConfigState::kConfigured) ||
+-      current == static_cast<int>(ConfigState::kDefault0105)) {
+-    return Fail(out_error, ErrorCode::kAlreadyFrozen,
+-                "Launch fingerprint config is already frozen for this process");
+-  }
+-  storage.owned_config.emplace(std::move(config));
+-  storage.last_error = ConfigError();
+-  storage.active.store(&(*storage.owned_config), std::memory_order_release);
+-  SeedRuntimePolicyFromLaunchConfig(&(*storage.owned_config));
+-  storage.state.store(static_cast<int>(ConfigState::kConfigured),
+-                      std::memory_order_release);
++  const LaunchConfig* published = nullptr;
++  {
++    base::AutoLock locker(storage.write_lock);
++    const int current = storage.state.load(std::memory_order_acquire);
++    if (current == static_cast<int>(ConfigState::kConfigured) ||
++        current == static_cast<int>(ConfigState::kDefault0105)) {
++      return Fail(out_error, ErrorCode::kAlreadyFrozen,
++                  "Launch fingerprint config is already frozen for this process");
++    }
++    auto owned = std::make_unique<LaunchConfig>(std::move(config));
++    published = owned.get();
++    storage.config_history.push_back(std::move(owned));
++    storage.last_error = ConfigError();
++    storage.active.store(published, std::memory_order_release);
++    storage.hot_swap_revision.fetch_add(1u, std::memory_order_acq_rel);
++    storage.state.store(static_cast<int>(ConfigState::kConfigured),
++                        std::memory_order_release);
++  }
++  SeedRuntimePolicyFromLaunchConfig(published);
+   return true;
+ }
+ 
++void HotSwapLaunchConfig(LaunchConfig config) {
++  LaunchConfigStorage& storage = GetStorage();
++  const LaunchConfig* published = nullptr;
++  {
++    base::AutoLock locker(storage.write_lock);
++    auto owned = std::make_unique<LaunchConfig>(std::move(config));
++    published = owned.get();
++    storage.config_history.push_back(std::move(owned));
++    storage.last_error = ConfigError();
++    storage.active.store(published, std::memory_order_release);
++    storage.hot_swap_revision.fetch_add(1u, std::memory_order_acq_rel);
++    storage.state.store(static_cast<int>(ConfigState::kConfigured),
++                        std::memory_order_release);
++  }
++  ReseedRuntimePolicyForHotSwap(published);
++}
++
++uint64_t GetLaunchConfigRevision() {
++  return GetStorage().hot_swap_revision.load(std::memory_order_acquire);
++}
++
+ void RecordLaunchConfigRejection(ErrorCode code, std::string message) {
+   LaunchConfigStorage& storage = GetStorage();
++  base::AutoLock locker(storage.write_lock);
+   const int current = storage.state.load(std::memory_order_acquire);
+   if (current == static_cast<int>(ConfigState::kConfigured) ||
+       current == static_cast<int>(ConfigState::kDefault0105)) {
+@@ -1329,7 +1364,9 @@ ConfigState GetLaunchConfigState() {
+ }
+ 
+ ConfigError GetLastLaunchConfigError() {
+-  return GetStorage().last_error;
++  LaunchConfigStorage& storage = GetStorage();
++  base::AutoLock locker(storage.write_lock);
++  return storage.last_error;
+ }
+ 
+ std::string ResolveNavigatorPlatform(const blink::UserAgentMetadata& metadata) {
+diff --git a/third_party/blink/common/curium/curium_runtime_policy.cc b/third_party/blink/common/curium/curium_runtime_policy.cc
+index aa48e5f..7073975 100644
+--- a/third_party/blink/common/curium/curium_runtime_policy.cc
++++ b/third_party/blink/common/curium/curium_runtime_policy.cc
+@@ -11,6 +11,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/barrier_closure.h"
+ #include "base/functional/bind.h"
+ #include "base/json/json_reader.h"
+ #include "base/location.h"
+@@ -18,6 +19,7 @@
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/synchronization/lock.h"
++#include "base/task/bind_post_task.h"
+ #include "base/values.h"
+ 
+ namespace blink::curium {
+@@ -317,31 +319,9 @@ bool ParseRuntimePolicyPatch(std::string_view json,
+   return true;
+ }
+ 
+-}  // namespace
+-
+-RuntimePolicyError::RuntimePolicyError() = default;
+-RuntimePolicyError::RuntimePolicyError(ErrorCode code, std::string message)
+-    : code(code), message(std::move(message)) {}
+-RuntimePolicyError::RuntimePolicyError(const RuntimePolicyError&) = default;
+-RuntimePolicyError::RuntimePolicyError(RuntimePolicyError&&) noexcept = default;
+-RuntimePolicyError& RuntimePolicyError::operator=(const RuntimePolicyError&) =
+-    default;
+-RuntimePolicyError& RuntimePolicyError::operator=(
+-    RuntimePolicyError&&) noexcept = default;
+-RuntimePolicyError::~RuntimePolicyError() = default;
+-
+-RuntimePolicySnapshot::RuntimePolicySnapshot() = default;
+-RuntimePolicySnapshot::RuntimePolicySnapshot(const RuntimePolicySnapshot&) =
+-    default;
+-RuntimePolicySnapshot::RuntimePolicySnapshot(
+-    RuntimePolicySnapshot&&) noexcept = default;
+-RuntimePolicySnapshot& RuntimePolicySnapshot::operator=(
+-    const RuntimePolicySnapshot&) = default;
+-RuntimePolicySnapshot& RuntimePolicySnapshot::operator=(
+-    RuntimePolicySnapshot&&) noexcept = default;
+-RuntimePolicySnapshot::~RuntimePolicySnapshot() = default;
+-
+-void SeedRuntimePolicyFromLaunchConfig(const LaunchConfig* cfg) {
++void BuildSeededRuntimePolicy(const LaunchConfig* cfg,
++                              RuntimePolicySnapshot* out_snapshot,
++                              bool* out_auto_hide_default) {
+   RuntimePolicySnapshot seeded;
+   seeded.policy_revision = 0;
+   bool auto_hide_default = false;
+@@ -373,6 +353,39 @@ void SeedRuntimePolicyFromLaunchConfig(const LaunchConfig* cfg) {
+     }
+   }
+ 
++  *out_snapshot = std::move(seeded);
++  *out_auto_hide_default = auto_hide_default;
++}
++
++}  // namespace
++
++RuntimePolicyError::RuntimePolicyError() = default;
++RuntimePolicyError::RuntimePolicyError(ErrorCode code, std::string message)
++    : code(code), message(std::move(message)) {}
++RuntimePolicyError::RuntimePolicyError(const RuntimePolicyError&) = default;
++RuntimePolicyError::RuntimePolicyError(RuntimePolicyError&&) noexcept = default;
++RuntimePolicyError& RuntimePolicyError::operator=(const RuntimePolicyError&) =
++    default;
++RuntimePolicyError& RuntimePolicyError::operator=(
++    RuntimePolicyError&&) noexcept = default;
++RuntimePolicyError::~RuntimePolicyError() = default;
++
++RuntimePolicySnapshot::RuntimePolicySnapshot() = default;
++RuntimePolicySnapshot::RuntimePolicySnapshot(const RuntimePolicySnapshot&) =
++    default;
++RuntimePolicySnapshot::RuntimePolicySnapshot(
++    RuntimePolicySnapshot&&) noexcept = default;
++RuntimePolicySnapshot& RuntimePolicySnapshot::operator=(
++    const RuntimePolicySnapshot&) = default;
++RuntimePolicySnapshot& RuntimePolicySnapshot::operator=(
++    RuntimePolicySnapshot&&) noexcept = default;
++RuntimePolicySnapshot::~RuntimePolicySnapshot() = default;
++
++void SeedRuntimePolicyFromLaunchConfig(const LaunchConfig* cfg) {
++  RuntimePolicySnapshot seeded;
++  bool auto_hide_default = false;
++  BuildSeededRuntimePolicy(cfg, &seeded, &auto_hide_default);
++
+   RuntimePolicyStorage& storage = GetPolicyStorage();
+   base::AutoLock auto_lock(storage.lock);
+   storage.auto_hide_speech_voices_default = auto_hide_default;
+@@ -382,6 +395,43 @@ void SeedRuntimePolicyFromLaunchConfig(const LaunchConfig* cfg) {
+   storage.revision.store(0, std::memory_order_release);
+ }
+ 
++void ReseedRuntimePolicyForHotSwap(const LaunchConfig* cfg) {
++  RuntimePolicySnapshot seeded;
++  bool auto_hide_default = false;
++  BuildSeededRuntimePolicy(cfg, &seeded, &auto_hide_default);
++
++  RuntimePolicyStorage& storage = GetPolicyStorage();
++  RuntimePolicySnapshot committed;
++  std::vector<BrowserObserverEntry> browser_observers;
++  std::vector<RendererObserverEntry> renderer_observers;
++  {
++    base::AutoLock auto_lock(storage.lock);
++    const uint64_t next_monotonic =
++        storage.revision.load(std::memory_order_relaxed) + 1u;
++    seeded.policy_revision = next_monotonic;
++    storage.auto_hide_speech_voices_default = auto_hide_default;
++    storage.snapshot = seeded;
++    storage.fast_flags.store(ComputeFastFlags(storage.snapshot),
++                             std::memory_order_release);
++    storage.revision.store(next_monotonic, std::memory_order_release);
++    committed = std::move(seeded);
++    browser_observers = storage.browser_observers;
++    renderer_observers = storage.renderer_observers;
++  }
++
++  for (const BrowserObserverEntry& entry : browser_observers) {
++    if (!entry.callback.is_null()) {
++      entry.callback.Run(committed);
++    }
++  }
++  for (const RendererObserverEntry& entry : renderer_observers) {
++    if (entry.task_runner && !entry.callback.is_null()) {
++      entry.task_runner->PostTask(FROM_HERE,
++                                  base::BindOnce(entry.callback, committed));
++    }
++  }
++}
++
+ bool ApplyRuntimePolicyJSON(std::string_view json,
+                             RuntimePolicyError* error_out) {
+   ParsedRuntimePolicyPatch patch;
+@@ -647,4 +697,56 @@ void PurgeProfileRuntimeCaches() {
+   }
+ }
+ 
++void PurgeProfileRuntimeCaches(base::OnceClosure on_complete) {
++  if (on_complete.is_null()) {
++    PurgeProfileRuntimeCaches();
++    return;
++  }
++
++  std::vector<CachePurgeHookEntry> valid_hooks;
++  {
++    RuntimePolicyStorage& storage = GetPolicyStorage();
++    base::AutoLock auto_lock(storage.lock);
++    valid_hooks.reserve(storage.cache_purge_hooks.size());
++    for (const CachePurgeHookEntry& entry : storage.cache_purge_hooks) {
++      if (entry.task_runner && !entry.callback.is_null()) {
++        valid_hooks.push_back(entry);
++      }
++    }
++  }
++
++  scoped_refptr<base::SequencedTaskRunner> reply_runner =
++      base::SequencedTaskRunner::HasCurrentDefault()
++          ? base::SequencedTaskRunner::GetCurrentDefault()
++          : nullptr;
++
++  if (valid_hooks.empty()) {
++    if (reply_runner) {
++      reply_runner->PostTask(FROM_HERE, std::move(on_complete));
++    } else {
++      std::move(on_complete).Run();
++    }
++    return;
++  }
++
++  base::OnceClosure completion_on_caller =
++      reply_runner ? base::BindPostTask(reply_runner, std::move(on_complete))
++                   : std::move(on_complete);
++  base::RepeatingClosure barrier = base::BarrierClosure(
++      valid_hooks.size(), std::move(completion_on_caller));
++
++  for (const CachePurgeHookEntry& entry : valid_hooks) {
++    if (!entry.task_runner->PostTask(
++            FROM_HERE,
++            base::BindOnce(
++                [](base::RepeatingClosure cb, base::RepeatingClosure done) {
++                  cb.Run();
++                  done.Run();
++                },
++                entry.callback, barrier))) {
++      barrier.Run();
++    }
++  }
++}
++
+ }  // namespace blink::curium
+diff --git a/third_party/blink/common/device_memory/approximated_device_memory.cc b/third_party/blink/common/device_memory/approximated_device_memory.cc
+index 98f5d29..124cb74 100644
+--- a/third_party/blink/common/device_memory/approximated_device_memory.cc
++++ b/third_party/blink/common/device_memory/approximated_device_memory.cc
+@@ -11,6 +11,9 @@
+ #include "build/build_config.h"
+ #include "third_party/blink/public/common/features.h"
+ #if BUILDFLAG(IS_IOS)
++#include <atomic>
++#include <limits>
++
+ #include "base/command_line.h"
+ #include "base/strings/string_util.h"
+ #include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
+@@ -18,22 +21,49 @@
+ 
+ namespace blink {
+ 
++#if BUILDFLAG(IS_IOS)
++namespace {
++std::atomic<uint64_t> g_last_curium_device_memory_revision{
++    std::numeric_limits<uint64_t>::max()};
++}  // namespace
++#endif
++
+ // static
+ float ApproximatedDeviceMemory::approximated_device_memory_gb_ = 0.0;
+ int64_t ApproximatedDeviceMemory::physical_memory_mb_ = 0;
+ 
+ // static
+ void ApproximatedDeviceMemory::Initialize() {
++#if BUILDFLAG(IS_IOS)
++  const uint64_t current_revision = curium::GetLaunchConfigRevision();
++  if (approximated_device_memory_gb_ > 0.0f &&
++      g_last_curium_device_memory_revision.load(std::memory_order_acquire) ==
++          current_revision) {
++    return;
++  }
++  if (physical_memory_mb_ == 0) {
++    physical_memory_mb_ = ::base::SysInfo::AmountOfTotalPhysicalMemory().InMiB();
++  }
++  CalculateAndSetApproximatedDeviceMemory();
++  g_last_curium_device_memory_revision.store(current_revision,
++                                             std::memory_order_release);
++#else
+   if (approximated_device_memory_gb_ > 0.0)
+     return;
+   DCHECK_EQ(0, physical_memory_mb_);
+   physical_memory_mb_ = ::base::SysInfo::AmountOfTotalPhysicalMemory().InMiB();
+   CalculateAndSetApproximatedDeviceMemory();
++#endif
+ }
+ 
+ // static
+ float ApproximatedDeviceMemory::GetApproximatedDeviceMemory() {
+ #if BUILDFLAG(IS_IOS)
++  if (approximated_device_memory_gb_ <= 0.0f ||
++      g_last_curium_device_memory_revision.load(std::memory_order_acquire) !=
++          curium::GetLaunchConfigRevision()) {
++    Initialize();
++  }
+   if (const curium::LaunchConfig* cfg = curium::GetLaunchConfig()) {
+     if (cfg->device_memory_gb.has_value()) {
+       return *cfg->device_memory_gb;
+diff --git a/third_party/blink/public/common/curium/curium_fingerprint_config.h b/third_party/blink/public/common/curium/curium_fingerprint_config.h
+index 50a06ba..816630e 100644
+--- a/third_party/blink/public/common/curium/curium_fingerprint_config.h
++++ b/third_party/blink/public/common/curium/curium_fingerprint_config.h
+@@ -20,7 +20,7 @@
+ 
+ namespace blink::curium {
+ 
+-inline constexpr int kLaunchConfigSchemaVersion = 3;
++inline constexpr int kLaunchConfigSchemaVersion = 4;
+ inline constexpr int kMinSupportedLaunchConfigSchemaVersion = 1;
+ inline constexpr size_t kMaxLaunchConfigBytes = 65536;
+ 
+@@ -34,6 +34,9 @@ enum class ErrorCode : int {
+   kProfileUnavailable = 6,
+   kProfileLocked = 7,
+   kAlreadyFrozen = 8,
++  kHotSwapUnsupported = 9,
++  kHotSwapInProgress = 10,
++  kTeardownIncomplete = 11,
+ };
+ 
+ enum class ConfigState : int {
+@@ -248,7 +251,18 @@ BLINK_COMMON_EXPORT void RecordLaunchConfigRejection(ErrorCode code,
+ // ChromeMain begins early initialization.
+ BLINK_COMMON_EXPORT void FreezeDefault0105IfUnconfigured();
+ 
+-// Lock-free read of the frozen launch config. Returns nullptr when running in
++// Thread-safe Build 44 hot-swap of the active launch config after outgoing
++// ProfileIOS teardown. Publishes the new config atomically, bumps the
++// monotonic launch-config revision, and reseeds RuntimePolicySnapshot.
++// Retired configs remain alive for process lifetime so lock-free readers
++// holding a pointer from GetLaunchConfig() can never observe UAF.
++BLINK_COMMON_EXPORT void HotSwapLaunchConfig(LaunchConfig config);
++
++// Lock-free monotonic revision incremented on FreezeLaunchConfig and every
++// HotSwapLaunchConfig (0 until first configured).
++BLINK_COMMON_EXPORT uint64_t GetLaunchConfigRevision();
++
++// Lock-free read of the active launch config. Returns nullptr when running in
+ // default Build 39 (0105) mode or before configuration is frozen.
+ BLINK_COMMON_EXPORT const LaunchConfig* GetLaunchConfig();
+ 
+diff --git a/third_party/blink/public/common/curium/curium_runtime_policy.h b/third_party/blink/public/common/curium/curium_runtime_policy.h
+index 9a7b84d..1c8e3d4 100644
+--- a/third_party/blink/public/common/curium/curium_runtime_policy.h
++++ b/third_party/blink/public/common/curium/curium_runtime_policy.h
+@@ -76,6 +76,11 @@ using RuntimePolicyObserverCallback =
+ BLINK_COMMON_EXPORT void SeedRuntimePolicyFromLaunchConfig(
+     const LaunchConfig* cfg);
+ 
++// Reseeds the live runtime privacy policy snapshot during a Build 44 profile
++// hot-swap, monotonically advancing the policy revision and notifying
++// registered browser and renderer observers.
++BLINK_COMMON_EXPORT void ReseedRuntimePolicyForHotSwap(const LaunchConfig* cfg);
++
+ // Validates and atomically applies a bounded UTF-8 runtime privacy policy JSON
+ // payload (<= 16 KiB, policySchemaVersion == 1, strict key allowlist). Fails
+ // closed without mutating active policy state on any error.
+@@ -122,12 +127,15 @@ BLINK_COMMON_EXPORT void RegisterRendererPolicyObserver(
+     scoped_refptr<base::SequencedTaskRunner> task_runner,
+     RuntimePolicyObserverCallback callback);
+ 
+-// Future-ready (Build 44) hook allowing renderer runtime caches to be purged
+-// asynchronously on their owning sequence.
++// Build 44 hooks allowing renderer runtime caches to be purged on their owning
++// sequence, optionally invoking `on_complete` on the caller's sequence after
++// all registered hooks finish executing.
+ BLINK_COMMON_EXPORT void RegisterProfileCachePurgeHook(
+     scoped_refptr<base::SequencedTaskRunner> task_runner,
+     base::RepeatingClosure callback);
+ BLINK_COMMON_EXPORT void PurgeProfileRuntimeCaches();
++BLINK_COMMON_EXPORT void PurgeProfileRuntimeCaches(
++    base::OnceClosure on_complete);
+ 
+ }  // namespace blink::curium
+ 
+diff --git a/third_party/blink/renderer/core/timezone/timezone_controller.cc b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+index b6d440f..044483b 100644
+--- a/third_party/blink/renderer/core/timezone/timezone_controller.cc
++++ b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+@@ -11,7 +11,16 @@
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #if BUILDFLAG(IS_IOS)
++#include <tuple>
++
++#include "base/functional/bind.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "third_party/blink/public/common/curium/curium_fingerprint_config.h"
++#include "third_party/blink/public/common/curium/curium_runtime_policy.h"
++#include "third_party/blink/renderer/core/inspector/locale_controller.h"
++#include "third_party/blink/renderer/platform/fonts/font_cache.h"
++#include "third_party/blink/renderer/platform/loader/fetch/memory_cache.h"
++#include "third_party/skia/include/core/SkGraphics.h"
+ #endif
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/switches.h"
+@@ -97,6 +106,42 @@ void NotifyTimezoneChangeOnMainThread() {
+   DispatchTimeZoneChangeEventToFrames();
+ }
+ 
++#if BUILDFLAG(IS_IOS)
++std::unique_ptr<TimeZoneController::TimeZoneOverride>&
++GetCuriumTimeZoneOverrideHandle() {
++  static base::NoDestructor<
++      std::unique_ptr<TimeZoneController::TimeZoneOverride>>
++      curium_tz_override;
++  return *curium_tz_override;
++}
++
++void NotifyCuriumHotSwapToV8(v8::Isolate* isolate) {
++  if (!isolate) {
++    return;
++  }
++  isolate->DateTimeConfigurationChangeNotification();
++  isolate->LocaleConfigurationChangeNotification();
++  isolate->MemoryPressureNotification(v8::MemoryPressureLevel::kCritical);
++}
++
++void PurgeBlinkCoreCachesForCuriumHotSwap() {
++  TimeZoneController::UpdateCuriumTimeZoneOverrideForHotSwap();
++  if (MemoryCache* cache = MemoryCache::Get()) {
++    cache->EvictResources();
++  }
++  FontCache::Get().Invalidate();
++  SkGraphics::PurgeFontCache();
++  if (Thread* main_thread = Thread::MainThread()) {
++    if (ThreadScheduler* scheduler = main_thread->Scheduler()) {
++      if (MainThreadScheduler* main_scheduler =
++              scheduler->ToMainThreadScheduler()) {
++        main_scheduler->ForEachMainThreadIsolate(&NotifyCuriumHotSwapToV8);
++      }
++    }
++  }
++}
++#endif
++
+ }  // namespace
+ 
+ TimeZoneController::TimeZoneController() {
+@@ -123,20 +168,46 @@ void TimeZoneController::Init() {
+       monitor.BindNewPipeAndPassReceiver());
+   monitor->AddClient(instance().receiver_.BindNewPipeAndPassRemote());
+ #if BUILDFLAG(IS_IOS)
+-  if (const curium::LaunchConfig* cfg = curium::GetLaunchConfig();
+-      cfg && cfg->timezone.has_value() && !cfg->timezone->empty()) {
+-    static base::NoDestructor<std::unique_ptr<TimeZoneOverride>>
+-        curium_tz_override;
+-    if (!*curium_tz_override) {
+-      TimeZoneOverrideResult result =
+-          SetTimeZoneOverride(String::FromUtf8(*cfg->timezone));
+-      if (result.status == TimeZoneOverrideStatus::kSuccess) {
+-        *curium_tz_override = std::move(result.handle);
++  UpdateCuriumTimeZoneOverrideForHotSwap();
++  static bool curium_purge_hook_registered = false;
++  if (!curium_purge_hook_registered &&
++      base::SequencedTaskRunner::HasCurrentDefault()) {
++    curium_purge_hook_registered = true;
++    curium::RegisterProfileCachePurgeHook(
++        base::SequencedTaskRunner::GetCurrentDefault(),
++        base::BindRepeating(&PurgeBlinkCoreCachesForCuriumHotSwap));
++  }
++#endif
++}
++
++#if BUILDFLAG(IS_IOS)
++// static
++void TimeZoneController::UpdateCuriumTimeZoneOverrideForHotSwap() {
++  const curium::LaunchConfig* cfg = curium::GetLaunchConfig();
++  auto& handle = GetCuriumTimeZoneOverrideHandle();
++  if (cfg && cfg->timezone.has_value() && !cfg->timezone->empty()) {
++    const String tz = String::FromUtf8(*cfg->timezone);
++    if (handle) {
++      handle->change(tz);
++    } else {
++      TimeZoneOverrideResult result = SetTimeZoneOverride(tz);
++      if (result.status == TimeZoneOverrideStatus::kSuccess && result.handle) {
++        handle = std::move(result.handle);
+       }
+     }
++  } else if (handle) {
++    handle.reset();
++  }
++
++  if (cfg && !cfg->languages.empty() && !cfg->languages[0].empty()) {
++    std::ignore = LocaleController::instance().SetLocaleOverride(
++        String::FromUtf8(cfg->languages[0]), /*is_claiming_override=*/false);
++  } else {
++    std::ignore = LocaleController::instance().SetLocaleOverride(
++        String(), /*is_claiming_override=*/false);
+   }
+-#endif
+ }
++#endif
+ 
+ // static
+ TimeZoneController& TimeZoneController::instance() {
+diff --git a/third_party/blink/renderer/core/timezone/timezone_controller.h b/third_party/blink/renderer/core/timezone/timezone_controller.h
+index 74df9fe..3e0f103 100644
+--- a/third_party/blink/renderer/core/timezone/timezone_controller.h
++++ b/third_party/blink/renderer/core/timezone/timezone_controller.h
+@@ -9,6 +9,7 @@
+ 
+ #include "base/no_destructor.h"
+ #include "base/synchronization/lock.h"
++#include "build/build_config.h"
+ #include "mojo/public/cpp/bindings/receiver.h"
+ #include "services/device/public/mojom/time_zone_monitor.mojom-blink.h"
+ #include "third_party/blink/renderer/core/core_export.h"
+@@ -79,6 +80,12 @@ class CORE_EXPORT TimeZoneController final
+ 
+   static void ChangeTimeZoneForTesting(const String&);
+ 
++#if BUILDFLAG(IS_IOS)
++  // Re-applies or clears Curium's profile timezone and ICU default locale
++  // overrides during initial launch and Build 44 profile hot-swaps.
++  static void UpdateCuriumTimeZoneOverrideForHotSwap();
++#endif
++
+  private:
+   friend class base::NoDestructor<TimeZoneController>;
+ 

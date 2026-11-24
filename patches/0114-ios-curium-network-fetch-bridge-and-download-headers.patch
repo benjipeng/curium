@@ -1,0 +1,1941 @@
+diff --git a/content/browser/download/download_item_utils.cc b/content/browser/download/download_item_utils.cc
+index 1acd7e7..7b56a34 100644
+--- a/content/browser/download/download_item_utils.cc
++++ b/content/browser/download/download_item_utils.cc
+@@ -40,6 +40,21 @@ class DownloadItemData : public base::SupportsUserData::Data,
+   void set_request_method(std::string method) {
+     request_method_ = std::move(method);
+   }
++  bool accept_ranges() const { return accept_ranges_; }
++  const std::string& etag() const { return etag_; }
++  const std::string& last_modified() const { return last_modified_; }
++  const std::string& content_disposition() const {
++    return content_disposition_;
++  }
++  void set_response_metadata(bool accept_ranges,
++                             std::string etag,
++                             std::string last_modified,
++                             std::string content_disposition) {
++    accept_ranges_ = accept_ranges;
++    etag_ = std::move(etag);
++    last_modified_ = std::move(last_modified);
++    content_disposition_ = std::move(content_disposition);
++  }
+ 
+  private:
+   // WebContentsObserver methods.
+@@ -50,6 +65,10 @@ class DownloadItemData : public base::SupportsUserData::Data,
+   raw_ptr<BrowserContext, DanglingUntriaged> browser_context_;
+   GlobalRenderFrameHostId id_;
+   std::string request_method_;
++  bool accept_ranges_ = false;
++  std::string etag_;
++  std::string last_modified_;
++  std::string content_disposition_;
+ };
+ 
+ // static
+@@ -190,4 +209,75 @@ std::string DownloadItemUtils::GetRequestMethod(
+   return data->request_method();
+ }
+ 
++// static
++void DownloadItemUtils::SetResponseMetadata(
++    download::DownloadItem* download_item,
++    bool accept_ranges,
++    std::string etag,
++    std::string last_modified,
++    std::string content_disposition) {
++  if (!download_item) {
++    return;
++  }
++  DownloadItemData* data = DownloadItemData::Get(download_item);
++  if (!data) {
++    return;
++  }
++  data->set_response_metadata(accept_ranges, std::move(etag),
++                              std::move(last_modified),
++                              std::move(content_disposition));
++}
++
++// static
++bool DownloadItemUtils::GetAcceptRanges(
++    const download::DownloadItem* download_item) {
++  if (!download_item) {
++    return false;
++  }
++  DownloadItemData* data = DownloadItemData::Get(download_item);
++  if (!data) {
++    return false;
++  }
++  return data->accept_ranges();
++}
++
++// static
++std::string DownloadItemUtils::GetResponseETag(
++    const download::DownloadItem* download_item) {
++  if (!download_item) {
++    return std::string();
++  }
++  DownloadItemData* data = DownloadItemData::Get(download_item);
++  if (!data) {
++    return std::string();
++  }
++  return data->etag();
++}
++
++// static
++std::string DownloadItemUtils::GetResponseLastModified(
++    const download::DownloadItem* download_item) {
++  if (!download_item) {
++    return std::string();
++  }
++  DownloadItemData* data = DownloadItemData::Get(download_item);
++  if (!data) {
++    return std::string();
++  }
++  return data->last_modified();
++}
++
++// static
++std::string DownloadItemUtils::GetResponseContentDisposition(
++    const download::DownloadItem* download_item) {
++  if (!download_item) {
++    return std::string();
++  }
++  DownloadItemData* data = DownloadItemData::Get(download_item);
++  if (!data) {
++    return std::string();
++  }
++  return data->content_disposition();
++}
++
+ }  // namespace content
+diff --git a/content/browser/download/download_manager_impl.cc b/content/browser/download/download_manager_impl.cc
+index 78ac859..a18af29 100644
+--- a/content/browser/download/download_manager_impl.cc
++++ b/content/browser/download/download_manager_impl.cc
+@@ -5,6 +5,7 @@
+ #include "content/browser/download/download_manager_impl.h"
+ 
+ #include <iterator>
++#include <optional>
+ #include <utility>
+ 
+ #include "base/debug/alias.h"
+@@ -82,6 +83,7 @@
+ #include "net/base/registry_controlled_domains/registry_controlled_domain.h"
+ #include "net/base/request_priority.h"
+ #include "net/base/upload_bytes_element_reader.h"
++#include "net/http/http_response_headers.h"
+ #include "services/metrics/public/cpp/ukm_source_id.h"
+ #include "services/network/public/cpp/cross_thread_pending_shared_url_loader_factory.h"
+ #include "services/network/public/cpp/features.h"
+@@ -528,6 +530,48 @@ download::DownloadItemImpl* DownloadManagerImpl::CreateActiveItem(
+   if (!info.method.empty()) {
+     DownloadItemUtils::SetRequestMethod(download, info.method);
+   }
++  {
++    bool accept_ranges = false;
++    if (info.response_headers) {
++      const bool has_bytes =
++          info.response_headers->HasHeaderValue("Accept-Ranges", "bytes");
++      const bool has_none =
++          info.response_headers->HasHeaderValue("Accept-Ranges", "none");
++      accept_ranges = has_bytes && !has_none;
++    } else if (info.accept_range ==
++               download::RangeRequestSupportType::kSupport) {
++      accept_ranges = true;
++    }
++
++    std::string etag = download->GetETag();
++    if (etag.empty() && info.response_headers) {
++      if (std::optional<std::string> header =
++              info.response_headers->GetNormalizedHeader("ETag")) {
++        etag = std::move(*header);
++      }
++    }
++
++    std::string last_modified = download->GetLastModifiedTime();
++    if (last_modified.empty() && info.response_headers) {
++      if (std::optional<std::string> header =
++              info.response_headers->GetNormalizedHeader("Last-Modified")) {
++        last_modified = std::move(*header);
++      }
++    }
++
++    std::string content_disposition = download->GetContentDisposition();
++    if (content_disposition.empty() && info.response_headers) {
++      if (std::optional<std::string> header =
++              info.response_headers->GetNormalizedHeader(
++                  "Content-Disposition")) {
++        content_disposition = std::move(*header);
++      }
++    }
++
++    DownloadItemUtils::SetResponseMetadata(
++        download, accept_ranges, std::move(etag), std::move(last_modified),
++        std::move(content_disposition));
++  }
+   if (delegate_) {
+     delegate_->AttachExtraInfo(download);
+ #if BUILDFLAG(IS_ANDROID)
+diff --git a/content/public/browser/download_item_utils.h b/content/public/browser/download_item_utils.h
+index 6c5a345..9b20bac 100644
+--- a/content/public/browser/download_item_utils.h
++++ b/content/public/browser/download_item_utils.h
+@@ -65,6 +65,21 @@ class CONTENT_EXPORT DownloadItemUtils {
+                                std::string method);
+   static std::string GetRequestMethod(
+       const download::DownloadItem* downloadItem);
++
++  // [ios-blink-sideload] Sets/gets initial HTTP response metadata captured
++  // when the download was created (for zero-probe multi-lane handoff).
++  static void SetResponseMetadata(download::DownloadItem* downloadItem,
++                                  bool accept_ranges,
++                                  std::string etag,
++                                  std::string last_modified,
++                                  std::string content_disposition);
++  static bool GetAcceptRanges(const download::DownloadItem* downloadItem);
++  static std::string GetResponseETag(
++      const download::DownloadItem* downloadItem);
++  static std::string GetResponseLastModified(
++      const download::DownloadItem* downloadItem);
++  static std::string GetResponseContentDisposition(
++      const download::DownloadItem* downloadItem);
+ };
+ 
+ }  // namespace content
+diff --git a/ios/chrome/browser/curium/BUILD.gn b/ios/chrome/browser/curium/BUILD.gn
+index d2bfd24..e3275c3 100644
+--- a/ios/chrome/browser/curium/BUILD.gn
++++ b/ios/chrome/browser/curium/BUILD.gn
+@@ -47,6 +47,8 @@ if (use_blink) {
+       "curium_browser_provider.mm",
+       "curium_download_task.h",
+       "curium_download_task.mm",
++      "curium_network_fetch.h",
++      "curium_network_fetch.mm",
+       "curium_tab_host.h",
+       "curium_tab_host.mm",
+       "curium_web_state_delegate.h",
+@@ -62,6 +64,7 @@ if (use_blink) {
+       "//base",
+       "//build:blink_buildflags",
+       "//content/public/browser",
++      "//content/public/common",
+       "//ios/chrome/browser/shared/model/profile",
+       "//ios/chrome/browser/shared/model/web_state_list",
+       "//ios/chrome/browser/shared/public/commands",
+@@ -74,7 +77,11 @@ if (use_blink) {
+       "//ios/web/public/navigation",
+       "//ios/web/public/permissions",
+       "//ios/web/public/ui",
++      "//mojo/public/cpp/base",
++      "//mojo/public/cpp/bindings",
++      "//mojo/public/cpp/system",
+       "//net",
++      "//services/network/public/cpp",
+       "//services/network/public/mojom",
+       "//third_party/blink/public/common",
+       "//third_party/blink/public/mojom:mojom_platform",
+diff --git a/ios/chrome/browser/curium/DEPS b/ios/chrome/browser/curium/DEPS
+index b641905..d7ee188 100644
+--- a/ios/chrome/browser/curium/DEPS
++++ b/ios/chrome/browser/curium/DEPS
+@@ -12,7 +12,11 @@ include_rules = [
+   "+ios/web/common",
+   "+ios/web/content",
+   "+ios/web/public",
++  "+mojo/public/cpp/base",
++  "+mojo/public/cpp/bindings",
++  "+mojo/public/cpp/system",
+   "+net",
++  "+services/network/public/cpp",
+   "+services/network/public/mojom",
+   "+third_party/blink/public/common",
+   "+third_party/blink/public/mojom",
+diff --git a/ios/chrome/browser/curium/curium_browser_host.mm b/ios/chrome/browser/curium/curium_browser_host.mm
+index c3a90b7..dddfef5 100644
+--- a/ios/chrome/browser/curium/curium_browser_host.mm
++++ b/ios/chrome/browser/curium/curium_browser_host.mm
+@@ -12,6 +12,7 @@
+ 
+ #import "base/barrier_closure.h"
+ #import "base/check.h"
++#import "base/feature_list.h"
+ #import "base/functional/bind.h"
+ #import "base/functional/callback_helpers.h"
+ #import "base/memory/raw_ptr.h"
+@@ -20,10 +21,13 @@
+ #import "base/time/time.h"
+ #import "content/public/browser/browser_context.h"
+ #import "content/public/browser/download_manager.h"
++#import "content/public/browser/navigation_controller.h"
+ #import "content/public/browser/storage_partition.h"
+ #import "content/public/browser/web_contents.h"
++#import "content/public/common/content_features.h"
+ #import "ios/chrome/browser/curium/curium_download_router.h"
+ #import "ios/chrome/browser/curium/curium_download_task.h"
++#import "ios/chrome/browser/curium/curium_network_fetch.h"
+ #import "ios/chrome/browser/curium/curium_tab_host.h"
+ #import "ios/chrome/browser/curium/curium_web_state_delegate.h"
+ #import "ios/chrome/browser/shared/model/browser/browser.h"
+@@ -41,6 +45,7 @@
+ #import "net/cookies/canonical_cookie.h"
+ #import "net/cookies/cookie_options.h"
+ #import "net/cookies/cookie_partition_key_collection.h"
++#import "services/network/public/cpp/shared_url_loader_factory.h"
+ #import "services/network/public/mojom/clear_data_filter.mojom.h"
+ #import "services/network/public/mojom/cookie_manager.mojom.h"
+ #import "services/network/public/mojom/network_context.mojom.h"
+@@ -133,6 +138,7 @@ @implementation CuriumBrowserHost {
+   std::unique_ptr<CuriumWebStateListObserver> _listObserver;
+   std::map<web::WebState*, __strong CuriumTabHost*> _tabHosts;
+   NSMutableArray<CuriumDownloadTask*>* _downloads;
++  NSMutableArray<CuriumNetworkFetchTask*>* _activeFetches;
+   uintptr_t _runtimePolicyObserverToken;
+   BOOL _pendingTabsNotification;
+   BOOL _isShutdown;
+@@ -171,6 +177,7 @@ - (instancetype)initWithBrowser:(Browser*)browser
+     CHECK(browser);
+     _browser = browser;
+     _downloads = [[NSMutableArray alloc] init];
++    _activeFetches = [[NSMutableArray alloc] init];
+     _webStateDelegate = std::make_unique<CuriumWebStateDelegate>(browser, self);
+     WebStateList* list = browser->GetWebStateList();
+     _listObserver = std::make_unique<CuriumWebStateListObserver>(self, list);
+@@ -217,6 +224,11 @@ - (void)shutdown {
+   }
+   [_downloads removeAllObjects];
+ 
++  for (CuriumNetworkFetchTask* fetchTask in [_activeFetches copy]) {
++    [fetchTask invalidate];
++  }
++  [_activeFetches removeAllObjects];
++
+   _listObserver.reset();
+ 
+   CuriumDownloadRouter* downloadRouter = CuriumDownloadRouter::GetInstance();
+@@ -485,6 +497,77 @@ - (void)cookieHeaderForURL:(NSURL*)url
+       base::BindOnce(&OnCookieListFetched, copiedCompletion));
+ }
+ 
++- (nullable id<CrIOSNetworkFetchTaskV1>)
++    startFetchRequest:(CrIOSNetworkFetchRequestV1*)request
++             delegate:(id<CrIOSNetworkFetchDelegateV1>)delegate
++        callbackQueue:(dispatch_queue_t)callbackQueue {
++  CHECK([NSThread isMainThread]);
++  if (_isShutdown || !_browser || !request || !delegate || !callbackQueue) {
++    return nil;
++  }
++  content::BrowserContext* context =
++      web::ContentBrowserContext::FromBrowserState(_browser->GetProfile());
++  content::StoragePartition* partition =
++      context ? context->GetDefaultStoragePartition() : nullptr;
++  scoped_refptr<network::SharedURLLoaderFactory> factory =
++      partition ? partition->GetURLLoaderFactoryForBrowserProcess() : nullptr;
++  std::unique_ptr<network::PendingSharedURLLoaderFactory> pending_factory =
++      factory ? factory->Clone() : nullptr;
++  if (!pending_factory) {
++    return nil;
++  }
++
++  __weak CuriumBrowserHost* weakSelf = self;
++  CuriumNetworkFetchTask* task = [[CuriumNetworkFetchTask alloc]
++      initWithRequest:request
++       pendingFactory:std::move(pending_factory)
++             delegate:delegate
++        callbackQueue:callbackQueue
++           onTerminal:^(CuriumNetworkFetchTask* finished) {
++             CuriumBrowserHost* strongSelf = weakSelf;
++             if (strongSelf) {
++               [strongSelf->_activeFetches removeObjectIdenticalTo:finished];
++             }
++           }];
++  if (!task) {
++    return nil;
++  }
++  [_activeFetches addObject:task];
++  return task;
++}
++
++- (BOOL)discardTabWithID:(NSString*)tabID {
++  CHECK([NSThread isMainThread]);
++  if (_isShutdown || !_browser || tabID.length == 0) {
++    return NO;
++  }
++  if (!base::FeatureList::IsEnabled(content::features::kWebContentsDiscard)) {
++    return NO;
++  }
++  WebStateList* list = _browser->GetWebStateList();
++  if (!list || list->IsMutating()) {
++    return NO;
++  }
++  CuriumTabHost* tab = [self tabHostForTabID:tabID];
++  web::WebState* ws = tab ? tab.webState : nullptr;
++  if (!ws || ws == list->GetActiveWebState() || ws->IsVisible() ||
++      ws->IsBeingDestroyed() || !ws->IsRealized() ||
++      ws->GetNavigationItemCount() <= 0) {
++    return NO;
++  }
++  content::WebContents* wc =
++      static_cast<web::ContentWebState*>(ws)->GetWebContents();
++  if (!wc || wc->IsBeingDestroyed() || wc->WasDiscarded() ||
++      wc->IsCurrentlyAudible() || wc->GetCurrentlyPlayingVideoCount() > 0 ||
++      wc->HasPictureInPictureVideo() || wc->HasPictureInPictureDocument() ||
++      wc->IsBeingCaptured() ||
++      wc->HasUncommittedNavigationInPrimaryMainFrame()) {
++    return NO;
++  }
++  wc->Discard(base::DoNothing());
++  return wc->WasDiscarded() ? YES : NO;
++}
++
+ #pragma mark - Internal / Observer routing
+ 
+ - (nullable CuriumTabHost*)tabHostForWebState:(web::WebState*)webState {
+@@ -568,6 +651,12 @@ - (void)handleActiveWebStateChanged:(web::WebState*)oldActive
+   }
+   if (newActive) {
+     newActive->WasShown();
++    if (content::WebContents* wc =
++            static_cast<web::ContentWebState*>(newActive)->GetWebContents()) {
++      if (wc->GetController().NeedsReload()) {
++        wc->GetController().LoadIfNecessary();
++      }
++    }
+   }
+ }
+ 
+diff --git a/ios/chrome/browser/curium/curium_download_task.mm b/ios/chrome/browser/curium/curium_download_task.mm
+index 1068aba..8369b94 100644
+--- a/ios/chrome/browser/curium/curium_download_task.mm
++++ b/ios/chrome/browser/curium/curium_download_task.mm
+@@ -54,11 +54,16 @@ @implementation CuriumDownloadTask {
+   NSString* _downloadID;
+   NSString* _sourceTabID;
+   NSURL* _originalURL;
++  NSURL* _finalURL;
+   NSString* _suggestedFilename;
+   NSString* _mimeType;
+   BOOL _isExplicitDownload;
+   BOOL _isMainFrame;
+   NSString* _httpMethod;
++  BOOL _acceptRanges;
++  NSString* _eTag;
++  NSString* _lastModified;
++  NSString* _contentDisposition;
+   CrIOSDownloadState _terminalState;
+   int64_t _terminalTotalBytes;
+   int64_t _terminalReceivedBytes;
+@@ -76,6 +81,9 @@ - (instancetype)initWithDownloadTask:(std::unique_ptr<web::DownloadTask>)task
+     _downloadID = [_task->GetIdentifier() copy] ?: [[NSUUID UUID] UUIDString];
+     _sourceTabID = [sourceTabID copy];
+     _originalURL = net::NSURLWithGURL(_task->GetOriginalUrl());
++    const GURL& final_gurl = _task->GetFinalUrl();
++    _finalURL =
++        final_gurl.is_valid() ? net::NSURLWithGURL(final_gurl) : _originalURL;
+     base::FilePath generated = _task->GenerateFileName();
+     _suggestedFilename =
+         base::SysUTF8ToNSString(generated.value()) ?: @"Download";
+@@ -84,6 +92,16 @@ - (instancetype)initWithDownloadTask:(std::unique_ptr<web::DownloadTask>)task
+     _isExplicitDownload = _task->IsExplicitDownload();
+     _isMainFrame = _task->IsMainFrameDownload();
+     _httpMethod = [_task->GetHttpMethod() copy] ?: @"GET";
++    _acceptRanges = _task->AcceptsByteRanges() ? YES : NO;
++    const std::string etag = _task->GetETag();
++    _eTag = etag.empty() ? nil : base::SysUTF8ToNSString(etag);
++    const std::string last_modified = _task->GetLastModifiedTime();
++    _lastModified =
++        last_modified.empty() ? nil : base::SysUTF8ToNSString(last_modified);
++    const std::string content_disposition = _task->GetContentDisposition();
++    _contentDisposition = content_disposition.empty()
++                              ? nil
++                              : base::SysUTF8ToNSString(content_disposition);
+     _terminalState = CrIOSDownloadStateCancelled;
+     _terminalTotalBytes = -1;
+     _terminalReceivedBytes = 0;
+@@ -170,6 +188,26 @@ - (NSString*)httpMethod {
+   return _httpMethod;
+ }
+ 
++- (nullable NSURL*)finalURL {
++  return _finalURL;
++}
++
++- (BOOL)acceptRanges {
++  return _acceptRanges;
++}
++
++- (nullable NSString*)eTag {
++  return _eTag;
++}
++
++- (nullable NSString*)lastModified {
++  return _lastModified;
++}
++
++- (nullable NSString*)contentDisposition {
++  return _contentDisposition;
++}
++
+ - (int64_t)totalBytes {
+   return _task ? _task->GetTotalBytes() : _terminalTotalBytes;
+ }
+@@ -210,7 +248,36 @@ - (void)cancel {
+ }
+ 
+ - (void)handleTaskUpdated {
+-  if (!_task || !_task->IsDone()) {
++  if (!_task) {
++    return;
++  }
++  if (const GURL& final_gurl = _task->GetFinalUrl(); final_gurl.is_valid()) {
++    if (NSURL* updated_final = net::NSURLWithGURL(final_gurl)) {
++      _finalURL = updated_final;
++    }
++  }
++  if (!_acceptRanges && _task->AcceptsByteRanges()) {
++    _acceptRanges = YES;
++  }
++  if (!_eTag) {
++    const std::string etag = _task->GetETag();
++    if (!etag.empty()) {
++      _eTag = base::SysUTF8ToNSString(etag);
++    }
++  }
++  if (!_lastModified) {
++    const std::string last_modified = _task->GetLastModifiedTime();
++    if (!last_modified.empty()) {
++      _lastModified = base::SysUTF8ToNSString(last_modified);
++    }
++  }
++  if (!_contentDisposition) {
++    const std::string cd = _task->GetContentDisposition();
++    if (!cd.empty()) {
++      _contentDisposition = base::SysUTF8ToNSString(cd);
++    }
++  }
++  if (!_task->IsDone()) {
+     return;
+   }
+   const web::DownloadTask::State taskState = _task->GetState();
+diff --git a/ios/chrome/browser/curium/curium_engine_contract_internal.h b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+index 30b1bf5..b09999f 100644
+--- a/ios/chrome/browser/curium/curium_engine_contract_internal.h
++++ b/ios/chrome/browser/curium/curium_engine_contract_internal.h
+@@ -138,6 +138,47 @@ __attribute__((visibility("default")))
+ @property(nonatomic, readonly) BOOL isExplicitDownload;
+ @property(nonatomic, readonly) BOOL isMainFrame;
+ @property(nonatomic, copy, readonly) NSString* httpMethod;
++@property(nonatomic, copy, readonly, nullable) NSURL* finalURL;
++@property(nonatomic, readonly) BOOL acceptRanges;
++@property(nonatomic, copy, readonly, nullable) NSString* eTag;
++@property(nonatomic, copy, readonly, nullable) NSString* lastModified;
++@property(nonatomic, copy, readonly, nullable) NSString* contentDisposition;
++@end
++
++__attribute__((visibility("default")))
++@interface CrIOSNetworkFetchRequestV1 : NSObject
++@property(nonatomic, copy) NSURL* URL;
++@property(nonatomic, copy) NSString* HTTPMethod;
++@property(nonatomic, copy, nullable) NSDictionary<NSString*, NSString*>* headers;
++@property(nonatomic, copy, nullable) NSURL* isolationTopFrameURL;
++@property(nonatomic) BOOL includeCookies;
++@property(nonatomic) BOOL blockPrivateNetworkTargets;
++@property(nonatomic) NSTimeInterval timeoutInterval;
++@end
++
++@protocol CrIOSNetworkFetchTaskV1 <NSObject>
++- (void)setSuspended:(BOOL)suspended;
++- (void)cancel;
++@end
++
++@protocol CrIOSNetworkFetchDelegateV1 <NSObject>
++- (void)networkFetchTask:(id<CrIOSNetworkFetchTaskV1>)task
++     willPerformRedirect:(NSURL*)newURL
++              statusCode:(NSInteger)statusCode
++         responseHeaders:(NSDictionary<NSString*, NSString*>*)headers
++         decisionHandler:
++             (void (^)(BOOL allowRedirect,
++                       NSDictionary<NSString*, NSString*>* _Nullable
++                           modifiedHeaders))decisionHandler;
++- (void)networkFetchTask:(id<CrIOSNetworkFetchTaskV1>)task
++      didReceiveResponse:(NSInteger)statusCode
++                finalURL:(NSURL*)finalURL
++          expectedLength:(int64_t)expectedLength
++         responseHeaders:(NSDictionary<NSString*, NSString*>*)headers;
++- (void)networkFetchTask:(id<CrIOSNetworkFetchTaskV1>)task
++          didReceiveData:(NSData*)chunk;
++- (void)networkFetchTask:(id<CrIOSNetworkFetchTaskV1>)task
++    didCompleteWithError:(nullable NSError*)error;
+ @end
+ 
+ @protocol CrIOSBrowserHostDelegateV1 <NSObject>
+@@ -196,6 +237,12 @@ __attribute__((visibility("default")))
+ - (void)cookieHeaderForURL:(NSURL*)url
+                inTabWithID:(NSString*)tabID
+                 completion:(void (^)(NSString* _Nullable cookieHeader))completion;
++@optional
++- (nullable id<CrIOSNetworkFetchTaskV1>)
++    startFetchRequest:(CrIOSNetworkFetchRequestV1*)request
++             delegate:(id<CrIOSNetworkFetchDelegateV1>)delegate
++        callbackQueue:(dispatch_queue_t)callbackQueue;
++- (BOOL)discardTabWithID:(NSString*)tabID;
+ @end
+ 
+ NS_ASSUME_NONNULL_END
+diff --git a/ios/chrome/browser/curium/curium_network_fetch.h b/ios/chrome/browser/curium/curium_network_fetch.h
+new file mode 100644
+index 0000000..6520d32
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_network_fetch.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef IOS_CHROME_BROWSER_CURIUM_CURIUM_NETWORK_FETCH_H_
++#define IOS_CHROME_BROWSER_CURIUM_CURIUM_NETWORK_FETCH_H_
++
++#import <memory>
++
++#import "ios/chrome/browser/curium/curium_engine_contract_internal.h"
++
++namespace network {
++class PendingSharedURLLoaderFactory;
++}  // namespace network
++
++NS_ASSUME_NONNULL_BEGIN
++
++@interface CuriumNetworkFetchTask : NSObject <CrIOSNetworkFetchTaskV1>
++
++- (nullable instancetype)
++    initWithRequest:(CrIOSNetworkFetchRequestV1*)request
++     pendingFactory:
++         (std::unique_ptr<network::PendingSharedURLLoaderFactory>)pendingFactory
++           delegate:(id<CrIOSNetworkFetchDelegateV1>)delegate
++      callbackQueue:(dispatch_queue_t)callbackQueue
++         onTerminal:(nullable void (^)(CuriumNetworkFetchTask*))onTerminal
++    NS_DESIGNATED_INITIALIZER;
++- (instancetype)init NS_UNAVAILABLE;
++
++// Cancels the underlying Chromium URLLoader and tears down state cleanly.
++// Safe to invoke from any thread, including CuriumBrowserHost -shutdown.
++- (void)invalidate;
++
++@end
++
++NS_ASSUME_NONNULL_END
++
++#endif  // IOS_CHROME_BROWSER_CURIUM_CURIUM_NETWORK_FETCH_H_
+diff --git a/ios/chrome/browser/curium/curium_network_fetch.mm b/ios/chrome/browser/curium/curium_network_fetch.mm
+new file mode 100644
+index 0000000..e586e3e
+--- /dev/null
++++ b/ios/chrome/browser/curium/curium_network_fetch.mm
+@@ -0,0 +1,1063 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "ios/chrome/browser/curium/curium_network_fetch.h"
++
++#import <algorithm>
++#import <atomic>
++#import <cmath>
++#import <cstdint>
++#import <map>
++#import <memory>
++#import <optional>
++#import <string>
++#import <string_view>
++#import <utility>
++
++#import "base/check_op.h"
++#import "base/containers/span.h"
++#import "base/functional/bind.h"
++#import "base/location.h"
++#import "base/memory/ref_counted.h"
++#import "base/memory/ref_counted_delete_on_sequence.h"
++#import "base/memory/scoped_refptr.h"
++#import "base/sequence_checker.h"
++#import "base/strings/string_util.h"
++#import "base/strings/sys_string_conversions.h"
++#import "base/task/sequenced_task_runner.h"
++#import "base/task/task_traits.h"
++#import "base/task/thread_pool.h"
++#import "base/time/time.h"
++#import "base/timer/timer.h"
++#import "mojo/public/cpp/base/big_buffer.h"
++#import "mojo/public/cpp/bindings/pending_receiver.h"
++#import "mojo/public/cpp/bindings/pending_remote.h"
++#import "mojo/public/cpp/bindings/receiver.h"
++#import "mojo/public/cpp/bindings/remote.h"
++#import "mojo/public/cpp/system/data_pipe.h"
++#import "mojo/public/cpp/system/handle_signals_state.h"
++#import "mojo/public/cpp/system/simple_watcher.h"
++#import "net/base/apple/url_conversions.h"
++#import "net/base/ip_address.h"
++#import "net/base/ip_endpoint.h"
++#import "net/base/isolation_info.h"
++#import "net/base/load_flags.h"
++#import "net/base/net_errors.h"
++#import "net/base/proxy_chain.h"
++#import "net/base/request_priority.h"
++#import "net/base/url_util.h"
++#import "net/cookies/site_for_cookies.h"
++#import "net/http/http_request_headers.h"
++#import "net/http/http_response_headers.h"
++#import "net/http/http_util.h"
++#import "net/traffic_annotation/network_traffic_annotation.h"
++#import "net/url_request/redirect_info.h"
++#import "net/url_request/referrer_policy.h"
++#import "services/network/public/cpp/header_util.h"
++#import "services/network/public/cpp/http_request_headers_update_params.h"
++#import "services/network/public/cpp/resource_request.h"
++#import "services/network/public/cpp/shared_url_loader_factory.h"
++#import "services/network/public/cpp/url_loader_completion_status.h"
++#import "services/network/public/mojom/early_hints.mojom.h"
++#import "services/network/public/mojom/fetch_api.mojom-shared.h"
++#import "services/network/public/mojom/url_loader.mojom.h"
++#import "services/network/public/mojom/url_loader_factory.mojom.h"
++#import "services/network/public/mojom/url_response_head.mojom.h"
++#import "url/gurl.h"
++#import "url/origin.h"
++
++namespace {
++
++NSString* const kCuriumNetworkFetchErrorDomain =
++    @"CuriumNetworkFetchErrorDomain";
++constexpr size_t kMaxChunkBytes = 64 * 1024;
++constexpr int kMaxInFlightChunks = 4;
++constexpr int kMaxRedirects = 20;
++
++constexpr net::NetworkTrafficAnnotationTag kCuriumNetworkFetchTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("curium_network_fetch_bridge", R"(
++      semantics {
++        sender: "Curium Network Fetch Bridge"
++        description:
++          "Executes user-initiated download and media transfers through "
++          "Chromium's active profile network stack."
++        trigger:
++          "The user initiates, inspects, or resumes a download or media "
++          "transfer in Curium."
++        user_data {
++          type: PROFILE_DATA
++        }
++        data:
++          "Request URL, HTTP headers, and active profile cookies when "
++          "credentials are enabled."
++        destination: OTHER
++        destination_other:
++          "The destination URL requested by the user's download transfer."
++        internal {
++          contacts {
++            email: "curium-ios@appautomaton.invalid"
++          }
++        }
++        last_reviewed: "2026-11-24"
++      }
++      policy {
++        cookies_allowed: YES
++        cookies_store: "user"
++        setting:
++          "Controlled by active user downloads and profile proxy configuration."
++        policy_exception_justification:
++          "Not controlled by enterprise policy in iOS Curium shell."
++      })");
++
++NSError* MakeCancelledError(NSString* description) {
++  return [NSError
++      errorWithDomain:NSCocoaErrorDomain
++                 code:NSUserCancelledError
++             userInfo:@{
++               NSLocalizedDescriptionKey : description ?: @"Fetch cancelled.",
++               @"netError" : @(net::ERR_ABORTED),
++             }];
++}
++
++NSError* MakeTimeoutError() {
++  return [NSError errorWithDomain:NSURLErrorDomain
++                             code:NSURLErrorTimedOut
++                         userInfo:@{
++                           NSLocalizedDescriptionKey :
++                               @"Network fetch request timed out.",
++                           @"netError" : @(net::ERR_TIMED_OUT),
++                         }];
++}
++
++NSError* MakeNetError(int net_error, NSString* description) {
++  NSString* message = description;
++  if (!message) {
++    NSString* short_name =
++        base::SysUTF8ToNSString(net::ErrorToShortString(net_error));
++    message =
++        short_name.length > 0
++            ? [NSString stringWithFormat:@"Network fetch failed (%@, %d).",
++                                         short_name, net_error]
++            : [NSString
++                  stringWithFormat:@"Network fetch failed (net error %d).",
++                                   net_error];
++  }
++  return [NSError errorWithDomain:kCuriumNetworkFetchErrorDomain
++                             code:net_error
++                         userInfo:@{
++                           NSLocalizedDescriptionKey : message,
++                           @"netError" : @(net_error),
++                         }];
++}
++
++NSError* MakeBlockedPrivateTargetError(NSString* description) {
++  return MakeNetError(net::ERR_BLOCKED_BY_CLIENT, description);
++}
++
++bool IsBlockedPrivateIP(const net::IPAddress& address) {
++  if (!address.IsValid()) {
++    return false;
++  }
++  const net::IPAddress normalized =
++      address.IsIPv4MappedIPv6() ? net::ConvertIPv4MappedIPv6ToIPv4(address)
++                                 : address;
++  return normalized.IsZero() || normalized.IsLoopback() ||
++         normalized.IsLinkLocal() || normalized.IsMulticast() ||
++         normalized.IsUniqueLocalIPv6() || !normalized.IsPubliclyRoutable();
++}
++
++bool IsBlockedTargetURL(const GURL& url) {
++  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS()) {
++    return true;
++  }
++  if (net::IsLocalhost(url)) {
++    return true;
++  }
++  net::IPAddress literal_ip;
++  if (net::ParseURLHostnameToAddress(url.host(), &literal_ip)) {
++    return IsBlockedPrivateIP(literal_ip);
++  }
++  return false;
++}
++
++bool IsBlockedResponseEndpoint(const network::mojom::URLResponseHead& head) {
++  // When a request is routed through a user-configured proxy chain,
++  // `remote_endpoint` is the proxy's socket address rather than the origin
++  // server's resolved IP. Only enforce post-DNS IP blocking on direct sockets.
++  if (head.proxy_chain.IsValid() && !head.proxy_chain.is_direct()) {
++    return false;
++  }
++  return IsBlockedPrivateIP(head.remote_endpoint.address());
++}
++
++NSString* HeaderValueToNSString(const std::string& value) {
++  if (NSString* utf8 = base::SysUTF8ToNSString(value)) {
++    return utf8;
++  }
++  return [[NSString alloc] initWithBytes:value.data()
++                                  length:value.size()
++                                encoding:NSISOLatin1StringEncoding];
++}
++
++NSDictionary<NSString*, NSString*>* BuildNormalizedResponseHeaders(
++    const net::HttpResponseHeaders* headers) {
++  if (!headers) {
++    return @{};
++  }
++  std::map<std::string, std::string> coalesced;
++  size_t iter = 0;
++  std::string name;
++  std::string value;
++  while (headers->EnumerateHeaderLines(&iter, &name, &value)) {
++    const std::string lower_name = base::ToLowerASCII(name);
++    auto [it, inserted] = coalesced.try_emplace(lower_name, value);
++    if (!inserted) {
++      it->second.append(", ");
++      it->second.append(value);
++    }
++  }
++  NSMutableDictionary<NSString*, NSString*>* result =
++      [NSMutableDictionary dictionaryWithCapacity:coalesced.size()];
++  for (const auto& [lower_name, combined_value] : coalesced) {
++    NSString* ns_name = base::SysUTF8ToNSString(lower_name);
++    NSString* ns_value = HeaderValueToNSString(combined_value);
++    if (ns_name && ns_value) {
++      result[ns_name] = ns_value;
++    }
++  }
++  return [result copy];
++}
++
++class CuriumURLLoaderClient final
++    : public base::RefCountedDeleteOnSequence<CuriumURLLoaderClient>,
++      public network::mojom::URLLoaderClient {
++ public:
++  CuriumURLLoaderClient(
++      scoped_refptr<base::SequencedTaskRunner> task_runner,
++      std::unique_ptr<network::ResourceRequest> request,
++      std::unique_ptr<network::PendingSharedURLLoaderFactory> pending_factory,
++      bool include_cookies,
++      bool block_private_network_targets,
++      base::TimeDelta timeout_delta,
++      id<CrIOSNetworkFetchDelegateV1> delegate,
++      dispatch_queue_t callback_queue,
++      void (^on_terminal)(CuriumNetworkFetchTask*))
++      : base::RefCountedDeleteOnSequence<CuriumURLLoaderClient>(task_runner),
++        task_runner_(std::move(task_runner)),
++        initial_request_(std::move(request)),
++        pending_factory_(std::move(pending_factory)),
++        current_url_(initial_request_->url),
++        include_cookies_(include_cookies),
++        block_private_network_targets_(block_private_network_targets),
++        timeout_delta_(timeout_delta),
++        delegate_(delegate),
++        callback_queue_(callback_queue),
++        on_terminal_([on_terminal copy]) {
++    DETACH_FROM_SEQUENCE(sequence_checker_);
++  }
++
++  CuriumURLLoaderClient(const CuriumURLLoaderClient&) = delete;
++  CuriumURLLoaderClient& operator=(const CuriumURLLoaderClient&) = delete;
++
++  void Start(CuriumNetworkFetchTask* task) {
++    task_runner_->PostTask(
++        FROM_HERE,
++        base::BindOnce(&CuriumURLLoaderClient::StartOnSequence,
++                       base::WrapRefCounted(this), task));
++  }
++
++  void SetSuspended(bool suspended) {
++    task_runner_->PostTask(
++        FROM_HERE,
++        base::BindOnce(&CuriumURLLoaderClient::SetSuspendedOnSequence,
++                       base::WrapRefCounted(this), suspended));
++  }
++
++  void Cancel(int net_error, NSString* reason) {
++    cancelled_.store(true, std::memory_order_release);
++    NSString* reason_copy = [reason copy];
++    task_runner_->PostTask(
++        FROM_HERE,
++        base::BindOnce(&CuriumURLLoaderClient::CancelOnSequence,
++                       base::WrapRefCounted(this), net_error, reason_copy));
++  }
++
++  bool IsCancelled() const {
++    return cancelled_.load(std::memory_order_acquire);
++  }
++
++ private:
++  friend class base::RefCountedDeleteOnSequence<CuriumURLLoaderClient>;
++  friend class base::DeleteHelper<CuriumURLLoaderClient>;
++
++  ~CuriumURLLoaderClient() override {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    TeardownMojoOnSequence();
++  }
++
++  // network::mojom::URLLoaderClient:
++  void OnReceiveEarlyHints(network::mojom::EarlyHintsPtr) override {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  }
++
++  void OnReceiveResponse(
++      network::mojom::URLResponseHeadPtr response_head,
++      mojo::ScopedDataPipeConsumerHandle body,
++      std::optional<mojo_base::BigBuffer>) override {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_ || IsCancelled()) {
++      return;
++    }
++    if (block_private_network_targets_ && response_head &&
++        IsBlockedResponseEndpoint(*response_head)) {
++      FinishOnSequence(MakeBlockedPrivateTargetError(
++          @"Response from private network target blocked."));
++      return;
++    }
++    NSURL* final_ns_url = net::NSURLWithGURL(current_url_);
++    if (!final_ns_url) {
++      FinishOnSequence(
++          MakeNetError(net::ERR_INVALID_URL, @"Invalid final response URL."));
++      return;
++    }
++
++    const NSInteger status_code =
++        (response_head && response_head->headers)
++            ? response_head->headers->response_code()
++            : 200;
++    const int64_t expected_length =
++        (response_head && response_head->content_length >= 0)
++            ? response_head->content_length
++            : -1;
++    NSDictionary<NSString*, NSString*>* headers_dict =
++        BuildNormalizedResponseHeaders(
++            response_head ? response_head->headers.get() : nullptr);
++
++    received_response_ = true;
++    body_pipe_ = std::move(body);
++    if (!body_pipe_.is_valid()) {
++      body_complete_ = true;
++    }
++    awaiting_response_dispatch_ = true;
++    ArmTimeoutTimer();
++
++    scoped_refptr<CuriumURLLoaderClient> self_ref(this);
++    id<CrIOSNetworkFetchDelegateV1> delegate = delegate_;
++    CuriumNetworkFetchTask* task = active_task_;
++    scoped_refptr<base::SequencedTaskRunner> runner = task_runner_;
++    dispatch_async(callback_queue_, ^{
++      if (!self_ref->IsCancelled() && delegate && task) {
++        [delegate networkFetchTask:task
++                didReceiveResponse:status_code
++                          finalURL:final_ns_url
++                    expectedLength:expected_length
++                   responseHeaders:headers_dict];
++      }
++      runner->PostTask(
++          FROM_HERE,
++          base::BindOnce(&CuriumURLLoaderClient::OnResponseDeliveredOnSequence,
++                         self_ref));
++    });
++  }
++
++  void OnReceiveRedirect(
++      const net::RedirectInfo& redirect_info,
++      network::mojom::URLResponseHeadPtr response_head) override {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_ || IsCancelled()) {
++      return;
++    }
++    ++redirect_count_;
++    if (redirect_count_ > kMaxRedirects) {
++      FinishOnSequence(
++          MakeNetError(net::ERR_TOO_MANY_REDIRECTS, @"Too many redirects."));
++      return;
++    }
++    if (!redirect_info.new_url.is_valid() ||
++        !redirect_info.new_url.SchemeIsHTTPOrHTTPS()) {
++      FinishOnSequence(MakeNetError(
++          net::ERR_UNSAFE_REDIRECT,
++          @"Redirect to unsupported URL scheme blocked."));
++      return;
++    }
++    if (block_private_network_targets_) {
++      if (response_head && IsBlockedResponseEndpoint(*response_head)) {
++        FinishOnSequence(MakeBlockedPrivateTargetError(
++            @"Redirect response from private network target blocked."));
++        return;
++      }
++      if (IsBlockedTargetURL(redirect_info.new_url)) {
++        FinishOnSequence(MakeBlockedPrivateTargetError(
++            @"Redirect to private network target blocked."));
++        return;
++      }
++    }
++
++    NSURL* new_ns_url = net::NSURLWithGURL(redirect_info.new_url);
++    if (!new_ns_url) {
++      FinishOnSequence(
++          MakeNetError(net::ERR_INVALID_URL, @"Invalid redirect URL."));
++      return;
++    }
++
++    const NSInteger status_code =
++        redirect_info.status_code > 0
++            ? redirect_info.status_code
++            : ((response_head && response_head->headers)
++                   ? response_head->headers->response_code()
++                   : 302);
++    NSDictionary<NSString*, NSString*>* headers_dict =
++        BuildNormalizedResponseHeaders(
++            response_head ? response_head->headers.get() : nullptr);
++
++    pending_redirect_url_ = redirect_info.new_url;
++    awaiting_redirect_decision_ = true;
++    ArmTimeoutTimer();
++
++    scoped_refptr<CuriumURLLoaderClient> self_ref(this);
++    id<CrIOSNetworkFetchDelegateV1> delegate = delegate_;
++    CuriumNetworkFetchTask* task = active_task_;
++    scoped_refptr<base::SequencedTaskRunner> runner = task_runner_;
++    auto handled = std::make_shared<std::atomic<bool>>(false);
++    dispatch_async(callback_queue_, ^{
++      if (self_ref->IsCancelled() || !delegate || !task) {
++        return;
++      }
++      [delegate networkFetchTask:task
++             willPerformRedirect:new_ns_url
++                      statusCode:status_code
++                 responseHeaders:headers_dict
++                 decisionHandler:^(
++                     BOOL allowRedirect,
++                     NSDictionary<NSString*, NSString*>* _Nullable
++                         modifiedHeaders) {
++                   if (handled->exchange(true, std::memory_order_acq_rel)) {
++                     return;
++                   }
++                   NSDictionary<NSString*, NSString*>* headers_copy =
++                       modifiedHeaders ? [modifiedHeaders copy] : nil;
++                   runner->PostTask(
++                       FROM_HERE,
++                       base::BindOnce(
++                           &CuriumURLLoaderClient::OnRedirectDecisionOnSequence,
++                           self_ref, allowRedirect == YES, headers_copy));
++                 }];
++    });
++  }
++
++  void OnUploadProgress(int64_t,
++                        int64_t,
++                        OnUploadProgressCallback ack_callback) override {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    std::move(ack_callback).Run();
++  }
++
++  void OnTransferSizeUpdated(int32_t) override {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  }
++
++  void OnComplete(const network::URLLoaderCompletionStatus& status) override {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_ || IsCancelled()) {
++      return;
++    }
++    has_completion_status_ = true;
++    completion_status_ = status;
++    if (!received_response_ || status.error_code != net::OK) {
++      if (body_watcher_) {
++        body_watcher_->Cancel();
++        body_watcher_.reset();
++      }
++      body_pipe_.reset();
++      body_complete_ = true;
++    }
++    MaybeFinalizeOnSequence();
++  }
++
++  void StartOnSequence(CuriumNetworkFetchTask* task) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    active_task_ = task;
++    if (finished_) {
++      return;
++    }
++    if (IsCancelled()) {
++      FinishOnSequence(MakeCancelledError(@"Fetch task cancelled."));
++      return;
++    }
++    if (block_private_network_targets_ && IsBlockedTargetURL(current_url_)) {
++      FinishOnSequence(MakeBlockedPrivateTargetError(
++          @"Request to private network target blocked."));
++      return;
++    }
++    if (!pending_factory_ || !initial_request_) {
++      FinishOnSequence(MakeNetError(
++          net::ERR_FAILED, @"Network loader factory unavailable."));
++      return;
++    }
++
++    loader_factory_ =
++        network::SharedURLLoaderFactory::Create(std::move(pending_factory_));
++    if (!loader_factory_) {
++      FinishOnSequence(MakeNetError(
++          net::ERR_FAILED, @"Failed to bind SharedURLLoaderFactory."));
++      return;
++    }
++
++    const uint32_t load_options =
++        include_cookies_ ? network::mojom::kURLLoadOptionNone
++                         : network::mojom::kURLLoadOptionBlockAllCookies;
++    loader_factory_->CreateLoaderAndStart(
++        url_loader_.BindNewPipeAndPassReceiver(task_runner_),
++        /*request_id=*/0, load_options, *initial_request_,
++        client_receiver_.BindNewPipeAndPassRemote(task_runner_),
++        net::MutableNetworkTrafficAnnotationTag(
++            kCuriumNetworkFetchTrafficAnnotation));
++    initial_request_.reset();
++    client_receiver_.set_disconnect_handler(
++        base::BindOnce(&CuriumURLLoaderClient::OnMojoDisconnectOnSequence,
++                       base::Unretained(this)));
++    ArmTimeoutTimer();
++  }
++
++  void OnRedirectDecisionOnSequence(
++      bool allow,
++      NSDictionary<NSString*, NSString*>* modified_headers) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_ || IsCancelled() || !awaiting_redirect_decision_ ||
++        !url_loader_.is_bound()) {
++      return;
++    }
++    awaiting_redirect_decision_ = false;
++    if (!allow) {
++      FinishOnSequence(MakeCancelledError(@"Redirect cancelled by delegate."));
++      return;
++    }
++
++    network::HttpRequestHeadersUpdateParams headers_update_params;
++    const url::Origin old_origin = url::Origin::Create(current_url_);
++    const url::Origin new_origin = url::Origin::Create(pending_redirect_url_);
++    if (!old_origin.IsSameOriginWith(new_origin)) {
++      headers_update_params.RemoveHeader(
++          net::HttpRequestHeaders::kAuthorization);
++      headers_update_params.RemoveHeader(
++          net::HttpRequestHeaders::kProxyAuthorization);
++      if (current_url_.SchemeIs("https") &&
++          !pending_redirect_url_.SchemeIs("https")) {
++        headers_update_params.RemoveHeader(net::HttpRequestHeaders::kOrigin);
++        headers_update_params.RemoveHeader(net::HttpRequestHeaders::kReferer);
++      }
++    }
++
++    if (modified_headers) {
++      for (id raw_key in modified_headers) {
++        if (![raw_key isKindOfClass:[NSString class]]) {
++          continue;
++        }
++        const std::string key = base::SysNSStringToUTF8((NSString*)raw_key);
++        if (!net::HttpUtil::IsValidHeaderName(key)) {
++          continue;
++        }
++        id raw_value = modified_headers[raw_key];
++        if (![raw_value isKindOfClass:[NSString class]] ||
++            [(NSString*)raw_value length] == 0) {
++          headers_update_params.RemoveHeader(key);
++          continue;
++        }
++        const std::string value = base::SysNSStringToUTF8((NSString*)raw_value);
++        if (net::HttpUtil::IsValidHeaderValue(value) &&
++            network::IsRequestHeaderSafe(key, value)) {
++          headers_update_params.SetHeader(key, value);
++        }
++      }
++    }
++
++    current_url_ = pending_redirect_url_;
++    pending_redirect_url_ = GURL();
++    ArmTimeoutTimer();
++    url_loader_->FollowRedirect(std::move(headers_update_params), std::nullopt);
++  }
++
++  void OnResponseDeliveredOnSequence() {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    awaiting_response_dispatch_ = false;
++    if (finished_ || IsCancelled()) {
++      return;
++    }
++    if (has_completion_status_ && completion_status_.error_code != net::OK) {
++      if (body_watcher_) {
++        body_watcher_->Cancel();
++        body_watcher_.reset();
++      }
++      body_pipe_.reset();
++      body_complete_ = true;
++      MaybeFinalizeOnSequence();
++      return;
++    }
++    if (body_pipe_.is_valid() && !body_complete_) {
++      body_watcher_ = std::make_unique<mojo::SimpleWatcher>(
++          FROM_HERE, mojo::SimpleWatcher::ArmingPolicy::MANUAL, task_runner_);
++      const MojoResult watch_result = body_watcher_->Watch(
++          body_pipe_.get(),
++          MOJO_HANDLE_SIGNAL_READABLE | MOJO_HANDLE_SIGNAL_PEER_CLOSED,
++          MOJO_WATCH_CONDITION_SATISFIED,
++          base::BindRepeating(&CuriumURLLoaderClient::OnBodyPipeReadyOnSequence,
++                              base::Unretained(this)));
++      if (watch_result != MOJO_RESULT_OK) {
++        body_watcher_.reset();
++        body_pipe_.reset();
++        body_complete_ = true;
++        FinishOnSequence(MakeNetError(
++            net::ERR_FAILED, @"Failed to watch response body data pipe."));
++        return;
++      }
++      if (!suspended_) {
++        ReadBodyOnSequence();
++      }
++      return;
++    }
++    body_complete_ = true;
++    MaybeFinalizeOnSequence();
++  }
++
++  void OnBodyPipeReadyOnSequence(MojoResult result,
++                                 const mojo::HandleSignalsState&) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_ || IsCancelled()) {
++      return;
++    }
++    if (result == MOJO_RESULT_CANCELLED ||
++        result == MOJO_RESULT_FAILED_PRECONDITION) {
++      if (body_watcher_) {
++        body_watcher_->Cancel();
++        body_watcher_.reset();
++      }
++      body_pipe_.reset();
++      body_complete_ = true;
++      MaybeFinalizeOnSequence();
++      return;
++    }
++    if (result != MOJO_RESULT_OK) {
++      FinishOnSequence(MakeNetError(
++          net::ERR_FAILED, @"Response body data pipe signaled error."));
++      return;
++    }
++    if (suspended_ || in_flight_chunks_ >= kMaxInFlightChunks) {
++      return;
++    }
++    ReadBodyOnSequence();
++  }
++
++  void ReadBodyOnSequence() {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_ || IsCancelled() || suspended_ || body_complete_ ||
++        !body_pipe_.is_valid()) {
++      return;
++    }
++    while (!suspended_ && in_flight_chunks_ < kMaxInFlightChunks &&
++           body_pipe_.is_valid()) {
++      base::span<const uint8_t> buffer;
++      const MojoResult read_result =
++          body_pipe_->BeginReadData(MOJO_BEGIN_READ_DATA_FLAG_NONE, buffer);
++      if (read_result == MOJO_RESULT_OK) {
++        if (buffer.empty()) {
++          body_pipe_->EndReadData(0);
++          if (body_watcher_) {
++            body_watcher_->ArmOrNotify();
++          }
++          return;
++        }
++        const size_t bytes_to_read = std::min(buffer.size(), kMaxChunkBytes);
++        NSData* chunk = [NSData dataWithBytes:buffer.data()
++                                       length:bytes_to_read];
++        const MojoResult end_result = body_pipe_->EndReadData(bytes_to_read);
++        if (end_result != MOJO_RESULT_OK) {
++          FinishOnSequence(MakeNetError(
++              net::ERR_FAILED, @"Failed to finalize response body read."));
++          return;
++        }
++        ++in_flight_chunks_;
++        ArmTimeoutTimer();
++
++        scoped_refptr<CuriumURLLoaderClient> self_ref(this);
++        id<CrIOSNetworkFetchDelegateV1> delegate = delegate_;
++        CuriumNetworkFetchTask* task = active_task_;
++        scoped_refptr<base::SequencedTaskRunner> runner = task_runner_;
++        dispatch_async(callback_queue_, ^{
++          if (!self_ref->IsCancelled() && delegate && task) {
++            [delegate networkFetchTask:task didReceiveData:chunk];
++          }
++          runner->PostTask(
++              FROM_HERE,
++              base::BindOnce(&CuriumURLLoaderClient::OnChunkDeliveredOnSequence,
++                             self_ref));
++        });
++      } else if (read_result == MOJO_RESULT_SHOULD_WAIT) {
++        if (body_watcher_) {
++          body_watcher_->ArmOrNotify();
++        }
++        return;
++      } else if (read_result == MOJO_RESULT_FAILED_PRECONDITION) {
++        if (body_watcher_) {
++          body_watcher_->Cancel();
++          body_watcher_.reset();
++        }
++        body_pipe_.reset();
++        body_complete_ = true;
++        MaybeFinalizeOnSequence();
++        return;
++      } else {
++        FinishOnSequence(MakeNetError(
++            net::ERR_FAILED, @"Response body data pipe read error."));
++        return;
++      }
++    }
++  }
++
++  void OnChunkDeliveredOnSequence() {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    DCHECK_GT(in_flight_chunks_, 0);
++    --in_flight_chunks_;
++    if (finished_ || IsCancelled()) {
++      return;
++    }
++    if (body_complete_) {
++      MaybeFinalizeOnSequence();
++      return;
++    }
++    if (!suspended_ && in_flight_chunks_ < kMaxInFlightChunks &&
++        body_pipe_.is_valid()) {
++      ReadBodyOnSequence();
++    }
++  }
++
++  void SetSuspendedOnSequence(bool suspended) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_ || IsCancelled() || suspended_ == suspended) {
++      return;
++    }
++    suspended_ = suspended;
++    if (suspended_) {
++      timeout_timer_.Stop();
++      return;
++    }
++    ArmTimeoutTimer();
++    if (!awaiting_response_dispatch_ && !body_complete_ &&
++        body_pipe_.is_valid() && in_flight_chunks_ < kMaxInFlightChunks) {
++      ReadBodyOnSequence();
++    }
++  }
++
++  void CancelOnSequence(int net_error, NSString* reason) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_) {
++      return;
++    }
++    NSError* error = (net_error == net::ERR_ABORTED)
++                         ? MakeCancelledError(reason)
++                         : MakeNetError(net_error, reason);
++    FinishOnSequence(error);
++  }
++
++  void OnMojoDisconnectOnSequence() {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_ || IsCancelled() || has_completion_status_) {
++      return;
++    }
++    FinishOnSequence(MakeNetError(
++        net::ERR_FAILED, @"Network service loader disconnected unexpectedly."));
++  }
++
++  void OnTimeoutOnSequence() {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_ || IsCancelled()) {
++      return;
++    }
++    cancelled_.store(true, std::memory_order_release);
++    FinishOnSequence(MakeTimeoutError());
++  }
++
++  void ArmTimeoutTimer() {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_ || IsCancelled() || suspended_ ||
++        timeout_delta_ <= base::TimeDelta()) {
++      timeout_timer_.Stop();
++      return;
++    }
++    timeout_timer_.Start(
++        FROM_HERE, timeout_delta_,
++        base::BindOnce(&CuriumURLLoaderClient::OnTimeoutOnSequence,
++                       base::Unretained(this)));
++  }
++
++  void MaybeFinalizeOnSequence() {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_ || IsCancelled() || awaiting_response_dispatch_ ||
++        !has_completion_status_ || !body_complete_ || in_flight_chunks_ > 0) {
++      return;
++    }
++    NSError* error =
++        completion_status_.error_code == net::OK
++            ? nil
++            : MakeNetError(completion_status_.error_code, nil);
++    FinishOnSequence(error);
++  }
++
++  void TeardownMojoOnSequence() {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    timeout_timer_.Stop();
++    if (body_watcher_) {
++      body_watcher_->Cancel();
++      body_watcher_.reset();
++    }
++    body_pipe_.reset();
++    client_receiver_.reset();
++    url_loader_.reset();
++    loader_factory_.reset();
++    pending_factory_.reset();
++    initial_request_.reset();
++  }
++
++  void FinishOnSequence(NSError* error) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (finished_) {
++      return;
++    }
++    finished_ = true;
++    cancelled_.store(true, std::memory_order_release);
++    TeardownMojoOnSequence();
++
++    id<CrIOSNetworkFetchDelegateV1> delegate = delegate_;
++    delegate_ = nil;
++    CuriumNetworkFetchTask* task = active_task_;
++    active_task_ = nil;
++    void (^on_terminal)(CuriumNetworkFetchTask*) = on_terminal_;
++    on_terminal_ = nil;
++    dispatch_queue_t queue = callback_queue_;
++    callback_queue_ = nil;
++
++    if (delegate && task && queue) {
++      dispatch_async(queue, ^{
++        [delegate networkFetchTask:task didCompleteWithError:error];
++      });
++    }
++    if (on_terminal && task) {
++      dispatch_async(dispatch_get_main_queue(), ^{
++        on_terminal(task);
++      });
++    }
++  }
++
++  SEQUENCE_CHECKER(sequence_checker_);
++
++  scoped_refptr<base::SequencedTaskRunner> task_runner_;
++  std::unique_ptr<network::ResourceRequest> initial_request_;
++  std::unique_ptr<network::PendingSharedURLLoaderFactory> pending_factory_;
++  GURL current_url_;
++  GURL pending_redirect_url_;
++  const bool include_cookies_;
++  const bool block_private_network_targets_;
++  const base::TimeDelta timeout_delta_;
++
++  std::atomic<bool> cancelled_{false};
++  bool finished_ = false;
++  bool suspended_ = false;
++  bool awaiting_redirect_decision_ = false;
++  bool awaiting_response_dispatch_ = false;
++  bool received_response_ = false;
++  bool body_complete_ = false;
++  bool has_completion_status_ = false;
++  int redirect_count_ = 0;
++  int in_flight_chunks_ = 0;
++  network::URLLoaderCompletionStatus completion_status_;
++
++  id<CrIOSNetworkFetchDelegateV1> delegate_ = nil;
++  CuriumNetworkFetchTask* active_task_ = nil;
++  dispatch_queue_t callback_queue_ = nil;
++  void (^on_terminal_)(CuriumNetworkFetchTask*) = nil;
++
++  // Ordered so reverse destruction stops timer and cancels watcher before
++  // closing the data pipe or Mojo endpoints.
++  scoped_refptr<network::SharedURLLoaderFactory> loader_factory_;
++  mojo::Remote<network::mojom::URLLoader> url_loader_;
++  mojo::Receiver<network::mojom::URLLoaderClient> client_receiver_{this};
++  mojo::ScopedDataPipeConsumerHandle body_pipe_;
++  std::unique_ptr<mojo::SimpleWatcher> body_watcher_;
++  base::OneShotTimer timeout_timer_;
++};
++
++std::unique_ptr<network::ResourceRequest> BuildResourceRequest(
++    CrIOSNetworkFetchRequestV1* request) {
++  if (!request || !request.URL) {
++    return nullptr;
++  }
++  const GURL gurl = net::GURLWithNSURL(request.URL);
++  if (!gurl.is_valid() || !gurl.SchemeIsHTTPOrHTTPS()) {
++    return nullptr;
++  }
++
++  std::string method = net::HttpRequestHeaders::kGetMethod;
++  if (request.HTTPMethod.length > 0) {
++    method = base::ToUpperASCII(base::SysNSStringToUTF8(request.HTTPMethod));
++  }
++  if (method != net::HttpRequestHeaders::kGetMethod &&
++      method != net::HttpRequestHeaders::kHeadMethod) {
++    return nullptr;
++  }
++
++  auto resource_request = std::make_unique<network::ResourceRequest>();
++  resource_request->url = gurl;
++  resource_request->method = method;
++  resource_request->mode = network::mojom::RequestMode::kNoCors;
++  resource_request->redirect_mode = network::mojom::RedirectMode::kFollow;
++  resource_request->destination = network::mojom::RequestDestination::kEmpty;
++  resource_request->priority = net::MEDIUM;
++  // Bypass HTTP cache so parallel multi-lane Range requests do not serialize
++  // on Chromium's single-writer HttpCache entry lock or evict web assets.
++  resource_request->load_flags = net::LOAD_DISABLE_CACHE;
++
++  if (request.includeCookies) {
++    resource_request->credentials_mode =
++        network::mojom::CredentialsMode::kInclude;
++    GURL top_url;
++    if (request.isolationTopFrameURL) {
++      GURL candidate = net::GURLWithNSURL(request.isolationTopFrameURL);
++      if (candidate.is_valid() && candidate.SchemeIsHTTPOrHTTPS()) {
++        top_url = std::move(candidate);
++      }
++    }
++    const GURL& isolation_source = top_url.is_valid() ? top_url : gurl;
++    const url::Origin top_origin = url::Origin::Create(isolation_source);
++    const url::Origin frame_origin = top_origin;
++    const net::SiteForCookies site_for_cookies =
++        net::SiteForCookies::FromUrl(isolation_source);
++    resource_request->site_for_cookies = site_for_cookies;
++    resource_request->trusted_params.emplace();
++    resource_request->trusted_params->isolation_info =
++        net::IsolationInfo::Create(net::IsolationInfo::RequestType::kOther,
++                                   top_origin, frame_origin, site_for_cookies);
++  } else {
++    resource_request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++    resource_request->site_for_cookies = net::SiteForCookies();
++    resource_request->trusted_params.emplace();
++    resource_request->trusted_params->isolation_info =
++        net::IsolationInfo::CreateTransient(/*nonce=*/std::nullopt);
++  }
++
++  if (request.headers) {
++    for (id raw_key in request.headers) {
++      if (![raw_key isKindOfClass:[NSString class]]) {
++        continue;
++      }
++      id raw_value = request.headers[raw_key];
++      if (![raw_value isKindOfClass:[NSString class]]) {
++        continue;
++      }
++      const std::string key = base::SysNSStringToUTF8((NSString*)raw_key);
++      const std::string value = base::SysNSStringToUTF8((NSString*)raw_value);
++      if (!net::HttpUtil::IsValidHeaderName(key) ||
++          !net::HttpUtil::IsValidHeaderValue(value)) {
++        continue;
++      }
++      if (base::EqualsCaseInsensitiveASCII(key,
++                                           net::HttpRequestHeaders::kReferer)) {
++        const GURL ref_url(value);
++        if (ref_url.is_valid() && ref_url.SchemeIsHTTPOrHTTPS()) {
++          resource_request->referrer = ref_url;
++          resource_request->referrer_policy = net::ReferrerPolicy::
++              CLEAR_ON_TRANSITION_FROM_SECURE_TO_INSECURE;
++        }
++        continue;
++      }
++      if (network::IsRequestHeaderSafe(key, value)) {
++        resource_request->headers.SetHeader(key, value);
++      }
++    }
++  }
++
++  return resource_request;
++}
++
++}  // namespace
++
++@implementation CrIOSNetworkFetchRequestV1
++
++- (instancetype)init {
++  self = [super init];
++  if (self) {
++    _HTTPMethod = @"GET";
++    _includeCookies = YES;
++    _blockPrivateNetworkTargets = YES;
++    _timeoutInterval = 60.0;
++  }
++  return self;
++}
++
++@end
++
++@implementation CuriumNetworkFetchTask {
++  scoped_refptr<CuriumURLLoaderClient> _core;
++}
++
++- (nullable instancetype)
++    initWithRequest:(CrIOSNetworkFetchRequestV1*)request
++     pendingFactory:
++         (std::unique_ptr<network::PendingSharedURLLoaderFactory>)pendingFactory
++           delegate:(id<CrIOSNetworkFetchDelegateV1>)delegate
++      callbackQueue:(dispatch_queue_t)callbackQueue
++         onTerminal:(nullable void (^)(CuriumNetworkFetchTask*))onTerminal {
++  if (!request || !pendingFactory || !delegate || !callbackQueue) {
++    return nil;
++  }
++  std::unique_ptr<network::ResourceRequest> resource_request =
++      BuildResourceRequest(request);
++  if (!resource_request) {
++    return nil;
++  }
++
++  self = [super init];
++  if (self) {
++    const NSTimeInterval raw_timeout = request.timeoutInterval;
++    const base::TimeDelta timeout_delta =
++        (std::isfinite(raw_timeout) && raw_timeout > 0.0)
++            ? base::Seconds(raw_timeout)
++            : base::TimeDelta();
++    scoped_refptr<base::SequencedTaskRunner> task_runner =
++        base::ThreadPool::CreateSequencedTaskRunner(
++            {base::TaskPriority::USER_VISIBLE,
++             base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN});
++    _core = base::MakeRefCounted<CuriumURLLoaderClient>(
++        std::move(task_runner), std::move(resource_request),
++        std::move(pendingFactory), request.includeCookies == YES,
++        request.blockPrivateNetworkTargets == YES, timeout_delta, delegate,
++        callbackQueue, onTerminal);
++    _core->Start(self);
++  }
++  return self;
++}
++
++- (void)dealloc {
++  if (_core) {
++    _core->Cancel(net::ERR_ABORTED, @"Fetch task deallocated.");
++  }
++}
++
++- (void)setSuspended:(BOOL)suspended {
++  if (_core) {
++    _core->SetSuspended(suspended == YES);
++  }
++}
++
++- (void)cancel {
++  if (_core) {
++    _core->Cancel(net::ERR_ABORTED, @"Fetch task cancelled.");
++  }
++}
++
++- (void)invalidate {
++  if (_core) {
++    _core->Cancel(net::ERR_ABORTED, @"Fetch task invalidated.");
++  }
++}
++
++@end
+diff --git a/ios/web/content/download/content_download_task.h b/ios/web/content/download/content_download_task.h
+index 7ccc900..1656514 100644
+--- a/ios/web/content/download/content_download_task.h
++++ b/ios/web/content/download/content_download_task.h
+@@ -13,6 +13,7 @@
+ #import "components/download/public/common/download_item.h"
+ #import "components/download/public/common/download_target_info.h"
+ #import "ios/web/download/download_task_impl.h"
++#import "url/gurl.h"
+ 
+ namespace base {
+ class SequencedTaskRunner;
+@@ -49,6 +50,10 @@ class ContentDownloadTask final : public DownloadTaskImpl,
+   // web::DownloadTask:
+   bool IsExplicitDownload() const final;
+   bool IsMainFrameDownload() const final;
++  const GURL& GetFinalUrl() const final;
++  bool AcceptsByteRanges() const final;
++  std::string GetETag() const final;
++  std::string GetLastModifiedTime() const final;
+ 
+  private:
+   // DownloadTaskImpl:
+@@ -65,6 +70,10 @@ class ContentDownloadTask final : public DownloadTaskImpl,
+   std::string suggested_name_;
+   bool is_explicit_download_ = false;
+   bool is_main_frame_download_ = true;
++  GURL final_url_;
++  bool accepts_byte_ranges_ = false;
++  std::string etag_;
++  std::string last_modified_;
+ };
+ 
+ }  // namespace web
+diff --git a/ios/web/content/download/content_download_task.mm b/ios/web/content/download/content_download_task.mm
+index 258d168..b8de334 100644
+--- a/ios/web/content/download/content_download_task.mm
++++ b/ios/web/content/download/content_download_task.mm
+@@ -6,6 +6,9 @@
+ 
+ #import <Foundation/Foundation.h>
+ 
++#import <optional>
++#import <utility>
++
+ #import "base/strings/sys_string_conversions.h"
+ #import "base/task/sequenced_task_runner.h"
+ #import "components/download/public/common/download_source.h"
+@@ -17,12 +20,85 @@
+ #import "ios/web/download/download_result.h"
+ #import "net/base/net_errors.h"
+ #import "net/http/http_content_disposition.h"
++#import "net/http/http_response_headers.h"
+ #import "ui/base/page_transition_types.h"
+ 
+ namespace web {
+ 
+ namespace {
+ 
++const GURL& OriginalUrlForItem(::download::DownloadItem* item) {
++  return item->GetOriginalUrl().is_valid() ? item->GetOriginalUrl()
++                                           : item->GetURL();
++}
++
++const GURL& FinalUrlForItem(::download::DownloadItem* item) {
++  return item->GetURL().is_valid() ? item->GetURL() : item->GetOriginalUrl();
++}
++
++bool AcceptRangesForItem(::download::DownloadItem* item) {
++  if (content::DownloadItemUtils::GetAcceptRanges(item)) {
++    return true;
++  }
++  if (const auto& headers = item->GetResponseHeaders()) {
++    return headers->HasHeaderValue("Accept-Ranges", "bytes") &&
++           !headers->HasHeaderValue("Accept-Ranges", "none");
++  }
++  return false;
++}
++
++std::string ETagForItem(::download::DownloadItem* item) {
++  if (!item->GetETag().empty()) {
++    return item->GetETag();
++  }
++  if (std::string etag = content::DownloadItemUtils::GetResponseETag(item);
++      !etag.empty()) {
++    return etag;
++  }
++  if (const auto& headers = item->GetResponseHeaders()) {
++    if (std::optional<std::string> etag = headers->GetNormalizedHeader("ETag")) {
++      return std::move(*etag);
++    }
++  }
++  return std::string();
++}
++
++std::string LastModifiedForItem(::download::DownloadItem* item) {
++  if (!item->GetLastModifiedTime().empty()) {
++    return item->GetLastModifiedTime();
++  }
++  if (std::string last_modified =
++          content::DownloadItemUtils::GetResponseLastModified(item);
++      !last_modified.empty()) {
++    return last_modified;
++  }
++  if (const auto& headers = item->GetResponseHeaders()) {
++    if (std::optional<std::string> last_modified =
++            headers->GetNormalizedHeader("Last-Modified")) {
++      return std::move(*last_modified);
++    }
++  }
++  return std::string();
++}
++
++std::string ContentDispositionForItem(::download::DownloadItem* item) {
++  if (!item->GetContentDisposition().empty()) {
++    return item->GetContentDisposition();
++  }
++  if (std::string cd =
++          content::DownloadItemUtils::GetResponseContentDisposition(item);
++      !cd.empty()) {
++    return cd;
++  }
++  if (const auto& headers = item->GetResponseHeaders()) {
++    if (std::optional<std::string> cd =
++            headers->GetNormalizedHeader("Content-Disposition")) {
++      return std::move(*cd);
++    }
++  }
++  return std::string();
++}
++
+ // The host of the page that started the download, for Chrome's download UI.
+ NSString* OriginatingHostForItem(::download::DownloadItem* item) {
+   const GURL& url =
+@@ -83,10 +159,10 @@ bool IsMainFrameDownloadItem(::download::DownloadItem* item) {
+     ::download::DownloadTargetCallback target_callback,
+     const scoped_refptr<base::SequencedTaskRunner>& task_runner)
+     : DownloadTaskImpl(web_state,
+-                       item->GetURL(),
++                       OriginalUrlForItem(item),
+                        OriginatingHostForItem(item),
+                        HttpMethodForItem(item),
+-                       item->GetContentDisposition(),
++                       ContentDispositionForItem(item),
+                        item->GetTotalBytes() > 0 ? item->GetTotalBytes() : -1,
+                        item->GetMimeType(),
+                        [[NSUUID UUID] UUIDString],
+@@ -95,7 +171,14 @@ bool IsMainFrameDownloadItem(::download::DownloadItem* item) {
+       target_callback_(std::move(target_callback)),
+       suggested_name_(item->GetSuggestedFilename()),
+       is_explicit_download_(IsExplicitDownloadItem(item)),
+-      is_main_frame_download_(IsMainFrameDownloadItem(item)) {
++      is_main_frame_download_(IsMainFrameDownloadItem(item)),
++      final_url_(FinalUrlForItem(item)),
++      accepts_byte_ranges_(AcceptRangesForItem(item)),
++      etag_(ETagForItem(item)),
++      last_modified_(LastModifiedForItem(item)) {
++  if (final_url_.is_valid() && final_url_ != original_url_) {
++    redirected_url_ = final_url_;
++  }
+   item_->AddObserver(this);
+ }
+ 
+@@ -117,6 +200,26 @@ bool IsMainFrameDownloadItem(::download::DownloadItem* item) {
+ 
+ void ContentDownloadTask::OnDownloadUpdated(::download::DownloadItem* item) {
+   DCHECK_EQ(item, item_);
++  if (const GURL& updated_url = FinalUrlForItem(item);
++      updated_url.is_valid() && updated_url != final_url_) {
++    final_url_ = updated_url;
++    if (final_url_ != original_url_) {
++      redirected_url_ = final_url_;
++    }
++  }
++  if (!accepts_byte_ranges_ && AcceptRangesForItem(item)) {
++    accepts_byte_ranges_ = true;
++  }
++  if (etag_.empty()) {
++    etag_ = ETagForItem(item);
++  }
++  if (last_modified_.empty()) {
++    last_modified_ = LastModifiedForItem(item);
++  }
++  if (content_disposition_.empty()) {
++    content_disposition_ = ContentDispositionForItem(item);
++  }
++
+   // Before Chrome starts the task, content may already be fetching data; the
+   // task only reports progress once it is running.
+   if (state_ != State::kInProgress) {
+@@ -195,6 +298,22 @@ bool IsMainFrameDownloadItem(::download::DownloadItem* item) {
+   return is_main_frame_download_;
+ }
+ 
++const GURL& ContentDownloadTask::GetFinalUrl() const {
++  return final_url_.is_valid() ? final_url_ : GetRedirectedUrl();
++}
++
++bool ContentDownloadTask::AcceptsByteRanges() const {
++  return accepts_byte_ranges_;
++}
++
++std::string ContentDownloadTask::GetETag() const {
++  return etag_;
++}
++
++std::string ContentDownloadTask::GetLastModifiedTime() const {
++  return last_modified_;
++}
++
+ void ContentDownloadTask::RunTargetCallback(const base::FilePath& path) {
+   if (!target_callback_) {
+     return;
+diff --git a/ios/web/public/download/download_task.h b/ios/web/public/download/download_task.h
+index 55821f8..0012497 100644
+--- a/ios/web/public/download/download_task.h
++++ b/ios/web/public/download/download_task.h
+@@ -148,6 +148,22 @@ class DownloadTask {
+   // main frame rather than an embedded subframe.
+   virtual bool IsMainFrameDownload() const { return true; }
+ 
++  // [ios-blink-sideload] Final URL after redirects (defaults to the redirected
++  // URL reported by the task).
++  virtual const GURL& GetFinalUrl() const { return GetRedirectedUrl(); }
++
++  // [ios-blink-sideload] True when the initial HTTP response advertised
++  // `Accept-Ranges: bytes` (and not `none`).
++  virtual bool AcceptsByteRanges() const { return false; }
++
++  // [ios-blink-sideload] ETag header captured from the initial HTTP response,
++  // if any.
++  virtual std::string GetETag() const { return std::string(); }
++
++  // [ios-blink-sideload] Last-Modified header captured from the initial HTTP
++  // response, if any.
++  virtual std::string GetLastModifiedTime() const { return std::string(); }
++
+   // Returns a weak pointer to DownloadTask.
+   virtual base::WeakPtr<DownloadTask> GetWeakPtr() = 0;
+ 

@@ -16,6 +16,9 @@ typedef NS_ENUM(NSInteger, CrIOSFingerprintErrorCode) {
   CrIOSFingerprintErrorProfileUnavailable = 6,
   CrIOSFingerprintErrorProfileLocked = 7,
   CrIOSFingerprintErrorAlreadyFrozen = 8,
+  CrIOSFingerprintErrorHotSwapUnsupported = 9,
+  CrIOSFingerprintErrorHotSwapInProgress = 10,
+  CrIOSFingerprintErrorTeardownIncomplete = 11,
 };
 
 __attribute__((unused)) static NSString *const CrIOSFingerprintErrorDomain =
@@ -82,6 +85,21 @@ NS_SWIFT_UI_ACTOR
 /// enableGlobalPrivacyControl, hideSpeechVoices).
 /// Probe via respondsToSelector: on engines older than Build 43.
 + (NSDictionary<NSString *, id> *)activeRuntimePolicyStatus;
+
+/// Atomically switches the running engine to another profile (or reconfigures
+/// the active profile's launch-scoped identity/proxy/languages) without process
+/// restart. Tears down outgoing WebStates, extensions, and ProfileIOS while
+/// pinning the single-process RenderProcessHost, purges renderer/V8/font caches,
+/// invokes beforeProfileCreate on @MainActor for CoreText font swap, then boots
+/// the target ProfileIOS and returns fresh browserHost + extensionManager.
+/// Probe via respondsToSelector: on engines older than Build 44.
++ (void)switchToProfileWithConfigJSON:(NSData *)jsonData
+                  beforeProfileCreate:(nullable void (^NS_SWIFT_UI_ACTOR)(void))beforeProfileCreate
+                           completion:(void (^NS_SWIFT_UI_ACTOR)(
+                                          id<CrIOSBrowserHostV1> _Nullable browserHost,
+                                          id<CrIOSExtensionManagingV1> _Nullable extensionManager,
+                                          NSError *_Nullable error))completion
+    NS_SWIFT_NAME(switchToProfile(configJSON:beforeProfileCreate:completion:));
 
 @end
 

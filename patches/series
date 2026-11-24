@@ -105,3 +105,6 @@
 0110-ios-curium-native-anti-fingerprinting.patch
 0111-ios-curium-runtime-privacy-policy-v3.patch
 0112-ios-curium-native-desktop-parity.patch
+0113-ios-curium-zero-restart-profile-hotswap.patch
+0114-ios-curium-network-fetch-bridge-and-download-headers.patch
+0115-ios-curium-stealth-locale-pip-and-tab-discard.patch
