@@ -531,6 +531,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     @ObservationIgnored private var savedDownloadsGeneration = 0
     @ObservationIgnored private var mediaPermissions: CuriumMediaPermissionCoordinator!
     @ObservationIgnored private var backgroundKeepAlive: CuriumBackgroundKeepAlive!
+    @ObservationIgnored private var transferCoordinator: CuriumTransferCoordinator!
+    @ObservationIgnored private let ephemeralTestStagingRoot: URL?
     @ObservationIgnored private var cachedDOMScanByTabID: [String: (pageTitle: String?, entries: [CuriumDOMMediaEntry], blobVideoCount: Int, scannedAt: Date)] = [:]
     @ObservationIgnored private var cachedHLSInspections: [URL: CuriumHLSMasterInspection] = [:]
     @ObservationIgnored private var lastMediaNavigationURLByTabID: [String: URL] = [:]
@@ -555,8 +557,30 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     var activeTabMediaCount: Int { currentMediaSnapshot().candidates.count }
     var pendingOrActiveDownloadCount: Int {
         downloads.reduce(into: 0) { count, item in
-            if item.state == .pending || item.isActive { count += 1 }
+            if item.phase == .pendingConfirmation || item.phase == .queued || item.isActive {
+                count += 1
+            }
         }
+    }
+    var activeTransferCount: Int {
+        downloads.reduce(into: 0) { count, item in
+            if item.phase == .queued || item.phase.isActive {
+                count += 1
+            }
+        }
+    }
+    var aggregateActiveSpeedBytesPerSec: Double {
+        downloads.reduce(into: 0.0) { total, item in
+            if item.phase == .downloading && item.speedBytesPerSec > 0 {
+                total += item.speedBytesPerSec
+            }
+        }
+    }
+    internal var backgroundKeepAliveActiveTaskCount: Int {
+        backgroundKeepAlive.activeTaskCount
+    }
+    internal var isBackgroundKeepAliveArmed: Bool {
+        backgroundKeepAlive.shouldBeActive
     }
 
     init(
@@ -570,7 +594,12 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         library: CuriumLibrary? = nil,
         fingerprintStore: CuriumFingerprintStore? = nil,
         sessionDirectoryOverride: URL? = nil,
-        restoreSession: Bool = true
+        restoreSession: Bool = true,
+        transferDatabaseURL: URL? = nil,
+        transferStagingRoot: URL? = nil,
+        transferRangeEngine: CuriumRangeTransferEngine? = nil,
+        transferHLSEngine: CuriumHLSTransferEngine? = nil,
+        transferRangeConfiguration: CuriumRangeEngineConfiguration? = nil
     ) {
         let trimmedProfileID = activeProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedProfileID = trimmedProfileID.isEmpty ? "default" : trimmedProfileID
@@ -586,6 +615,11 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         self.pdfPreviewCacheRootOverride = pdfPreviewCacheRoot
             ?? (try? CuriumDownloadStorage.pdfPreviewCacheRoot(profileID: resolvedProfileID))
         self.sessionDirectoryOverride = sessionDirectoryOverride
+        let ephemeralStaging: URL? = (transferStagingRoot == nil && Self.isRunningTests)
+            ? FileManager.default.temporaryDirectory
+                .appending(path: "curium-test-staging-\(UUID().uuidString)", directoryHint: .isDirectory)
+            : nil
+        self.ephemeralTestStagingRoot = ephemeralStaging
         // The optional delegate method is ours, so probing it cannot tell us
         // whether Blink sends it. Patch 0097 adds this forwarder to the host.
         reportsNavigationCommits = host?.responds(to: NSSelectorFromString(
@@ -597,6 +631,62 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             guard let self else { return false }
             return self.tabs.contains { $0.hasPlayingVideo || $0.isPictureInPictureActive }
         })
+        let enableTransferPersistence = transferDatabaseURL != nil || !Self.isRunningTests
+        let resolvedTransferStagingRoot = transferStagingRoot ?? ephemeralStaging
+        transferCoordinator = CuriumTransferCoordinator(
+            environment: CuriumTransferCoordinator.Environment(
+                downloadsRootOverride: downloadsRoot,
+                stagingRootOverride: resolvedTransferStagingRoot,
+                databaseURLOverride: transferDatabaseURL,
+                rangeEngine: transferRangeEngine ?? CuriumRangeTransferEngine(),
+                hlsEngine: transferHLSEngine ?? CuriumHLSTransferEngine(),
+                rangeConfiguration: transferRangeConfiguration ?? CuriumRangeEngineConfiguration(),
+                installStoreLifecycleObservers: false,
+                enablePersistence: enableTransferPersistence
+            ),
+            host: CuriumTransferCoordinator.HostBridge(
+                activeProfileID: { [weak self] in self?.activeProfileID ?? "default" },
+                effectiveProxy: { [weak self] in self?.effectiveMediaLaunchProxy() ?? .system },
+                resolveCookieHeader: { [weak self] url, tabID in
+                    guard let self, let tabID = tabID ?? self.activeTab?.id else { return nil }
+                    return await self.resolveCookieHeader(for: url, inTabID: tabID)
+                },
+                tabContext: { [weak self] tabID in
+                    guard let self else { return (nil, nil) }
+                    let tab = (tabID.flatMap { self.tabsByID[$0] }) ?? self.activeTab
+                    let ua = tab?.engine?.effectiveUserAgent ?? nil
+                    let url = tab?.engine?.currentURL ?? tab?.url
+                    return (ua, url)
+                },
+                allDownloads: { [weak self] in self?.downloads ?? [] },
+                insertDownload: { [weak self] item, presentBanner in
+                    guard let self else { return }
+                    self.downloads.insert(item, at: 0)
+                    if presentBanner {
+                        self.presentDownloadBannerIfAppropriate(for: item)
+                    }
+                    self.syncBackgroundKeepAlive()
+                },
+                appendHydratedDownload: { [weak self] item in
+                    guard let self, !self.downloads.contains(where: { $0.id == item.id }) else { return }
+                    self.downloads.append(item)
+                },
+                removeDownload: { [weak self] id in
+                    guard let self else { return }
+                    self.downloads.removeAll { $0.id == id }
+                    self.deletedDownloadIDs.remove(id)
+                    if self.activeDownloadBanner?.id == id {
+                        self.activeDownloadBanner = nil
+                    }
+                },
+                syncBackgroundKeepAlive: { [weak self] in
+                    self?.syncBackgroundKeepAlive()
+                },
+                refreshSavedDownloads: { [weak self] in
+                    self?.refreshSavedDownloads()
+                }
+            )
+        )
         mediaPermissions = CuriumMediaPermissionCoordinator(
             isRequestCurrent: { [weak self] tabID, originKey in
                 self?.isMediaPermissionRequestCurrent(tabID: tabID, originKey: originKey) == true
@@ -634,6 +724,27 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         refreshSavedDownloads()
     }
 
+    deinit {
+        if let tempStaging = ephemeralTestStagingRoot {
+            try? FileManager.default.removeItem(at: tempStaging)
+        }
+    }
+
+    internal func waitForTransferHydration() async {
+        await transferCoordinator.waitForHydration()
+    }
+
+    private func presentDownloadBannerIfAppropriate(for item: CuriumDownload) {
+        if item.phase == .pendingConfirmation {
+            activeDownloadBanner = item
+            return
+        }
+        if activeDownloadBanner?.phase == .pendingConfirmation {
+            return
+        }
+        activeDownloadBanner = item
+    }
+
     func updateViewportWidth(_ width: CGFloat) {
         guard width > 0 else { return }
         let changed = abs(viewportWidth - width) >= 0.5
@@ -666,8 +777,13 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     }
 
     func handleSceneWillDeactivate() {
+        syncBackgroundKeepAlive()
+        if backgroundKeepAlive.activeTaskCount > 0 {
+            backgroundKeepAlive.setBackgrounded(true)
+        }
         cancelAllSnapshotCaptures()
         saveOpenTabsSession()
+        transferCoordinator.checkpointStoreForBackground()
     }
 
     func handleSceneDidEnterBackground() {
@@ -677,6 +793,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         syncMediaPermissionPresentationGate()
         cancelAllSnapshotCaptures()
         saveOpenTabsSession()
+        transferCoordinator.checkpointStoreForBackground()
         backgroundEpoch += 1
         // Retain at most the active tab's thumbnail in background to minimize idle footprint.
         let keepID = activeTab?.id
@@ -814,9 +931,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         guard switchProfileForNextLaunch(to: profileID) else {
             return false
         }
-        for item in downloads where item.isActive {
-            item.cancel()
-        }
+        await transferCoordinator.pauseAllActiveTransfersForRelaunch()
         syncBackgroundKeepAlive()
         saveOpenTabsSession()
         await library.checkpointAsync()
@@ -1186,6 +1301,7 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             mediaPermissions.invalidate(tabID: tabID)
             clearMediaCaches(for: tabID)
             tabsByID[tabID]?.dismissPDFSession()
+            syncBackgroundKeepAlive()
             scheduleSessionSave()
         } else if Self.changedPathOrQuery(from: previousMediaURL, to: url) {
             clearMediaCaches(for: tabID)
@@ -1302,31 +1418,93 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
                     guard let self, let targetTab else { return }
                     targetTab.clearSnapshot()
                     self.scheduleSnapshot(for: targetTab)
+                    self.syncBackgroundKeepAlive()
                 }
             )
             targetTab.presentPDFSession(session)
+            observePDFSessionActivity(for: targetTab, session: session)
+            syncBackgroundKeepAlive()
             return
         }
 
-        let item = CuriumDownload(task: download)
-        guard !downloads.contains(where: { $0.id == item.id }) else { return }
-        item.onActivityChange = { [weak self] in
-            self?.syncBackgroundKeepAlive()
+        _ = transferCoordinator.registerBlinkDownload(task: download)
+    }
+
+    private func observePDFSessionActivity(for tab: CuriumTabModel, session: CuriumTabPDFSession) {
+        withObservationTracking {
+            _ = tab.pdfSession
+            _ = session.phase
+            _ = session.isSaving
+        } onChange: { [weak self, weak tab, weak session] in
+            Task { @MainActor [weak self, weak tab, weak session] in
+                guard let self else { return }
+                self.syncBackgroundKeepAlive()
+                if let tab, let session, tab.pdfSession === session, self.isPDFSessionActive(session) {
+                    self.observePDFSessionActivity(for: tab, session: session)
+                }
+            }
         }
-        downloads.insert(item, at: 0)
-        activeDownloadBanner = item
     }
 
     func startDownload(_ item: CuriumDownload) async {
-        item.onActivityChange = { [weak self] in
-            self?.syncBackgroundKeepAlive()
+        await transferCoordinator.startDownload(item)
+    }
+
+    func pauseDownload(_ item: CuriumDownload) {
+        transferCoordinator.pauseDownload(item)
+    }
+
+    func resumeDownload(_ item: CuriumDownload) {
+        transferCoordinator.resumeDownload(item)
+    }
+
+    func retryDownload(_ item: CuriumDownload) {
+        transferCoordinator.retryDownload(item)
+    }
+
+    func cancelDownload(_ item: CuriumDownload) {
+        transferCoordinator.cancelDownload(item)
+    }
+
+    func removeTransfer(_ item: CuriumDownload) {
+        transferCoordinator.removeTransfer(item)
+    }
+
+    func canInheritActiveTabCookies(for url: URL) -> Bool {
+        let activeTabURL = activeTab?.engine?.currentURL ?? activeTab?.url
+        return CuriumTransferCoordinator.canInheritCookies(for: url, activeTabURL: activeTabURL)
+    }
+
+    @discardableResult
+    func startManualDownload(
+        url: URL,
+        suggestedFilename: String? = nil,
+        lanes: Int = CuriumTransferRecord.defaultLanes,
+        includeActiveTabCookies: Bool = false
+    ) async -> CuriumDownload? {
+        guard CuriumHLSParser.isAllowedHTTPURL(url) else {
+            errorMessage = CuriumMediaDownloadError.disallowedURLScheme(url.scheme ?? "unknown").localizedDescription
+            return nil
         }
-        syncBackgroundKeepAlive()
-        defer { syncBackgroundKeepAlive() }
-        let saved = await item.start(downloadsRoot: downloadsRootOverride)
-        if saved != nil {
-            refreshSavedDownloads()
+        let tab = activeTab
+        let tabURL = tab?.engine?.currentURL ?? tab?.url
+        let tabUA = tab?.engine?.effectiveUserAgent ?? nil
+        let item = await transferCoordinator.startManualDownload(
+            url: url,
+            suggestedFilename: suggestedFilename,
+            lanes: lanes,
+            includeActiveTabCookies: includeActiveTabCookies,
+            activeTabID: tab?.id,
+            activeTabURL: tabURL,
+            activeTabUserAgent: tabUA
+        )
+        if item != nil {
+            CuriumDiagnostics.shared.record(
+                "manual-download",
+                "start host=\(url.host ?? "-") lanes=\(CuriumTransferRecord.clampLanes(lanes))"
+            )
         }
+        return item
     }
 
     // MARK: - Media Radar, HLS Inspection & Authenticated Media Downloads
@@ -1482,69 +1660,21 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         }
 
         let context = await makeMediaRequestContext(for: targetURL, candidate: candidate, inTabID: tabID)
-        let downloadTask: any CrIOSDownloadTaskV1
-
-        switch candidate.kind {
-        case .hls:
-            let cachedInspection = cachedHLSInspections[candidate.url]
-            let prefersMP4 = hlsVariant?.audioURI != nil || cachedInspection?.isFMP4 == true
-            let ext = prefersMP4 ? "mp4" : "ts"
-            let baseStem = (candidate.suggestedFilename as NSString).deletingPathExtension
-            let labeledStem: String
-            if let res = hlsVariant?.resolutionLabel, !res.isEmpty {
-                labeledStem = "\(baseStem) (\(res))"
-            } else {
-                labeledStem = baseStem
-            }
-            let filename = CuriumDownloadStorage.sanitizedFilename(
-                "\(labeledStem).\(ext)",
-                fallback: "Video.\(ext)"
-            )
-            downloadTask = CuriumHLSMediaDownloadTask(
-                sourceTabID: tabID,
-                playlistURL: targetURL,
-                audioPlaylistURL: hlsVariant?.audioURI,
-                masterPlaylistURL: hlsVariant != nil ? candidate.url : nil,
-                suggestedFilename: filename,
-                mimeType: prefersMP4 ? "video/mp4" : "video/mp2t",
-                context: context,
-                cookieProvider: { [weak self] url in
-                    await self?.resolveCookieHeader(for: url, inTabID: tabID)
-                }
-            )
-
-        case .video, .audio:
-            downloadTask = CuriumDirectMediaDownloadTask(
-                sourceTabID: tabID,
-                url: targetURL,
-                suggestedFilename: candidate.suggestedFilename,
-                mimeType: candidate.mimeType,
-                expectedBytes: candidate.contentLength,
-                context: context,
-                cookieProvider: { [weak self] url in
-                    await self?.resolveCookieHeader(for: url, inTabID: tabID)
-                }
-            )
-
-        case .dash:
+        let cachedInspection = candidate.kind == .hls ? cachedHLSInspections[candidate.url] : nil
+        guard let item = transferCoordinator.startMediaRadarDownload(
+            candidate: candidate,
+            hlsVariant: hlsVariant,
+            inTabID: tabID,
+            context: context,
+            cachedHLSInspection: cachedInspection
+        ) else {
             return nil
         }
-
-        let item = CuriumDownload(task: downloadTask)
-        item.onActivityChange = { [weak self] in
-            self?.syncBackgroundKeepAlive()
-        }
-        downloads.insert(item, at: 0)
-        activeDownloadBanner = item
 
         CuriumDiagnostics.shared.record(
             "media-download",
             "start kind=\(candidate.kind.rawValue) host=\(targetURL.host ?? "-")"
         )
-
-        Task { @MainActor [weak self] in
-            await self?.startDownload(item)
-        }
         return item
     }
 
@@ -1599,15 +1729,27 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         }
     }
 
-    private func syncBackgroundKeepAlive() {
+    private func isPDFSessionActive(_ session: CuriumTabPDFSession) -> Bool {
+        if case .loading = session.phase {
+            return true
+        }
+        return session.isSaving
+    }
+
+    internal func syncBackgroundKeepAlive() {
         let externalMediaActive = tabs.contains { $0.hasPlayingVideo || $0.isPictureInPictureActive }
         backgroundKeepAlive.setExternalMediaPlaybackActive(externalMediaActive)
-        let activeCount = downloads.reduce(into: 0) { count, item in
-            if item.isActive && item.state != .cancelled && item.state != .completed && item.state != .failed {
+        let activeTransferKeepAliveCount = downloads.reduce(into: 0) { count, item in
+            if item.requiresBackgroundKeepAlive {
                 count += 1
             }
         }
-        backgroundKeepAlive.setActiveTaskCount(activeCount)
+        let activePDFKeepAliveCount = tabs.reduce(into: 0) { count, tab in
+            if let pdfSession = tab.pdfSession, isPDFSessionActive(pdfSession) {
+                count += 1
+            }
+        }
+        backgroundKeepAlive.setActiveTaskCount(activeTransferKeepAliveCount + activePDFKeepAliveCount)
     }
 
     private func clearMediaCaches(for tabID: String) {
@@ -1700,32 +1842,43 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             savedDownloadsGeneration += 1
             savedDownloads.removeAll { $0.id == item.id }
             let deletedCanonical = item.url.resolvingSymlinksInPath().standardizedFileURL
+            var matchedDownloadIDs: [String] = []
             for download in downloads {
                 if let saved = download.savedURL,
                    saved.resolvingSymlinksInPath().standardizedFileURL == deletedCanonical {
                     deletedDownloadIDs.insert(download.id)
+                    matchedDownloadIDs.append(download.id)
                     if activeDownloadBanner?.id == download.id {
                         activeDownloadBanner = nil
                     }
                 }
+            }
+            if !matchedDownloadIDs.isEmpty {
+                transferCoordinator.handleSavedFileDeleted(matchingDownloadIDs: matchedDownloadIDs)
             }
             for tab in tabs {
                 if tab.pdfSession?.handleSavedFileDeleted(at: item.url) == true {
                     tab.dismissPDFSession()
                 }
             }
+            syncBackgroundKeepAlive()
         } catch {
             errorMessage = "Couldn’t delete “\(item.filename)”: \(error.localizedDescription)"
         }
     }
 
     func clearFinishedDownloadTasks() {
-        downloads.removeAll { !$0.isActive && $0.state != .pending }
+        let finishedIDs = downloads.filter { $0.phase.isTerminal }.map(\.id)
+        downloads.removeAll { $0.phase.isTerminal }
+        if !finishedIDs.isEmpty {
+            transferCoordinator.pruneFinishedTransfers(ids: finishedIDs)
+        }
         let remainingIDs = Set(downloads.map(\.id))
         deletedDownloadIDs.formIntersection(remainingIDs)
         if let banner = activeDownloadBanner, !remainingIDs.contains(banner.id) {
             activeDownloadBanner = nil
         }
+        syncBackgroundKeepAlive()
     }
 
     private func recordSnapshot(for tabID: String) {

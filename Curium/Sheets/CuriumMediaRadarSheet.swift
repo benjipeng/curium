@@ -251,7 +251,11 @@ struct CuriumMediaRadarSheet: View {
                     HStack(spacing: 10) {
                         Label("Open Downloads", systemImage: "arrow.down.circle")
                         Spacer(minLength: 8)
-                        if store.pendingOrActiveDownloadCount > 0 {
+                        if store.activeTransferCount > 0 && store.aggregateActiveSpeedBytesPerSec >= 1 {
+                            Text("\(store.activeTransferCount) active · \(CuriumTransferFormatters.speed(store.aggregateActiveSpeedBytesPerSec))")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        } else if store.pendingOrActiveDownloadCount > 0 {
                             Text("\(store.pendingOrActiveDownloadCount) active")
                                 .font(.caption.monospacedDigit())
                                 .foregroundStyle(.secondary)
@@ -310,10 +314,10 @@ struct CuriumMediaRadarSheet: View {
 
             if candidate.kind == .video || candidate.kind == .audio {
                 let tracked = resolvedDownload(for: candidate.id, url: candidate.url)
-                if let tracked, tracked.isActive {
+                if let tracked, showsInlineProgress(for: tracked) {
                     inlineProgressView(for: tracked)
                         .padding(.leading, 34)
-                } else if let tracked, tracked.state == .failed, let failure = tracked.failure {
+                } else if let tracked, tracked.phase == .failed || tracked.state == .failed, let failure = tracked.failure {
                     Text(failure)
                         .font(.caption)
                         .foregroundStyle(.red)
@@ -544,9 +548,9 @@ struct CuriumMediaRadarSheet: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
-                if let tracked, tracked.isActive {
+                if let tracked, showsInlineProgress(for: tracked) {
                     inlineProgressView(for: tracked)
-                } else if let tracked, tracked.state == .failed, let failure = tracked.failure {
+                } else if let tracked, tracked.phase == .failed || tracked.state == .failed, let failure = tracked.failure {
                     Text(failure)
                         .font(.caption2)
                         .foregroundStyle(.red)
@@ -585,9 +589,9 @@ struct CuriumMediaRadarSheet: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
-                if let tracked, tracked.isActive {
+                if let tracked, showsInlineProgress(for: tracked) {
                     inlineProgressView(for: tracked)
-                } else if let tracked, tracked.state == .failed, let failure = tracked.failure {
+                } else if let tracked, tracked.phase == .failed || tracked.state == .failed, let failure = tracked.failure {
                     Text(failure)
                         .font(.caption2)
                         .foregroundStyle(.red)
@@ -619,18 +623,19 @@ struct CuriumMediaRadarSheet: View {
         action: @escaping () -> Void
     ) -> some View {
         if let download, isQueuedOrSaved(download) {
+            let statusPill = mediaDownloadStatusPill(for: download)
             Button {
                 onOpenDownloads()
             } label: {
                 HStack(spacing: 4) {
-                    Image(systemName: "checkmark.circle.fill")
-                    Text("View")
+                    Image(systemName: statusPill.symbol)
+                    Text(statusPill.title)
                 }
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(palette.tint)
+                .font(.caption.monospacedDigit().weight(.semibold))
+                .foregroundStyle(statusPill.foreground)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
-                .background(palette.tile, in: Capsule())
+                .background(statusPill.background, in: Capsule())
                 .fixedSize()
             }
             .buttonStyle(.plain)
@@ -678,15 +683,51 @@ struct CuriumMediaRadarSheet: View {
         }
     }
 
+    private func showsInlineProgress(for download: CuriumDownload) -> Bool {
+        download.isActive || download.phase == .paused || download.phase == .queued
+    }
+
+    private func mediaDownloadStatusPill(
+        for download: CuriumDownload
+    ) -> (title: String, symbol: String, foreground: Color, background: Color) {
+        switch download.phase {
+        case .completed:
+            return ("View", "checkmark.circle.fill", .green, Color.green.opacity(0.14))
+        case .paused:
+            return ("Paused", "pause.circle.fill", .orange, Color.orange.opacity(0.16))
+        case .remuxing:
+            return ("Muxing", "film", .green, Color.green.opacity(0.14))
+        case .saving:
+            return ("Saving", "folder.badge.plus", palette.tint, palette.tile)
+        case .probing:
+            return ("Probing", "arrow.down.circle.fill", palette.tint, palette.tile)
+        case .downloading:
+            let pct = CuriumTransferFormatters.percentage(download.fraction) ?? "Active"
+            return (pct, "arrow.down.circle.fill", palette.tint, palette.tile)
+        case .queued, .pendingConfirmation:
+            return ("Queued", "clock.fill", palette.tint, palette.tile)
+        case .failed:
+            return ("Failed", "exclamationmark.triangle.fill", .red, Color.red.opacity(0.14))
+        case .cancelled:
+            return ("Cancelled", "xmark.circle.fill", .secondary, Color(uiColor: .tertiarySystemFill))
+        }
+    }
+
     @ViewBuilder
     private func inlineProgressView(for download: CuriumDownload) -> some View {
-        if let fraction = download.fraction {
-            ProgressView(value: fraction)
-                .tint(palette.tint)
-        } else {
-            Text("Downloading…")
-                .font(.caption2)
+        VStack(alignment: .leading, spacing: 4) {
+            CuriumByteRangeHeatmapBar(
+                slices: download.slices,
+                totalBytes: download.knownTotalBytes,
+                fallbackFraction: download.fraction,
+                phase: download.phase,
+                height: 5
+            )
+            Text(CuriumTransferFormatters.mediaRadarProgressLine(for: download))
+                .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
         }
     }
 
@@ -780,7 +821,7 @@ struct CuriumMediaRadarSheet: View {
         }
         return store.downloads.first { item in
             guard item.originalURL == url,
-                  item.isActive || item.state == .pending || item.state == .completed else {
+                  item.isActive || item.phase == .paused || item.phase == .queued || item.state == .pending || item.state == .completed else {
                 return false
             }
             if let masterPlaylistURL {
@@ -791,10 +832,10 @@ struct CuriumMediaRadarSheet: View {
     }
 
     private func isQueuedOrSaved(_ download: CuriumDownload) -> Bool {
-        if download.isActive || download.state == .pending {
+        if download.isActive || download.phase == .paused || download.phase == .queued || download.state == .pending {
             return true
         }
-        if download.state == .completed {
+        if download.phase == .completed || download.state == .completed {
             if download.savedURL != nil {
                 return store.savedURL(for: download) != nil
             }

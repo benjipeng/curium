@@ -223,7 +223,9 @@ struct CuriumBrowserView: View {
                     store.dismissDownloadBanner()
                     present(.downloads)
                 })
-            case .downloads: CuriumDownloadsSheet(store: store)
+            case .downloads:
+                CuriumDownloadsSheet(store: store)
+                    .presentationSizing(.page)
             case .bookmarks:
                 CuriumLibrarySheet(
                     store: store, section: .bookmarks,
@@ -995,9 +997,10 @@ private struct CuriumStoreInstallPill: View {
     }
 }
 
-/// Floating Liquid Glass download prompt & progress bar for non-PDF downloads.
-/// Isolates 4 Hz progress polling inside `CuriumDownloadBannerProgressView` so
-/// the glass container and layout geometry never re-evaluate on byte ticks.
+/// Floating Liquid Glass download prompt & progress capsule for non-PDF downloads.
+/// Isolates high-frequency byte/speed/progress reads inside `CuriumDownloadBannerLeadingGlyph`
+/// and `CuriumDownloadBannerProgressView` so the `.glassEffect()` backdrop and capsule geometry
+/// never re-evaluate on byte ticks.
 private struct CuriumDownloadBannerCard: View {
     let store: CuriumBrowserStore
     let download: CuriumDownload
@@ -1006,68 +1009,34 @@ private struct CuriumDownloadBannerCard: View {
     let openDownloads: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: statusIcon)
-                .font(.body.weight(.semibold))
-                .foregroundStyle(palette.tint)
-                .frame(width: 24)
+        let phase = download.phase
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(download.filename)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if download.isActive {
-                    CuriumDownloadBannerProgressView(download: download, tint: palette.tint)
-                } else if let failure = download.failure {
-                    Text(failure)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                } else if download.state == .completed {
-                    Text("Saved to Downloads")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else if let size = download.formattedByteSize {
-                    Text(size)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Ready to download")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+        HStack(spacing: 11) {
+            Button(action: openDownloads) {
+                HStack(spacing: 11) {
+                    CuriumDownloadBannerLeadingGlyph(
+                        store: store,
+                        download: download,
+                        tint: palette.tint
+                    )
 
-            if download.isActive {
-                Button {
-                    download.cancel()
-                } label: {
-                    Text("Cancel")
-                        .font(.footnote.weight(.semibold))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(download.filename)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+
+                        CuriumDownloadBannerProgressView(download: download)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            } else if download.state == .pending {
-                Button {
-                    Task { await store.startDownload(download) }
-                } label: {
-                    Text("Download")
-                        .font(.footnote.weight(.semibold))
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(palette.tint)
-                .controlSize(.small)
-                .accessibilityIdentifier("curium.download.banner.start")
-            } else if download.state == .completed {
-                Button("View", action: openDownloads)
-                    .font(.footnote.weight(.semibold))
-                    .buttonStyle(.borderedProminent)
-                    .tint(palette.tint)
-                    .controlSize(.small)
-                    .accessibilityIdentifier("curium.download.banner.view")
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .accessibilityHint("Opens Downloads")
+
+            trailingActionControl(for: phase)
 
             Button {
                 store.dismissDownloadBanner()
@@ -1082,24 +1051,186 @@ private struct CuriumDownloadBannerCard: View {
             .buttonStyle(.plain)
             .accessibilityIdentifier("curium.download.banner.dismiss")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
         .frame(maxWidth: maxWidth, minHeight: CuriumSpace.tapTarget + 6)
         .glassEffect(.regular.interactive(), in: Capsule())
     }
 
-    private var statusIcon: String {
-        switch download.state {
-        case .completed: "checkmark.circle.fill"
-        case .failed: "exclamationmark.triangle.fill"
-        default: "arrow.down.circle.fill"
+    @ViewBuilder
+    private func trailingActionControl(for phase: CuriumTransferPhase) -> some View {
+        if phase == .pendingConfirmation {
+            Button {
+                Task { await store.startDownload(download) }
+            } label: {
+                Text("Save")
+                    .font(.footnote.weight(.semibold))
+            }
+            .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.capsule)
+            .tint(palette.tint)
+            .controlSize(.small)
+            .accessibilityIdentifier("curium.download.banner.start")
+        } else if phase == .completed {
+            Button("View", action: openDownloads)
+                .font(.footnote.weight(.semibold))
+                .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.capsule)
+                .tint(palette.tint)
+                .controlSize(.small)
+                .accessibilityIdentifier("curium.download.banner.view")
+        } else if download.canPause {
+            Button {
+                store.pauseDownload(download)
+            } label: {
+                Label("Pause Download", systemImage: "pause.fill")
+                    .labelStyle(.iconOnly)
+                    .font(.caption.weight(.semibold))
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.capsule)
+            .tint(palette.tint)
+            .controlSize(.small)
+            .accessibilityIdentifier("curium.download.banner.pause")
+        } else if download.canResume {
+            Button {
+                store.resumeDownload(download)
+            } label: {
+                Label("Resume Download", systemImage: "play.fill")
+                    .labelStyle(.iconOnly)
+                    .font(.caption.weight(.semibold))
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.capsule)
+            .tint(palette.tint)
+            .controlSize(.small)
+            .accessibilityIdentifier("curium.download.banner.resume")
+        } else if download.canRetry {
+            Button {
+                store.retryDownload(download)
+            } label: {
+                Label("Retry Download", systemImage: "arrow.clockwise")
+                    .labelStyle(.iconOnly)
+                    .font(.caption.weight(.semibold))
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.capsule)
+            .tint(palette.tint)
+            .controlSize(.small)
+            .accessibilityIdentifier("curium.download.banner.retry")
         }
     }
 }
 
-private struct CuriumDownloadBannerProgressView: View {
+/// Leaf circular progress ring + SF Symbol + optional `+N` active count badge.
+private struct CuriumDownloadBannerLeadingGlyph: View {
+    let store: CuriumBrowserStore
     let download: CuriumDownload
     let tint: Color
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var ringColor: Color {
+        switch download.phase {
+        case .completed, .remuxing:
+            return .green
+        case .paused:
+            return .orange
+        case .failed:
+            return .red
+        case .cancelled:
+            return .secondary
+        case .pendingConfirmation, .queued, .probing, .downloading, .saving:
+            return tint
+        }
+    }
+
+    private var ringProgress: CGFloat {
+        if download.phase == .completed { return 1.0 }
+        if let fraction = download.fraction {
+            return CGFloat(min(1.0, max(0.0, fraction)))
+        }
+        return 0
+    }
+
+    private var centerSymbolName: String {
+        switch download.phase {
+        case .completed:
+            return "checkmark"
+        case .failed:
+            return "exclamationmark"
+        case .paused:
+            return "pause.fill"
+        case .remuxing:
+            return "film"
+        case .saving:
+            return "folder.fill"
+        case .probing:
+            return "antenna.radiowaves.left.and.right"
+        case .pendingConfirmation, .queued, .downloading, .cancelled:
+            let symbol = download.symbolName
+            return symbol == "doc" ? "arrow.down" : symbol
+        }
+    }
+
+    private var shouldPulseGlyph: Bool {
+        guard !reduceMotion else { return false }
+        switch download.phase {
+        case .probing, .remuxing, .saving:
+            return true
+        case .downloading:
+            return download.fraction == nil
+        default:
+            return false
+        }
+    }
+
+    var body: some View {
+        let extraActiveCount = max(0, store.activeTransferCount - 1)
+        let color = ringColor
+        let progress = ringProgress
+
+        ZStack {
+            Circle()
+                .stroke(.secondary.opacity(0.22), lineWidth: 2.5)
+
+            if progress > 0 {
+                Circle()
+                    .trim(from: 0, to: progress)
+                    .stroke(color, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .animation(reduceMotion ? nil : .linear(duration: 0.2), value: progress)
+            }
+
+            Image(systemName: centerSymbolName)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(color)
+                .contentTransition(.symbolEffect(.replace))
+                .symbolEffect(.breathe.pulse, isActive: shouldPulseGlyph)
+        }
+        .frame(width: 30, height: 30)
+        .overlay(alignment: .topTrailing) {
+            if extraActiveCount > 0 {
+                Text("+\(extraActiveCount)")
+                    .font(.system(size: 9, weight: .bold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1.5)
+                    .background(tint, in: Capsule())
+                    .offset(x: 6, y: -5)
+                    .accessibilityLabel("\(store.activeTransferCount) active transfers")
+            }
+        }
+        .accessibilityHidden(extraActiveCount == 0)
+    }
+}
+
+/// Leaf monospaced telemetry readout isolated from the outer Liquid Glass container.
+private struct CuriumDownloadBannerProgressView: View {
+    let download: CuriumDownload
     @Environment(\.scenePhase) private var scenePhase
 
     private struct PollKey: Equatable {
@@ -1109,23 +1240,20 @@ private struct CuriumDownloadBannerProgressView: View {
 
     var body: some View {
         let shouldPoll = scenePhase == .active && download.isActive
-        Group {
-            if let fraction = download.fraction {
-                ProgressView(value: fraction)
-                    .tint(tint)
-            } else {
-                Text("Downloading…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        let isFailed = download.phase == .failed
+
+        Text(CuriumTransferFormatters.bannerTelemetryLine(for: download))
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(isFailed ? Color.red : Color.secondary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .task(id: PollKey(downloadID: download.id, shouldPoll: shouldPoll)) {
+                guard shouldPoll else { return }
+                while !Task.isCancelled && scenePhase == .active && download.isActive {
+                    download.refresh()
+                    do { try await Task.sleep(for: .milliseconds(250)) } catch { break }
+                }
             }
-        }
-        .task(id: PollKey(downloadID: download.id, shouldPoll: shouldPoll)) {
-            guard shouldPoll else { return }
-            while !Task.isCancelled && scenePhase == .active && download.isActive {
-                download.refresh()
-                do { try await Task.sleep(for: .milliseconds(250)) } catch { break }
-            }
-        }
     }
 }
 

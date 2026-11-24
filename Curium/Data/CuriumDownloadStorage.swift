@@ -33,6 +33,7 @@ struct CuriumSavedDownload: Identifiable, Equatable, Sendable {
 enum CuriumDownloadStorage {
     static let previewCacheDirectoryName = "CuriumPDFPreview"
     static let downloadStagingDirectoryName = "CuriumDownloadStaging"
+    static let durableTransfersStagingRelativePath = "Transfers/Staging"
 
     private static let maxStemUTF8Bytes = 200
     private static let stateLock = NSLock()
@@ -367,7 +368,10 @@ enum CuriumDownloadStorage {
         func adoptRegularFile(_ fileURL: URL) {
             guard isRegularNonSymlinkFile(atPath: fileURL.path) else { return }
             let name = fileURL.lastPathComponent
-            guard !name.isEmpty, name != ".DS_Store", !name.hasPrefix(".") else { return }
+            guard !name.isEmpty,
+                  name != ".DS_Store",
+                  !name.hasPrefix("."),
+                  !isIncompleteDownloadFilename(name) else { return }
             if (try? commitStagedFile(
                 from: fileURL,
                 toDirectory: targetRoot,
@@ -589,6 +593,125 @@ enum CuriumDownloadStorage {
         }
     }
 
+    // MARK: - Durable Transfer Staging (`Application Support/Curium/Transfers/Staging/`)
+
+    /// Returns `true` for in-progress partial download artifacts (`.crdownload`, `.part`)
+    /// that must never be surfaced in Saved Files listings.
+    nonisolated static func isIncompleteDownloadFilename(_ filename: String) -> Bool {
+        let lower = filename.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return lower.hasSuffix(".crdownload") || lower.hasSuffix(".part")
+    }
+
+    /// Durable local staging root (`<PersistentSupportRoot>/Transfers/Staging/`) immune to iOS
+    /// `Caches/` purging so paused multi-lane Range and HLS transfers survive relaunches.
+    /// Marks `isExcludedFromBackup = true` strictly on the staging root (never on committed files)
+    /// and applies `completeUntilFirstUserAuthentication` so background keep-alive transfers never
+    /// fail with `EPERM` after screen lock.
+    nonisolated static func durableTransferStagingRoot() throws -> URL {
+        let supportRoot = try CuriumLibraryLocation.supportRootDirectory()
+        let transfersDir = supportRoot.appending(path: "Transfers", directoryHint: .isDirectory)
+        let root = supportRoot.appending(
+            path: durableTransfersStagingRelativePath,
+            directoryHint: .isDirectory
+        )
+        let fm = FileManager.default
+        let protection: [FileAttributeKey: Any] = [
+            .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
+        ]
+        try fm.createDirectory(at: transfersDir, withIntermediateDirectories: true, attributes: protection)
+        try? fm.setAttributes(protection, ofItemAtPath: transfersDir.path)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true, attributes: protection)
+        try? fm.setAttributes(protection, ofItemAtPath: root.path)
+        var mutableRoot = root
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? mutableRoot.setResourceValues(values)
+        return root
+    }
+
+    /// Ensures and returns the per-transfer durable staging folder `<StagingRoot>/<TransferID>/`.
+    nonisolated static func durableTransferStagingDirectory(
+        for transferID: String,
+        stagingRoot: URL? = nil
+    ) throws -> URL {
+        let root = try stagingRoot ?? durableTransferStagingRoot()
+        let fm = FileManager.default
+        let protection: [FileAttributeKey: Any] = [
+            .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
+        ]
+        if !fm.fileExists(atPath: root.path) {
+            try fm.createDirectory(at: root, withIntermediateDirectories: true, attributes: protection)
+            if stagingRoot == nil {
+                var mutableRoot = root
+                var values = URLResourceValues()
+                values.isExcludedFromBackup = true
+                try? mutableRoot.setResourceValues(values)
+            }
+        } else {
+            try? fm.setAttributes(protection, ofItemAtPath: root.path)
+        }
+        let safeDirName = sanitizedFilename(transferID, fallback: UUID().uuidString)
+        let dir = root.appending(path: safeDirName, directoryHint: .isDirectory)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: protection)
+        try? fm.setAttributes(protection, ofItemAtPath: dir.path)
+        return dir
+    }
+
+    /// Removes a per-transfer durable staging directory safely (symlink-safe, confined to `stagingRoot`).
+    nonisolated static func removeDurableTransferStagingDirectory(
+        named directoryName: String,
+        stagingRoot: URL? = nil
+    ) {
+        let safeName = sanitizedFilename(directoryName, fallback: "")
+        guard !safeName.isEmpty, safeName != ".", safeName != ".." else { return }
+        guard let root = try? (stagingRoot ?? durableTransferStagingRoot())
+            .resolvingSymlinksInPath()
+            .standardizedFileURL else {
+            return
+        }
+        let target = root.appending(path: safeName, directoryHint: .isDirectory)
+        let targetParent = target.deletingLastPathComponent()
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        guard targetParent == root,
+              !isSymbolicLink(atPath: target.path),
+              FileManager.default.fileExists(atPath: target.path) else {
+            return
+        }
+        try? FileManager.default.removeItem(at: target)
+    }
+
+    /// Sweeps orphaned transfer staging directories not tracked by any active or paused record.
+    nonisolated static func cleanupOrphanedDurableTransferStaging(
+        preservingDirectoryNames: Set<String>,
+        stagingRoot: URL? = nil,
+        minimumAgeSeconds: TimeInterval = 60
+    ) {
+        guard let root = try? stagingRoot ?? durableTransferStagingRoot() else { return }
+        let fm = FileManager.default
+        guard !isSymbolicLink(atPath: root.path),
+              let entries = try? fm.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey],
+                options: [.skipsHiddenFiles]
+              ) else {
+            return
+        }
+        let now = Date()
+        for entry in entries {
+            let name = entry.lastPathComponent
+            guard !preservingDirectoryNames.contains(name),
+                  !isSymbolicLink(atPath: entry.path) else { continue }
+            if minimumAgeSeconds > 0,
+               let values = try? entry.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey]),
+               let modified = values.contentModificationDate ?? values.creationDate,
+               now.timeIntervalSince(modified) < minimumAgeSeconds {
+                continue
+            }
+            try? fm.removeItem(at: entry)
+        }
+    }
+
     /// Allocates a collision-free flat file URL directly inside the durable Downloads folder
     /// (e.g. `paper.pdf`, `paper (2).pdf`, `paper (3).pdf`).
     nonisolated static func uniqueDownloadDestination(
@@ -790,6 +913,7 @@ enum CuriumDownloadStorage {
                   values.isRegularFile == true,
                   isRegularNonSymlinkFile(atPath: url.path) else { return }
             let name = url.lastPathComponent
+            guard !isIncompleteDownloadFilename(name) else { return }
             let size = Int64(values.fileSize ?? 0)
             let modified = values.contentModificationDate ?? values.creationDate ?? .distantPast
             results.append(
