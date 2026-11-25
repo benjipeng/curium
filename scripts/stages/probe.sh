@@ -338,6 +338,17 @@ PY
 probe_apple_objects() {
   init_linux
   prepare_linux compile
+  if [ "${INCREMENTAL_MODE:-false}" = "true" ]; then
+    [ -n "${EXPECTED_GRAPH_SHA:-}" ] || fail "INCREMENTAL_MODE=true requires EXPECTED_GRAPH_SHA"
+    [ -n "${EXPECTED_CODEGEN_SHA:-}" ] || fail "INCREMENTAL_MODE=true requires EXPECTED_CODEGEN_SHA"
+    [ -n "${EXPECTED_OBJECTS_SHA:-}" ] || fail "INCREMENTAL_MODE=true requires EXPECTED_OBJECTS_SHA"
+    "$SCRIPTS/graph_index.py" verify \
+      --out-dir "$LOUT" \
+      --ninja "$NINJA" \
+      --expected-graph-sha "$EXPECTED_GRAPH_SHA" \
+      --expected-codegen-sha "$EXPECTED_CODEGEN_SHA" \
+      --expected-objects-sha "$EXPECTED_OBJECTS_SHA"
+  fi
   ccache_env
   export PATH="$LWORK/depot_tools:$PATH" DEPOT_TOOLS_UPDATE=0
   export APPLE_TOOL_MODE=replay APPLE_TOOL_CACHE_DIR="$RUNNER_TEMP/apple_tool_cache"
@@ -365,4 +376,30 @@ PY
   ccache -s || true
   [ "$rc" -ne 124 ] || fail "Apple-dependent object gate exceeded its build budget"
   [ "$rc" -eq 0 ] || fail "Apple-dependent object gate failed (see FAILED blocks above)"
+}
+
+probe_index_check() {
+  check_done "${INDEX_REF:?}"
+}
+
+probe_index_backfill() {
+  init_linux
+  if ! command -v rg >/dev/null 2>&1; then
+    sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+  fi
+  prepare_linux compile
+  mkdir -p "$STATE/index_out"
+  "$SCRIPTS/graph_index.py" build \
+    --out-dir "$LOUT" \
+    --ninja "$NINJA" \
+    --src-dir "$LWORK/src" \
+    --k-codegen "${K_CODEGEN:?}" \
+    --src-ref "${SRC_REF:?}" \
+    --stub-ref "${STUB_REF:?}" \
+    --shard-count "${SHARD_COUNT:?}" \
+    --apple-cache-dir "$RUNNER_TEMP/apple_tool_cache" \
+    --require-rg \
+    --output "$STATE/index_out/graph_index.json"
+  rm -rf "$LWORK" || echo "::warning::Work tree not fully removed; continuing"
+  oci push "${INDEX_REF:?}" "$STATE/index_out" graph_index.json --repo "$GITHUB_REPOSITORY" --once
 }

@@ -9,15 +9,61 @@ link_init() { init_linux; }
 # edges, and proves the remaining plan compiles nothing.
 link_prepare() {
   prepare_linux link
+  if [ "${INCREMENTAL_MODE:-false}" = "true" ]; then
+    [ -n "${SHARD_KEYS_JSON:-}" ] || fail "INCREMENTAL_MODE=true requires SHARD_KEYS_JSON"
+    [ -n "${STAGE_CACHE:-}" ] || fail "INCREMENTAL_MODE=true requires STAGE_CACHE"
+    [ -n "${EXPECTED_GRAPH_SHA:-}" ] || fail "INCREMENTAL_MODE=true requires EXPECTED_GRAPH_SHA"
+    [ -n "${EXPECTED_CODEGEN_SHA:-}" ] || fail "INCREMENTAL_MODE=true requires EXPECTED_CODEGEN_SHA"
+    [ -n "${EXPECTED_OBJECTS_SHA:-}" ] || fail "INCREMENTAL_MODE=true requires EXPECTED_OBJECTS_SHA"
+  fi
+  if [ -n "${EXPECTED_GRAPH_SHA:-}" ]; then
+    "$SCRIPTS/graph_index.py" verify \
+      --out-dir "$LOUT" \
+      --ninja "$NINJA" \
+      --expected-graph-sha "$EXPECTED_GRAPH_SHA" \
+      --expected-codegen-sha "${EXPECTED_CODEGEN_SHA:?}" \
+      --expected-objects-sha "${EXPECTED_OBJECTS_SHA:?}"
+  fi
   # Today's plan for every partition, from this job's own graph.
   plan_shard "$SHARD_COUNT" 0 --split-dir "$STATE/plan" >/dev/null
+  local -a shard_keys=()
+  if [ -n "${SHARD_KEYS_JSON:-}" ]; then
+    [ -n "${STAGE_CACHE:-}" ] || fail "SHARD_KEYS_JSON requires STAGE_CACHE"
+    local parsed_keys key
+    parsed_keys="$(python3 - "$SHARD_KEYS_JSON" "$SHARD_COUNT" <<'PY'
+import json, re, sys
+raw, count = sys.argv[1], int(sys.argv[2])
+try:
+    keys = json.loads(raw)
+except json.JSONDecodeError as exc:
+    sys.exit(f"Invalid SHARD_KEYS_JSON: {exc}")
+if not isinstance(keys, list) or len(keys) != count:
+    sys.exit(f"SHARD_KEYS_JSON length {len(keys) if isinstance(keys, list) else type(keys).__name__} != {count}")
+for idx, k in enumerate(keys):
+    if not isinstance(k, str) or not re.fullmatch(r"[0-9a-f]{20}", k):
+        sys.exit(f"Invalid shard key at index {idx}: {k!r}")
+    print(k)
+PY
+)" || fail "Invalid SHARD_KEYS_JSON"
+    while IFS= read -r key; do
+      [ -n "$key" ] && shard_keys+=("$key")
+    done <<< "$parsed_keys"
+    [ "${#shard_keys[@]}" -eq "$SHARD_COUNT" ] || fail "Expected $SHARD_COUNT shard keys, got ${#shard_keys[@]}"
+  fi
   : > "$STATE/imported.txt"
-  local i
+  local i ref identity
   for (( i = 0; i < SHARD_COUNT; i++ )); do
-    pull_pinned "${COMPILE_PREFIX:?}-$i" "$STATE/shard"
+    if [ "${#shard_keys[@]}" -gt 0 ]; then
+      ref="${STAGE_CACHE}:compile-${shard_keys[$i]}-$i"
+      identity="$(printf '{"key":"compile-%s","shard":%s,"shards":%s}' "${shard_keys[$i]}" "$i" "${SHARD_COUNT:?}")"
+    else
+      ref="${COMPILE_PREFIX:?}-$i"
+      identity="$(shard_identity "$i")"
+    fi
+    pull_pinned "$ref" "$STATE/shard"
     tar -C "$LOUT" -xf "$STATE/shard/objects.tar"
     "$SCRIPTS/shard_artifact.py" verify --out-dir "$LOUT" --targets "$STATE/plan/shard-$i.txt" \
-      --manifest "$STATE/shard/manifest.json" --identity "$(shard_identity "$i")"
+      --manifest "$STATE/shard/manifest.json" --identity "$identity"
     cat "$STATE/plan/shard-$i.txt" >> "$STATE/imported.txt"
     rm -rf "$STATE/shard"
   done

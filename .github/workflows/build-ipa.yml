@@ -1,5 +1,5 @@
 name: Build Chromium Blink iOS IPA
-run-name: ${{ inputs.verify_only && 'Verify Swift objects' || 'IPA' }} · ${{ github.ref_name }} · build ${{ github.run_number }}
+run-name: ${{ inputs.backfill_index_only && 'Backfill graph index' || inputs.verify_only && 'Verify Swift objects' || 'IPA' }} · ${{ github.ref_name }} · build ${{ github.run_number }}
 
 # Orchestration only: every stage runs scripts/stage.sh, and its checkpoint key
 # comes from scripts/plan_pipeline.py (inputs by content, never this YAML).
@@ -8,11 +8,14 @@ run-name: ${{ inputs.verify_only && 'Verify Swift objects' || 'IPA' }} · ${{ gi
 #     -> 3 Compile x 18 (Linux, parallel) -> 4 Link (Linux) -> 5 Package (Mac)
 #
 # Finished stages and shards are reused across runs; a new run only does the
-# work whose checkpoint is missing. To rebuild a stage on purpose, bump its
-# epoch in ci/epochs.json.
+# work whose checkpoint is missing. Pure implementation-only patch edits can
+# also reuse an anchor commit's codegen, apple, and untouched compile shards
+# via its published graph index. To rebuild a stage on purpose, bump its epoch
+# in ci/epochs.json.
 #
-# Only a stage's build and checkpoint steps decide its outcome; ccache uploads
-# and summaries are best-effort and never block the stages after it.
+# Only a stage's build and checkpoint steps decide its outcome; ccache uploads,
+# graph-index publication, and summaries are best-effort and never block the
+# stages after it.
 
 on:
   workflow_dispatch:
@@ -36,6 +39,18 @@ on:
         default: ""
       verify_only:
         description: "Stop after Stage 2 + Swift-dependent object gate (skip compile shards, link, and package)"
+        type: boolean
+        default: false
+      incremental:
+        description: "Reuse anchor codegen, apple, and untouched compile shards for pure implementation patch edits"
+        type: boolean
+        default: true
+      baseline_commit:
+        description: "Optional anchor commit SHA/ref for incremental planning (empty = auto-discover in git history)"
+        type: string
+        default: ""
+      backfill_index_only:
+        description: "Publish missing graph index for HEAD's existing codegen/apple checkpoints without compiling or linking"
         type: boolean
         default: false
 
@@ -89,6 +104,9 @@ jobs:
       chromium_version: ${{ steps.plan.outputs.chromium_version }}
       src_ref: ${{ steps.plan.outputs.src_ref }}
       stub_ref: ${{ steps.plan.outputs.stub_ref }}
+      stage_cache: ${{ steps.plan.outputs.stage_cache }}
+      k_codegen: ${{ steps.plan.outputs.k_codegen }}
+      index_ref: ${{ steps.plan.outputs.index_ref }}
       codegen_ref: ${{ steps.plan.outputs.codegen_ref }}
       apple_ref: ${{ steps.plan.outputs.apple_ref }}
       compile_prefix: ${{ steps.plan.outputs.compile_prefix }}
@@ -96,17 +114,33 @@ jobs:
       ccache_repo: ${{ steps.plan.outputs.ccache_repo }}
       shard_count: ${{ steps.plan.outputs.shard_count }}
       shards_json: ${{ steps.plan.outputs.shards_json }}
+      shard_keys_json: ${{ steps.plan.outputs.shard_keys_json }}
+      compile_matrix_json: ${{ steps.plan.outputs.compile_matrix_json }}
+      incremental_mode: ${{ steps.plan.outputs.incremental_mode }}
+      anchor_commit: ${{ steps.plan.outputs.anchor_commit }}
+      expected_graph_sha: ${{ steps.plan.outputs.expected_graph_sha }}
+      expected_codegen_sha: ${{ steps.plan.outputs.expected_codegen_sha }}
+      expected_objects_sha: ${{ steps.plan.outputs.expected_objects_sha }}
       run_codegen: ${{ steps.plan.outputs.run_codegen }}
+      run_index_backfill: ${{ steps.plan.outputs.run_index_backfill }}
       run_apple: ${{ steps.plan.outputs.run_apple }}
+      run_verify_apple_objects: ${{ steps.plan.outputs.run_verify_apple_objects }}
       run_compile: ${{ steps.plan.outputs.run_compile }}
       run_link: ${{ steps.plan.outputs.run_link }}
       run_package: ${{ steps.plan.outputs.run_package }}
+      k_package: ${{ steps.plan.outputs.k_package }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - id: plan
         env:
           WITH_APP_GROUPS: ${{ inputs.with_app_groups }}
           ONLY_SHARDS: ${{ inputs.shards }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
+          INCREMENTAL: ${{ inputs.incremental }}
+          BASELINE_COMMIT: ${{ inputs.baseline_commit }}
+          BACKFILL_INDEX_ONLY: ${{ inputs.backfill_index_only }}
         run: ./scripts/stage.sh plan run
 
   codegen:
@@ -122,6 +156,9 @@ jobs:
       SRC_REF: ${{ needs.plan.outputs.src_ref }}
       STUB_REF: ${{ needs.plan.outputs.stub_ref }}
       CODEGEN_REF: ${{ needs.plan.outputs.codegen_ref }}
+      K_CODEGEN: ${{ needs.plan.outputs.k_codegen }}
+      INDEX_REF: ${{ needs.plan.outputs.index_ref }}
+      SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
       CCACHE_REPO: ${{ needs.plan.outputs.ccache_repo }}
       CHROMIUM_REV: ${{ needs.plan.outputs.chromium_rev }}
     steps:
@@ -140,9 +177,34 @@ jobs:
         name: Build host tools, Rust & generated files
         if: steps.check.outputs.done != 'true'
         run: ./scripts/stage.sh codegen build
-      - name: Persist checkpoint
+      - id: build_index
+        name: Build graph index
+        if: steps.build.outcome == 'success'
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+          fi
+          mkdir -p "$RUNNER_TEMP/stage/index_out"
+          ./scripts/graph_index.py build \
+            --out-dir /tmp/cb_work/src/out/Release \
+            --ninja /tmp/cb_work/src/third_party/ninja/ninja \
+            --src-dir /tmp/cb_work/src \
+            --k-codegen "$K_CODEGEN" \
+            --src-ref "$SRC_REF" \
+            --stub-ref "$STUB_REF" \
+            --shard-count "$SHARD_COUNT" \
+            --require-rg \
+            --output "$RUNNER_TEMP/stage/index_out/graph_index.json"
+      - id: persist
+        name: Persist checkpoint
         if: steps.build.outcome == 'success'
         run: ./scripts/stage.sh codegen persist
+      - name: Publish graph index
+        if: steps.persist.outcome == 'success' && steps.build_index.outcome == 'success'
+        continue-on-error: true
+        run: ./scripts/oci_artifacts.sh push "$INDEX_REF" "$RUNNER_TEMP/stage/index_out" graph_index.json --repo "$GITHUB_REPOSITORY" --once
       - name: Persist ccache bucket
         continue-on-error: true
         if: always() && steps.check.outputs.done == 'false'
@@ -154,6 +216,31 @@ jobs:
           ./scripts/write_job_summary.py --title "1 Codegen (Linux)"
           --checkpoint "$CODEGEN_REF" --key "${CODEGEN_REF##*:}" --outcome "${{ steps.build.outcome }}"
           --start-epoch "${JOB_START:-0}" --ccache-dir "$RUNNER_TEMP/ccache" --ninja-log "$RUNNER_TEMP/stage/ninja.log"
+
+  index_backfill:
+    name: 1.5 Backfill graph index (Linux)
+    needs: plan
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_index_backfill == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      JOB_TIMEOUT_MIN: 45
+      PERSIST_RESERVE_MIN: 5
+      CI_ARTIFACT_KEY: ${{ secrets.CI_ARTIFACT_KEY }}
+      SRC_REF: ${{ needs.plan.outputs.src_ref }}
+      STUB_REF: ${{ needs.plan.outputs.stub_ref }}
+      CODEGEN_REF: ${{ needs.plan.outputs.codegen_ref }}
+      APPLE_REF: ${{ needs.plan.outputs.apple_ref }}
+      K_CODEGEN: ${{ needs.plan.outputs.k_codegen }}
+      INDEX_REF: ${{ needs.plan.outputs.index_ref }}
+      SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: check
+        run: ./scripts/stage.sh probe index-check
+      - name: Build and publish graph index from existing checkpoints
+        if: steps.check.outputs.done != 'true'
+        run: ./scripts/stage.sh probe index-backfill
 
   apple:
     name: 2 Apple tools (Mac)
@@ -194,7 +281,7 @@ jobs:
   verify_apple_objects:
     name: 2.5 Verify Swift-dependent objects (Linux)
     needs: [plan, codegen, apple]
-    if: ${{ !failure() && !cancelled() && (needs.plan.outputs.run_compile == 'true' || inputs.verify_only == true) }}
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.run_verify_apple_objects == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -205,13 +292,18 @@ jobs:
       STUB_REF: ${{ needs.plan.outputs.stub_ref }}
       CODEGEN_REF: ${{ needs.plan.outputs.codegen_ref }}
       APPLE_REF: ${{ needs.plan.outputs.apple_ref }}
+      SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
+      INCREMENTAL_MODE: ${{ needs.plan.outputs.incremental_mode }}
+      EXPECTED_GRAPH_SHA: ${{ needs.plan.outputs.expected_graph_sha }}
+      EXPECTED_CODEGEN_SHA: ${{ needs.plan.outputs.expected_codegen_sha }}
+      EXPECTED_OBJECTS_SHA: ${{ needs.plan.outputs.expected_objects_sha }}
     steps:
       - uses: actions/checkout@v5
       - name: Compile Swift-dependent ObjC++ gate objects
         run: ./scripts/stage.sh probe apple-objects
 
   compile:
-    name: 3 Compile shard ${{ matrix.shard }} (Linux)
+    name: 3 Compile shard ${{ matrix.target.shard }} (Linux)
     needs: [plan, codegen, apple, verify_apple_objects]
     if: ${{ !failure() && !cancelled() && !inputs.verify_only && needs.plan.outputs.run_compile == 'true' }}
     runs-on: ubuntu-24.04
@@ -220,7 +312,7 @@ jobs:
       fail-fast: false
       max-parallel: 18
       matrix:
-        shard: ${{ fromJSON(needs.plan.outputs.shards_json) }}
+        target: ${{ fromJSON(needs.plan.outputs.compile_matrix_json) }}
     env:
       JOB_TIMEOUT_MIN: 185
       PERSIST_RESERVE_MIN: 20
@@ -229,11 +321,15 @@ jobs:
       STUB_REF: ${{ needs.plan.outputs.stub_ref }}
       CODEGEN_REF: ${{ needs.plan.outputs.codegen_ref }}
       APPLE_REF: ${{ needs.plan.outputs.apple_ref }}
-      COMPILE_PREFIX: ${{ needs.plan.outputs.compile_prefix }}
+      COMPILE_PREFIX: ${{ needs.plan.outputs.stage_cache }}:compile-${{ matrix.target.key }}
       CCACHE_REPO: ${{ needs.plan.outputs.ccache_repo }}
       CHROMIUM_REV: ${{ needs.plan.outputs.chromium_rev }}
       SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
-      SHARD_INDEX: ${{ matrix.shard }}
+      SHARD_INDEX: ${{ matrix.target.shard }}
+      INCREMENTAL_MODE: ${{ needs.plan.outputs.incremental_mode }}
+      EXPECTED_GRAPH_SHA: ${{ needs.plan.outputs.expected_graph_sha }}
+      EXPECTED_CODEGEN_SHA: ${{ needs.plan.outputs.expected_codegen_sha }}
+      EXPECTED_OBJECTS_SHA: ${{ needs.plan.outputs.expected_objects_sha }}
       INJECT_FAILURE: ${{ inputs.inject_failure }}
     steps:
       - uses: actions/checkout@v5
@@ -244,6 +340,28 @@ jobs:
       - name: Prepare tree & plan shard
         if: steps.check.outputs.done != 'true'
         run: ./scripts/stage.sh compile prepare
+      - name: Verify incremental graph invariance & shard cleanliness
+        if: steps.check.outputs.done != 'true' && needs.plan.outputs.incremental_mode == 'true'
+        run: |
+          set -euo pipefail
+          [ -n "${EXPECTED_GRAPH_SHA:-}" ] || { echo "::error::Missing EXPECTED_GRAPH_SHA in incremental mode"; exit 1; }
+          [ -n "${EXPECTED_CODEGEN_SHA:-}" ] || { echo "::error::Missing EXPECTED_CODEGEN_SHA in incremental mode"; exit 1; }
+          [ -n "${EXPECTED_OBJECTS_SHA:-}" ] || { echo "::error::Missing EXPECTED_OBJECTS_SHA in incremental mode"; exit 1; }
+          ./scripts/graph_index.py verify \
+            --out-dir /tmp/cb_work/src/out/Release \
+            --ninja /tmp/cb_work/src/third_party/ninja/ninja \
+            --expected-graph-sha "$EXPECTED_GRAPH_SHA" \
+            --expected-codegen-sha "$EXPECTED_CODEGEN_SHA" \
+            --expected-objects-sha "$EXPECTED_OBJECTS_SHA"
+          python3 scripts/check_remote_patches.py --patched-source /tmp/cb_work/src
+          dirty="$(awk '$2 ~ /^(CC|CXX|OBJC|OBJCXX|ASM|CXX_MODULE|RUST)/ || ($3 ~ /^clang_/ && $2 != "STAMP")' "$RUNNER_TEMP/stage/shard_plan.txt" \
+            | grep -vE ' (CC|CXX|OBJC|OBJCXX|ASM) target$' || true)"
+          if [ -n "$dirty" ]; then
+            echo "::error::Incremental shard $SHARD_INDEX would redo host, Rust, or codegen work"
+            printf '%s\n' "$dirty"
+            cat "$RUNNER_TEMP/stage/shard_plan.txt"
+            exit 1
+          fi
       - id: build
         name: Compile shard objects
         if: steps.check.outputs.done != 'true'
@@ -259,15 +377,15 @@ jobs:
         continue-on-error: true
         if: always() && steps.check.outputs.done == 'false'
         run: >-
-          ./scripts/write_job_summary.py --title "3 Compile shard ${{ matrix.shard }}"
-          --checkpoint "$COMPILE_PREFIX-${{ matrix.shard }}" --key "${COMPILE_PREFIX##*:}-${{ matrix.shard }}"
+          ./scripts/write_job_summary.py --title "3 Compile shard ${{ matrix.target.shard }}"
+          --checkpoint "$COMPILE_PREFIX-${{ matrix.target.shard }}" --key "${COMPILE_PREFIX##*:}-${{ matrix.target.shard }}"
           --outcome "${{ steps.build.outcome }}" --start-epoch "${JOB_START:-0}"
           --ccache-dir "$RUNNER_TEMP/ccache" --ninja-log "$RUNNER_TEMP/stage/ninja.log"
 
   link:
     name: 4 Link (Linux)
-    needs: [plan, codegen, apple, compile]
-    if: ${{ !failure() && !cancelled() && !inputs.verify_only && needs.plan.outputs.run_link == 'true' }}
+    needs: [plan, codegen, apple, verify_apple_objects, compile]
+    if: ${{ !failure() && !cancelled() && !inputs.verify_only && needs.plan.outputs.run_link == 'true' && (needs.plan.outputs.run_compile != 'true' || needs.compile.result == 'success') && (needs.plan.outputs.run_verify_apple_objects != 'true' || needs.verify_apple_objects.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -278,9 +396,15 @@ jobs:
       STUB_REF: ${{ needs.plan.outputs.stub_ref }}
       CODEGEN_REF: ${{ needs.plan.outputs.codegen_ref }}
       APPLE_REF: ${{ needs.plan.outputs.apple_ref }}
+      STAGE_CACHE: ${{ needs.plan.outputs.stage_cache }}
       COMPILE_PREFIX: ${{ needs.plan.outputs.compile_prefix }}
+      SHARD_KEYS_JSON: ${{ needs.plan.outputs.shard_keys_json }}
       LINK_REF: ${{ needs.plan.outputs.link_ref }}
       SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
+      INCREMENTAL_MODE: ${{ needs.plan.outputs.incremental_mode }}
+      EXPECTED_GRAPH_SHA: ${{ needs.plan.outputs.expected_graph_sha }}
+      EXPECTED_CODEGEN_SHA: ${{ needs.plan.outputs.expected_codegen_sha }}
+      EXPECTED_OBJECTS_SHA: ${{ needs.plan.outputs.expected_objects_sha }}
       INJECT_FAILURE: ${{ inputs.inject_failure }}
     steps:
       - uses: actions/checkout@v5
@@ -318,7 +442,7 @@ jobs:
   package:
     name: 5 Package IPA (Mac)
     needs: [plan, link]
-    if: ${{ !failure() && !cancelled() && !inputs.verify_only && needs.plan.outputs.run_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && !inputs.verify_only && needs.plan.outputs.run_package == 'true' && (needs.plan.outputs.run_link != 'true' || needs.link.result == 'success') }}
     runs-on: xcode-27
     timeout-minutes: 45
     env:
