@@ -1395,15 +1395,8 @@ private struct CuriumDownloadBannerLeadingGlyph: View {
 /// Leaf monospaced telemetry readout isolated from the outer Liquid Glass container.
 private struct CuriumDownloadBannerProgressView: View {
     let download: CuriumDownload
-    @Environment(\.scenePhase) private var scenePhase
-
-    private struct PollKey: Equatable {
-        let downloadID: String
-        let shouldPoll: Bool
-    }
 
     var body: some View {
-        let shouldPoll = scenePhase == .active && download.isActive
         let isFailed = download.phase == .failed
 
         Text(CuriumTransferFormatters.bannerTelemetryLine(for: download))
@@ -1411,13 +1404,6 @@ private struct CuriumDownloadBannerProgressView: View {
             .foregroundStyle(isFailed ? Color.red : Color.secondary)
             .lineLimit(1)
             .truncationMode(.tail)
-            .task(id: PollKey(downloadID: download.id, shouldPoll: shouldPoll)) {
-                guard shouldPoll else { return }
-                while !Task.isCancelled && scenePhase == .active && download.isActive {
-                    download.refresh()
-                    do { try await Task.sleep(for: .milliseconds(250)) } catch { break }
-                }
-            }
     }
 }
 

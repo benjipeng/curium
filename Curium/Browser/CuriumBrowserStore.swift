@@ -463,16 +463,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     private static let maxRetainedSnapshots = 12
     private static let maxLiveTabs = 24
     private static let minTabAdmissionHeadroomBytes: UInt64 = 192 * 1024 * 1024
-    private static let repeatVisitInterval: Duration = .seconds(2)
     private static let idleSnapshotDelay: Duration = .milliseconds(1500)
     private static let sessionSaveDebounceDelay: Duration = .milliseconds(400)
-
-    private struct ObservedVisit {
-        let url: URL
-        var title: String
-        var recordedAt: ContinuousClock.Instant
-        var isRepeatLoad = false
-    }
 
     private struct CommittedHistory {
         let url: URL
@@ -496,7 +488,6 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
     )
 
     private var host: (any CrIOSBrowserHostV1)?
-    private var reportsNavigationCommits: Bool
     private(set) var activeProfileID: String
     private(set) var extensions: CuriumExtensionStore
     private(set) var library: CuriumLibrary
@@ -530,7 +521,6 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     @ObservationIgnored private var tabsByID: [String: CuriumTabModel] = [:]
     @ObservationIgnored private var tabLastActivatedAt: [String: ContinuousClock.Instant] = [:]
-    @ObservationIgnored private var historyByTabID: [String: ObservedVisit] = [:]
     @ObservationIgnored private var committedHistoryByTabID: [String: CommittedHistory] = [:]
     @ObservationIgnored private var snapshotLRU: [String] = []
     @ObservationIgnored private var lastExtensionTabID: Int32 = -1
@@ -657,11 +647,6 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
                 .appending(path: "curium-test-staging-\(UUID().uuidString)", directoryHint: .isDirectory)
             : nil
         self.ephemeralTestStagingRoot = ephemeralStaging
-        // The optional delegate method is ours, so probing it cannot tell us
-        // whether Blink sends it. Patch 0097 adds this forwarder to the host.
-        reportsNavigationCommits = host?.responds(to: NSSelectorFromString(
-            "tabHost:didCommitNavigationToURL:navigationID:isSameDocument:isReload:"
-        )) == true
         extensions = CuriumExtensionStore(manager: host == nil ? nil : (extensionManager ?? CuriumSharedExtensionManager()))
         super.init()
         backgroundKeepAlive = CuriumBackgroundKeepAlive(isMediaPlayingProvider: { [weak self] in
@@ -1091,7 +1076,6 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         cachedDOMScanByTabID.removeAll()
         cachedHLSInspections.removeAll()
         lastMediaNavigationURLByTabID.removeAll()
-        historyByTabID.removeAll()
         committedHistoryByTabID.removeAll()
         for tab in tabs {
             mediaPermissions.invalidate(tabID: tab.id)
@@ -1144,9 +1128,6 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         initialLaunchProxy = targetProfile.proxy
         pdfPreviewCacheRootOverride = try? CuriumDownloadStorage.pdfPreviewCacheRoot(profileID: targetProfile.id)
         library = CuriumLibrary(profileID: targetProfile.id, fingerprintStore: fingerprintStore)
-        reportsNavigationCommits = newHost.responds(to: NSSelectorFromString(
-            "tabHost:didCommitNavigationToURL:navigationID:isSameDocument:isReload:"
-        ))
         extensions = CuriumExtensionStore(manager: result.extensionManager ?? CuriumSharedExtensionManager())
         host = newHost
         newHost.delegate = self
@@ -1553,7 +1534,6 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             clearMediaCaches(for: tabID)
             scheduleSessionSave()
         }
-        guard reportsNavigationCommits else { return }
         let previous = committedHistoryByTabID[tabID]
         var history = CommittedHistory(url: url, visitURL: nil, title: "")
         // A fragment-only commit still belongs to the last recorded visit.
@@ -1584,13 +1564,8 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
 
     private func refresh(_ tab: CuriumTabModel, from engine: any CrIOSTabHostingV1) {
         let revision = tab.snapshotRevision
-        let wasLoading = tab.isLoading
         if let update = tab.refresh(from: engine) {
-            if reportsNavigationCommits {
-                updateCommittedTitle(for: tab, rawTitle: update.title, titleChanged: update.titleChanged)
-            } else {
-                noteHistory(for: tab, rawTitle: update.title, titleChanged: update.titleChanged, wasLoading: wasLoading)
-            }
+            updateCommittedTitle(for: tab, rawTitle: update.title, titleChanged: update.titleChanged)
         }
         if tab.snapshotRevision != revision {
             scheduleSnapshot(for: tab)
@@ -1605,37 +1580,6 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
         history.title = title
         committedHistoryByTabID[tab.id] = history
         library.updateTitle(title, for: visitURL)
-    }
-
-    private func noteHistory(for tab: CuriumTabModel, rawTitle: String, titleChanged: Bool, wasLoading: Bool) {
-        // Older engines expose only the visible URL, which can be provisional.
-        guard let url = tab.url, Self.isHistoryURL(url) else {
-            historyByTabID.removeValue(forKey: tab.id)
-            return
-        }
-        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hasPageTitle = !tab.isLoading || titleChanged
-        let now = ContinuousClock.now
-        guard var visit = historyByTabID[tab.id], visit.url == url else {
-            // A pending URL may still be paired with the previous page's title.
-            let initialTitle = hasPageTitle ? title : ""
-            historyByTabID[tab.id] = ObservedVisit(url: url, title: initialTitle, recordedAt: now)
-            library.recordVisit(url: url, title: initialTitle)
-            return
-        }
-        if !wasLoading && tab.isLoading {
-            // Require a new loading cycle after the first visit's coalesced updates.
-            visit.isRepeatLoad = now - visit.recordedAt > Self.repeatVisitInterval
-        } else if wasLoading && !tab.isLoading && visit.isRepeatLoad {
-            visit.isRepeatLoad = false
-            visit.recordedAt = now
-            if !title.isEmpty { visit.title = title }
-            library.recordVisit(url: url, title: title)
-        } else if hasPageTitle, !title.isEmpty, visit.title != title {
-            visit.title = title
-            library.updateTitle(title, for: url)
-        }
-        historyByTabID[tab.id] = visit
     }
 
     func browserHost(_ host: any CrIOSBrowserHostV1, didCreateDownload download: any CrIOSDownloadTaskV1) {
@@ -2255,7 +2199,6 @@ final class CuriumBrowserStore: NSObject, CrIOSBrowserHostDelegateV1 {
             clearMediaCaches(for: evictedID)
             lastMediaNavigationURLByTabID.removeValue(forKey: evictedID)
             evictedTab.invalidate()
-            historyByTabID.removeValue(forKey: evictedID)
             committedHistoryByTabID.removeValue(forKey: evictedID)
         }
 

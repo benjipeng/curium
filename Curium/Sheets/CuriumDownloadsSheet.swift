@@ -356,15 +356,6 @@ struct CuriumDownloadsSheet: View {
         .onChange(of: folderManager.revision) { _, _ in
             store.refreshSavedDownloads()
         }
-        .task(id: scenePhase == .active && hasActiveDownloads) {
-            guard scenePhase == .active, hasActiveDownloads else { return }
-            while !Task.isCancelled {
-                for item in store.downloads where item.isActive {
-                    item.refresh()
-                }
-                do { try await Task.sleep(for: .milliseconds(350)) } catch { break }
-            }
-        }
         .curiumSheetErrorAlert(store: store)
         .sheet(isPresented: $isShowingNewDownloadSheet) {
             CuriumNewDownloadSheet(store: store) { started in

@@ -4848,74 +4848,10 @@ struct CuriumMediaRadarAndDownloaderTests {
         #expect(liveScan.candidates.map(\.kind) == [.hls, .audio])
     }
 
-    @Test("CuriumMediaNetworking maps system/direct/fixed proxies, configures cookie-isolated ephemeral sessions, and attaches auth headers")
+    @Test("CuriumMediaNetworking attaches auth headers and strips file:// Referer and null Origin")
     @MainActor
-    func mediaNetworkingProxyDictionaryEphemeralSessionAndAuthHeaders() throws {
-        // 1. Proxy dictionary mapping (.system, .direct, .fixed for socks5://, http://, https://, IPv6, bypass).
-        #expect(CuriumMediaNetworking.proxyDictionary(for: .system) == nil)
-        let directDict = try #require(CuriumMediaNetworking.proxyDictionary(for: .direct))
-        #expect(directDict.isEmpty)
-
-        let socksDict = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "localhost,127.0.0.1;<local>")
-        ))
-        #expect((socksDict["SOCKSEnable"] as? Int) == 1)
-        #expect((socksDict["SOCKSProxy"] as? String) == "127.0.0.1")
-        #expect((socksDict["SOCKSPort"] as? Int) == 1080)
-        #expect((socksDict["ExceptionsList"] as? [String]) == ["localhost", "127.0.0.1"])
-        #expect((socksDict["ExcludeSimpleHostnames"] as? Int) == 1)
-
-        let httpDict = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "http://proxy.internal:8080", bypassRules: nil)
-        ))
-        #expect((httpDict["HTTPEnable"] as? Int) == 1)
-        #expect((httpDict["HTTPProxy"] as? String) == "proxy.internal")
-        #expect((httpDict["HTTPPort"] as? Int) == 8080)
-        #expect((httpDict["HTTPSEnable"] as? Int) == 1)
-        #expect((httpDict["HTTPSProxy"] as? String) == "proxy.internal")
-        #expect((httpDict["HTTPSPort"] as? Int) == 8080)
-
-        // Explicit `https://` TLS-to-proxy scheme cannot be expressed in CFNetwork connectionProxyDictionary
-        // (whose HTTPSProxy is plaintext HTTP CONNECT), so it fails closed rather than downgrading to cleartext.
-        let httpsDict = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "https://tls-proxy.internal:8443", bypassRules: nil)
-        ))
-        #expect((httpsDict["SOCKSEnable"] as? Int) == 1)
-        #expect((httpsDict["SOCKSProxy"] as? String) == "127.0.0.1")
-        #expect((httpsDict["SOCKSPort"] as? Int) == 1)
-        #expect(httpsDict["HTTPEnable"] == nil)
-        #expect(httpsDict["HTTPSEnable"] == nil)
-
-        let splitIPv6Dict = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "http=10.0.0.2:3128;https=socks5://[::1]:1085", bypassRules: nil)
-        ))
-        #expect((splitIPv6Dict["HTTPEnable"] as? Int) == 1)
-        #expect((splitIPv6Dict["HTTPProxy"] as? String) == "10.0.0.2")
-        #expect((splitIPv6Dict["HTTPPort"] as? Int) == 3128)
-        #expect((splitIPv6Dict["SOCKSEnable"] as? Int) == 1)
-        #expect((splitIPv6Dict["SOCKSProxy"] as? String) == "::1")
-        #expect((splitIPv6Dict["SOCKSPort"] as? Int) == 1085)
-
-        // Fixed proxy with unsupported-only scheme clause fails closed rather than degrading to direct [:] real IP.
-        let failClosedFixed = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "ftp=127.0.0.1:2121", bypassRules: nil)
-        ))
-        #expect((failClosedFixed["SOCKSEnable"] as? Int) == 1)
-        #expect((failClosedFixed["SOCKSProxy"] as? String) == "127.0.0.1")
-        #expect((failClosedFixed["SOCKSPort"] as? Int) == 1)
-
-        // 2. Ephemeral session enforces cookie & cache isolation on LiveContainer.
-        let session = CuriumMediaNetworking.makeEphemeralSession(
-            proxy: .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: nil)
-        )
-        defer { session.invalidateAndCancel() }
-        let cfg = session.configuration
-        #expect(cfg.httpShouldSetCookies == false)
-        #expect(cfg.httpCookieAcceptPolicy == .never)
-        #expect(cfg.urlCache == nil)
-        #expect((cfg.connectionProxyDictionary?["SOCKSProxy"] as? String) == "127.0.0.1")
-
-        // 3. makeRequest attaches Cookie, User-Agent, Referer, Origin, and Range while blocking file:// Referer & "null" Origin.
+    func mediaNetworkingRequestAuthHeadersAndStripping() throws {
+        // makeRequest attaches Cookie, User-Agent, Referer, Origin, and Range while blocking file:// Referer & "null" Origin.
         let targetURL = try #require(URL(string: "https://cdn.example/video/seg1.m4s"))
         let context = CuriumMediaRequestContext(
             cookieHeader: "  sid=abc123; theme=dark  ",
@@ -5272,66 +5208,6 @@ struct CuriumMediaRadarAndDownloaderTests {
         ))
     }
 
-    @Test("P0-1: Fixed proxy blackholes unconfigured HTTP/HTTPS slots, fails closed on https:// proxy scheme, and honors <-loopback>")
-    func fixedProxyBlackholesMissingSlotsRejectsHTTPSProxyAndHonorsNegatedLoopback() throws {
-        // Single-scheme http= must blackhole HTTPS to 127.0.0.1:1 so https:// never leaks direct.
-        let httpOnly = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "http=10.0.0.1:8080", bypassRules: nil)
-        ))
-        #expect((httpOnly["HTTPEnable"] as? Int) == 1)
-        #expect((httpOnly["HTTPProxy"] as? String) == "10.0.0.1")
-        #expect((httpOnly["HTTPPort"] as? Int) == 8080)
-        #expect((httpOnly["HTTPSEnable"] as? Int) == 1)
-        #expect((httpOnly["HTTPSProxy"] as? String) == "127.0.0.1")
-        #expect((httpOnly["HTTPSPort"] as? Int) == 1)
-
-        // Single-scheme https= must blackhole HTTP to 127.0.0.1:1 so http:// never leaks direct.
-        let httpsOnly = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "https=10.0.0.1:8443", bypassRules: nil)
-        ))
-        #expect((httpsOnly["HTTPSEnable"] as? Int) == 1)
-        #expect((httpsOnly["HTTPSProxy"] as? String) == "10.0.0.1")
-        #expect((httpsOnly["HTTPSPort"] as? Int) == 8443)
-        #expect((httpsOnly["HTTPEnable"] as? Int) == 1)
-        #expect((httpsOnly["HTTPProxy"] as? String) == "127.0.0.1")
-        #expect((httpsOnly["HTTPPort"] as? Int) == 1)
-
-        // Explicit `https://` TLS-to-proxy in a fallback list must fail closed instead of downgrading to plaintext.
-        let httpsWithFallback = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "https://tls-proxy.internal:8443,http://cleartext-fallback:8080", bypassRules: nil)
-        ))
-        #expect((httpsWithFallback["SOCKSEnable"] as? Int) == 1)
-        #expect((httpsWithFallback["SOCKSProxy"] as? String) == "127.0.0.1")
-        #expect((httpsWithFallback["SOCKSPort"] as? Int) == 1)
-        #expect(httpsWithFallback["HTTPProxy"] == nil)
-
-        // Per-scheme https=https://tls-proxy fails closed on HTTPS while keeping explicit HTTP proxy.
-        let mixedTLS = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "http=10.0.0.1:8080;https=https://tls-proxy.internal:8443", bypassRules: nil)
-        ))
-        #expect((mixedTLS["HTTPProxy"] as? String) == "10.0.0.1")
-        #expect((mixedTLS["HTTPSProxy"] as? String) == "127.0.0.1")
-        #expect((mixedTLS["HTTPSPort"] as? Int) == 1)
-
-        // Unsupported ftp=socks5:// must not bind SOCKS for HTTP/HTTPS.
-        let ftpSocks = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "ftp=socks5://10.0.0.9:1080", bypassRules: nil)
-        ))
-        #expect((ftpSocks["SOCKSProxy"] as? String) == "127.0.0.1")
-        #expect((ftpSocks["SOCKSPort"] as? Int) == 1)
-
-        // <-loopback> is stripped from ExceptionsList and removes explicit loopback bypasses.
-        let loopbackOnly = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "<-loopback>")
-        ))
-        #expect(loopbackOnly["ExceptionsList"] == nil)
-
-        let loopbackMixed = try #require(CuriumMediaNetworking.proxyDictionary(
-            for: .fixed(rules: "socks5://127.0.0.1:1080", bypassRules: "localhost,127.0.0.1,[::1],sub.localhost,<-loopback>,*.internal")
-        ))
-        #expect((loopbackMixed["ExceptionsList"] as? [String]) == ["*.internal"])
-    }
-
     @Test("P0-2: HostCookieCache scopes cookies by (scheme, host, directoryPath) and never leaks https cookies over http://")
     func hostCookieCacheEnforcesSchemeAndDirectoryPathScoping() async throws {
         let baseURL = try #require(URL(string: "https://media.example.com/private/v1/master.m3u8"))
@@ -5668,74 +5544,6 @@ struct CuriumMediaRadarAndDownloaderTests {
         #expect(retained.contains(where: { $0.url == dashManifest }))
     }
 
-    @Test("P1-7 & P1-8: Ephemeral session timeout configuration and EXT-X-BYTERANGE 206/200 validation")
-    func byteRangeValidationAndSessionTimeout() throws {
-        let directSession = CuriumMediaNetworking.makeEphemeralSession(
-            proxy: .direct,
-            timeoutIntervalForResource: 86_400
-        )
-        defer { directSession.invalidateAndCancel() }
-        #expect(directSession.configuration.timeoutIntervalForRequest == 30)
-        #expect(directSession.configuration.timeoutIntervalForResource == 86_400)
-
-        let fullPayload = Data(0..<20)
-
-        // Exact 206 Partial Content succeeds.
-        let ok206 = try CuriumMediaNetworking.validateByteRangeResponse(
-            data: Data(10..<15),
-            statusCode: 206,
-            contentRangeHeader: "bytes 10-14/20",
-            byteRange: (length: 5, offset: 10)
-        )
-        #expect(ok206 == Data(10..<15))
-
-        // Truncated 206 fails closed.
-        #expect(throws: CuriumMediaDownloadError.byteRangeMismatch(expected: 5, actual: 3)) {
-            _ = try CuriumMediaNetworking.validateByteRangeResponse(
-                data: Data(10..<13),
-                statusCode: 206,
-                contentRangeHeader: nil,
-                byteRange: (length: 5, offset: 10)
-            )
-        }
-
-        // Mismatched Content-Range start on 206 fails closed.
-        #expect(throws: CuriumMediaDownloadError.byteRangeMismatch(expected: 5, actual: 5)) {
-            _ = try CuriumMediaNetworking.validateByteRangeResponse(
-                data: Data(0..<5),
-                statusCode: 206,
-                contentRangeHeader: "bytes 0-4/20",
-                byteRange: (length: 5, offset: 10)
-            )
-        }
-
-        // Full 200 OK slices exact [offset ..< offset + length].
-        let sliced200 = try CuriumMediaNetworking.validateByteRangeResponse(
-            data: fullPayload,
-            statusCode: 200,
-            byteRange: (length: 5, offset: 10)
-        )
-        #expect(sliced200 == Data(10..<15))
-
-        // Truncated/out-of-bounds 200 OK fails closed.
-        #expect(throws: CuriumMediaDownloadError.byteRangeMismatch(expected: 5, actual: 2)) {
-            _ = try CuriumMediaNetworking.validateByteRangeResponse(
-                data: Data(0..<12),
-                statusCode: 200,
-                byteRange: (length: 5, offset: 10)
-            )
-        }
-
-        // Non-200/206 2xx status fails closed.
-        #expect(throws: CuriumMediaDownloadError.byteRangeMismatch(expected: 5, actual: 0)) {
-            _ = try CuriumMediaNetworking.validateByteRangeResponse(
-                data: Data(),
-                statusCode: 204,
-                byteRange: (length: 5, offset: 0)
-            )
-        }
-    }
-
     @Test("P2-9: Public-to-private SSRF guard blocks local/RFC1918/link-local/ULA targets while allowing loopback-to-loopback")
     @MainActor
     func publicToPrivateSSRFGuardBlocksLocalTargetsAndAllowsLoopbackToLoopback() async throws {
@@ -5944,21 +5752,21 @@ struct CuriumMediaRadarAndDownloaderTests {
         let downgradedInitialReq = CuriumMediaNetworking.makeRequest(url: httpVideo, context: ctx, includeOrigin: false)
         #expect(downgradedInitialReq.value(forHTTPHeaderField: "Referer") == nil)
 
-        // 2. Redirect https -> http strips Referer & old Cookie; cross-subdomain redirect refreshes Cookie via cookieResolver.
+        // 2. Redirect https -> http strips Referer & old Cookie; cross-subdomain redirect strips Cookie and requests refresh.
         let prevHTTPS = try #require(URL(string: "https://www.example.com/watch/video"))
         var downgradeProposed = URLRequest(url: try #require(URL(string: "http://www.example.com/watch/video")))
         downgradeProposed.setValue("https://www.example.com/watch", forHTTPHeaderField: "Referer")
         downgradeProposed.setValue("secure_sid=secret", forHTTPHeaderField: "Cookie")
 
-        let downgradeResult = await CuriumMediaNetworking.sanitizeRedirectRequest(
+        let downgradeResult = CuriumMediaNetworking.validateAndSanitizeRedirectRequest(
             downgradeProposed,
             from: prevHTTPS,
-            originatingHostIsPublic: true,
-            cookieResolver: { _ in nil }
+            originatingHostIsPublic: true
         )
-        if case .allowed(let sanitized, _) = downgradeResult {
+        if case .allowed(let sanitized, let needsRefresh) = downgradeResult {
             #expect(sanitized.value(forHTTPHeaderField: "Referer") == nil)
             #expect(sanitized.value(forHTTPHeaderField: "Cookie") == nil)
+            #expect(needsRefresh)
         } else {
             Issue.record("Expected allowed downgrade redirect with scrubbed headers, got \(downgradeResult)")
         }
@@ -5967,33 +5775,36 @@ struct CuriumMediaRadarAndDownloaderTests {
         crossSubdomainProposed.setValue("host_only_www=secret", forHTTPHeaderField: "Cookie")
         crossSubdomainProposed.setValue("https://www.example.com/watch", forHTTPHeaderField: "Referer")
 
-        let subdomainResult = await CuriumMediaNetworking.sanitizeRedirectRequest(
+        let subdomainResult = CuriumMediaNetworking.validateAndSanitizeRedirectRequest(
             crossSubdomainProposed,
             from: prevHTTPS,
-            originatingHostIsPublic: true,
-            cookieResolver: { url in
-                url.host == "cdn.example.com" ? "domain_auth=valid_for_cdn" : nil
-            }
+            originatingHostIsPublic: true
         )
-        if case .allowed(let sanitized, _) = subdomainResult {
-            #expect(sanitized.value(forHTTPHeaderField: "Cookie") == "domain_auth=valid_for_cdn")
+        if case .allowed(let sanitized, let needsRefresh) = subdomainResult {
+            #expect(sanitized.value(forHTTPHeaderField: "Cookie") == nil)
+            #expect(needsRefresh)
             #expect(sanitized.value(forHTTPHeaderField: "Referer") == "https://www.example.com/watch")
         } else {
-            Issue.record("Expected cross-subdomain redirect with refreshed cookie, got \(subdomainResult)")
+            Issue.record("Expected cross-subdomain redirect requesting cookie refresh, got \(subdomainResult)")
         }
 
-        // 3. CuriumDownload.cancel() cancels an in-flight staged-file commit after task.state == .completed.
+        // 3. CuriumTransferCoordinator cancels an in-flight staged-file commit after task.state == .completed.
         let commitDir = try makeTempDir("curium-mr-commit-cancel")
         defer { try? FileManager.default.removeItem(at: commitDir) }
         let committedDest = commitDir.appending(path: "movie.mp4", directoryHint: .notDirectory)
 
+        let host = MockBrowserHost()
+        let store = CuriumBrowserStore(host: host, downloadsRoot: commitDir)
         let mockTask = MockDownloadTask(
             originalURL: httpsVideo,
             suggestedFilename: "movie.mp4",
             mimeType: "video/mp4",
+            isExplicitDownload: true,
+            httpMethod: "POST",
             payloadToWrite: Data("video-bytes".utf8)
         )
-        let download = CuriumDownload(task: mockTask)
+        store.browserHost(host, didCreateDownload: mockTask)
+        let download = try #require(store.downloads.first { $0.id == mockTask.downloadID })
         let gate = StagedCommitTestGate()
         download.stagedCommitHandlerOverride = { stagedURL, _ in
             await gate.markEnteredAndWaitForRelease()
@@ -6003,18 +5814,17 @@ struct CuriumMediaRadarAndDownloaderTests {
         }
 
         let startTask = Task { @MainActor in
-            await download.start()
+            await store.startDownload(download)
         }
         await gate.waitUntilEntered()
         #expect(mockTask.state == .completed)
         #expect(download.isActive)
 
-        download.cancel()
+        store.cancelDownload(download)
         #expect(download.state == .cancelled)
         await gate.release()
 
-        let savedURL = await startTask.value
-        #expect(savedURL == nil)
+        await startTask.value
         #expect(download.state == .cancelled)
         #expect(download.savedURL == nil)
         #expect(download.failure == nil)
@@ -6108,19 +5918,9 @@ struct CuriumMediaRadarAndDownloaderTests {
         #expect(!subsumedStandalone.contains(audioChildURL.absoluteString))
     }
 
-    @Test("Oracle P1: Untrusted Content-Range, BYTERANGE, MEDIA-SEQUENCE, and RESOLUTION values fail safely without integer overflow traps")
+    @Test("Oracle P1: Untrusted BYTERANGE, MEDIA-SEQUENCE, and RESOLUTION values fail safely without integer overflow traps")
     func untrustedMediaHeadersAndPlaylistsResistIntegerOverflow() throws {
-        // 1. Content-Range: bytes 0-Int.max/* fails closed without trapping in validateByteRangeResponse.
-        #expect(throws: CuriumMediaDownloadError.byteRangeMismatch(expected: 16, actual: Int.max)) {
-            _ = try CuriumMediaNetworking.validateByteRangeResponse(
-                data: Data(repeating: 0xAA, count: 16),
-                statusCode: 206,
-                contentRangeHeader: "bytes 0-9223372036854775807/*",
-                byteRange: (length: 16, offset: 0)
-            )
-        }
-
-        // 2. Explicit #EXT-X-BYTERANGE overflow throws .invalidPlaylist without trapping.
+        // 1. Explicit #EXT-X-BYTERANGE overflow throws .invalidPlaylist without trapping.
         let baseURL = try #require(URL(string: "https://cdn.example/video.m3u8"))
         let explicitOverflowPlaylist = """
         #EXTM3U

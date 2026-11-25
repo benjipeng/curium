@@ -71,18 +71,6 @@ enum CuriumMediaDownloadError: LocalizedError, Equatable, Sendable {
 
 /// Ephemeral, proxy-aware, scheme-guarded networking primitives for Media Radar & downloads.
 enum CuriumMediaNetworking {
-    private static let keyHTTPSEnable = "HTTPSEnable"
-    private static let keyHTTPSProxy = "HTTPSProxy"
-    private static let keyHTTPSPort = "HTTPSPort"
-    private static let keyHTTPEnable = "HTTPEnable"
-    private static let keyHTTPProxy = "HTTPProxy"
-    private static let keyHTTPPort = "HTTPPort"
-    private static let keySOCKSEnable = "SOCKSEnable"
-    private static let keySOCKSProxy = "SOCKSProxy"
-    private static let keySOCKSPort = "SOCKSPort"
-    private static let keyExceptionsList = "ExceptionsList"
-    private static let keyExcludeSimpleHostnames = "ExcludeSimpleHostnames"
-
     enum RedirectValidationResult: Equatable, Sendable {
         case allowed(URLRequest, needsCookieRefresh: Bool)
         case rejectedScheme(String)
@@ -191,167 +179,6 @@ enum CuriumMediaNetworking {
         }
     }
 
-    /// Maps `CuriumProxyConfig` to a `URLSessionConfiguration.connectionProxyDictionary`.
-    /// - `.system`: returns `nil` (inherits OS proxy configuration).
-    /// - `.direct`: returns `[:]` (explicitly bypasses system proxy).
-    /// - `.fixed`: parses `http://`, `socks5://` / `socks://` / `socks4://` and Chromium
-    ///   `scheme=host:port` clauses. Fails closed (`127.0.0.1:1`) on `https://` proxy schemes
-    ///   (CFNetwork `HTTPSProxy` is plaintext HTTP `CONNECT`, not TLS-to-proxy) and blackholes
-    ///   any unconfigured HTTP or HTTPS slot when `SOCKSEnable == nil` so fixed-proxy profiles
-    ///   never leak real IP. Strips/honors Chromium's `<-loopback>` directive.
-    static func proxyDictionary(for proxy: CuriumProxyConfig) -> [AnyHashable: Any]? {
-        switch proxy {
-        case .system:
-            return nil
-        case .direct:
-            return [:]
-        case .fixed(let rules, let bypassRules):
-            var dict: [AnyHashable: Any] = [:]
-            let clauses = rules.split(separator: ";", omittingEmptySubsequences: true)
-
-            for rawClause in clauses {
-                let clause = rawClause.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !clause.isEmpty else { continue }
-
-                let targetPrefix: String?
-                let uriList: String
-                if let eqIdx = clause.firstIndex(of: "=") {
-                    targetPrefix = clause[..<eqIdx]
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                        .lowercased()
-                    uriList = String(clause[clause.index(after: eqIdx)...])
-                } else {
-                    targetPrefix = nil
-                    uriList = clause
-                }
-
-                // Use the first valid proxy server in a comma-separated fallback chain,
-                // failing closed on explicit `https://` TLS-to-proxy schemes rather than
-                // downgrading them to plaintext CFNetwork HTTP `CONNECT` or a fallback entry.
-                for rawEntry in uriList.split(separator: ",", omittingEmptySubsequences: true) {
-                    let entry = rawEntry.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let loweredEntry = entry.lowercased()
-                    guard !entry.isEmpty, loweredEntry != "direct://" else { continue }
-                    if loweredEntry.hasPrefix("https://") {
-                        break
-                    }
-                    guard let parsed = parseProxyEndpoint(entry, targetPrefix: targetPrefix) else { continue }
-
-                    switch parsed.kind {
-                    case .socks:
-                        if dict[keySOCKSEnable] == nil {
-                            dict[keySOCKSEnable] = 1
-                            dict[keySOCKSProxy] = parsed.host
-                            dict[keySOCKSPort] = parsed.port
-                        }
-                    case .httpOnly:
-                        if dict[keyHTTPEnable] == nil {
-                            dict[keyHTTPEnable] = 1
-                            dict[keyHTTPProxy] = parsed.host
-                            dict[keyHTTPPort] = parsed.port
-                        }
-                    case .httpsOnly:
-                        if dict[keyHTTPSEnable] == nil {
-                            dict[keyHTTPSEnable] = 1
-                            dict[keyHTTPSProxy] = parsed.host
-                            dict[keyHTTPSPort] = parsed.port
-                        }
-                    case .httpAndHTTPS:
-                        if dict[keyHTTPEnable] == nil {
-                            dict[keyHTTPEnable] = 1
-                            dict[keyHTTPProxy] = parsed.host
-                            dict[keyHTTPPort] = parsed.port
-                        }
-                        if dict[keyHTTPSEnable] == nil {
-                            dict[keyHTTPSEnable] = 1
-                            dict[keyHTTPSProxy] = parsed.host
-                            dict[keyHTTPSPort] = parsed.port
-                        }
-                    }
-                    break
-                }
-            }
-
-            if let bypassRules {
-                let tokens = bypassRules
-                    .split { $0 == "," || $0 == ";" }
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-                var exceptions: [String] = []
-                var forceProxyLoopback = false
-                for token in tokens {
-                    let lowered = token.lowercased()
-                    if lowered == "<local>" {
-                        dict[keyExcludeSimpleHostnames] = 1
-                    } else if lowered == "<-loopback>" {
-                        forceProxyLoopback = true
-                    } else {
-                        exceptions.append(token)
-                    }
-                }
-                if forceProxyLoopback {
-                    exceptions.removeAll { token in
-                        let lowered = token.lowercased()
-                        return lowered == "localhost"
-                            || lowered.hasPrefix("localhost:")
-                            || lowered == "127.0.0.1"
-                            || lowered == "::1"
-                            || lowered == "[::1]"
-                            || lowered.hasPrefix("[::1]:")
-                            || lowered.hasPrefix("::1/")
-                            || lowered.hasPrefix("127.")
-                            || lowered.hasSuffix(".localhost")
-                    }
-                }
-                if !exceptions.isEmpty {
-                    dict[keyExceptionsList] = exceptions
-                }
-            }
-
-            if dict[keySOCKSEnable] == nil && dict[keyHTTPEnable] == nil && dict[keyHTTPSEnable] == nil {
-                // Fail closed: never degrade a fixed-proxy profile to direct (real-IP) egress.
-                dict[keySOCKSEnable] = 1
-                dict[keySOCKSProxy] = "127.0.0.1"
-                dict[keySOCKSPort] = 1
-            } else if dict[keySOCKSEnable] == nil {
-                // Without a SOCKS catch-all, blackhole any unconfigured HTTP or HTTPS slot
-                // so single-scheme rules never egress the uncovered scheme over the real IP.
-                if dict[keyHTTPEnable] == nil {
-                    dict[keyHTTPEnable] = 1
-                    dict[keyHTTPProxy] = "127.0.0.1"
-                    dict[keyHTTPPort] = 1
-                }
-                if dict[keyHTTPSEnable] == nil {
-                    dict[keyHTTPSEnable] = 1
-                    dict[keyHTTPSProxy] = "127.0.0.1"
-                    dict[keyHTTPSPort] = 1
-                }
-            }
-
-            return dict
-        }
-    }
-
-    static func makeEphemeralSession(
-        proxy: CuriumProxyConfig,
-        delegate: (any URLSessionDelegate)? = nil,
-        timeoutIntervalForResource: TimeInterval = 60 * 60
-    ) -> URLSession {
-        let config = URLSessionConfiguration.ephemeral
-        config.httpShouldSetCookies = false
-        config.httpCookieAcceptPolicy = .never
-        config.httpCookieStorage = nil
-        config.urlCache = nil
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.waitsForConnectivity = false
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = timeoutIntervalForResource
-        if let proxyDict = proxyDictionary(for: proxy) {
-            config.connectionProxyDictionary = proxyDict
-        }
-        return URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
-    }
-
     static func makeRequest(
         url: URL,
         context: CuriumMediaRequestContext,
@@ -450,161 +277,7 @@ enum CuriumMediaNetworking {
         return try CuriumHLSParser.parseMasterOrMedia(text: text, baseURL: finalURL)
     }
 
-    /// Validates an HTTP response body for an `EXT-X-BYTERANGE` request:
-    /// - `206 Partial Content`: requires exact length match (and matching `Content-Range` if present).
-    /// - `200 OK`: slices `[start ..< start + length]` and fails closed if truncated or out-of-bounds.
-    static func validateByteRangeResponse(
-        data: Data,
-        statusCode: Int,
-        contentRangeHeader: String? = nil,
-        byteRange: (length: Int, offset: Int?)
-    ) throws -> Data {
-        let expectedLength = byteRange.length
-        guard expectedLength > 0 else {
-            throw CuriumMediaDownloadError.byteRangeMismatch(expected: expectedLength, actual: data.count)
-        }
-        let start = max(0, byteRange.offset ?? 0)
-        let (endExclusive, overflow) = start.addingReportingOverflow(expectedLength)
-        guard !overflow else {
-            throw CuriumMediaDownloadError.byteRangeMismatch(expected: expectedLength, actual: data.count)
-        }
-
-        if statusCode == 206 {
-            if let contentRangeHeader,
-               let parsed = parseContentRangeHeader(contentRangeHeader) {
-                let (advertisedLength, lenOverflow) = (parsed.end - parsed.start).addingReportingOverflow(1)
-                guard !lenOverflow, parsed.start == start, advertisedLength == expectedLength else {
-                    throw CuriumMediaDownloadError.byteRangeMismatch(
-                        expected: expectedLength,
-                        actual: lenOverflow ? Int.max : max(0, advertisedLength)
-                    )
-                }
-            }
-            guard data.count == expectedLength else {
-                throw CuriumMediaDownloadError.byteRangeMismatch(expected: expectedLength, actual: data.count)
-            }
-            return data
-        }
-
-        if statusCode == 200 {
-            guard endExclusive <= data.count else {
-                throw CuriumMediaDownloadError.byteRangeMismatch(
-                    expected: expectedLength,
-                    actual: max(0, data.count - start)
-                )
-            }
-            return Data(data[start..<endExclusive])
-        }
-
-        throw CuriumMediaDownloadError.byteRangeMismatch(expected: expectedLength, actual: data.count)
-    }
-
-    // MARK: - Proxy Parsing & Redirect Helpers
-
-    private enum ProxyEndpointKind {
-        case socks
-        case httpOnly
-        case httpsOnly
-        case httpAndHTTPS
-    }
-
-    private struct ParsedProxyEndpoint {
-        let kind: ProxyEndpointKind
-        let host: String
-        let port: Int
-    }
-
-    private static func parseProxyEndpoint(
-        _ entry: String,
-        targetPrefix: String?
-    ) -> ParsedProxyEndpoint? {
-        if let targetPrefix,
-           targetPrefix != "http" && targetPrefix != "https" && targetPrefix != "socks" {
-            return nil
-        }
-
-        let scheme: String?
-        let hostPort: Substring
-        if let sepRange = entry.range(of: "://") {
-            scheme = entry[..<sepRange.lowerBound].lowercased()
-            hostPort = entry[sepRange.upperBound...]
-        } else {
-            scheme = nil
-            hostPort = Substring(entry)
-        }
-
-        guard !hostPort.isEmpty, !hostPort.contains("/") else { return nil }
-
-        let host: String
-        let portStr: Substring?
-        if hostPort.hasPrefix("[") {
-            guard let closeIdx = hostPort.firstIndex(of: "]") else { return nil }
-            host = String(hostPort[hostPort.index(after: hostPort.startIndex)..<closeIdx])
-            let rest = hostPort[hostPort.index(after: closeIdx)...]
-            if rest.isEmpty {
-                portStr = nil
-            } else if rest.hasPrefix(":") {
-                portStr = rest.dropFirst()
-            } else {
-                return nil
-            }
-        } else if let colonIdx = hostPort.lastIndex(of: ":") {
-            host = String(hostPort[..<colonIdx])
-            portStr = hostPort[hostPort.index(after: colonIdx)...]
-            if host.contains(":") { return nil }
-        } else {
-            host = String(hostPort)
-            portStr = nil
-        }
-
-        guard !host.isEmpty else { return nil }
-
-        let kind: ProxyEndpointKind
-        let defaultPort: Int
-        if let scheme {
-            switch scheme {
-            case "socks", "socks4", "socks5":
-                kind = .socks
-                defaultPort = 1080
-            case "https":
-                // CFNetwork's `HTTPSProxy` configures a plaintext HTTP `CONNECT` proxy, not TLS-to-proxy.
-                // Fail closed rather than downgrading an explicit `https://` TLS proxy to cleartext.
-                return nil
-            case "http":
-                kind = (targetPrefix == "http") ? .httpOnly : (targetPrefix == "https" ? .httpsOnly : .httpAndHTTPS)
-                defaultPort = 80
-            default:
-                return nil
-            }
-        } else {
-            switch targetPrefix {
-            case "socks":
-                kind = .socks
-                defaultPort = 1080
-            case "http":
-                kind = .httpOnly
-                defaultPort = 80
-            case "https":
-                kind = .httpsOnly
-                defaultPort = 443
-            case nil:
-                kind = .httpAndHTTPS
-                defaultPort = 80
-            default:
-                return nil
-            }
-        }
-
-        let resolvedPort: Int
-        if let portStr {
-            guard let parsed = Int(portStr), (1...65535).contains(parsed) else { return nil }
-            resolvedPort = parsed
-        } else {
-            resolvedPort = defaultPort
-        }
-
-        return ParsedProxyEndpoint(kind: kind, host: host, port: resolvedPort)
-    }
+    // MARK: - Origin & Redirect Helpers
 
     static func originURL(from rawOrigin: String?) -> URL? {
         guard let trimmed = rawOrigin?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -629,22 +302,6 @@ enum CuriumMediaNetworking {
 
     private static func isHTTPSDowngrade(from sourceURL: URL, to targetURL: URL) -> Bool {
         sourceURL.scheme?.lowercased() == "https" && targetURL.scheme?.lowercased() == "http"
-    }
-
-    private static func parseContentRangeHeader(_ raw: String) -> (start: Int, end: Int)? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.lowercased().hasPrefix("bytes ") else { return nil }
-        let body = trimmed.dropFirst(6).trimmingCharacters(in: .whitespaces)
-        guard let rangePart = body.split(separator: "/", maxSplits: 1).first else { return nil }
-        let bounds = rangePart.split(separator: "-", maxSplits: 1)
-        guard bounds.count == 2,
-              let start = Int(bounds[0]),
-              let end = Int(bounds[1]),
-              start >= 0,
-              end >= start else {
-            return nil
-        }
-        return (start, end)
     }
 
     static func validateAndSanitizeRedirectRequest(
@@ -685,45 +342,18 @@ enum CuriumMediaNetworking {
             return .allowed(sanitized, needsCookieRefresh: false)
         }
     }
-
-    static func sanitizeRedirectRequest(
-        _ proposed: URLRequest,
-        from previousURL: URL?,
-        originatingHostIsPublic: Bool,
-        cookieResolver: (@Sendable (URL) async -> String?)? = nil
-    ) async -> RedirectValidationResult {
-        let initial = validateAndSanitizeRedirectRequest(
-            proposed,
-            from: previousURL,
-            originatingHostIsPublic: originatingHostIsPublic
-        )
-        guard case .allowed(var sanitized, let needsCookieRefresh) = initial else {
-            return initial
-        }
-        if needsCookieRefresh, let cookieResolver, let targetURL = sanitized.url {
-            if let refreshed = await cookieResolver(targetURL)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-               !refreshed.isEmpty {
-                sanitized.setValue(refreshed, forHTTPHeaderField: "Cookie")
-            }
-        }
-        return .allowed(sanitized, needsCookieRefresh: false)
-    }
 }
 
-// MARK: - Bounded Fetch Coordinator (Playlists, Keys, Segments)
+// MARK: - Bounded Playlist Fetch Coordinator
 
 private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private struct ActiveFetch {
         let originatingHostIsPublic: Bool
         let maxBytes: Int
-        let expectedByteRange: (length: Int, offset: Int?)?
         let cookieResolver: (@Sendable (URL) async -> String?)?
         var data = Data()
         var currentURL: URL
         var finalURL: URL
-        var statusCode: Int = 0
-        var contentRangeHeader: String?
         var overrideError: (any Error)?
         var continuation: CheckedContinuation<(Data, URL), any Error>?
     }
@@ -734,7 +364,6 @@ private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @
         request: URLRequest,
         session: URLSession,
         maxBytes: Int,
-        expectedByteRange: (length: Int, offset: Int?)? = nil,
         originatingHostIsPublic: Bool = false,
         cookieResolver: (@Sendable (URL) async -> String?)? = nil
     ) async throws -> (Data, URL) {
@@ -756,13 +385,10 @@ private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @
                     map[taskID] = ActiveFetch(
                         originatingHostIsPublic: originatingHostIsPublic,
                         maxBytes: maxBytes,
-                        expectedByteRange: expectedByteRange,
                         cookieResolver: cookieResolver,
                         data: Data(),
                         currentURL: url,
                         finalURL: url,
-                        statusCode: 0,
-                        contentRangeHeader: nil,
                         overrideError: nil,
                         continuation: continuation
                     )
@@ -887,45 +513,11 @@ private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @
                 entry.finalURL = responseURL
             }
 
-            entry.statusCode = http.statusCode
-            entry.contentRangeHeader = http.value(forHTTPHeaderField: "Content-Range")
-
             if http.expectedContentLength > Int64(entry.maxBytes) {
                 let err = CuriumMediaDownloadError.responseTooLarge(maxBytes: entry.maxBytes)
                 entry.overrideError = err
                 map[dataTask.taskIdentifier] = entry
                 return err
-            }
-
-            if let byteRange = entry.expectedByteRange {
-                if http.statusCode == 206 {
-                    if http.expectedContentLength >= 0 && http.expectedContentLength != Int64(byteRange.length) {
-                        let err = CuriumMediaDownloadError.byteRangeMismatch(
-                            expected: byteRange.length,
-                            actual: Int(min(Int64(Int.max), http.expectedContentLength))
-                        )
-                        entry.overrideError = err
-                        map[dataTask.taskIdentifier] = entry
-                        return err
-                    }
-                } else if http.statusCode == 200 {
-                    let start = max(0, byteRange.offset ?? 0)
-                    let (endExclusive, overflow) = start.addingReportingOverflow(byteRange.length)
-                    if overflow || (http.expectedContentLength >= 0 && http.expectedContentLength < Int64(endExclusive)) {
-                        let actualAvail = http.expectedContentLength >= 0
-                            ? max(0, Int(min(Int64(Int.max), http.expectedContentLength)) - start)
-                            : 0
-                        let err = CuriumMediaDownloadError.byteRangeMismatch(expected: byteRange.length, actual: actualAvail)
-                        entry.overrideError = err
-                        map[dataTask.taskIdentifier] = entry
-                        return err
-                    }
-                } else {
-                    let err = CuriumMediaDownloadError.byteRangeMismatch(expected: byteRange.length, actual: 0)
-                    entry.overrideError = err
-                    map[dataTask.taskIdentifier] = entry
-                    return err
-                }
             }
 
             map[dataTask.taskIdentifier] = entry
@@ -970,20 +562,6 @@ private final class BoundedFetchCoordinator: NSObject, URLSessionDataDelegate, @
             if (error as NSError).code == NSURLErrorCancelled {
                 continuation.resume(throwing: CancellationError())
             } else {
-                continuation.resume(throwing: error)
-            }
-            return
-        }
-        if let byteRange = completed.expectedByteRange {
-            do {
-                let validated = try CuriumMediaNetworking.validateByteRangeResponse(
-                    data: completed.data,
-                    statusCode: completed.statusCode,
-                    contentRangeHeader: completed.contentRangeHeader,
-                    byteRange: byteRange
-                )
-                continuation.resume(returning: (validated, completed.finalURL))
-            } catch {
                 continuation.resume(throwing: error)
             }
             return

@@ -49,7 +49,6 @@ final class CuriumDownload: Identifiable {
     /// Expected size in bytes, or `-1` when unknown (preserved for legacy compatibility).
     private(set) var totalBytes: Int64 = -1
     private(set) var receivedBytes: Int64 = 0
-    private(set) var isStarting = false
 
     @ObservationIgnored var onActivityChange: (@MainActor () -> Void)?
     @ObservationIgnored var stagedCommitHandlerOverride: (@Sendable (URL, String) async throws -> URL)?
@@ -58,11 +57,9 @@ final class CuriumDownload: Identifiable {
     @ObservationIgnored internal var isManagedByCoordinator = false
     @ObservationIgnored internal var onCancelRequested: (@MainActor () -> Void)?
     @ObservationIgnored private var storedHLSMasterPlaylistURL: URL?
-    @ObservationIgnored private var cancelRequested = false
-    @ObservationIgnored private var activeCommitTask: Task<URL, any Error>?
 
     var isActive: Bool {
-        phase.isActive || isStarting || state == .inProgress
+        phase.isActive || state == .inProgress
     }
 
     var requiresBackgroundKeepAlive: Bool {
@@ -142,8 +139,20 @@ final class CuriumDownload: Identifiable {
         self.createdAt = Date()
         let initialState = task.state
         self.state = initialState
-        self.phase = Self.phase(forLegacyState: initialState)
-        refresh()
+        let initialPhase = Self.phase(forLegacyState: initialState)
+        self.phase = initialPhase
+        let initialKnownTotal: Int64? = task.totalBytes > 0 ? task.totalBytes : nil
+        self.knownTotalBytes = initialKnownTotal
+        self.totalBytes = initialKnownTotal ?? -1
+        let initialReceived = max(0, task.receivedBytes)
+        self.receivedBytes = initialReceived
+        self.fraction = Self.computeFraction(
+            phase: initialPhase,
+            receivedBytes: initialReceived,
+            knownTotalBytes: initialKnownTotal,
+            completedSegments: 0,
+            totalSegments: nil
+        )
     }
 
     internal init(
@@ -232,227 +241,8 @@ final class CuriumDownload: Identifiable {
         return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
     }
 
-    // MARK: - Standalone Legacy Refresh / Start / Cancel
-
-    func refresh() {
-        // Coordinator-managed transfers push structured updates directly; ignore legacy polling ticks.
-        guard !isManagedByCoordinator, let task = blinkTask else { return }
-
-        let newState: CrIOSDownloadState
-        if cancelRequested {
-            newState = .cancelled
-        } else if phase == .saving {
-            newState = .inProgress
-        } else {
-            newState = task.state
-        }
-        if state != newState { state = newState }
-
-        if cancelRequested {
-            if phase != .cancelled { phase = .cancelled }
-        } else if phase != .saving {
-            let mappedPhase = Self.phase(forLegacyState: newState)
-            if phase != mappedPhase { phase = mappedPhase }
-        }
-
-        let rawTotal = task.totalBytes
-        let nextKnownTotal: Int64? = rawTotal > 0 ? rawTotal : nil
-        if knownTotalBytes != nextKnownTotal { knownTotalBytes = nextKnownTotal }
-        let nextLegacyTotal = nextKnownTotal ?? -1
-        if totalBytes != nextLegacyTotal { totalBytes = nextLegacyTotal }
-
-        let received = max(0, task.receivedBytes)
-        if receivedBytes != received { receivedBytes = received }
-
-        let newFraction = Self.computeFraction(
-            phase: phase,
-            receivedBytes: received,
-            knownTotalBytes: nextKnownTotal,
-            completedSegments: completedSegments,
-            totalSegments: totalSegments
-        )
-        if fraction != newFraction { fraction = newFraction }
-    }
-
-    @discardableResult
-    func start(downloadsRoot: URL? = nil) async -> URL? {
-        guard let task = blinkTask, state == .pending, !isStarting, !cancelRequested else {
-            return savedURL
-        }
-        isStarting = true
-        failure = nil
-        applyPhase(.downloading)
-        onActivityChange?()
-        defer {
-            activeCommitTask = nil
-            isStarting = false
-            if cancelRequested {
-                applyPhase(.cancelled)
-            } else if savedURL != nil {
-                applyPhase(.completed)
-            } else if failure != nil {
-                applyPhase(.failed)
-            } else {
-                refresh()
-            }
-            onActivityChange?()
-        }
-
-        let name = filename
-        let customCommitHandler = stagedCommitHandlerOverride
-        let useStagedCommit = customCommitHandler != nil
-            || (downloadsRoot == nil && CuriumDownloadsFolderManager.isUsingCustomDownloadsFolder)
-
-        if useStagedCommit {
-            var stagingDirectory: URL?
-            defer {
-                if let stagingDirectory {
-                    CuriumDownloadStorage.removeDownloadStagingDirectory(stagingDirectory)
-                }
-            }
-            do {
-                let staged = try await Task.detached(priority: .utility) {
-                    try CuriumDownloadStorage.makeDownloadStagingDestination(filename: name)
-                }.value
-                stagingDirectory = staged.sessionDirectory
-                if cancelRequested {
-                    applyPhase(.cancelled)
-                    return nil
-                }
-                let downloadedURL = try await task.start(withDestinationURL: staged.fileURL)
-                if cancelRequested {
-                    applyPhase(.cancelled)
-                    return nil
-                }
-                let commitName = downloadedURL.lastPathComponent.isEmpty ? name : downloadedURL.lastPathComponent
-                let sessionToClean = staged.sessionDirectory
-                saveDestinationLabel = CuriumDownloadsFolderManager.displayDownloadsPath
-                applyPhase(.saving)
-                onActivityChange?()
-
-                let commitTask = Task.detached(priority: .utility) { () throws -> URL in
-                    defer {
-                        CuriumDownloadStorage.removeDownloadStagingDirectory(sessionToClean)
-                    }
-                    try Task.checkCancellation()
-                    if let customCommitHandler {
-                        let committed = try await customCommitHandler(downloadedURL, commitName)
-                        if Task.isCancelled {
-                            try? FileManager.default.removeItem(at: committed)
-                            throw CancellationError()
-                        }
-                        return committed
-                    }
-                    let destinationDirectory = try CuriumDownloadStorage.downloadsRootDirectory()
-                    try Task.checkCancellation()
-                    let committed = try CuriumDownloadStorage.commitStagedFile(
-                        from: downloadedURL,
-                        toDirectory: destinationDirectory,
-                        preferredFilename: commitName,
-                        removeSource: true
-                    )
-                    if Task.isCancelled {
-                        try? CuriumDownloadStorage.deleteSavedDownload(at: committed, downloadsRoot: destinationDirectory)
-                        throw CancellationError()
-                    }
-                    return committed
-                }
-                activeCommitTask = commitTask
-                let committedURL = try await commitTask.value
-                stagingDirectory = nil
-                if cancelRequested {
-                    let cleanupURL = committedURL
-                    Task.detached(priority: .utility) {
-                        if customCommitHandler != nil {
-                            try? FileManager.default.removeItem(at: cleanupURL)
-                        } else if let destDir = try? CuriumDownloadStorage.downloadsRootDirectory() {
-                            try? CuriumDownloadStorage.deleteSavedDownload(at: cleanupURL, downloadsRoot: destDir)
-                        }
-                    }
-                    applyPhase(.cancelled)
-                    return nil
-                }
-                savedURL = committedURL
-                completedAt = Date()
-                if saveDestinationLabel == nil {
-                    saveDestinationLabel = Self.displayDestinationLabel(forSavedURL: committedURL)
-                }
-                let finalName = committedURL.lastPathComponent
-                if !finalName.isEmpty && finalName != filename {
-                    filename = finalName
-                }
-                applyPhase(.completed)
-                return savedURL
-            } catch is CancellationError {
-                saveDestinationLabel = nil
-                applyPhase(.cancelled)
-                return nil
-            } catch {
-                saveDestinationLabel = nil
-                if !cancelRequested && task.state != .cancelled {
-                    failure = error.localizedDescription
-                    applyPhase(.failed)
-                }
-                return nil
-            }
-        }
-
-        var reservedURL: URL?
-        defer {
-            if let reservedURL {
-                CuriumDownloadStorage.releaseDownloadReservation(at: reservedURL)
-            }
-        }
-        do {
-            let destination = try await Task.detached(priority: .utility) {
-                try CuriumDownloadStorage.uniqueDownloadDestination(filename: name, in: downloadsRoot)
-            }.value
-            reservedURL = destination
-            if cancelRequested {
-                applyPhase(.cancelled)
-                return nil
-            }
-            let resolved = try await task.start(withDestinationURL: destination)
-            if cancelRequested {
-                try? FileManager.default.removeItem(at: resolved)
-                applyPhase(.cancelled)
-                return nil
-            }
-            savedURL = resolved
-            completedAt = Date()
-            if saveDestinationLabel == nil {
-                saveDestinationLabel = Self.displayDestinationLabel(forSavedURL: resolved)
-            }
-            let finalName = resolved.lastPathComponent
-            if !finalName.isEmpty && finalName != filename {
-                filename = finalName
-            }
-            applyPhase(.completed)
-            return savedURL
-        } catch is CancellationError {
-            applyPhase(.cancelled)
-            return nil
-        } catch {
-            if !cancelRequested && task.state != .cancelled {
-                failure = error.localizedDescription
-                applyPhase(.failed)
-            }
-            return nil
-        }
-    }
-
     func cancel() {
-        if isManagedByCoordinator {
-            onCancelRequested?()
-            return
-        }
-        guard isActive || state == .pending else { return }
-        cancelRequested = true
-        activeCommitTask?.cancel()
-        blinkTask?.cancel()
-        saveDestinationLabel = nil
-        applyPhase(.cancelled)
-        onActivityChange?()
+        onCancelRequested?()
     }
 
     // MARK: - Internal Coordinator Mutation Surface

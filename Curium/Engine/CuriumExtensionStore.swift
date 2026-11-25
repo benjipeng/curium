@@ -101,9 +101,12 @@ private final class MainThreadObservationBox: @unchecked Sendable {
 @MainActor
 @Observable
 final class CuriumExtensionStore {
+    private static let retiredDesktopParityExtensionID = "igckbhkefpgcfcijbdhbkalaofkagpom"
+    private static let retiredDesktopParityDirectoryName = "curium_desktop_parity"
+
     static let hiddenBuiltInExtensionIDs: Set<String> =
         CuriumVideoPiPExtension.hiddenExtensionIDs
-            .union(CuriumDesktopParityExtension.hiddenExtensionIDs)
+            .union([retiredDesktopParityExtensionID])
 
     private static let windows = NSHashTable<CuriumExtensionStore>.weakObjects()
     private static let actionRefreshDebounce: Duration = .milliseconds(120)
@@ -132,17 +135,26 @@ final class CuriumExtensionStore {
         return counts.isEmpty ? nil : counts.reduce(0, +)
     }
 
-    static func shouldEnableDesktopParityExtension(
-        for profile: CuriumFingerprintProfile,
-        capabilities: CuriumEngineFingerprintCapabilities = CuriumFingerprintBootstrap.engineCapabilities()
-    ) -> Bool {
-        profile.defaultSlot == .desktop && !capabilities.supportsNativeDesktopParity
+    /// Disables and deletes disk files for the retired pre-Kernel-43 Desktop Parity JS
+    /// extension on upgraded containers (superseded by native C++ parity in patch `0112`).
+    static func disableRetiredDesktopParityExtension(using manager: any CrIOSExtensionManagingV1) {
+        var dirError: NSError?
+        guard let rootPath = CuriumTrustedUnpackedExtensionsDirectory(manager, &dirError),
+              !rootPath.isEmpty else {
+            return
+        }
+        if let installed = try? manager.extensions(),
+           installed.contains(where: {
+               ($0["id"] as? String) == retiredDesktopParityExtensionID && (($0["enabled"] as? Bool) ?? true)
+           }) {
+            try? manager.setExtensionWithID(retiredDesktopParityExtensionID, enabled: false)
+        }
+        let legacyDir = URL(fileURLWithPath: rootPath, isDirectory: true)
+            .appending(path: retiredDesktopParityDirectoryName, directoryHint: .isDirectory)
+        try? FileManager.default.removeItem(at: legacyDir)
     }
 
-    init(
-        manager: (any CrIOSExtensionManagingV1)?,
-        capabilitiesProvider: (() -> CuriumEngineFingerprintCapabilities)? = nil
-    ) {
+    init(manager: (any CrIOSExtensionManagingV1)?) {
         self.manager = manager
         if let manager {
             Self.windows.add(self)
@@ -150,28 +162,9 @@ final class CuriumExtensionStore {
                 self?.handleActionPresentationChange(extensionID: extensionID)
             })
             observationBox = MainThreadObservationBox(token)
-            let resolveCapabilities = capabilitiesProvider ?? {
-                CuriumFingerprintBootstrap.engineCapabilities()
-            }
             Task { @MainActor in
                 await CuriumVideoPiPExtension.ensureInstalled(using: manager)
-                let active = CuriumFingerprintBootstrap.frozenLaunchProfile
-                    ?? CuriumFingerprintStore.shared.activeProfile
-                let capabilities = resolveCapabilities()
-                let desktopParityEnabled = Self.shouldEnableDesktopParityExtension(
-                    for: active,
-                    capabilities: capabilities
-                )
-                let profileSeed = CuriumProfileFontManager.profileSeedString(for: active)
-                let menuBarHeight = CuriumMacOSManifold.inferredMenuBarHeight(for: active.desktop.screen)
-                let dockOnLeft = CuriumMacOSManifold.prefersLeftDock(forProfileSeed: profileSeed)
-                await CuriumDesktopParityExtension.ensureInstalled(
-                    using: manager,
-                    enabled: desktopParityEnabled,
-                    profileSeed: profileSeed,
-                    menuBarHeight: menuBarHeight,
-                    dockOnLeft: dockOnLeft
-                )
+                Self.disableRetiredDesktopParityExtension(using: manager)
             }
         }
     }

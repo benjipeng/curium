@@ -7,7 +7,6 @@ struct CuriumMediaRadarSheet: View {
     var onOpenDownloads: () -> Void = {}
 
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.curiumPalette) private var palette
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
@@ -115,10 +114,6 @@ struct CuriumMediaRadarSheet: View {
         snapshot.candidates.filter { $0.kind == .audio }
     }
 
-    private var hasActiveDownloads: Bool {
-        store.downloads.contains { $0.isActive }
-    }
-
     private var hasDownloadsToOpen: Bool {
         store.pendingOrActiveDownloadCount > 0 || !store.downloads.isEmpty
     }
@@ -195,15 +190,6 @@ struct CuriumMediaRadarSheet: View {
         }
         .task {
             await performScan()
-        }
-        .task(id: scenePhase == .active && hasActiveDownloads) {
-            guard scenePhase == .active, hasActiveDownloads else { return }
-            while !Task.isCancelled {
-                for item in store.downloads where item.isActive {
-                    item.refresh()
-                }
-                do { try await Task.sleep(for: .milliseconds(350)) } catch { break }
-            }
         }
         .onDisappear {
             manualScanTask?.cancel()

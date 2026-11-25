@@ -363,18 +363,7 @@ final class CuriumTransferCoordinator {
 
     /// Starts a pending Blink download (or resumes a queued/pending coordinator item), awaiting completion.
     func startDownload(_ item: CuriumDownload) async {
-        // Legacy standalone items created directly without coordinator registration.
-        if !item.isManagedByCoordinator {
-            item.onActivityChange = { [weak self] in
-                self?.host.syncBackgroundKeepAlive()
-            }
-            host.syncBackgroundKeepAlive()
-            defer { host.syncBackgroundKeepAlive() }
-            if await item.start(downloadsRoot: environment.downloadsRootOverride) != nil {
-                host.refreshSavedDownloads()
-            }
-            return
-        }
+        guard item.isManagedByCoordinator else { return }
 
         if let existingTask = runningTasksByID[item.id] {
             await existingTask.value
@@ -1412,12 +1401,7 @@ final class CuriumTransferCoordinator {
     }
 
     func cancelDownload(_ item: CuriumDownload) {
-        if !item.isManagedByCoordinator {
-            item.cancel()
-            return
-        }
-
-        guard !item.phase.isTerminal else { return }
+        guard item.isManagedByCoordinator, !item.phase.isTerminal else { return }
 
         stopIntentsByID[item.id] = .cancel
         transientCookiesByID.removeValue(forKey: item.id)
@@ -1522,14 +1506,7 @@ final class CuriumTransferCoordinator {
         let allItems = host.allDownloads()
         var tasksToAwait: [Task<Void, Never>] = []
 
-        for item in allItems {
-            guard item.isManagedByCoordinator else {
-                if item.isActive {
-                    item.cancel()
-                }
-                continue
-            }
-
+        for item in allItems where item.isManagedByCoordinator {
             switch item.phase {
             case .queued:
                 if let running = runningTasksByID[item.id] {
