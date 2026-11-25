@@ -109,7 +109,7 @@ final class CuriumDownload: Identifiable {
 
     /// Non-nil when this download originated from a specific HLS master playlist's variant row.
     var hlsMasterPlaylistURL: URL? {
-        storedHLSMasterPlaylistURL ?? (blinkTask as? CuriumHLSMediaDownloadTask)?.masterPlaylistURL
+        storedHLSMasterPlaylistURL
     }
 
     private var supportsHTTPReplay: Bool {
@@ -136,17 +136,8 @@ final class CuriumDownload: Identifiable {
         let method = (task.httpMethod ?? "GET").trimmingCharacters(in: .whitespacesAndNewlines)
         self.httpMethod = method.isEmpty ? "GET" : method.uppercased()
 
-        if let hlsTask = task as? CuriumHLSMediaDownloadTask {
-            self.source = .mediaRadarHLS
-            self.transportKind = .hlsRemuxMP4
-            self.storedHLSMasterPlaylistURL = hlsTask.masterPlaylistURL
-        } else if task is CuriumDirectMediaDownloadTask {
-            self.source = .mediaRadarDirect
-            self.transportKind = .singleStream
-        } else {
-            self.source = .blinkDownload
-            self.transportKind = .blinkNativeStream
-        }
+        self.source = .blinkDownload
+        self.transportKind = .blinkNativeStream
 
         self.createdAt = Date()
         let initialState = task.state

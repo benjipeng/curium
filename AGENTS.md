@@ -41,8 +41,5 @@ The upstream tree is far too large for this machine. Never run `fetch`, `gclient
 | Pipeline, checkpoints, repository setup | [README](README.md) |
 | App build modes and engine linking | [Curium/README](Curium/README.md) |
 | Shell–engine ABI | [EngineContract/README](EngineContract/README.md) |
-| `Curium/` UI or simulator driving | Workspace skills [`iphone-duo-liquid-glass`](../.agents/skills/iphone-duo-liquid-glass/SKILL.md) and [`axe`](../.agents/skills/axe/SKILL.md) |
-| Deploying to `ac_duo` under LiveContainer | Workspace skill [`livecontainer-guest`](../.agents/skills/livecontainer-guest/SKILL.md) |
-| Standalone Chromium IPA diagnostics | [Simulator guide](docs/simulator.md) |
-
-`docs/research/` holds dated research records, not current guidance.
+| `Curium/` UI or simulator driving | Workspace skills `../.agents/skills/iphone-duo-liquid-glass/SKILL.md` and `../.agents/skills/axe/SKILL.md` |
+| Deploying to `ac_duo` under LiveContainer | Workspace skill `../.agents/skills/livecontainer-guest/SKILL.md` |

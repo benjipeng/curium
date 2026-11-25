@@ -1,7 +1,7 @@
 name: IslandProbe
 options:
   bundleIdPrefix: com.appautomaton.probe
-  deploymentTarget: { iOS: "27.1" }
+  deploymentTarget: { iOS: "27.2" }
 targets:
   IslandProbe:
     type: application

@@ -3047,26 +3047,9 @@ struct CuriumWave2MultiProfileAndDownloadsTests {
         #expect(CuriumSessionStorage.load(forProfile: "p-a1b2c3d4", directory: profileDir) == nil)
     }
 
-    @Test("Profile switch handoff builds LiveContainer 1/2 relaunch URLs and flushes tabs, SQLite, and selection safely")
+    @Test("Profile switch handoff flushes tabs, SQLite, and selection safely")
     @MainActor
-    func profileSwitchHandoffAndLiveContainerRelaunchURLs() async throws {
-        let bundlePath = "/var/containers/Bundle/Application/12345678/com.appautomaton.curium.app"
-        let lc1URL = try #require(
-            CuriumProfileRelauncher.liveContainerRelaunchURL(bundlePath: bundlePath, scheme: "livecontainer")
-        )
-        #expect(lc1URL.absoluteString == "livecontainer://livecontainer-launch?bundle-name=com.appautomaton.curium.app")
-
-        let lc2URL = try #require(
-            CuriumProfileRelauncher.liveContainerRelaunchURL(bundlePath: bundlePath, scheme: "livecontainer2")
-        )
-        #expect(lc2URL.absoluteString == "livecontainer2://livecontainer-launch?bundle-name=com.appautomaton.curium.app")
-
-        let fallbackBundleURL = try #require(
-            CuriumProfileRelauncher.liveContainerRelaunchURL(bundlePath: "/tmp/not-a-bundle", scheme: "livecontainer")
-        )
-        #expect(fallbackBundleURL.absoluteString == "livecontainer://livecontainer-launch?bundle-name=com.appautomaton.curium.app")
-        #expect(CuriumProfileRelauncher.liveContainerRelaunchURL(bundlePath: bundlePath, scheme: "   ") == nil)
-
+    func profileSwitchHandoffFlushesStateSafely() async throws {
         let root = try makeTempDir("curium-w2-handoff")
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -4275,9 +4258,9 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
         }
     }
 
-    @Test("CuriumProfileRelauncher exposes honest close-to-switch copy and LiveContainer launch/menu URLs")
+    @Test("CuriumProfileRelauncher exposes honest close-to-switch copy and invokes flush handler")
     @MainActor
-    func relauncherCopyAndLiveContainerURLs() throws {
+    func relauncherCopyAndFlushHandler() throws {
         #expect(CuriumProfileRelauncher.primaryRelaunchButtonTitle == "Save & Close to Switch")
         #expect(CuriumProfileRelauncher.shortActionButtonTitle == "Close & Switch")
         #expect(CuriumProfileRelauncher.recoveryCloseButtonTitle == "Close Curium")
@@ -4291,21 +4274,6 @@ struct CuriumPhaseAFingerprintAndSwitchTests {
         #expect(handoffCopy.contains("save open tabs and library data"))
         #expect(handoffCopy.contains("close cleanly"))
         #expect(handoffCopy.contains("isolated Blink process"))
-
-        let relaunchLC1 = try #require(
-            CuriumProfileRelauncher.liveContainerRelaunchURL(
-                bundlePath: "/var/containers/Bundle/Application/1234/com.appautomaton.curium.app",
-                scheme: "livecontainer"
-            )
-        )
-        #expect(relaunchLC1.absoluteString == "livecontainer://livecontainer-launch?bundle-name=com.appautomaton.curium.app")
-
-        let menuLC1 = try #require(CuriumProfileRelauncher.liveContainerMenuURL(scheme: "livecontainer"))
-        #expect(menuLC1.absoluteString == "livecontainer://livecontainer-launch?bundle-name=ui")
-
-        let menuLC2 = try #require(CuriumProfileRelauncher.liveContainerMenuURL(scheme: "livecontainer2"))
-        #expect(menuLC2.absoluteString == "livecontainer2://livecontainer-launch?bundle-name=ui")
-        #expect(CuriumProfileRelauncher.liveContainerMenuURL(scheme: "   ") == nil)
 
         var customHandlerCalled = false
         CuriumProfileRelauncher.relaunchAfterFlush {
@@ -4985,39 +4953,6 @@ struct CuriumMediaRadarAndDownloaderTests {
         #expect(scrubbedReq.value(forHTTPHeaderField: "Referer") == nil)
         #expect(scrubbedReq.value(forHTTPHeaderField: "Origin") == nil)
         #expect(scrubbedReq.value(forHTTPHeaderField: "Range") == "bytes=0-255")
-
-        // 4. Direct & HLS tasks deterministically reject non-http(s) URLs before touching the network.
-        let tempDir = try makeTempDir("curium-mr-scheme")
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-        let destFile = tempDir.appending(path: "out.mp4", directoryHint: .notDirectory)
-
-        let directTask = CuriumDirectMediaDownloadTask(
-            url: URL(fileURLWithPath: "/etc/passwd"),
-            suggestedFilename: "passwd.mp4",
-            context: context
-        )
-        var directError: (any Error)?
-        directTask.start(withDestinationURL: destFile) { saved, err in
-            #expect(saved == nil)
-            directError = err
-        }
-        #expect(directTask.state == .failed)
-        #expect((directError as? CuriumMediaDownloadError) == .disallowedURLScheme("file"))
-        #expect(!FileManager.default.fileExists(atPath: destFile.path))
-
-        let hlsTask = CuriumHLSMediaDownloadTask(
-            playlistURL: URL(fileURLWithPath: "/etc/passwd"),
-            suggestedFilename: "passwd.ts",
-            context: context
-        )
-        var hlsError: (any Error)?
-        hlsTask.start(withDestinationURL: destFile) { saved, err in
-            #expect(saved == nil)
-            hlsError = err
-        }
-        #expect(hlsTask.state == .failed)
-        #expect((hlsError as? CuriumMediaDownloadError) == .disallowedURLScheme("file"))
-        #expect(!FileManager.default.fileExists(atPath: destFile.path))
     }
 
     @Test("CuriumDownloadStorage classifies PDF/video/audio symbols and CuriumBackgroundKeepAlive gates strictly on background && activeTaskCount > 0")
@@ -5525,8 +5460,8 @@ struct CuriumMediaRadarAndDownloaderTests {
         #expect(context.proxy == launchProxy)
     }
 
-    @Test("P1-3: Separate-audio HLS preserves URI-less DEFAULT=YES muxed audio, detects packed audio extensions, and surfaces mux failures")
-    func hlsSeparateAudioMuxedDefaultPackedExtensionsAndFailureSurfacing() async throws {
+    @Test("P1-3: Separate-audio HLS preserves URI-less DEFAULT=YES muxed audio")
+    func hlsSeparateAudioMuxedDefault() async throws {
         let baseURL = try #require(URL(string: "https://cdn.video.example/master.m3u8"))
 
         // 1. Secondary commentary URI appearing BEFORE muxed DEFAULT=YES (no URI) must NOT overwrite primary muxed track.
@@ -5554,52 +5489,6 @@ struct CuriumMediaRadarAndDownloaderTests {
         let inspection2 = try CuriumHLSParser.parseMasterOrMedia(text: defaultFirstMaster, baseURL: baseURL)
         #expect(inspection2.variants[0].audioURI == nil)
         #expect(inspection2.referencedPlaylistURLs.contains(try #require(URL(string: "https://cdn.video.example/es.m3u8"))))
-
-        // 3. Packed audio extension detection (fMP4 -> .m4a, packed ADTS/AC-3/EC-3/MP3 -> native ext, TS -> .ts).
-        for (segName, expectedExt) in [
-            ("seg0.m4s", "m4a"),
-            ("seg0.aac", "aac"),
-            ("seg0.adts", "aac"),
-            ("seg0.ac3", "ac3"),
-            ("seg0.ec3", "ec3"),
-            ("seg0.mp3", "mp3"),
-            ("seg0.ts", "ts"),
-        ] {
-            let playlistText = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\n\(segName)\n#EXT-X-ENDLIST"
-            let media = try CuriumHLSParser.parseMediaPlaylist(text: playlistText, baseURL: baseURL)
-            #expect(CuriumHLSMediaDownloadTask.preferredAudioTrackExtension(for: media) == expectedExt)
-        }
-
-        // 4. muxFMP4Tracks surfaces audioMuxFailed cleanly on invalid media and rethrows CancellationError when cancelled.
-        let dir = try makeTempDir("curium-mr-mux")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let badVideo = dir.appending(path: "bad.mp4", directoryHint: .notDirectory)
-        let badAudio = dir.appending(path: "bad.m4a", directoryHint: .notDirectory)
-        let outMux = dir.appending(path: "out.mp4", directoryHint: .notDirectory)
-        try Data("not-an-mp4".utf8).write(to: badVideo)
-        try Data("not-an-m4a".utf8).write(to: badAudio)
-
-        do {
-            try await CuriumHLSMediaDownloadTask.muxFMP4Tracks(videoURL: badVideo, audioURL: badAudio, outputURL: outMux)
-            Issue.record("Expected muxFMP4Tracks to throw audioMuxFailed on unreadable inputs")
-        } catch let error as CuriumMediaDownloadError {
-            if case .audioMuxFailed = error {
-                // Expected clean failure surfaced instead of silently saving mute video.
-            } else {
-                Issue.record("Expected .audioMuxFailed, got \(error)")
-            }
-        }
-
-        let cancelledTask = Task {
-            withUnsafeCurrentTask { $0?.cancel() }
-            try await CuriumHLSMediaDownloadTask.muxFMP4Tracks(videoURL: badVideo, audioURL: badAudio, outputURL: outMux)
-        }
-        do {
-            try await cancelledTask.value
-            Issue.record("Expected CancellationError when cancelled before muxing")
-        } catch is CancellationError {
-            // Expected.
-        }
     }
 
     @Test("P1-4: CuriumBackgroundKeepAlive preserves WebRTC/PiP audio sessions, skips deactivation while playing, and respects .shouldResume")
@@ -5779,14 +5668,11 @@ struct CuriumMediaRadarAndDownloaderTests {
         #expect(retained.contains(where: { $0.url == dashManifest }))
     }
 
-    @Test("P1-7 & P1-8: 64 MiB segment cap, 86400s direct download timeout, and EXT-X-BYTERANGE 206/200 validation")
-    func byteRangeValidationSegmentCapAndDirectDownloadTimeout() throws {
-        #expect(CuriumHLSMediaDownloadTask.maxSegmentBytes == 64 * 1024 * 1024)
-        #expect(CuriumDirectMediaDownloadTask.resourceTimeoutInterval == 86_400)
-
+    @Test("P1-7 & P1-8: Ephemeral session timeout configuration and EXT-X-BYTERANGE 206/200 validation")
+    func byteRangeValidationAndSessionTimeout() throws {
         let directSession = CuriumMediaNetworking.makeEphemeralSession(
             proxy: .direct,
-            timeoutIntervalForResource: CuriumDirectMediaDownloadTask.resourceTimeoutInterval
+            timeoutIntervalForResource: 86_400
         )
         defer { directSession.invalidateAndCancel() }
         #expect(directSession.configuration.timeoutIntervalForRequest == 30)
@@ -6175,13 +6061,14 @@ struct CuriumMediaRadarAndDownloaderTests {
 
         // Master-variant download (across sheet reopen -> empty localDownloadsByTargetKey): variant STAYS subsumed!
         let masterVariantDownload = CuriumDownload(
-            task: CuriumHLSMediaDownloadTask(
-                playlistURL: variantURL,
-                audioPlaylistURL: audioChildURL,
-                masterPlaylistURL: masterURL,
-                suggestedFilename: "Clip (720p).mp4",
-                context: ctx
-            )
+            record: CuriumTransferRecord(
+                source: .mediaRadarHLS,
+                transportKind: .hlsRemuxMP4,
+                phase: .downloading,
+                sourceURL: variantURL,
+                filename: "Clip (720p).mp4"
+            ),
+            hlsMasterPlaylistURL: masterURL
         )
         let subsumedMasterVariant = CuriumMediaRadarSheet.computeSubsumedChildHLSIDs(
             loadedMasters: loadedMasters,
@@ -6193,22 +6080,24 @@ struct CuriumMediaRadarAndDownloaderTests {
 
         // Standalone direct child download (masterPlaylistURL == nil) across sheet reopen: NOT subsumed!
         let standaloneVariantDownload = CuriumDownload(
-            task: CuriumHLSMediaDownloadTask(
-                playlistURL: variantURL,
-                audioPlaylistURL: nil,
-                masterPlaylistURL: nil,
-                suggestedFilename: "prog_index.ts",
-                context: ctx
-            )
+            record: CuriumTransferRecord(
+                source: .mediaRadarHLS,
+                transportKind: .hlsRemuxMP4,
+                phase: .downloading,
+                sourceURL: variantURL,
+                filename: "prog_index.ts"
+            ),
+            hlsMasterPlaylistURL: nil
         )
         let standaloneAudioDownload = CuriumDownload(
-            task: CuriumHLSMediaDownloadTask(
-                playlistURL: audioChildURL,
-                audioPlaylistURL: nil,
-                masterPlaylistURL: nil,
-                suggestedFilename: "audio.m4a",
-                context: ctx
-            )
+            record: CuriumTransferRecord(
+                source: .mediaRadarHLS,
+                transportKind: .hlsRemuxMP4,
+                phase: .downloading,
+                sourceURL: audioChildURL,
+                filename: "audio.m4a"
+            ),
+            hlsMasterPlaylistURL: nil
         )
         let subsumedStandalone = CuriumMediaRadarSheet.computeSubsumedChildHLSIDs(
             loadedMasters: loadedMasters,
