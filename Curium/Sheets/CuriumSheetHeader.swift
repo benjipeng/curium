@@ -248,6 +248,10 @@ struct CuriumSettingsSheet: View {
                 }
 
                 Section("Runtime & Diagnostics") {
+                    LabeledContent("Curium App", value: CuriumDiagnostics.appVersionLabel())
+                    if let kernel = CuriumDiagnostics.KernelMetadata.bundled {
+                        LabeledContent("Curium Kernel", value: kernel.shortLabel)
+                    }
                     LabeledContent("Engine", value: engineReady ? "Blink · Single-Process" : "Blink · Standby")
                     LabeledContent("V8 Runtime", value: activeV8RuntimeLabel)
                     LabeledContent("Available Memory", value: availableMemoryText)
@@ -365,6 +369,15 @@ private struct CuriumDiagnosticsSheet: View {
                 }
 
                 Section("Runtime") {
+                    LabeledContent("Curium App", value: CuriumDiagnostics.appVersionLabel())
+                    if let kernel = CuriumDiagnostics.KernelMetadata.bundled {
+                        LabeledContent("Curium Kernel") {
+                            Text(kernel.detailedLabel)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
                     LabeledContent("Environment", value: environmentLabel)
                     LabeledContent("V8 Runtime", value: engineReady ? CuriumDiagnostics.jitModeLabel(CuriumActiveV8JitMode()) : "Standby")
                     LabeledContent("Available Memory", value: availableMemoryText)

@@ -107,6 +107,7 @@ select_xcode
 MARKETING_VERSION="$(read_xcconfig_var MARKETING_VERSION)"
 BUILD_NUMBER="$(read_xcconfig_var CURRENT_PROJECT_VERSION)"
 BUNDLE_ID="$(read_xcconfig_var PRODUCT_BUNDLE_IDENTIFIER)"
+KERNEL_BUILD="$(read_lock_var KERNEL_BUILD)"
 KERNEL_CHROMIUM_VERSION="$(read_lock_var KERNEL_CHROMIUM_VERSION)"
 KERNEL_COMMIT="$(read_lock_var KERNEL_COMMIT)"
 KERNEL_RUN_ID="$(read_lock_var KERNEL_RUN_ID)"
@@ -114,9 +115,10 @@ KERNEL_IPA_SHA256="$(read_lock_var KERNEL_IPA_SHA256)"
 
 [ -n "$MARKETING_VERSION" ] || { echo "error: missing MARKETING_VERSION in Version.xcconfig" >&2; exit 1; }
 [ -n "$BUILD_NUMBER" ] || { echo "error: missing CURRENT_PROJECT_VERSION in Version.xcconfig" >&2; exit 1; }
+[ -n "$KERNEL_BUILD" ] || { echo "error: missing KERNEL_BUILD in Kernel.lock" >&2; exit 1; }
 
-echo "==> Target: Curium ${MARKETING_VERSION} (${BUILD_NUMBER}) [${BUNDLE_ID}]"
-echo "==> Pinned engine: Chromium ${KERNEL_CHROMIUM_VERSION} (commit ${KERNEL_COMMIT:0:7}, run ${KERNEL_RUN_ID})"
+echo "==> Target: Curium ${MARKETING_VERSION} (app build ${BUILD_NUMBER}) [${BUNDLE_ID}]"
+echo "==> Pinned kernel: Kernel ${KERNEL_BUILD} · Chromium ${KERNEL_CHROMIUM_VERSION} (commit ${KERNEL_COMMIT:0:7}, CI run ${KERNEL_RUN_ID})"
 
 # 1. Ensure Vendor/CuriumEngine matches Kernel.lock.
 if [ "$SKIP_SYNC" -eq 0 ]; then
@@ -191,6 +193,7 @@ fi
 for req in \
   "Frameworks/EarlyMallocZoneRegistration.framework/EarlyMallocZoneRegistration" \
   "Frameworks/chrome_framework.framework/chrome_framework" \
+  "CuriumKernelManifest.json" \
   "icudtl.dat" \
   "resources.pak"; do
   [ -f "$APP_BUNDLE/$req" ] || { echo "error: missing required bundle asset: $req" >&2; exit 1; }
@@ -250,6 +253,7 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "version=$MARKETING_VERSION"
     echo "build_number=$BUILD_NUMBER"
     echo "sdk_version=$REQUIRED_SDK"
+    echo "kernel_build=$KERNEL_BUILD"
     echo "chromium_version=$KERNEL_CHROMIUM_VERSION"
     echo "kernel_commit=$KERNEL_COMMIT"
     echo "kernel_run_id=$KERNEL_RUN_ID"

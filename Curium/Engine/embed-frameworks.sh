@@ -17,6 +17,7 @@ import sys
 
 source, bundle, manifest = map(Path, sys.argv[1:4])
 enabled = sys.argv[4] == "YES"
+vendor_manifest = source.parent / "engine-manifest.json"
 previous = set(manifest.read_text(encoding="utf-8").splitlines()) if manifest.is_file() else set()
 if enabled and not all((source / name).is_file() for name in ("icudtl.dat", "resources.pak")):
     sys.exit(f"error: Missing Curium engine resources in {source}")
@@ -37,8 +38,12 @@ files = {
     and not p.relative_to(source).as_posix().startswith("bundled_extensions/ios_probe/")
     and p.relative_to(source).as_posix() not in EXCLUDED_FILES
 } if enabled else set()
+extra_copies: dict[str, Path] = {}
+if enabled and vendor_manifest.is_file():
+    extra_copies["CuriumKernelManifest.json"] = vendor_manifest
+tracked_files = files | set(extra_copies.keys())
 
-for name in sorted(previous - files):
+for name in sorted(previous - tracked_files):
     file = bundle / name
     file.unlink(missing_ok=True)
     for parent in file.parents:
@@ -49,8 +54,8 @@ for name in sorted(previous - files):
                 break
             parent.rmdir()
 
-for name in sorted(files):
-    src = source / name
+for name in sorted(tracked_files):
+    src = extra_copies.get(name, source / name)
     dst = bundle / name
     src_st = os.stat(src)
     if dst.is_file():
@@ -61,7 +66,7 @@ for name in sorted(files):
     shutil.copy2(src, dst)
 
 if enabled:
-    content = "\n".join(sorted(files)) + "\n"
+    content = "\n".join(sorted(tracked_files)) + "\n"
     if not manifest.is_file() or manifest.read_text(encoding="utf-8") != content:
         manifest.write_text(content, encoding="utf-8")
 else:

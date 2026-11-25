@@ -7493,4 +7493,38 @@ struct CuriumBuild44ContractV4Tests {
         #expect(enriched?.wasCached == true)
         #expect(enriched?.redirectChain.count == 2)
     }
+
+    @Test("CuriumDiagnostics parses embedded CuriumKernelManifest.json and surfaces independent App and Kernel build numbers")
+    func diagnosticsParsesAndFormatsKernelMetadata() throws {
+        let json = """
+        {
+          "schema_version": 1,
+          "source": {
+            "kernel": {
+              "KERNEL_BUILD": "44",
+              "KERNEL_CHROMIUM_VERSION": "160.0.8171.0",
+              "KERNEL_COMMIT": "3139702acc94d94cd5d68d448c356039f0140aba",
+              "KERNEL_RUN_ID": "45489802926"
+            }
+          }
+        }
+        """
+        let meta = try #require(CuriumDiagnostics.KernelMetadata.parse(data: Data(json.utf8)))
+        #expect(meta.kernelBuild == "44")
+        #expect(meta.chromiumVersion == "160.0.8171.0")
+        #expect(meta.commitShort == "3139702")
+        #expect(meta.runID == "45489802926")
+        #expect(meta.shortLabel == "Kernel 44 · Chromium 160.0.8171.0")
+        #expect(meta.detailedLabel == "Kernel 44 · Chromium 160.0.8171.0 · 3139702")
+        #expect(meta.bootToken == "44 (160.0.8171.0@3139702)")
+
+        // Missing KERNEL_BUILD fails closed to nil.
+        let missingBuild = #"{"schema_version":1,"source":{"kernel":{"KERNEL_CHROMIUM_VERSION":"160.0.8171.0"}}}"#
+        #expect(CuriumDiagnostics.KernelMetadata.parse(data: Data(missingBuild.utf8)) == nil)
+
+        let diag = CuriumDiagnostics(directory: nil, observeSystemNotifications: false)
+        let report = diag.formattedReport(hooks: [], lines: [], kernelMetadata: meta)
+        #expect(report.contains("Curium App:"))
+        #expect(report.contains("Curium Kernel: Kernel 44 (Chromium 160.0.8171.0 · commit 3139702 · run 45489802926)"))
+    }
 }

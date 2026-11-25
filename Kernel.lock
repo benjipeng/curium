@@ -1,4 +1,5 @@
 # Verified Actions artifact for local Curium engine assembly.
+KERNEL_BUILD=44
 KERNEL_REPO=benjipeng/curium
 KERNEL_BRANCH=feat/build-44-engine-wave
 KERNEL_COMMIT=3139702acc94d94cd5d68d448c356039f0140aba

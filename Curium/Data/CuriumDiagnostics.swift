@@ -18,6 +18,79 @@ final class CuriumDiagnostics: @unchecked Sendable {
         var isFailed: Bool { status == "failed" }
     }
 
+    struct KernelMetadata: Equatable, Sendable {
+        let kernelBuild: String
+        let chromiumVersion: String
+        let commitShort: String
+        let runID: String
+
+        static let bundleResourceName = "CuriumKernelManifest"
+        static let bundleResourceExtension = "json"
+        static let bundled: KernelMetadata? = load(from: .main)
+
+        var shortLabel: String {
+            "Kernel \(kernelBuild) · Chromium \(chromiumVersion)"
+        }
+
+        var detailedLabel: String {
+            var parts = ["Kernel \(kernelBuild)", "Chromium \(chromiumVersion)"]
+            if !commitShort.isEmpty {
+                parts.append(commitShort)
+            }
+            return parts.joined(separator: " · ")
+        }
+
+        var bootToken: String {
+            if commitShort.isEmpty {
+                return "\(kernelBuild) (\(chromiumVersion))"
+            }
+            return "\(kernelBuild) (\(chromiumVersion)@\(commitShort))"
+        }
+
+        static func parse(data: Data) -> KernelMetadata? {
+            guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let source = root["source"] as? [String: Any],
+                  let kernel = source["kernel"] as? [String: Any]
+            else {
+                return nil
+            }
+            let build = (kernel["KERNEL_BUILD"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !build.isEmpty else { return nil }
+            let chromiumVersion = (kernel["KERNEL_CHROMIUM_VERSION"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "?"
+            let commit = (kernel["KERNEL_COMMIT"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let runID = (kernel["KERNEL_RUN_ID"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return KernelMetadata(
+                kernelBuild: build,
+                chromiumVersion: chromiumVersion.isEmpty ? "?" : chromiumVersion,
+                commitShort: String(commit.prefix(7)),
+                runID: runID
+            )
+        }
+
+        static func load(from bundle: Bundle = .main) -> KernelMetadata? {
+            guard let url = bundle.url(
+                forResource: bundleResourceName,
+                withExtension: bundleResourceExtension
+            ),
+                  let data = try? Data(contentsOf: url)
+            else {
+                return nil
+            }
+            return parse(data: data)
+        }
+    }
+
+    static func appVersionLabel(from bundle: Bundle = .main) -> String {
+        let info = bundle.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info["CFBundleVersion"] as? String ?? "?"
+        return "\(version) (\(build))"
+    }
+
     static let shared = CuriumDiagnostics()
     static let logFileName = "curium-diagnostics.log"
     static let rotatedFileName = "curium-diagnostics.prev.log"
@@ -103,9 +176,9 @@ final class CuriumDiagnostics: @unchecked Sendable {
         }
         guard shouldRecord else { return }
 
-        let info = Bundle.main.infoDictionary ?? [:]
-        let version = info["CFBundleShortVersionString"] as? String ?? "?"
-        let build = info["CFBundleVersion"] as? String ?? "?"
+        let appLabel = Self.appVersionLabel()
+        let kernel = KernelMetadata.bundled
+        let kernelSegment = kernel.map { " kernel=\($0.bootToken)" } ?? ""
         let isLiveContainer = ProcessInfo.processInfo.environment["LC_HOME_PATH"] != nil
         let envName = isLiveContainer ? "LiveContainer" : "Standalone/Sim"
         let activeProfile = CuriumFingerprintBootstrap.activeProfileID
@@ -115,7 +188,7 @@ final class CuriumDiagnostics: @unchecked Sendable {
             countStyle: .memory
         )
 
-        appendLine(category: "boot", message: "Curium \(version) (\(build)) env=\(envName) profile=\(activeProfile) v8=\(jit) avail=\(avail)")
+        appendLine(category: "boot", message: "Curium \(appLabel)\(kernelSegment) env=\(envName) profile=\(activeProfile) v8=\(jit) avail=\(avail)")
         for hook in hookStatuses() {
             let suffix = hook.detail.isEmpty ? "" : " (\(hook.detail))"
             appendLine(category: "hooks", message: "\(hook.name): \(hook.status)\(suffix)")
@@ -170,14 +243,13 @@ final class CuriumDiagnostics: @unchecked Sendable {
         lines: [String]? = nil,
         fingerprintStatus: CuriumEngineFingerprintStatus? = nil,
         fingerprintCapabilities: CuriumEngineFingerprintCapabilities? = nil,
-        nextLaunchProfile: String? = nil
+        nextLaunchProfile: String? = nil,
+        kernelMetadata: KernelMetadata? = KernelMetadata.bundled
     ) -> String {
         recordStartupIfNeeded()
         let resolvedHooks = hooks ?? hookStatuses()
         let resolvedLines = lines ?? currentLines()
-        let info = Bundle.main.infoDictionary ?? [:]
-        let version = info["CFBundleShortVersionString"] as? String ?? "?"
-        let build = info["CFBundleVersion"] as? String ?? "?"
+        let appLabel = Self.appVersionLabel()
         let envName = ProcessInfo.processInfo.environment["LC_HOME_PATH"] != nil ? "LiveContainer" : "Standalone/Sim"
         let jit = Self.jitModeLabel(CuriumActiveV8JitMode())
         let avail = ByteCountFormatter.string(
@@ -187,13 +259,27 @@ final class CuriumDiagnostics: @unchecked Sendable {
 
         let activeProfile = fingerprintStatus?.appliedProfileId ?? CuriumFingerprintBootstrap.activeProfileID
         var out: [String] = [
-            "Curium \(version) (\(build)) Diagnostics",
+            "Curium \(appLabel) Diagnostics",
+            "Curium App: \(appLabel)",
+        ]
+        if let kernelMetadata {
+            var kernelDetail = "Kernel \(kernelMetadata.kernelBuild) (Chromium \(kernelMetadata.chromiumVersion)"
+            if !kernelMetadata.commitShort.isEmpty {
+                kernelDetail += " · commit \(kernelMetadata.commitShort)"
+            }
+            if !kernelMetadata.runID.isEmpty {
+                kernelDetail += " · run \(kernelMetadata.runID)"
+            }
+            kernelDetail += ")"
+            out.append("Curium Kernel: \(kernelDetail)")
+        }
+        out.append(contentsOf: [
             "Environment: \(envName)",
             "Active Profile: \(activeProfile)",
             "V8 Runtime: \(jit)",
             "Available Memory: \(avail)",
             "Engine Hooks: \(Self.summarizeHooks(resolvedHooks).summary)",
-        ]
+        ])
         if let status = fingerprintStatus {
             out.append(
                 "Fingerprint Contract: v\(status.contractVersion) state=\(status.state) "

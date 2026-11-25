@@ -1,5 +1,5 @@
 name: Build Chromium Blink iOS IPA
-run-name: ${{ inputs.backfill_index_only && 'Backfill graph index' || inputs.verify_only && 'Verify Swift objects' || 'IPA' }} · ${{ github.ref_name }} · build ${{ github.run_number }}
+run-name: ${{ inputs.backfill_index_only && 'Backfill graph index' || inputs.verify_only && 'Verify Swift objects' || 'IPA' }} · ${{ github.ref_name }} · run #${{ github.run_number }}
 
 # Orchestration only: every stage runs scripts/stage.sh, and its checkpoint key
 # comes from scripts/plan_pipeline.py (inputs by content, never this YAML).
@@ -464,6 +464,6 @@ jobs:
         run: |
           tag="v${CHROMIUM_VERSION}-r${GITHUB_RUN_NUMBER}"
           gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" \
-            --title "Chromium Blink iOS ${CHROMIUM_VERSION} (Build #${GITHUB_RUN_NUMBER})" \
+            --title "Chromium Blink iOS ${CHROMIUM_VERSION} (CI Run #${GITHUB_RUN_NUMBER})" \
             --notes "Unsigned arm64 iOS build with Blink engine, Chromium ${{ needs.plan.outputs.chromium_rev }}."
           gh release upload "$tag" dist/*.ipa dist/*.ipa.sha256 --clobber

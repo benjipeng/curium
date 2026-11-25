@@ -51,6 +51,7 @@ def read_lock() -> dict[str, str]:
             raise ValueError(f"Invalid Kernel.lock entry: {line}")
         lock[key] = value
     for key, pattern in {
+        "KERNEL_BUILD": r"[0-9]+",
         "KERNEL_REPO": r"[\w.-]+/[\w.-]+",
         "KERNEL_RUN_ID": r"[0-9]+",
         "KERNEL_ARTIFACT_NAME": r"[\w.-]+",
@@ -324,7 +325,8 @@ def status(lock: dict[str, str]) -> int:
         print(f"Curium engine not ready: {error}", file=sys.stderr)
         return 1
     label = "ready" if verified else "ready for local testing (unverified IPA)"
-    print(f"Curium engine {label}: {len(xcframeworks)} XCFrameworks, {len(files)} resource files")
+    print(f"Curium engine {label}: Kernel {lock['KERNEL_BUILD']} (Chromium {lock.get('KERNEL_CHROMIUM_VERSION', '?')}), "
+          f"{len(xcframeworks)} XCFrameworks, {len(files)} resource files")
     print(f"IPA SHA-256: {ipa_sha}")
     return 0
 

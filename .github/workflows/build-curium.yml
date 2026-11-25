@@ -85,6 +85,7 @@ jobs:
           }
           version="$(read_var MARKETING_VERSION Version.xcconfig)"
           build_num="$(read_var CURRENT_PROJECT_VERSION Version.xcconfig)"
+          kernel_build="$(read_var KERNEL_BUILD Kernel.lock)"
           kernel_sha="$(read_var KERNEL_IPA_SHA256 Kernel.lock)"
           kernel_run="$(read_var KERNEL_RUN_ID Kernel.lock)"
           kernel_ver="$(read_var KERNEL_CHROMIUM_VERSION Kernel.lock)"
@@ -92,6 +93,7 @@ jobs:
           {
             echo "version=$version"
             echo "build_number=$build_num"
+            echo "kernel_build=$kernel_build"
             echo "kernel_ipa_sha256=$kernel_sha"
             echo "kernel_run_id=$kernel_run"
             echo "kernel_chromium_version=$kernel_ver"
@@ -144,6 +146,7 @@ jobs:
           IPA_SHA256: ${{ steps.build.outputs.ipa_sha256 }}
           IPA_SIZE: ${{ steps.build.outputs.ipa_size }}
           SDK_VERSION: ${{ steps.build.outputs.sdk_version }}
+          KERNEL_BUILD: ${{ steps.build.outputs.kernel_build }}
           CHROMIUM_VERSION: ${{ steps.build.outputs.chromium_version }}
           KERNEL_COMMIT: ${{ steps.build.outputs.kernel_commit }}
           KERNEL_RUN_ID: ${{ steps.build.outputs.kernel_run_id }}
@@ -170,11 +173,12 @@ jobs:
 
           | Field | Value |
           | --- | --- |
+          | **Curium App** | \`${CURIUM_VERSION}\` (build \`${CURIUM_BUILD}\`) |
+          | **Curium Kernel** | \`Kernel ${KERNEL_BUILD}\` · Chromium \`${CHROMIUM_VERSION}\` (commit \`${KERNEL_COMMIT:0:7}\`, CI run \`${KERNEL_RUN_ID}\`) |
           | **Artifact** | \`${IPA_NAME}\` (${IPA_SIZE}) |
           | **Curium IPA SHA-256** | \`${IPA_SHA256}\` |
           | **iOS SDK** | \`${SDK_VERSION}\` (\`arm64\`) |
-          | **Chromium Blink Engine** | \`${CHROMIUM_VERSION}\` (commit \`${KERNEL_COMMIT:0:7}\`, run \`${KERNEL_RUN_ID}\`) |
-          | **Engine IPA SHA-256** | \`${KERNEL_IPA_SHA256}\` |
+          | **Kernel IPA SHA-256** | \`${KERNEL_IPA_SHA256}\` |
           | **Source Commit** | \`${GITHUB_SHA:0:7}\` |
           EOF
           } > "$notes_file"
@@ -210,7 +214,7 @@ jobs:
           | **IPA** | \`${IPA_NAME}\` (${IPA_SIZE}) |
           | **SHA-256** | \`${IPA_SHA256}\` |
           | **SDK** | iPhoneOS \`${SDK_VERSION}\` (\`arm64\`) |
-          | **Engine** | Chromium \`${CHROMIUM_VERSION}\` (run \`${KERNEL_RUN_ID}\`, commit \`${KERNEL_COMMIT:0:7}\`) |
+          | **Curium Kernel** | \`Kernel ${KERNEL_BUILD}\` · Chromium \`${CHROMIUM_VERSION}\` (CI run \`${KERNEL_RUN_ID}\`, commit \`${KERNEL_COMMIT:0:7}\`) |
           | **Release published** | \`${PUBLISHED}\` |
           EOF
         env:
@@ -220,6 +224,7 @@ jobs:
           IPA_SIZE: ${{ steps.build.outputs.ipa_size }}
           IPA_SHA256: ${{ steps.build.outputs.ipa_sha256 }}
           SDK_VERSION: ${{ steps.build.outputs.sdk_version }}
+          KERNEL_BUILD: ${{ steps.build.outputs.kernel_build }}
           CHROMIUM_VERSION: ${{ steps.build.outputs.chromium_version }}
           KERNEL_RUN_ID: ${{ steps.build.outputs.kernel_run_id }}
           KERNEL_COMMIT: ${{ steps.build.outputs.kernel_commit }}

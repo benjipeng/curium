@@ -585,6 +585,14 @@ struct CuriumProfileSwitcherSheet: View {
                     .lineLimit(1)
             }
 
+            if let kernel = CuriumDiagnostics.KernelMetadata.bundled {
+                LabeledContent("Curium Kernel") {
+                    Text(kernel.shortLabel)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             if let status = engineStatus {
                 LabeledContent("Engine Contract") {
                     Text("v\(status.contractVersion) · \(status.state)")
