@@ -2,7 +2,7 @@
 # Build, verify, ad-hoc sign, and package the Curium Swift iOS IPA against the
 # prebuilt Chromium Blink engine pinned in Kernel.lock.
 #
-# Shared by local developer builds and GitHub Actions (.github/workflows/build-curium.yml).
+# Shared by local developer builds and GitHub Actions (.github/workflows/build-app.yml).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

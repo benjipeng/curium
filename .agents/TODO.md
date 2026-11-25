@@ -14,7 +14,7 @@ the pinned engine first, translate to `patches/` once proven.
 ## Open Work
 
 - [ ] **Verify smaller initial Wasm reservations on TXM (`ac_duo`, `0001`).**
-  `0001` targets at most 8 MiB for a module's first reservation (Simulator verified `256` JS ↔ Wasm calls under `Native MAP_JIT`). On physical `ac_duo`, compare a large module and repeated tab/worker loads against Build 40 before resizing the 64 MiB pool. This V8 pin requires global jitless for DrumBrake; crossing its committed-code cap is fatal.
+  `0001` targets at most 8 MiB for a module's first reservation (Simulator verified `256` JS ↔ Wasm calls under `Native MAP_JIT`). On physical `ac_duo`, compare a large module and repeated tab/worker loads against Kernel 40 before resizing the 64 MiB pool. This V8 pin requires global jitless for DrumBrake; crossing its committed-code cap is fatal.
 - [ ] **Pure-Swift MPEG-DASH (`.mpd`) downloader (deferred from Kernel 44).**
   Standalone app-side PR gated upfront on `avc1`/`hvc1` + `mp4a` fMP4 codecs (rejecting VP9/AV1+Opus incompatible with `AVAssetExportPresetPassthrough`).
 - [ ] **`extensions/tabs.json` schema expansion (next engine wave).**
@@ -22,12 +22,12 @@ the pinned engine first, translate to `patches/` once proven.
 
 ## Live Hooks
 
-Permanent shell-side runtime guards in `Curium/Engine/CuriumRuntime.m` (all temporary Build 35 and Build 40 workarounds are retired).
+Permanent shell-side runtime guards in `Curium/Engine/CuriumRuntime.m` (all temporary Kernel 35 and Kernel 40 workarounds are retired).
 
 | Hook | Effect | Exit |
 | --- | --- | --- |
 | `CrIOSEngineBootstrap` launch, hot-swap & policy bridge | Probes `EngineContract` v4 capabilities, configures bounded launch JSON (schema v1..3; `EngineContract` v4 accepts 1..4) before `ChromeMain` (failing closed on rejection), drives hot runtime privacy policy (`policySchemaVersion: 1`, `applyRuntimePolicyJSON:error:`) and zero-restart `switchToProfile`. | Permanent shell ↔ engine contract. |
-| `-[NSProcessInfo arguments]` | Adds launch switches: Google features off, `--disable-sync`, JIT mode, Skia Graphite off on Simulator, desktop zero-touch macOS switches (`--touch-events=disabled`, `--disable-blink-features=TouchEventFeatureDetection`, `--enable-blink-features=KeyboardLock`, `--js-flags=--max-old-space-size=2048`), and legacy Build 39–42 fallbacks. | Permanent channel. |
+| `-[NSProcessInfo arguments]` | Adds launch switches: Google features off, `--disable-sync`, JIT mode, Skia Graphite off on Simulator, desktop zero-touch macOS switches (`--touch-events=disabled`, `--disable-blink-features=TouchEventFeatureDetection`, `--enable-blink-features=KeyboardLock`, `--js-flags=--max-old-space-size=2048`), and legacy Kernel 39–42 fallbacks. | Permanent channel. |
 | `V8IOSJitPrepareForProcess` pre-`ChromeMain` probe | Prepares V8's iOS TXM / Simulator JIT pool before Crashpad installs exception handlers. | Permanent: shell-controlled JIT preference. |
 | `+[MetricsMediator logLaunchMetricsWithStartupInformation:connectedScenes:]` | No-op. Launch metrics walk Chrome's tab model for uploads Curium never makes. | None planned. |
 

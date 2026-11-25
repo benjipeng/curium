@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-/// Imports either a full `CuriumFingerprintProfile` JSON export or a Build 40/41/42
+/// Imports either a full `CuriumFingerprintProfile` JSON export or a Kernel 40+
 /// engine wire payload (`schemaVersion` + `profileId`) as a brand-new local profile
 /// under a freshly minted collision-free `p-<8hex>` slug.
 struct CuriumProfileImportSheet: View {
@@ -85,7 +85,7 @@ struct CuriumProfileImportSheet: View {
                     Text("Profile or Engine Wire JSON")
                 } footer: {
                     Text(
-                        "Accepts exported Curium profile JSON or Build 40/41/42 engine wire payloads (schemaVersion 1–2). Always mints a fresh isolated profile ID so existing, template, and retired slugs never collide."
+                        "Accepts exported Curium profile JSON or Kernel 40+ engine wire payloads (schemaVersion 1–3). Always mints a fresh isolated profile ID so existing, template, and retired slugs never collide."
                     )
                 }
 

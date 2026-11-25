@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plans a build-ipa run: build identities, existing checkpoints, work to do.
+"""Plans a build-kernel run: build identities, existing checkpoints, work to do.
 
 Every stage produces one write-once checkpoint in GHCR named by a key over the
 inputs that shape its output: its epoch (ci/epochs.json), the upstream key,

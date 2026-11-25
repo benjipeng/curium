@@ -168,7 +168,7 @@ class RealRepoInvarianceTests(unittest.TestCase):
         self.assertEqual(k_compile, "22eaeed27ee22740a8f1")
 
     def test_workflow_exports_all_plan_outputs(self):
-        wf_text = (REPO_ROOT / ".github/workflows/build-ipa.yml").read_text(encoding="utf-8")
+        wf_text = (REPO_ROOT / ".github/workflows/build-kernel.yml").read_text(encoding="utf-8")
         referenced = set(re.findall(r"needs\.plan\.outputs\.([a-z0-9_]+)", wf_text))
         # Extract plan job outputs block.
         m = re.search(r"(?ms)^  plan:\n.*?^    outputs:\n(.*?)^    steps:", wf_text)

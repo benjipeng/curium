@@ -6,7 +6,7 @@ name: Retry failed build once
 
 on:
   workflow_run:
-    workflows: ["Build Chromium Blink iOS IPA"]
+    workflows: ["Build Curium Kernel"]
     types: [completed]
 
 permissions:

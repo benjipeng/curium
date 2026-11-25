@@ -5,8 +5,8 @@
 
   <p>
     <a href="https://github.com/benjipeng/curium/releases/latest"><img src="https://img.shields.io/github/v/release/benjipeng/curium?label=Release&color=57349C&style=flat" alt="Latest Release" /></a>
-    <a href="https://github.com/benjipeng/curium/actions/workflows/build-curium.yml"><img src="https://img.shields.io/github/actions/workflow/status/benjipeng/curium/build-curium.yml?label=Curium%20IPA&style=flat" alt="Build &amp; Release Curium IPA" /></a>
-    <a href="https://github.com/benjipeng/curium/actions/workflows/build-ipa.yml"><img src="https://img.shields.io/github/actions/workflow/status/benjipeng/curium/build-ipa.yml?label=Blink%20Kernel&style=flat" alt="Build Chromium Blink Engine" /></a>
+    <a href="https://github.com/benjipeng/curium/actions/workflows/build-app.yml"><img src="https://img.shields.io/github/actions/workflow/status/benjipeng/curium/build-app.yml?label=Curium%20App&style=flat" alt="Build &amp; Release Curium App" /></a>
+    <a href="https://github.com/benjipeng/curium/actions/workflows/build-kernel.yml"><img src="https://img.shields.io/github/actions/workflow/status/benjipeng/curium/build-kernel.yml?label=Blink%20Kernel&style=flat" alt="Build Curium Kernel" /></a>
     <img src="https://img.shields.io/badge/Chromium%20Blink-160.0.8171.0-4285F4?style=flat&logo=googlechrome&logoColor=white" alt="Chromium Blink 160.0.8171.0" />
     <img src="https://img.shields.io/badge/iOS%20SDK-27.2%20%C2%B7%20arm64-111111?style=flat&logo=apple&logoColor=white" alt="iOS 27.2 SDK arm64" />
     <a href="LICENSE"><img src="https://img.shields.io/github/license/benjipeng/curium?style=flat&color=6E7681" alt="BSD-3-Clause License" /></a>
@@ -58,7 +58,7 @@ Managed in **Settings → Profile**, Curium keeps `"default"` in `<Application S
 
 ```mermaid
 flowchart LR
-    subgraph P1["Pipeline 1 · Blink Kernel (build-ipa.yml)"]
+    subgraph P1["Pipeline 1 · Blink Kernel (build-kernel.yml)"]
         direction LR
         S0["0–1 · SDK Stub &amp; Codegen"] --> S2["2–3 · Apple Tools &amp; 18 Linux Shards"]
         S2 --> S4["4–5 · Link &amp; Kernel IPA"]
@@ -66,7 +66,7 @@ flowchart LR
 
     S4 -->|"Bump KERNEL_BUILD + SHA-256"| LOCK["Kernel.lock"]
 
-    subgraph P2["Pipeline 2 · Curium App (build-curium.yml)"]
+    subgraph P2["Pipeline 2 · Curium App (build-app.yml)"]
         direction LR
         SYNC["sync_curium_engine.py<br/>XCFrameworks + Resources"] --> XC["Xcode 27.2 · Release arm64"]
         XC --> REL["Verify SDK 27.2 &amp; Publish Release"]
@@ -105,7 +105,7 @@ xcodebuild -project Curium.xcodeproj -scheme Curium \
 
 See [`Curium/README.md`](Curium/README.md) for Xcode build modes and module boundaries, and [`EngineContract/README.md`](EngineContract/README.md) for the shell ↔ Blink ABI.
 
-**Forks / Self-Hosting:** Use a public repository with secret `CI_ARTIFACT_KEY` → run `sync-source.yml` → run `build-ipa.yml` and pin `Kernel.lock` → push a `curium-v*` tag or dispatch `build-curium.yml`.
+**Forks / Self-Hosting:** Use a public repository with secret `CI_ARTIFACT_KEY` → run `sync-source.yml` → run `build-kernel.yml` and pin `Kernel.lock` → push a `curium-v*` tag or dispatch `build-app.yml`.
 
 ## Repository Layout
 

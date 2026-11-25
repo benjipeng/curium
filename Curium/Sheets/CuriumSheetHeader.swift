@@ -425,7 +425,7 @@ private struct CuriumDiagnosticsSheet: View {
                             }
                         }
                     } else {
-                        LabeledContent("Engine Contract", value: "Not linked / Pre-Build 40")
+                        LabeledContent("Engine Contract", value: "Not linked / Pre-Kernel 40")
                     }
 
                     if let caps = fingerprintCapabilities, caps.supportsLaunchFingerprintConfig {

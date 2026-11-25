@@ -1,12 +1,12 @@
-name: Build & Release Curium IPA
-run-name: "Curium · ${{ github.ref_name }} · #${{ github.run_number }}"
+name: Build & Release Curium App
+run-name: "App · ${{ github.ref_name }} · run #${{ github.run_number }}"
 
 # Pipeline 2: builds the Swift Curium browser app (Curium.xcodeproj + Curium/)
 # against the prebuilt Chromium Blink engine pinned in Kernel.lock (produced by
-# Pipeline 1: build-ipa.yml), verifies iOS 27.2 SDK linkage and inside-out
+# Pipeline 1: build-kernel.yml), verifies iOS 27.2 SDK linkage and inside-out
 # ad-hoc code signing, and publishes the packaged arm64 IPA to GitHub Releases.
 #
-# Runs independently of build-ipa.yml and never rebuilds Chromium.
+# Runs independently of build-kernel.yml and never rebuilds Chromium.
 
 on:
   push:
@@ -167,7 +167,7 @@ jobs:
               printf '%s\n\n' "$INPUT_RELEASE_NOTES"
             fi
             cat <<EOF
-          ### Curium ${CURIUM_VERSION}-b${CURIUM_BUILD}
+          ### Curium ${CURIUM_VERSION} (${CURIUM_BUILD}) · Kernel ${KERNEL_BUILD}
 
           Ad-hoc signed \`arm64\` iOS IPA built with Xcode ${SDK_VERSION} (iOS ${SDK_VERSION} SDK) for LiveContainer and sideloading.
 
@@ -183,9 +183,10 @@ jobs:
           EOF
           } > "$notes_file"
 
+          release_title="Curium ${CURIUM_VERSION} (${CURIUM_BUILD}) · Kernel ${KERNEL_BUILD}"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release edit "$tag" \
-              --title "Curium ${CURIUM_VERSION}-b${CURIUM_BUILD}" \
+              --title "$release_title" \
               --notes-file "$notes_file"
             gh release upload "$tag" "$IPA_PATH" "$SHA_PATH" --clobber
           else
@@ -196,7 +197,7 @@ jobs:
             gh release create "$tag" \
               "$IPA_PATH" "$SHA_PATH" \
               --target "$GITHUB_SHA" \
-              --title "Curium ${CURIUM_VERSION}-b${CURIUM_BUILD}" \
+              --title "$release_title" \
               --notes-file "$notes_file" \
               --generate-notes \
               ${extra_flags[@]+"${extra_flags[@]}"}
@@ -207,7 +208,7 @@ jobs:
         if: always() && steps.build.outcome == 'success'
         run: |
           cat <<EOF >> "$GITHUB_STEP_SUMMARY"
-          ## Curium ${CURIUM_VERSION}-b${CURIUM_BUILD}
+          ## Curium ${CURIUM_VERSION} (${CURIUM_BUILD}) · Kernel ${KERNEL_BUILD}
 
           | Metric | Value |
           | --- | --- |

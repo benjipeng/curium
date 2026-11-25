@@ -9,7 +9,7 @@ on:
         type: boolean
         default: false
 
-# Shares build-ipa.yml's group: both write GHCR artifacts. A forced re-sync
+# Shares build-kernel.yml's group: both write GHCR artifacts. A forced re-sync
 # overwrites the tag, but builds key on the snapshot digest, so they rebuild.
 concurrency:
   group: ghcr-writes
